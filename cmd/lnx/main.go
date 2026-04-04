@@ -37,9 +37,9 @@ func init() {
 func main() {
 	initHostLogging()
 
-	// Default to bash when no command is given.
+	// Default to login bash when no command is given.
 	if len(os.Args) == 1 {
-		os.Args = append(os.Args, "bash")
+		os.Args = append(os.Args, "bash", "-l")
 	}
 
 	// If the first arg is not a known subcommand or flag, bypass cobra

@@ -365,6 +365,7 @@ func (s *apiServer) handleExecInteractive(w http.ResponseWriter, r *http.Request
 		close(done)
 	}()
 	io.Copy(conn, vsockConn)
+	vsockConn.Close()
 	<-done
 
 	// Read exit code from the gob exec connection.
@@ -441,13 +442,8 @@ func (s *apiServer) runExecInteractiveDirect(execDec *gob.Decoder) int {
 	}
 	defer vsockConn.Close()
 
-	done := make(chan struct{})
-	go func() {
-		io.Copy(vsockConn, os.Stdin)
-		close(done)
-	}()
+	go io.Copy(vsockConn, os.Stdin)
 	io.Copy(os.Stdout, vsockConn)
-	<-done
 
 	var msg protocol.Msg
 	if err := execDec.Decode(&msg); err == nil && msg.ExecDone != nil {

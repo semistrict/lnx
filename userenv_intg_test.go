@@ -53,6 +53,16 @@ func TestRun_CWDIsHostCWD(t *testing.T) {
 	assert.Contains(t, string(data), cwd)
 }
 
+func TestRun_ProfileDExists(t *testing.T) {
+	t.Parallel()
+	dir := setupTestDir(t)
+	cfg := testConfig(dir)
+
+	exitCode, err := lnx.Run(cfg, "test", "-f", "/etc/profile.d/lnx-bashrc.sh")
+	require.NoError(t, err)
+	assert.Equal(t, 0, exitCode)
+}
+
 func TestRun_NotRoot(t *testing.T) {
 	t.Parallel()
 	dir := setupTestDir(t)

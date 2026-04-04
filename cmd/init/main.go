@@ -136,6 +136,7 @@ func run() error {
 
 	configureNetwork()
 	writeResolvConf()
+	installBashDefaults()
 	installXdgOpen()
 	startStatusServer()
 	startExecServer()
@@ -235,6 +236,13 @@ func setClockFromEpoch(epochStr string) {
 }
 
 func setupUser(username string, uid int) {
+	// Skip if user was already created in a prior boot.
+	if data, err := os.ReadFile("/etc/passwd"); err == nil {
+		if strings.Contains(string(data), username+":") {
+			return
+		}
+	}
+
 	gid := uid
 	home := "/home/" + username
 
@@ -257,6 +265,18 @@ func appendFile(path, line string) {
 	}
 	f.WriteString(line)
 	f.Close()
+}
+
+// installBashDefaults ensures bash has color support and standard aliases
+// even when the user's home dir is a read-only 9P mount without .bashrc.
+func installBashDefaults() {
+	script := `# lnx: source skeleton bashrc for color support
+if [ -n "$BASH_VERSION" ] && [ -f /etc/skel/.bashrc ]; then
+    . /etc/skel/.bashrc
+fi
+`
+	os.MkdirAll("/etc/profile.d", 0755)
+	os.WriteFile("/etc/profile.d/lnx-bashrc.sh", []byte(script), 0644)
 }
 
 // installXdgOpen writes a shim that forwards xdg-open calls to the host
