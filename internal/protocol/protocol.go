@@ -86,6 +86,7 @@ type StatusResp struct {
 type ExecReq struct {
 	Args []string
 	Env  []string
+	CWD  string // working directory (empty = use setup CWD)
 	PTY  bool
 	Rows uint16
 	Cols uint16

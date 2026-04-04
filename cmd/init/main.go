@@ -40,6 +40,9 @@ var (
 	ctrlMu    sync.RWMutex
 	ctrlPTY   *os.File
 	ctrlPTYMu sync.RWMutex
+
+	setupUID int    // UID from the host Setup message
+	setupCWD string // CWD from the host Setup message
 )
 
 func run() error {
@@ -114,6 +117,8 @@ func run() error {
 	os.Setenv("TERM", "xterm-256color")
 	os.Setenv("LANG", "C.UTF-8")
 
+	setupUID = setup.UID
+	setupCWD = setup.CWD
 	if setup.User != "" && setup.UID > 0 {
 		setupUser(setup.User, setup.UID)
 		os.Setenv("HOME", "/home/"+setup.User)

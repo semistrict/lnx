@@ -76,15 +76,19 @@ func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener) {
 	for _, kv := range req.Env {
 		cmd.Env = append(cmd.Env, kv)
 	}
-	if home := os.Getenv("HOME"); home != "" {
-		cmd.Dir = home
+	switch {
+	case req.CWD != "":
+		cmd.Dir = req.CWD
+	case setupCWD != "":
+		cmd.Dir = setupCWD
+	default:
+		cmd.Dir = os.Getenv("HOME")
 	}
-	uid := os.Getuid()
-	if uid > 0 {
+	if setupUID > 0 {
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Credential: &syscall.Credential{
-				Uid: uint32(uid),
-				Gid: uint32(uid),
+				Uid: uint32(setupUID),
+				Gid: uint32(setupUID),
 			},
 		}
 	}
@@ -168,8 +172,21 @@ func runExecPipe(enc *gob.Encoder, req *protocol.ExecReq) {
 	for _, kv := range req.Env {
 		cmd.Env = append(cmd.Env, kv)
 	}
-	if home := os.Getenv("HOME"); home != "" {
-		cmd.Dir = home
+	switch {
+	case req.CWD != "":
+		cmd.Dir = req.CWD
+	case setupCWD != "":
+		cmd.Dir = setupCWD
+	default:
+		cmd.Dir = os.Getenv("HOME")
+	}
+	if setupUID > 0 {
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Credential: &syscall.Credential{
+				Uid: uint32(setupUID),
+				Gid: uint32(setupUID),
+			},
+		}
 	}
 
 	stdout, err := cmd.StdoutPipe()

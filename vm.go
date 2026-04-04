@@ -145,6 +145,7 @@ func Run(cfg *Config, args ...string) (int, error) {
 
 	exitCode := vs.api.runExec(&protocol.ExecReq{
 		Args: args,
+		CWD:  cwd,
 		PTY:  interactive,
 		Rows: rows,
 		Cols: cols,
