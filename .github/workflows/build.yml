@@ -27,8 +27,8 @@ jobs:
       - name: Vet (Linux-compatible packages)
         run: go vet ./internal/... ./cmd/init/...
 
-      - name: Run tests
-        run: go test -race -v ./...
+      - name: Run tests (Linux-compatible packages)
+        run: go test -race -v ./internal/...
 
   build-macos:
     runs-on: macos-latest
@@ -50,6 +50,9 @@ jobs:
 
       - name: Build lnx (macOS)
         run: go build -ldflags '-extldflags "-Wl,-no_warn_duplicate_libraries"' -o lnx ./cmd/lnx
+
+      - name: Run tests
+        run: go test -race -v ./...
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
