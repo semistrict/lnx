@@ -1,0 +1,34 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build guest init (linux/arm64)
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o cmd/lnx/init ./cmd/init
+
+      - name: Build lnx (macOS)
+        run: go build -ldflags '-extldflags "-Wl,-no_warn_duplicate_libraries"' -o lnx ./cmd/lnx
+
+      - name: Run tests
+        run: go test -v ./...
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: lnx-darwin-arm64
+          path: lnx
