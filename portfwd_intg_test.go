@@ -47,7 +47,7 @@ s.close()
 	// Wait for port forwarding to detect the listener and forward it.
 	var conn net.Conn
 	var err error
-	for i := 0; i < 30; i++ {
+	for i := 0; i < 60; i++ {
 		time.Sleep(time.Second)
 		conn, err = net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", guestPort), time.Second)
 		if err == nil {

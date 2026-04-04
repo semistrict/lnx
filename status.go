@@ -53,6 +53,8 @@ type apiServer struct {
 
 	guestCtrlConn net.Conn
 
+	pf *portForwarder
+
 	sockPath string
 	listener net.Listener
 }
@@ -168,6 +170,7 @@ func (s *apiServer) listenUnix(sockPath string) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /status", s.handleStatus)
+	mux.HandleFunc("GET /ports", s.handlePorts)
 	mux.HandleFunc("POST /exec", s.handleExec)
 
 	go http.Serve(ln, mux)
@@ -200,6 +203,28 @@ func (s *apiServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// PortEntry describes a single forwarded port.
+type PortEntry struct {
+	Guest uint16 `json:"guest"`
+	Host  uint16 `json:"host"`
+}
+
+func (s *apiServer) handlePorts(w http.ResponseWriter, r *http.Request) {
+	var ports []PortEntry
+	if s.pf != nil {
+		s.pf.mu.Lock()
+		for _, fp := range s.pf.listeners {
+			ports = append(ports, PortEntry{Guest: fp.guestPort, Host: fp.hostPort})
+		}
+		s.pf.mu.Unlock()
+	}
+	if ports == nil {
+		ports = []PortEntry{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ports)
 }
 
 // ExecRequest is the JSON body for POST /exec.

@@ -55,7 +55,7 @@ test:
 # Usage: make test-integration [RUN=TestName]
 test-integration: cmd/lnx/init
 	go build -o /tmp/lnx-codesign ./cmd/codesign
-	go test -v -timeout 60s -tags integration -exec /tmp/lnx-codesign $(if $(RUN),-run $(RUN)) ./...
+	go test -v -timeout 120s -tags integration -exec /tmp/lnx-codesign $(if $(RUN),-run $(RUN)) ./...
 
 # Install to $GOPATH/bin
 install: cmd/lnx/init

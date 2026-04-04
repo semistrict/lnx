@@ -3,15 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/semistrict/lnx"
 	"github.com/spf13/cobra"
@@ -37,26 +33,14 @@ func runExec(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("usage: lnx exec [--] command [args...]")
 	}
 
-	sockPath := filepath.Join(lnxDir(), "status.sock")
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return net.DialTimeout("unix", sockPath, 2*time.Second)
-			},
-		},
-	}
-
-	body, err := json.Marshal(lnx.ExecRequest{
-		Args: args,
-	})
+	body, err := json.Marshal(lnx.ExecRequest{Args: args})
 	if err != nil {
 		return err
 	}
 
-	resp, err := client.Post("http://localhost/exec", "application/json", bytes.NewReader(body))
+	resp, err := apiClient().Post("http://localhost/exec", "application/json", bytes.NewReader(body))
 	if err != nil {
-		if os.IsNotExist(err) || strings.Contains(err.Error(), "no such file") || strings.Contains(err.Error(), "connection refused") {
+		if isNoVM(err) {
 			fmt.Fprintln(os.Stderr, "no VM running")
 			os.Exit(1)
 		}

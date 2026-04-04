@@ -42,16 +42,37 @@ func main() {
 	initHostLogging()
 
 	// Default to interactive bash when no command is given.
-	// Done here because Cobra shows help instead of calling RunE
-	// when subcommands exist and no args are provided.
 	if len(os.Args) == 1 {
 		os.Args = append(os.Args, "-i", "bash")
+	}
+
+	// If the first arg is not a known subcommand or flag, bypass cobra
+	// entirely so flags like -g aren't intercepted.
+	if len(os.Args) > 1 && !isSubcommandOrFlag(os.Args[1]) {
+		exitCode, err := runVM(os.Args[1:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(exitCode)
 	}
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func isSubcommandOrFlag(arg string) bool {
+	if strings.HasPrefix(arg, "-") {
+		return true
+	}
+	for _, cmd := range rootCmd.Commands() {
+		if cmd.Name() == arg {
+			return true
+		}
+	}
+	return false
 }
 
 func runVM(args []string) (int, error) {

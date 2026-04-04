@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -332,7 +333,9 @@ func runDirect(args []string, cwdPath string, uid int, exitCode *int) error {
 	}
 
 	if err := cmd.Start(); err != nil {
-		slog.Error("exec failed", "error", err)
+		if errors.Is(err, exec.ErrNotFound) {
+			fmt.Fprintf(termConn, "%s: command not found\n", args[0])
+		}
 		*exitCode = 127
 		return nil
 	}

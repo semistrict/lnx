@@ -1,13 +1,8 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"net"
-	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -29,28 +24,18 @@ func init() {
 }
 
 func runStatus(cmd *cobra.Command, args []string) error {
-	sockPath := filepath.Join(lnxDir(), "status.sock")
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return net.DialTimeout("unix", sockPath, 2*time.Second)
-			},
-		},
-	}
-
 	url := "http://localhost/status"
 	if showDmesg {
 		url += "?dmesg=1"
 	}
 
-	resp, err := client.Get(url)
+	resp, err := apiClient().Get(url)
 	if err != nil {
-		if os.IsNotExist(err) || strings.Contains(err.Error(), "no such file") || strings.Contains(err.Error(), "connection refused") {
+		if isNoVM(err) {
 			fmt.Println("no VM running")
 			return nil
 		}
-		return fmt.Errorf("connect to status socket: %w", err)
+		return err
 	}
 	defer resp.Body.Close()
 

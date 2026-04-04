@@ -271,6 +271,7 @@ func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, execMsg *proto
 
 	// API server: accept guest connections, serve HTTP on unix socket.
 	api := newAPIServer(execMsg.Args, execMsg.User, rootfsPath)
+	api.pf = pf
 	go func() {
 		conn, err := statusListener.Accept()
 		if err != nil {
@@ -358,11 +359,12 @@ func runControlConn(conn net.Conn, execMsg *protocol.Exec, exitCodeCh chan<- int
 
 	// Forward signals in a goroutine. SIGWINCH is converted to a Resize
 	// message with the current terminal dimensions instead of being forwarded
-	// as a raw signal number.
+	// as a raw signal number. Two SIGINTs within 1 second force-exits.
 	done := make(chan struct{})
 	defer close(done)
 	if sigCh != nil {
 		go func() {
+			var lastInt time.Time
 			for {
 				select {
 				case sig := <-sigCh:
@@ -374,7 +376,15 @@ func runControlConn(conn net.Conn, execMsg *protocol.Exec, exitCodeCh chan<- int
 								Cols: uint16(w),
 							}})
 						}
+					} else if sig == syscall.SIGINT && time.Since(lastInt) < time.Second {
+						fmt.Fprintln(os.Stderr, "\nforce quit")
+						code = 130
+						conn.Close()
+						return
 					} else {
+						if sig == syscall.SIGINT {
+							lastInt = time.Now()
+						}
 						enc.Encode(protocol.Msg{Signal: &protocol.Signal{
 							Sig: int(sig.(syscall.Signal)),
 						}})
@@ -410,16 +420,21 @@ func waitForVM(vm *vz.VirtualMachine, exitCodeCh <-chan int, cleanup func()) (in
 	for {
 		select {
 		case code := <-exitCodeCh:
-			// Guest sent Exit, host sent Ack, we have the code.
-			// Request graceful stop; the guest is already calling
-			// poweroff. If it doesn't stop quickly, force-stop.
-			vm.RequestStop()
-			select {
-			case <-time.After(3 * time.Second):
+			if code == 130 {
+				// Force quit (double Ctrl-C): stop VM immediately.
 				vm.Stop()
-			case state := <-stateCh:
-				if state != vz.VirtualMachineStateStopped {
+			} else {
+				// Guest sent Exit, host sent Ack, we have the code.
+				// Request graceful stop; the guest is already calling
+				// poweroff. If it doesn't stop quickly, force-stop.
+				vm.RequestStop()
+				select {
+				case <-time.After(3 * time.Second):
 					vm.Stop()
+				case state := <-stateCh:
+					if state != vz.VirtualMachineStateStopped {
+						vm.Stop()
+					}
 				}
 			}
 			return code, nil
