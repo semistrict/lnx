@@ -1,0 +1,23 @@
+FROM ubuntu:26.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    bc \
+    bison \
+    flex \
+    dwarves \
+    libelf-dev \
+    libssl-dev \
+    linux-source-7.0.0 \
+    cpio \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir /build && \
+    tar xf /usr/src/linux-source-7.0.0.tar.bz2 -C /build --strip-components=1
+
+WORKDIR /build
+
+COPY kernel.config .config
+RUN make olddefconfig && make -j$(nproc)
+
+# Output is arch/arm64/boot/Image

@@ -1,0 +1,15 @@
+# Build artifacts
+/lnx
+/init
+/cmd/lnx/init
+/kernel.Image
+/rootfs.ext4
+
+# Claude Code
+.claude/settings.local.json
+
+# Test artifacts
+/tmp/
+
+# Codesign helper
+/tmp/lnx-codesign

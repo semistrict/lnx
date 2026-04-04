@@ -1,0 +1,3 @@
+[submodule "third_party/vz"]
+	path = third_party/vz
+	url = https://github.com/Code-Hex/vz.git
