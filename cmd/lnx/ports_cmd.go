@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sort"
+	"time"
 
 	"github.com/semistrict/lnx"
 	"github.com/spf13/cobra"
@@ -50,12 +52,24 @@ func runPortsList(cmd *cobra.Command, args []string) error {
 		return ports[i].Guest < ports[j].Guest
 	})
 
+	probe := &http.Client{Timeout: 500 * time.Millisecond}
+
+	fmt.Printf("%-8s  %-8s  %s\n", "GUEST", "HOST", "URL")
 	for _, p := range ports {
-		if p.Guest == p.Host {
-			fmt.Printf(":%d\n", p.Guest)
-		} else {
-			fmt.Printf(":%d -> :%d\n", p.Guest, p.Host)
+		url := ""
+		if isHTTP(probe, p.Host) {
+			url = fmt.Sprintf("http://localhost:%d", p.Host)
 		}
+		fmt.Printf("%-8d  %-8d  %s\n", p.Guest, p.Host, url)
 	}
 	return nil
+}
+
+func isHTTP(client *http.Client, port uint16) bool {
+	resp, err := client.Head(fmt.Sprintf("http://localhost:%d/", port))
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return true
 }

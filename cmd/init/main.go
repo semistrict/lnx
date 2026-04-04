@@ -116,6 +116,7 @@ func run() error {
 	os.Setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	os.Setenv("TERM", "xterm-256color")
 	os.Setenv("LANG", "C.UTF-8")
+	os.Setenv("BROWSER", "xdg-open")
 
 	setupUID = setup.UID
 	setupCWD = setup.CWD
