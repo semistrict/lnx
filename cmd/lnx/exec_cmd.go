@@ -37,8 +37,8 @@ func runExec(cmd *cobra.Command, args []string) error {
 		return cmd.Help()
 	}
 
-	// Parse -i/--interactive manually since DisableFlagParsing is true.
-	interactive := false
+	// Auto-detect interactive mode, allow explicit override.
+	interactive := term.IsTerminal(int(os.Stdin.Fd()))
 	var filtered []string
 	for _, a := range args {
 		if a == "-i" || a == "--interactive" {
@@ -169,27 +169,9 @@ func runExecInteractive(args []string) error {
 	}
 
 	// Connection is now raw — splice stdin/stdout.
-	done := make(chan struct{})
-	go func() {
-		io.Copy(conn, os.Stdin)
-		close(done)
-	}()
+	go io.Copy(conn, os.Stdin)
+	io.Copy(os.Stdout, br)
 
-	// Read from connection. The last byte is the exit code.
-	var buf bytes.Buffer
-	io.Copy(&buf, br)
-	<-done
-
-	exitCode := 255
-	if buf.Len() > 0 {
-		data := buf.Bytes()
-		// Write all but the last byte (terminal output).
-		if len(data) > 1 {
-			os.Stdout.Write(data[:len(data)-1])
-		}
-		exitCode = int(data[len(data)-1])
-	}
-
-	os.Exit(exitCode)
+	os.Exit(0)
 	return nil
 }

@@ -368,15 +368,9 @@ func (s *apiServer) handleExecInteractive(w http.ResponseWriter, r *http.Request
 	vsockConn.Close()
 	<-done
 
-	// Read exit code from the gob exec connection.
-	exitCode := byte(255)
+	// Drain the exec done message.
 	var msg protocol.Msg
-	if err := execDec.Decode(&msg); err == nil && msg.ExecDone != nil {
-		exitCode = byte(msg.ExecDone.ExitCode)
-	}
-
-	// Write exit code as the last byte.
-	conn.Write([]byte{exitCode})
+	execDec.Decode(&msg)
 }
 
 // runExec runs a command on the guest. Creates a new vsock exec connection
