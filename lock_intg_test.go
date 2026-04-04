@@ -14,6 +14,7 @@ import (
 )
 
 func TestRun_ConcurrentLock(t *testing.T) {
+	t.Parallel()
 	dir := setupTestDir(t)
 	cfg := testConfig(dir)
 
@@ -21,7 +22,7 @@ func TestRun_ConcurrentLock(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		lnx.Run(cfg, "sleep", "3")
+		lnx.Run(cfg, "sleep", "1")
 	}()
 
 	pidPath := cfg.RootfsPath + ".pid"
@@ -39,6 +40,7 @@ func TestRun_ConcurrentLock(t *testing.T) {
 }
 
 func TestRun_StaleLockRecovery(t *testing.T) {
+	t.Parallel()
 	dir := setupTestDir(t)
 	cfg := testConfig(dir)
 
@@ -55,6 +57,7 @@ func TestRun_StaleLockRecovery(t *testing.T) {
 }
 
 func TestRun_PidfileCreatedAndCleaned(t *testing.T) {
+	t.Parallel()
 	dir := setupTestDir(t)
 	cfg := testConfig(dir)
 	pidPath := cfg.RootfsPath + ".pid"

@@ -13,6 +13,7 @@ import (
 )
 
 func TestRun_EchoHello(t *testing.T) {
+	t.Parallel()
 	dir := setupTestDir(t)
 	exitCode, err := lnx.Run(testConfig(dir), "echo", "hello")
 	require.NoError(t, err)
@@ -20,6 +21,7 @@ func TestRun_EchoHello(t *testing.T) {
 }
 
 func TestRun_ExitCodeZero(t *testing.T) {
+	t.Parallel()
 	dir := setupTestDir(t)
 	exitCode, err := lnx.Run(testConfig(dir), "true")
 	require.NoError(t, err)
@@ -27,6 +29,7 @@ func TestRun_ExitCodeZero(t *testing.T) {
 }
 
 func TestRun_ExitCodeOne(t *testing.T) {
+	t.Parallel()
 	dir := setupTestDir(t)
 	exitCode, err := lnx.Run(testConfig(dir), "false")
 	require.NoError(t, err)
@@ -34,6 +37,7 @@ func TestRun_ExitCodeOne(t *testing.T) {
 }
 
 func TestRun_ExitCodeCustom(t *testing.T) {
+	t.Parallel()
 	dir := setupTestDir(t)
 	exitCode, err := lnx.Run(testConfig(dir), "sh", "-c", "exit 42")
 	require.NoError(t, err)
@@ -41,6 +45,7 @@ func TestRun_ExitCodeCustom(t *testing.T) {
 }
 
 func TestRun_OnlineResize(t *testing.T) {
+	t.Parallel()
 	dir := setupTestDir(t)
 	cfg := testConfig(dir)
 
@@ -61,6 +66,7 @@ func TestRun_OnlineResize(t *testing.T) {
 }
 
 func TestRun_MissingKernel(t *testing.T) {
+	t.Parallel()
 	lnx.InitBinary = []byte("fake")
 	_, err := lnx.Run(&lnx.Config{
 		KernelPath: "/nonexistent/vmlinuz",

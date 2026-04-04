@@ -248,6 +248,27 @@ func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, execMsg *proto
 		io.Copy(os.Stdout, conn)
 	}()
 
+	// Port forwarding: accept guest notification connection.
+	portFwdListener, err := sock.Listen(protocol.PortForwardPort)
+	if err != nil {
+		termListener.Close()
+		guestCtrlListener.Close()
+		execListener.Close()
+		statusListener.Close()
+		ctrlListener.Close()
+		logListener.Close()
+		return nil, nil, fmt.Errorf("vsock port forward listen: %w", err)
+	}
+
+	pf := newPortForwarder(sock)
+	go func() {
+		conn, err := portFwdListener.Accept()
+		if err != nil {
+			return
+		}
+		pf.run(conn)
+	}()
+
 	// API server: accept guest connections, serve HTTP on unix socket.
 	api := newAPIServer(execMsg.Args, execMsg.User, rootfsPath)
 	go func() {
@@ -281,7 +302,9 @@ func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, execMsg *proto
 	go handleControlConn(ctrlListener, execMsg, exitCodeCh)
 
 	cleanup := func() {
+		pf.close()
 		api.close()
+		portFwdListener.Close()
 		termListener.Close()
 		guestCtrlListener.Close()
 		execListener.Close()

@@ -13,6 +13,11 @@ const (
 	GuestControlPort = 1028
 	// TerminalPort is the vsock port for raw terminal I/O (stdin/stdout bytes).
 	TerminalPort = 1029
+	// PortForwardPort is the vsock port for port-forwarding notifications (guest → host).
+	PortForwardPort = 1030
+	// PortForwardDataPort is the vsock port the guest listens on for
+	// forwarded TCP connections (host connects via VirtioSocketDevice.Connect).
+	PortForwardDataPort = 1031
 )
 
 // Msg is the envelope for all control messages.
@@ -118,4 +123,9 @@ type OpenURLReq struct {
 // OpenURLResp reports the result of opening a URL.
 type OpenURLResp struct {
 	Error string // non-empty on failure
+}
+
+// PortForward notifies the host of the current set of listening TCP ports in the guest.
+type PortForward struct {
+	Ports []uint16
 }

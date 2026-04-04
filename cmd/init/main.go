@@ -5,6 +5,7 @@ package main
 import (
 	"encoding/gob"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -180,6 +181,7 @@ func run(exitCode *int) error {
 	startStatusServer()
 	startExecServer()
 	startGuestControlServer()
+	startPortForwarder()
 
 	slog.Info("running command", "args", execMsg.Args, "cwd", execMsg.CWD, "pty", execMsg.PTY, "user", execMsg.User, "uid", execMsg.UID)
 
@@ -306,7 +308,6 @@ func runDirect(args []string, cwdPath string, uid int, exitCode *int) error {
 	defer termConn.Close()
 
 	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Stdin = termConn
 	cmd.Stdout = termConn
 	cmd.Stderr = termConn
 	cmd.Env = os.Environ()
@@ -322,6 +323,14 @@ func runDirect(args []string, cwdPath string, uid int, exitCode *int) error {
 		}
 	}
 
+	// Use StdinPipe so cmd.Wait() doesn't block on the vsock read.
+	// The vsock terminal never closes (host stdin stays open), so
+	// passing it directly as cmd.Stdin would hang cmd.Wait() forever.
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("stdin pipe: %w", err)
+	}
+
 	if err := cmd.Start(); err != nil {
 		slog.Error("exec failed", "error", err)
 		*exitCode = 127
@@ -329,6 +338,12 @@ func runDirect(args []string, cwdPath string, uid int, exitCode *int) error {
 	}
 	setControlProcess(cmd.Process)
 	defer setControlProcess(nil)
+
+	// Copy terminal vsock → stdin pipe in background.
+	go func() {
+		io.Copy(stdinPipe, termConn)
+		stdinPipe.Close()
+	}()
 
 	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {

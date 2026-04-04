@@ -13,6 +13,7 @@ import (
 )
 
 func TestRun_VirtioFS_CWDMountedAtSamePath(t *testing.T) {
+	t.Parallel()
 	dir := setupTestDir(t)
 	cfg := testConfig(dir)
 
@@ -30,6 +31,7 @@ func TestRun_VirtioFS_CWDMountedAtSamePath(t *testing.T) {
 }
 
 func TestRun_VirtioFS_GuestWriteVisibleOnHost(t *testing.T) {
+	t.Parallel()
 	dir := setupTestDir(t)
 	cfg := testConfig(dir)
 

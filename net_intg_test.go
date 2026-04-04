@@ -11,6 +11,7 @@ import (
 )
 
 func TestRun_NetworkPing(t *testing.T) {
+	t.Parallel()
 	dir := setupTestDir(t)
 	cfg := testConfig(dir)
 
@@ -20,6 +21,7 @@ func TestRun_NetworkPing(t *testing.T) {
 }
 
 func TestRun_NetworkHTTP(t *testing.T) {
+	t.Parallel()
 	dir := setupTestDir(t)
 	cfg := testConfig(dir)
 

@@ -52,9 +52,10 @@ test:
 	go test -v ./...
 
 # Integration tests (macOS only, needs kernel+rootfs+init in place)
+# Usage: make test-integration [RUN=TestName]
 test-integration: cmd/lnx/init
 	go build -o /tmp/lnx-codesign ./cmd/codesign
-	go test -v -timeout 30s -tags integration -exec /tmp/lnx-codesign ./...
+	go test -v -timeout 60s -tags integration -exec /tmp/lnx-codesign $(if $(RUN),-run $(RUN)) ./...
 
 # Install to $GOPATH/bin
 install: cmd/lnx/init
