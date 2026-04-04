@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	vz "github.com/Code-Hex/vz/v3"
+
 	"github.com/semistrict/lnx/internal/protocol"
 )
 
@@ -46,14 +48,10 @@ type apiServer struct {
 	statusDec  *gob.Decoder
 	statusConn net.Conn
 
-	execMu   sync.Mutex
-	execEnc  *gob.Encoder
-	execDec  *gob.Decoder
-	execConn net.Conn
-
 	guestCtrlConn net.Conn
 
-	pf *portForwarder
+	sock *vz.VirtioSocketDevice
+	pf   *portForwarder
 
 	sockPath string
 	listener net.Listener
@@ -77,13 +75,19 @@ func (s *apiServer) setStatusConn(conn net.Conn) {
 	s.statusDec = gob.NewDecoder(conn)
 }
 
-// setExecConn stores the guest's exec vsock connection.
-func (s *apiServer) setExecConn(conn net.Conn) {
-	s.execMu.Lock()
-	defer s.execMu.Unlock()
-	s.execConn = conn
-	s.execEnc = gob.NewEncoder(conn)
-	s.execDec = gob.NewDecoder(conn)
+// connectExec creates a new vsock connection to the guest's exec server.
+// Retries briefly since the guest may still be booting.
+func (s *apiServer) connectExec() (*gob.Encoder, *gob.Decoder, net.Conn, error) {
+	var conn net.Conn
+	var err error
+	for i := 0; i < 300; i++ {
+		conn, err = s.sock.Connect(protocol.ExecPort)
+		if err == nil {
+			return gob.NewEncoder(conn), gob.NewDecoder(conn), conn, nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return nil, nil, nil, err
 }
 
 // setGuestCtrlConn stores the guest control vsock connection and starts
@@ -231,6 +235,9 @@ func (s *apiServer) handlePorts(w http.ResponseWriter, r *http.Request) {
 type ExecRequest struct {
 	Args []string `json:"args"`
 	Env  []string `json:"env,omitempty"`
+	PTY  bool     `json:"pty,omitempty"`
+	Rows uint16   `json:"rows,omitempty"`
+	Cols uint16   `json:"cols,omitempty"`
 }
 
 func (s *apiServer) handleExec(w http.ResponseWriter, r *http.Request) {
@@ -244,23 +251,33 @@ func (s *apiServer) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.execMu.Lock()
-	defer s.execMu.Unlock()
-
-	if s.execEnc == nil {
-		http.Error(w, "guest exec not connected", http.StatusServiceUnavailable)
+	execEnc, execDec, execConn, err := s.connectExec()
+	if err != nil {
+		http.Error(w, "guest exec connect: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}
+	defer execConn.Close()
 
-	// Send ExecReq to guest.
-	if err := s.execEnc.Encode(protocol.Msg{ExecReq: &protocol.ExecReq{
+	if err := execEnc.Encode(protocol.Msg{ExecReq: &protocol.ExecReq{
 		Args: req.Args,
 		Env:  req.Env,
+		PTY:  req.PTY,
+		Rows: req.Rows,
+		Cols: req.Cols,
 	}}); err != nil {
 		http.Error(w, "send exec request: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	if req.PTY {
+		s.handleExecInteractive(w, r, execDec)
+	} else {
+		s.handleExecStream(w, execDec)
+	}
+}
+
+// handleExecStream handles non-interactive exec via NDJSON streaming.
+func (s *apiServer) handleExecStream(w http.ResponseWriter, execDec *gob.Decoder) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
@@ -274,11 +291,10 @@ func (s *apiServer) handleExec(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	for {
 		var msg protocol.Msg
-		if err := s.execDec.Decode(&msg); err != nil {
+		if err := execDec.Decode(&msg); err != nil {
 			if err != io.EOF {
 				slog.Debug("exec decode failed", "error", err)
 			}
-			// Write an error exit code if we lose connection.
 			enc.Encode(map[string]int{"exit_code": -1})
 			flusher.Flush()
 			return
@@ -303,6 +319,143 @@ func (s *apiServer) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleExecInteractive handles interactive exec with PTY via HTTP hijack.
+// After headers, the connection carries raw terminal bytes. The last byte
+// before close is the exit code.
+func (s *apiServer) handleExecInteractive(w http.ResponseWriter, r *http.Request, execDec *gob.Decoder) {
+	// Connect to the guest's interactive exec vsock listener.
+	// Retry briefly — the guest needs time to accept after receiving ExecReq.
+	var vsockConn net.Conn
+	var err error
+	for i := 0; i < 50; i++ {
+		vsockConn, err = s.sock.Connect(protocol.ExecInteractivePort)
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err != nil {
+		slog.Info("exec interactive connect failed", "error", err)
+		http.Error(w, "guest pty connect: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	defer vsockConn.Close()
+
+	// Hijack the HTTP connection for raw I/O.
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "hijack not supported", http.StatusInternalServerError)
+		return
+	}
+	conn, buf, err := hj.Hijack()
+	if err != nil {
+		slog.Debug("exec hijack failed", "error", err)
+		return
+	}
+	defer conn.Close()
+
+	// Send HTTP 200 to signal the client to switch to raw mode.
+	buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n")
+	buf.Flush()
+
+	// Splice: client ↔ guest PTY.
+	done := make(chan struct{})
+	go func() {
+		io.Copy(vsockConn, conn)
+		close(done)
+	}()
+	io.Copy(conn, vsockConn)
+	<-done
+
+	// Read exit code from the gob exec connection.
+	exitCode := byte(255)
+	var msg protocol.Msg
+	if err := execDec.Decode(&msg); err == nil && msg.ExecDone != nil {
+		exitCode = byte(msg.ExecDone.ExitCode)
+	}
+
+	// Write exit code as the last byte.
+	conn.Write([]byte{exitCode})
+}
+
+// runExec runs a command on the guest. Creates a new vsock exec connection
+// per call so multiple execs can run concurrently.
+// For interactive (PTY) mode, it splices os.Stdin/os.Stdout with the guest PTY.
+// Returns the exit code.
+func (s *apiServer) runExec(req *protocol.ExecReq, interactive bool) int {
+	execEnc, execDec, execConn, err := s.connectExec()
+	if err != nil {
+		slog.Info("exec connect failed", "error", err)
+		return -1
+	}
+	defer execConn.Close()
+
+	if err := execEnc.Encode(protocol.Msg{ExecReq: req}); err != nil {
+		slog.Debug("exec encode failed", "error", err)
+		return -1
+	}
+
+	if interactive {
+		return s.runExecInteractiveDirect(execDec)
+	}
+	return runExecStreamDirect(execDec)
+}
+
+// runExecStreamDirect reads ExecOutput/ExecDone from the gob connection,
+// writing stdout/stderr to os.Stdout/os.Stderr.
+func runExecStreamDirect(execDec *gob.Decoder) int {
+	for {
+		var msg protocol.Msg
+		if err := execDec.Decode(&msg); err != nil {
+			return -1
+		}
+		if msg.ExecOutput != nil {
+			if len(msg.ExecOutput.Stdout) > 0 {
+				os.Stdout.Write(msg.ExecOutput.Stdout)
+			}
+			if len(msg.ExecOutput.Stderr) > 0 {
+				os.Stderr.Write(msg.ExecOutput.Stderr)
+			}
+		}
+		if msg.ExecDone != nil {
+			return msg.ExecDone.ExitCode
+		}
+	}
+}
+
+// runExecInteractiveDirect connects to the guest PTY via vsock
+// and splices os.Stdin/os.Stdout directly.
+func (s *apiServer) runExecInteractiveDirect(execDec *gob.Decoder) int {
+	var vsockConn net.Conn
+	for i := 0; i < 50; i++ {
+		var err error
+		vsockConn, err = s.sock.Connect(protocol.ExecInteractivePort)
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if vsockConn == nil {
+		slog.Info("exec interactive connect failed")
+		return -1
+	}
+	defer vsockConn.Close()
+
+	done := make(chan struct{})
+	go func() {
+		io.Copy(vsockConn, os.Stdin)
+		close(done)
+	}()
+	io.Copy(os.Stdout, vsockConn)
+	<-done
+
+	var msg protocol.Msg
+	if err := execDec.Decode(&msg); err == nil && msg.ExecDone != nil {
+		return msg.ExecDone.ExitCode
+	}
+	return -1
+}
+
 func (s *apiServer) close() {
 	if s.listener != nil {
 		s.listener.Close()
@@ -315,11 +468,6 @@ func (s *apiServer) close() {
 		s.statusConn.Close()
 	}
 	s.statusMu.Unlock()
-	s.execMu.Lock()
-	if s.execConn != nil {
-		s.execConn.Close()
-	}
-	s.execMu.Unlock()
 	if s.guestCtrlConn != nil {
 		s.guestCtrlConn.Close()
 	}

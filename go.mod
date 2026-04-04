@@ -7,6 +7,7 @@ replace github.com/Code-Hex/vz/v3 => ./third_party/vz
 require (
 	github.com/Code-Hex/vz/v3 v3.7.1
 	github.com/creack/pty v1.1.24
+	github.com/hugelgupf/p9 v0.3.0
 	github.com/mdlayher/vsock v1.2.1
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
@@ -22,6 +23,7 @@ require (
 	github.com/mdlayher/socket v0.4.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
+	github.com/u-root/uio v0.0.0-20230305220412-3e8cd9d6bf63 // indirect
 	golang.org/x/mod v0.34.0 // indirect
 	golang.org/x/net v0.44.0 // indirect
 	golang.org/x/sync v0.17.0 // indirect

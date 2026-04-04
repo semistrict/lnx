@@ -28,10 +28,6 @@ type Config struct {
 	// at the same path via virtiofs. Defaults to os.Getwd().
 	CWD string
 
-	// Interactive allocates a PTY in the guest and puts the host
-	// terminal into raw mode.
-	Interactive bool
-
 	// Env is a list of extra KEY=VALUE environment variables to pass
 	// to the guest, merged with the filtered host environment.
 	Env []string

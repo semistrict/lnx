@@ -52,12 +52,9 @@ func attachDisks(vmConfig *vz.VirtualMachineConfiguration, rootfsPath, swapPath 
 	return nil
 }
 
-// attachShares mounts the CWD read-write and the user's home dir read-only via virtiofs.
-// Guest mounts them by tag: "cwd" and "home".
-func attachShares(vmConfig *vz.VirtualMachineConfiguration, cwd, homeDir string) error {
-	var devices []vz.DirectorySharingDeviceConfiguration
-
-	// CWD: read-write, mounted at same path in guest.
+// attachShares mounts the CWD read-write via virtiofs.
+// The home directory is served via 9P over vsock instead (for permission filtering).
+func attachShares(vmConfig *vz.VirtualMachineConfiguration, cwd string) error {
 	cwdFSConfig, err := vz.NewVirtioFileSystemDeviceConfiguration("cwd")
 	if err != nil {
 		return fmt.Errorf("cwd virtiofs config: %w", err)
@@ -71,27 +68,8 @@ func attachShares(vmConfig *vz.VirtualMachineConfiguration, cwd, homeDir string)
 		return fmt.Errorf("cwd dir share: %w", err)
 	}
 	cwdFSConfig.SetDirectoryShare(cwdShare)
-	devices = append(devices, cwdFSConfig)
 
-	// Home: read-only, mounted at same path in guest.
-	if homeDir != "" {
-		homeFSConfig, err := vz.NewVirtioFileSystemDeviceConfiguration("home")
-		if err != nil {
-			return fmt.Errorf("home virtiofs config: %w", err)
-		}
-		homeShared, err := vz.NewSharedDirectory(homeDir, true)
-		if err != nil {
-			return fmt.Errorf("home shared dir: %w", err)
-		}
-		homeShare, err := vz.NewSingleDirectoryShare(homeShared)
-		if err != nil {
-			return fmt.Errorf("home dir share: %w", err)
-		}
-		homeFSConfig.SetDirectoryShare(homeShare)
-		devices = append(devices, homeFSConfig)
-	}
-
-	vmConfig.SetDirectorySharingDevicesVirtualMachineConfiguration(devices)
+	vmConfig.SetDirectorySharingDevicesVirtualMachineConfiguration([]vz.DirectorySharingDeviceConfiguration{cwdFSConfig})
 	return nil
 }
 

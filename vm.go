@@ -3,7 +3,6 @@ package lnx
 import (
 	"encoding/gob"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -87,24 +86,49 @@ func Run(cfg *Config, args ...string) (int, error) {
 		return -1, err
 	}
 
-	if cfg.Interactive {
-		fd := int(os.Stdin.Fd())
-		if term.IsTerminal(fd) {
-			oldState, err := term.MakeRaw(fd)
-			if err != nil {
-				return -1, fmt.Errorf("make raw: %w", err)
-			}
-			defer term.Restore(fd, oldState)
-		}
-	}
+	// Auto-detect interactive mode based on whether stdin is a terminal.
+	interactive := term.IsTerminal(int(os.Stdin.Fd()))
 
 	vm, err := vz.NewVirtualMachine(vmConfig)
 	if err != nil {
 		return -1, fmt.Errorf("create vm: %w", err)
 	}
 
+	setupMsg := &protocol.Setup{
+		CWD:     cwd,
+		Env:     buildGuestEnv(cfg.Env),
+		User:    u.Username,
+		UID:     uid,
+		HomeDir: u.HomeDir,
+	}
+
+	vs, err := setupVsock(vm, filepath.Dir(cfg.RootfsPath), cfg.RootfsPath, setupMsg)
+	if err != nil {
+		return -1, err
+	}
+	if err := vm.Start(); err != nil {
+		vs.cleanup()
+		return -1, fmt.Errorf("start vm: %w", err)
+	}
+
+	// Wait for control connection, send setup message.
+	ctrlConn := <-vs.ctrlConnCh
+	if ctrlConn == nil {
+		vs.cleanup()
+		return -1, fmt.Errorf("control connection failed")
+	}
+	enc := gob.NewEncoder(ctrlConn)
+	if err := enc.Encode(protocol.Msg{Setup: setupMsg}); err != nil {
+		ctrlConn.Close()
+		vs.cleanup()
+		return -1, fmt.Errorf("send setup: %w", err)
+	}
+	forceQuitCh := make(chan struct{})
+	go forwardSignals(ctrlConn, enc, forceQuitCh)
+
+	// Run the command through the exec path — same as `lnx exec`.
 	var rows, cols uint16
-	if cfg.Interactive {
+	if interactive {
 		fd := int(os.Stdin.Fd())
 		if term.IsTerminal(fd) {
 			w, h, err := term.GetSize(fd)
@@ -112,31 +136,38 @@ func Run(cfg *Config, args ...string) (int, error) {
 				rows = uint16(h)
 				cols = uint16(w)
 			}
+			oldState, err := term.MakeRaw(fd)
+			if err == nil {
+				defer term.Restore(fd, oldState)
+			}
 		}
 	}
 
-	execMsg := &protocol.Exec{
-		Args:    args,
-		CWD:     cwd,
-		Env:     buildGuestEnv(cfg.Env),
-		PTY:     cfg.Interactive,
-		User:    u.Username,
-		UID:     uid,
-		HomeDir: u.HomeDir,
-		Rows:    rows,
-		Cols:    cols,
+	exitCode := vs.api.runExec(&protocol.ExecReq{
+		Args: args,
+		PTY:  interactive,
+		Rows: rows,
+		Cols: cols,
+	}, interactive)
+
+	// Check if force quit happened (double Ctrl-C).
+	select {
+	case <-forceQuitCh:
+		exitCode = 130
+	default:
 	}
 
-	exitCodeCh, cleanup, err := setupVsock(vm, filepath.Dir(cfg.RootfsPath), cfg.RootfsPath, execMsg)
-	if err != nil {
-		return -1, err
-	}
-	if err := vm.Start(); err != nil {
-		cleanup()
-		return -1, fmt.Errorf("start vm: %w", err)
-	}
+	// Shut down the VM by closing the control connection.
+	ctrlConn.Close()
 
-	return waitForVM(vm, exitCodeCh, cleanup)
+	return shutdownVM(vm, exitCode, vs.cleanup)
+}
+
+// vsockState holds the vsock infrastructure created during VM setup.
+type vsockState struct {
+	ctrlConnCh <-chan net.Conn
+	api        *apiServer
+	cleanup    func()
 }
 
 func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.VirtualMachineConfiguration, error) {
@@ -159,7 +190,7 @@ func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.
 	for _, attach := range []func(*vz.VirtualMachineConfiguration) error{
 		attachSerial,
 		func(c *vz.VirtualMachineConfiguration) error { return attachDisks(c, cfg.RootfsPath, swapPath) },
-		func(c *vz.VirtualMachineConfiguration) error { return attachShares(c, cwd, homeDir) },
+		func(c *vz.VirtualMachineConfiguration) error { return attachShares(c, cwd) },
 		attachNetwork,
 		attachMisc,
 	} {
@@ -181,84 +212,60 @@ func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.
 	return vmConfig, nil
 }
 
-func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, execMsg *protocol.Exec) (<-chan int, func(), error) {
+func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, setupMsg *protocol.Setup) (*vsockState, error) {
 	socketDevices := vm.SocketDevices()
 	if len(socketDevices) == 0 {
-		return nil, nil, fmt.Errorf("no vsock devices")
+		return nil, fmt.Errorf("no vsock devices")
 	}
 	sock := socketDevices[0]
 
 	logListener, err := sock.Listen(vsockLogPort)
 	if err != nil {
-		return nil, nil, fmt.Errorf("vsock log listen: %w", err)
+		return nil, fmt.Errorf("vsock log listen: %w", err)
 	}
 	waitLog := startLogReceiver(logListener, logDir)
 
 	ctrlListener, err := sock.Listen(protocol.Port)
 	if err != nil {
 		logListener.Close()
-		return nil, nil, fmt.Errorf("vsock ctrl listen: %w", err)
+		return nil, fmt.Errorf("vsock ctrl listen: %w", err)
 	}
 
 	statusListener, err := sock.Listen(protocol.StatusPort)
 	if err != nil {
 		ctrlListener.Close()
 		logListener.Close()
-		return nil, nil, fmt.Errorf("vsock status listen: %w", err)
-	}
-
-	execListener, err := sock.Listen(protocol.ExecPort)
-	if err != nil {
-		statusListener.Close()
-		ctrlListener.Close()
-		logListener.Close()
-		return nil, nil, fmt.Errorf("vsock exec listen: %w", err)
+		return nil, fmt.Errorf("vsock status listen: %w", err)
 	}
 
 	guestCtrlListener, err := sock.Listen(protocol.GuestControlPort)
 	if err != nil {
-		execListener.Close()
 		statusListener.Close()
 		ctrlListener.Close()
 		logListener.Close()
-		return nil, nil, fmt.Errorf("vsock guest ctrl listen: %w", err)
+		return nil, fmt.Errorf("vsock guest ctrl listen: %w", err)
 	}
 
-	termListener, err := sock.Listen(protocol.TerminalPort)
-	if err != nil {
-		guestCtrlListener.Close()
-		execListener.Close()
-		statusListener.Close()
-		ctrlListener.Close()
-		logListener.Close()
-		return nil, nil, fmt.Errorf("vsock terminal listen: %w", err)
-	}
-
-	// Terminal I/O: accept guest connection, splice os.Stdin/os.Stdout.
-	go func() {
-		conn, err := termListener.Accept()
-		if err != nil {
-			return
-		}
-		// stdin → guest
-		go func() {
-			io.Copy(conn, os.Stdin)
-		}()
-		// guest → stdout
-		io.Copy(os.Stdout, conn)
-	}()
-
-	// Port forwarding: accept guest notification connection.
 	portFwdListener, err := sock.Listen(protocol.PortForwardPort)
 	if err != nil {
-		termListener.Close()
 		guestCtrlListener.Close()
-		execListener.Close()
 		statusListener.Close()
 		ctrlListener.Close()
 		logListener.Close()
-		return nil, nil, fmt.Errorf("vsock port forward listen: %w", err)
+		return nil, fmt.Errorf("vsock port forward listen: %w", err)
 	}
+
+	// 9P file server for home directory.
+	p9Listener, err := sock.Listen(protocol.P9Port)
+	if err != nil {
+		portFwdListener.Close()
+		guestCtrlListener.Close()
+		statusListener.Close()
+		ctrlListener.Close()
+		logListener.Close()
+		return nil, fmt.Errorf("vsock 9p listen: %w", err)
+	}
+	start9PServer(p9Listener, setupMsg.HomeDir)
 
 	pf := newPortForwarder(sock)
 	go func() {
@@ -269,8 +276,8 @@ func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, execMsg *proto
 		pf.run(conn)
 	}()
 
-	// API server: accept guest connections, serve HTTP on unix socket.
-	api := newAPIServer(execMsg.Args, execMsg.User, rootfsPath)
+	api := newAPIServer(nil, setupMsg.User, rootfsPath)
+	api.sock = sock
 	api.pf = pf
 	go func() {
 		conn, err := statusListener.Accept()
@@ -278,13 +285,6 @@ func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, execMsg *proto
 			return
 		}
 		api.setStatusConn(conn)
-	}()
-	go func() {
-		conn, err := execListener.Accept()
-		if err != nil {
-			return
-		}
-		api.setExecConn(conn)
 	}()
 	go func() {
 		conn, err := guestCtrlListener.Accept()
@@ -299,162 +299,84 @@ func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, execMsg *proto
 		slog.Warn("status socket failed", "error", err)
 	}
 
-	exitCodeCh := make(chan int, 1)
-	go handleControlConn(ctrlListener, execMsg, exitCodeCh)
+	// Accept control connection asynchronously (VM hasn't started yet).
+	ctrlConnCh := make(chan net.Conn, 1)
+	go func() {
+		conn, err := ctrlListener.Accept()
+		if err != nil {
+			return
+		}
+		ctrlConnCh <- conn
+	}()
 
 	cleanup := func() {
 		pf.close()
 		api.close()
+		p9Listener.Close()
 		portFwdListener.Close()
-		termListener.Close()
 		guestCtrlListener.Close()
-		execListener.Close()
 		statusListener.Close()
 		ctrlListener.Close()
 		logListener.Close()
 		waitLog()
 	}
 
-	return exitCodeCh, cleanup, nil
+	return &vsockState{ctrlConnCh: ctrlConnCh, api: api, cleanup: cleanup}, nil
 }
 
-// handleControlConn accepts one guest connection, sends the Exec message,
-// forwards host signals, and reads the Exit message.
-func handleControlConn(listener interface {
-	Accept() (net.Conn, error)
-	Close() error
-}, execMsg *protocol.Exec, exitCodeCh chan<- int) {
-	conn, err := listener.Accept()
-	if err != nil {
-		slog.Debug("control accept failed", "error", err)
-		exitCodeCh <- -1
-		return
-	}
-	slog.Debug("control accepted")
-	defer conn.Close()
-
-	// Forward host signals and window size changes over the control connection.
+// forwardSignals reads host signals and forwards them to the guest via the
+// control connection. SIGWINCH is converted to Resize. Double SIGINT
+// force-quits.
+func forwardSignals(conn net.Conn, enc *gob.Encoder, forceQuitCh chan struct{}) {
 	sigCh := make(chan os.Signal, 4)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGWINCH)
 	defer signal.Stop(sigCh)
 
-	runControlConn(conn, execMsg, exitCodeCh, sigCh)
-}
-
-// runControlConn handles the gob protocol over an established connection.
-// It sends the Exec message, forwards signals from sigCh, and reads
-// messages until it receives Exit.
-func runControlConn(conn net.Conn, execMsg *protocol.Exec, exitCodeCh chan<- int, sigCh <-chan os.Signal) {
-	code := -1
-	defer func() { exitCodeCh <- code }()
-
-	enc := gob.NewEncoder(conn)
-	dec := gob.NewDecoder(conn)
-
-	if err := enc.Encode(protocol.Msg{Exec: execMsg}); err != nil {
-		slog.Debug("control exec encode failed", "error", err)
-		return
-	}
-	slog.Debug("control exec sent")
-
-	// Forward signals in a goroutine. SIGWINCH is converted to a Resize
-	// message with the current terminal dimensions instead of being forwarded
-	// as a raw signal number. Two SIGINTs within 1 second force-exits.
-	done := make(chan struct{})
-	defer close(done)
-	if sigCh != nil {
-		go func() {
-			var lastInt time.Time
-			for {
-				select {
-				case sig := <-sigCh:
-					if sig == syscall.SIGWINCH {
-						w, h, err := term.GetSize(int(os.Stdin.Fd()))
-						if err == nil {
-							enc.Encode(protocol.Msg{Resize: &protocol.Resize{
-								Rows: uint16(h),
-								Cols: uint16(w),
-							}})
-						}
-					} else if sig == syscall.SIGINT && time.Since(lastInt) < time.Second {
-						fmt.Fprintln(os.Stderr, "\nforce quit")
-						code = 130
-						conn.Close()
-						return
-					} else {
-						if sig == syscall.SIGINT {
-							lastInt = time.Now()
-						}
-						enc.Encode(protocol.Msg{Signal: &protocol.Signal{
-							Sig: int(sig.(syscall.Signal)),
-						}})
-					}
-				case <-done:
-					return
-				}
+	var lastInt time.Time
+	for sig := range sigCh {
+		if sig == syscall.SIGWINCH {
+			w, h, err := term.GetSize(int(os.Stdin.Fd()))
+			if err == nil {
+				enc.Encode(protocol.Msg{Resize: &protocol.Resize{
+					Rows: uint16(h),
+					Cols: uint16(w),
+				}})
 			}
-		}()
-	}
-
-	for {
-		var msg protocol.Msg
-		if err := dec.Decode(&msg); err != nil {
-			slog.Debug("control decode failed", "error", err)
+		} else if sig == syscall.SIGINT && time.Since(lastInt) < time.Second {
+			fmt.Fprintln(os.Stderr, "\nforce quit")
+			close(forceQuitCh)
+			conn.Close()
 			return
-		}
-		if msg.Exit != nil {
-			code = msg.Exit.Code
-			slog.Debug("control exit received", "code", code)
-			_ = enc.Encode(protocol.Msg{Ack: &protocol.Ack{}})
-			slog.Debug("control ack sent")
-			return
+		} else {
+			if sig == syscall.SIGINT {
+				lastInt = time.Now()
+			}
+			enc.Encode(protocol.Msg{Signal: &protocol.Signal{
+				Sig: int(sig.(syscall.Signal)),
+			}})
 		}
 	}
 }
 
-func waitForVM(vm *vz.VirtualMachine, exitCodeCh <-chan int, cleanup func()) (int, error) {
+func shutdownVM(vm *vz.VirtualMachine, exitCode int, cleanup func()) (int, error) {
 	defer cleanup()
 
-	// Wait for either the exit code (guest finished) or a VM state change.
+	if exitCode == 130 {
+		vm.Stop()
+		return exitCode, nil
+	}
+
+	vm.RequestStop()
 	stateCh := vm.StateChangedNotify()
-	for {
-		select {
-		case code := <-exitCodeCh:
-			if code == 130 {
-				// Force quit (double Ctrl-C): stop VM immediately.
-				vm.Stop()
-			} else {
-				// Guest sent Exit, host sent Ack, we have the code.
-				// Request graceful stop; the guest is already calling
-				// poweroff. If it doesn't stop quickly, force-stop.
-				vm.RequestStop()
-				select {
-				case <-time.After(3 * time.Second):
-					vm.Stop()
-				case state := <-stateCh:
-					if state != vz.VirtualMachineStateStopped {
-						vm.Stop()
-					}
-				}
-			}
-			return code, nil
-		case state := <-stateCh:
-			switch state {
-			case vz.VirtualMachineStateStopped:
-				// VM stopped before we got an exit code (crash/freeze).
-				cleanup()
-				select {
-				case code := <-exitCodeCh:
-					return code, nil
-				default:
-					return -1, nil
-				}
-			case vz.VirtualMachineStateError:
-				cleanup()
-				return -1, fmt.Errorf("vm entered error state")
-			}
+	select {
+	case <-time.After(3 * time.Second):
+		vm.Stop()
+	case state := <-stateCh:
+		if state != vz.VirtualMachineStateStopped {
+			vm.Stop()
 		}
 	}
+	return exitCode, nil
 }
 
 func validatePaths(cfg *Config) error {
@@ -468,13 +390,8 @@ func validatePaths(cfg *Config) error {
 
 func initHostLoggingFromEnv() {
 	hostLogOnce.Do(func() {
-		levelName := strings.ToLower(os.Getenv("LNX_LOG"))
-		if levelName == "" {
-			return
-		}
-
 		level := slog.LevelInfo
-		switch levelName {
+		switch strings.ToLower(os.Getenv("LNX_LOG")) {
 		case "debug":
 			level = slog.LevelDebug
 		case "warn":
@@ -483,7 +400,17 @@ func initHostLoggingFromEnv() {
 			level = slog.LevelError
 		}
 
-		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return
+		}
+		logDir := filepath.Join(home, ".lnx")
+		os.MkdirAll(logDir, 0755)
+		f, err := os.OpenFile(filepath.Join(logDir, "lnx.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return
+		}
+		slog.SetDefault(slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: level})))
 	})
 }
 

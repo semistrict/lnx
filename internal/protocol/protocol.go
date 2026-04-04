@@ -1,32 +1,35 @@
 // Package protocol defines the gob-encoded control messages exchanged
-// between the host (macOS) and guest (Linux) over vsock port 1024.
+// between the host (macOS) and guest (Linux) over vsock.
 package protocol
 
 const (
-	// Port is the vsock port used for the control connection.
+	// Port is the vsock port used for the control connection
+	// (setup, signals, resize).
 	Port = 1024
 	// StatusPort is the vsock port for status queries.
 	StatusPort = 1026
-	// ExecPort is the vsock port for exec requests.
+	// ExecPort is the vsock port for exec requests. The guest listens;
+	// the host connects once per exec session via VirtioSocketDevice.Connect.
 	ExecPort = 1027
 	// GuestControlPort is the vsock port for guest-initiated requests (checkpoint, etc).
 	GuestControlPort = 1028
-	// TerminalPort is the vsock port for raw terminal I/O (stdin/stdout bytes).
-	TerminalPort = 1029
 	// PortForwardPort is the vsock port for port-forwarding notifications (guest → host).
 	PortForwardPort = 1030
 	// PortForwardDataPort is the vsock port the guest listens on for
 	// forwarded TCP connections (host connects via VirtioSocketDevice.Connect).
 	PortForwardDataPort = 1031
+	// ExecInteractivePort is the vsock port the guest listens on for
+	// interactive exec PTY connections (host connects via VirtioSocketDevice.Connect).
+	ExecInteractivePort = 1032
+	// P9Port is the vsock port for the 9P file server (host listens, guest dials).
+	P9Port = 1033
 )
 
 // Msg is the envelope for all control messages.
 // Exactly one field is non-nil per message.
 type Msg struct {
-	Exec           *Exec
+	Setup          *Setup
 	Signal         *Signal
-	Exit           *Exit
-	Ack            *Ack
 	Resize         *Resize
 	StatusReq      *StatusReq
 	StatusResp     *StatusResp
@@ -39,17 +42,15 @@ type Msg struct {
 	OpenURLResp    *OpenURLResp
 }
 
-// Exec tells the guest to run a command.
-type Exec struct {
-	Args    []string // command vector: Args[0] is the program
+// Setup tells the guest the environment to configure (user, cwd, env vars).
+// Sent once on the control connection at boot. No command args — commands
+// are executed via the exec connection.
+type Setup struct {
 	CWD     string
 	Env     []string // KEY=VALUE pairs
-	PTY     bool
-	User    string // guest username (matches host)
-	UID     int    // guest UID (matches host)
-	HomeDir string // host home dir path (e.g. /Users/ramon), mounted read-only
-	Rows    uint16 // initial terminal rows (0 = unknown)
-	Cols    uint16 // initial terminal cols (0 = unknown)
+	User    string   // guest username (matches host)
+	UID     int      // guest UID (matches host)
+	HomeDir string   // host home dir path (e.g. /Users/ramon), mounted read-only
 }
 
 // Resize tells the guest to update the PTY window size.
@@ -62,14 +63,6 @@ type Resize struct {
 type Signal struct {
 	Sig int // syscall.Signal value
 }
-
-// Exit reports the guest process exit code back to the host.
-type Exit struct {
-	Code int
-}
-
-// Ack confirms the host received the guest's Exit message.
-type Ack struct{}
 
 // StatusReq asks the guest for current system status.
 type StatusReq struct {
@@ -93,6 +86,9 @@ type StatusResp struct {
 type ExecReq struct {
 	Args []string
 	Env  []string
+	PTY  bool
+	Rows uint16
+	Cols uint16
 }
 
 // ExecOutput streams command output from guest to host.

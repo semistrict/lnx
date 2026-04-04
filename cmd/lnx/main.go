@@ -11,10 +11,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var (
-	interactive  bool
-	doCheckpoint bool
-)
+var doCheckpoint bool
 
 var rootCmd = &cobra.Command{
 	Use:           "lnx [flags] [command [args...]]",
@@ -34,16 +31,15 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	lnx.InitBinary = initBinary
-	rootCmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "allocate a PTY for interactive use")
 	rootCmd.Flags().BoolVarP(&doCheckpoint, "checkpoint", "c", false, "snapshot rootfs before starting the VM")
 }
 
 func main() {
 	initHostLogging()
 
-	// Default to interactive bash when no command is given.
+	// Default to bash when no command is given.
 	if len(os.Args) == 1 {
-		os.Args = append(os.Args, "-i", "bash")
+		os.Args = append(os.Args, "bash")
 	}
 
 	// If the first arg is not a known subcommand or flag, bypass cobra
@@ -79,10 +75,9 @@ func runVM(args []string) (int, error) {
 	dir := lnxDir()
 
 	return lnx.Run(&lnx.Config{
-		KernelPath:  filepath.Join(dir, "vmlinuz"),
-		RootfsPath:  filepath.Join(dir, "rootfs.ext4"),
-		Interactive: interactive,
-		Checkpoint:  doCheckpoint,
+		KernelPath: filepath.Join(dir, "vmlinuz"),
+		RootfsPath: filepath.Join(dir, "rootfs.ext4"),
+		Checkpoint: doCheckpoint,
 	}, args...)
 }
 
@@ -96,7 +91,18 @@ func initHostLogging() {
 	case "error":
 		level = slog.LevelError
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	logDir := filepath.Join(home, ".lnx")
+	os.MkdirAll(logDir, 0755)
+	f, err := os.OpenFile(filepath.Join(logDir, "lnx.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: level})))
 }
 
 func lnxDir() string {

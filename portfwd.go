@@ -44,7 +44,6 @@ func (pf *portForwarder) run(conn net.Conn) {
 	for {
 		var msg protocol.PortForward
 		if err := dec.Decode(&msg); err != nil {
-			slog.Debug("port forward decode failed", "error", err)
 			return
 		}
 		pf.reconcile(msg.Ports)
@@ -127,7 +126,7 @@ func (pf *portForwarder) acceptLoop(fp *forwardedPort) {
 			case <-fp.done:
 				return
 			default:
-				slog.Debug("port forward accept failed", "error", err)
+				slog.Info("port forward accept failed", "error", err)
 				return
 			}
 		}
@@ -142,7 +141,7 @@ func (pf *portForwarder) forward(hostConn net.Conn, guestPort uint16) {
 	// Connect to guest's port forward data listener via vsock.
 	vsockConn, err := pf.sock.Connect(protocol.PortForwardDataPort)
 	if err != nil {
-		slog.Debug("port forward vsock connect failed", "port", guestPort, "error", err)
+		slog.Info("port forward vsock connect failed", "port", guestPort, "error", err)
 		return
 	}
 	defer vsockConn.Close()
