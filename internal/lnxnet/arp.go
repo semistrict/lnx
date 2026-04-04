@@ -33,15 +33,15 @@ func (b *Bridge) handleARP(eth *ethernetFrame) {
 
 	// Build ARP reply.
 	reply := make([]byte, 28)
-	binary.BigEndian.PutUint16(reply[0:2], 1)    // hardware type: ethernet
+	binary.BigEndian.PutUint16(reply[0:2], 1)      // hardware type: ethernet
 	binary.BigEndian.PutUint16(reply[2:4], 0x0800) // protocol type: IPv4
-	reply[4] = 6                                    // hardware size
-	reply[5] = 4                                    // protocol size
+	reply[4] = 6                                   // hardware size
+	reply[5] = 4                                   // protocol size
 	binary.BigEndian.PutUint16(reply[6:8], arpReply)
-	copy(reply[8:14], gatewayMAC)                  // sender MAC (gateway)
-	copy(reply[14:18], targetIP.To4())             // sender IP (gateway)
-	copy(reply[18:24], senderMAC)                  // target MAC (guest)
-	copy(reply[24:28], senderIP.To4())             // target IP (guest)
+	copy(reply[8:14], gatewayMAC)      // sender MAC (gateway)
+	copy(reply[14:18], targetIP.To4()) // sender IP (gateway)
+	copy(reply[18:24], senderMAC)      // target MAC (guest)
+	copy(reply[24:28], senderIP.To4()) // target IP (guest)
 
 	frame := buildEthernet(senderMAC, gatewayMAC, etherTypeARP, reply)
 	b.sendFrame(frame)

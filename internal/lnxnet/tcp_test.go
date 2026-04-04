@@ -14,12 +14,12 @@ func TestTCPChecksum(t *testing.T) {
 
 	// Build a minimal TCP SYN packet.
 	tcp := make([]byte, 20)
-	binary.BigEndian.PutUint16(tcp[0:2], 80)    // src port
-	binary.BigEndian.PutUint16(tcp[2:4], 12345) // dst port
-	binary.BigEndian.PutUint32(tcp[4:8], 1000)  // seq
-	binary.BigEndian.PutUint32(tcp[8:12], 0)    // ack
-	tcp[12] = 0x50                               // data offset = 5
-	tcp[13] = 0x02                               // SYN
+	binary.BigEndian.PutUint16(tcp[0:2], 80)      // src port
+	binary.BigEndian.PutUint16(tcp[2:4], 12345)   // dst port
+	binary.BigEndian.PutUint32(tcp[4:8], 1000)    // seq
+	binary.BigEndian.PutUint32(tcp[8:12], 0)      // ack
+	tcp[12] = 0x50                                // data offset = 5
+	tcp[13] = 0x02                                // SYN
 	binary.BigEndian.PutUint16(tcp[14:16], 65535) // window
 
 	checksum := tcpChecksum(srcIP, dstIP, tcp)

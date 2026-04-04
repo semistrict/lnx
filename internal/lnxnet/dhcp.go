@@ -52,7 +52,7 @@ func (b *Bridge) handleDHCP(eth *ethernetFrame, ip *ipv4Header, udpPayload []byt
 	reply[1] = 1 // ethernet
 	reply[2] = 6 // hw addr len
 	copy(reply[4:8], xid)
-	copy(reply[16:20], guestIPBytes) // yiaddr
+	copy(reply[16:20], guestIPBytes)   // yiaddr
 	copy(reply[20:24], gatewayIPBytes) // siaddr
 	copy(reply[28:34], clientMAC)
 	// Magic cookie.
@@ -61,13 +61,13 @@ func (b *Bridge) handleDHCP(eth *ethernetFrame, ip *ipv4Header, udpPayload []byt
 	// DHCP options.
 	opts := reply[240:]
 	i := 0
-	i += putDHCPOption(opts[i:], 53, []byte{replyType})              // msg type
-	i += putDHCPOption(opts[i:], 1, subnetBytes)                      // subnet mask
-	i += putDHCPOption(opts[i:], 3, gatewayIPBytes)                   // router
+	i += putDHCPOption(opts[i:], 53, []byte{replyType})                                // msg type
+	i += putDHCPOption(opts[i:], 1, subnetBytes)                                       // subnet mask
+	i += putDHCPOption(opts[i:], 3, gatewayIPBytes)                                    // router
 	i += putDHCPOption(opts[i:], 6, append([]byte{8, 8, 8, 8}, []byte{8, 8, 4, 4}...)) // DNS
-	i += putDHCPOption(opts[i:], 51, []byte{0, 0, 0xFF, 0xFF})       // lease time (infinite)
-	i += putDHCPOption(opts[i:], 54, gatewayIPBytes)                  // server ID
-	opts[i] = 255 // end
+	i += putDHCPOption(opts[i:], 51, []byte{0, 0, 0xFF, 0xFF})                         // lease time (infinite)
+	i += putDHCPOption(opts[i:], 54, gatewayIPBytes)                                   // server ID
+	opts[i] = 255                                                                      // end
 	i++
 
 	dhcpReply := reply[:240+i]

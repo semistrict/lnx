@@ -12,7 +12,7 @@ import (
 )
 
 var (
-	interactive bool
+	interactive  bool
 	doCheckpoint bool
 )
 

@@ -18,16 +18,16 @@ const (
 // Msg is the envelope for all control messages.
 // Exactly one field is non-nil per message.
 type Msg struct {
-	Exec       *Exec
-	Signal     *Signal
-	Exit       *Exit
-	Ack        *Ack
-	Resize     *Resize
-	StatusReq  *StatusReq
-	StatusResp *StatusResp
-	ExecReq       *ExecReq
-	ExecOutput    *ExecOutput
-	ExecDone      *ExecDone
+	Exec           *Exec
+	Signal         *Signal
+	Exit           *Exit
+	Ack            *Ack
+	Resize         *Resize
+	StatusReq      *StatusReq
+	StatusResp     *StatusResp
+	ExecReq        *ExecReq
+	ExecOutput     *ExecOutput
+	ExecDone       *ExecDone
 	CheckpointReq  *CheckpointReq
 	CheckpointResp *CheckpointResp
 	OpenURLReq     *OpenURLReq

@@ -16,12 +16,12 @@ type tcpConnKey struct {
 }
 
 type tcpConn struct {
-	hostConn   net.Conn
-	guestSeq   uint32
-	guestAck   uint32
-	hostSeq    uint32
-	state      string // "syn_received", "established", "closed"
-	mu         sync.Mutex
+	hostConn net.Conn
+	guestSeq uint32
+	guestAck uint32
+	hostSeq  uint32
+	state    string // "syn_received", "established", "closed"
+	mu       sync.Mutex
 }
 
 var (
@@ -99,7 +99,7 @@ func (b *Bridge) handleTCP(eth *ethernetFrame, ip *ipv4Header) {
 }
 
 func (b *Bridge) handleTCPSyn(key tcpConnKey, ip *ipv4Header, srcPort, dstPort uint16, guestSeq uint32) {
-	dst := fmt.Sprintf("%s:%d", ip.DstIP, dstPort)
+	dst := net.JoinHostPort(ip.DstIP.String(), fmt.Sprintf("%d", dstPort))
 
 	hostConn, err := net.Dial("tcp", dst)
 	if err != nil {

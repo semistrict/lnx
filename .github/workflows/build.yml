@@ -18,6 +18,12 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Check formatting
+        run: test -z "$(gofmt -l . | grep -v third_party/)" || (gofmt -l . | grep -v third_party/ && exit 1)
+
+      - name: Vet
+        run: go vet ./...
+
       - name: Build guest init (linux/arm64)
         run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o cmd/lnx/init ./cmd/init
 
@@ -25,7 +31,7 @@ jobs:
         run: go build -ldflags '-extldflags "-Wl,-no_warn_duplicate_libraries"' -o lnx ./cmd/lnx
 
       - name: Run tests
-        run: go test -v ./...
+        run: go test -race -v ./...
 
       - name: Upload binary
         uses: actions/upload-artifact@v4

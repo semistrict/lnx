@@ -36,9 +36,9 @@ type StatusResponse struct {
 // apiServer manages the guest vsock connections and the host unix
 // socket HTTP server for status queries and exec requests.
 type apiServer struct {
-	args      []string
-	user      string
-	startTime time.Time
+	args       []string
+	user       string
+	startTime  time.Time
 	rootfsPath string
 
 	statusMu   sync.Mutex
