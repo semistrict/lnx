@@ -320,28 +320,7 @@ func (s *apiServer) handleExecStream(w http.ResponseWriter, execDec *gob.Decoder
 }
 
 // handleExecInteractive handles interactive exec with PTY via HTTP hijack.
-// After headers, the connection carries raw terminal bytes. The last byte
-// before close is the exit code.
 func (s *apiServer) handleExecInteractive(w http.ResponseWriter, r *http.Request, execDec *gob.Decoder) {
-	// Connect to the guest's interactive exec vsock listener.
-	// Retry briefly — the guest needs time to accept after receiving ExecReq.
-	var vsockConn net.Conn
-	var err error
-	for i := 0; i < 50; i++ {
-		vsockConn, err = s.sock.Connect(protocol.ExecInteractivePort)
-		if err == nil {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if err != nil {
-		slog.Info("exec interactive connect failed", "error", err)
-		http.Error(w, "guest pty connect: "+err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	defer vsockConn.Close()
-
-	// Hijack the HTTP connection for raw I/O.
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijack not supported", http.StatusInternalServerError)
@@ -354,23 +333,10 @@ func (s *apiServer) handleExecInteractive(w http.ResponseWriter, r *http.Request
 	}
 	defer conn.Close()
 
-	// Send HTTP 200 to signal the client to switch to raw mode.
 	buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n")
 	buf.Flush()
 
-	// Splice: client ↔ guest PTY.
-	done := make(chan struct{})
-	go func() {
-		io.Copy(vsockConn, conn)
-		close(done)
-	}()
-	io.Copy(conn, vsockConn)
-	vsockConn.Close()
-	<-done
-
-	// Drain the exec done message.
-	var msg protocol.Msg
-	execDec.Decode(&msg)
+	s.spliceInteractive(conn, execDec)
 }
 
 // runExec runs a command on the guest. Creates a new vsock exec connection
@@ -391,14 +357,21 @@ func (s *apiServer) runExec(req *protocol.ExecReq, interactive bool) int {
 	}
 
 	if interactive {
-		return s.runExecInteractiveDirect(execDec)
+		// Wrap os.Stdin/os.Stdout as a ReadWriter for spliceInteractive.
+		return s.spliceInteractive(readWriter{os.Stdin, os.Stdout}, execDec)
 	}
-	return runExecStreamDirect(execDec)
+	return readExecOutput(execDec, os.Stdout, os.Stderr)
 }
 
-// runExecStreamDirect reads ExecOutput/ExecDone from the gob connection,
-// writing stdout/stderr to os.Stdout/os.Stderr.
-func runExecStreamDirect(execDec *gob.Decoder) int {
+// readWriter pairs a reader and writer into an io.ReadWriter.
+type readWriter struct {
+	io.Reader
+	io.Writer
+}
+
+// readExecOutput reads ExecOutput/ExecDone from the gob connection,
+// writing stdout/stderr to the provided writers.
+func readExecOutput(execDec *gob.Decoder, stdout, stderr io.Writer) int {
 	for {
 		var msg protocol.Msg
 		if err := execDec.Decode(&msg); err != nil {
@@ -406,10 +379,10 @@ func runExecStreamDirect(execDec *gob.Decoder) int {
 		}
 		if msg.ExecOutput != nil {
 			if len(msg.ExecOutput.Stdout) > 0 {
-				os.Stdout.Write(msg.ExecOutput.Stdout)
+				stdout.Write(msg.ExecOutput.Stdout)
 			}
 			if len(msg.ExecOutput.Stderr) > 0 {
-				os.Stderr.Write(msg.ExecOutput.Stderr)
+				stderr.Write(msg.ExecOutput.Stderr)
 			}
 		}
 		if msg.ExecDone != nil {
@@ -418,17 +391,18 @@ func runExecStreamDirect(execDec *gob.Decoder) int {
 	}
 }
 
-// runExecInteractiveDirect connects to the guest PTY via vsock
-// and splices os.Stdin/os.Stdout directly.
-func (s *apiServer) runExecInteractiveDirect(execDec *gob.Decoder) int {
+// spliceInteractive connects to the guest PTY via vsock and splices
+// raw bytes between rw (stdin/stdout or hijacked HTTP conn) and the PTY.
+// Used by both the main command and `lnx exec -i`.
+func (s *apiServer) spliceInteractive(rw io.ReadWriter, execDec *gob.Decoder) int {
 	var vsockConn net.Conn
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 300; i++ {
 		var err error
 		vsockConn, err = s.sock.Connect(protocol.ExecInteractivePort)
 		if err == nil {
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 	if vsockConn == nil {
 		slog.Info("exec interactive connect failed")
@@ -436,8 +410,8 @@ func (s *apiServer) runExecInteractiveDirect(execDec *gob.Decoder) int {
 	}
 	defer vsockConn.Close()
 
-	go io.Copy(vsockConn, os.Stdin)
-	io.Copy(os.Stdout, vsockConn)
+	go io.Copy(vsockConn, rw)
+	io.Copy(rw, vsockConn)
 
 	var msg protocol.Msg
 	if err := execDec.Decode(&msg); err == nil && msg.ExecDone != nil {
