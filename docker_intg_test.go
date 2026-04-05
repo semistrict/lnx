@@ -22,7 +22,7 @@ func TestDocker_HelloWorld(t *testing.T) {
 
 	// Start Docker, pull and run hello-world.
 	exitCode, err := lnx.Run(cfg, "sh", "-c",
-		waitForDocker + ` &&
+		waitForDocker+` &&
 		docker run --rm hello-world 2>&1 | grep -q "Hello from Docker"`)
 	require.NoError(t, err)
 	if exitCode == 127 {
@@ -46,7 +46,7 @@ CMD cat /msg.txt
 
 	cfg.CWD = buildDir
 	exitCode, err := lnx.Run(cfg, "sh", "-c",
-		waitForDocker + ` &&
+		waitForDocker+` &&
 		docker build -t lnx-test-build . &&
 		docker run --rm lnx-test-build | grep -q "built-ok"`)
 	require.NoError(t, err)
@@ -72,7 +72,7 @@ services:
 
 	cfg.CWD = composeDir
 	exitCode, err := lnx.Run(cfg, "sh", "-c",
-		waitForDocker + ` &&
+		waitForDocker+` &&
 		docker compose up --exit-code-from web 2>&1 | grep -q "COMPOSE_OK"`)
 	require.NoError(t, err)
 	if exitCode == 127 {
@@ -88,7 +88,7 @@ func TestDocker_Networking(t *testing.T) {
 
 	// Run an nginx container and curl it from another container on the same network.
 	exitCode, err := lnx.Run(cfg, "sh", "-c",
-		waitForDocker + ` &&
+		waitForDocker+` &&
 		docker network create lnx-test-net &&
 		docker run -d --name lnx-nginx --network lnx-test-net nginx:alpine &&
 		sleep 3 &&
