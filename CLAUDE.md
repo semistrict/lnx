@@ -24,7 +24,7 @@ The guest init is cross-compiled (`CGO_ENABLED=0 GOOS=linux GOARCH=arm64`) and e
 
 ### Two binaries, one repo
 
-- **Host binary** (`cmd/lnx/`): macOS CLI that creates and manages VMs. Uses `github.com/Code-Hex/vz/v3` (local fork in `third_party/vz/`).
+- **Host binary** (`cmd/lnx/`): macOS CLI that creates and manages VMs. Uses `github.com/Code-Hex/vz/v3` (fork at `github.com/semistrict/vz`, local checkout in `third_party/vz/`). `go.mod` points to the remote fork; a gitignored `go.work` overrides with the local submodule for development.
 - **Guest init** (`cmd/init/`): Linux binary that runs as PID 1 inside the VM. All files have `//go:build linux`.
 
 ### Host ↔ Guest communication over vsock
@@ -33,14 +33,15 @@ All communication uses virtio-vsock (no serial console for I/O). Ports are defin
 
 | Port | Purpose | Encoding |
 |------|---------|----------|
-| 1024 | Control (exec command, signals, resize, exit handshake) | gob |
+| 1024 | Control (setup, signals, resize) | gob |
 | 1025 | Guest → host logging | JSON lines |
 | 1026 | Status queries | gob |
-| 1027 | `lnx exec` commands | gob |
+| 1027 | Exec commands (host connects per session via `VirtioSocketDevice.Connect`) | gob |
 | 1028 | Guest → host requests (checkpoint, open URL) | gob |
-| 1029 | Terminal I/O (stdin/stdout for the running command) | raw bytes |
 | 1030 | Port forward notifications | gob |
-| 1031 | Port forward data (host connects to guest via `VirtioSocketDevice.Connect`) | raw bytes with 2-byte port header |
+| 1031 | Port forward data (host connects via `VirtioSocketDevice.Connect`) | raw bytes with 2-byte port header |
+| 1032 | Interactive exec PTY I/O (host connects via `VirtioSocketDevice.Connect`) | raw bytes |
+| 1033 | 9P file server (host home dir, read-only) | 9P2000.L |
 
 The `Msg` envelope in protocol.go has exactly one non-nil field per message.
 
@@ -51,10 +52,15 @@ The `Msg` envelope in protocol.go has exactly one non-nil field per message.
 3. Build VM config: kernel, initrd, serial→/dev/null, disks, virtiofs shares, vsock, NAT network
 4. Set terminal raw mode (interactive), query initial window size
 5. Start VM, set up vsock listeners for all ports
-6. Guest init boots, dials host on port 1024, receives `Exec` message
-7. Guest mounts rootfs, sets up user, starts services, runs command
-8. Terminal I/O flows over port 1029; signals/resize over port 1024
-9. Guest sends `Exit` with code, host sends `Ack`, VM powers off
+6. Guest init boots, dials host on port 1024, receives `Setup` message (user, env, cwd)
+7. Guest mounts rootfs, sets up user, starts services (exec server, status server, port forwarder)
+8. Host sends `ExecReq` on port 1027; interactive I/O flows over port 1032; signals/resize over port 1024
+9. Host closes control connection → guest powers off
+
+### Filesystem mounts
+
+- **CWD**: virtiofs share, mounted read-write in the guest at the same path as the host.
+- **Home directory**: 9P over vsock (port 1033), mounted read-only. Host serves via `hugelgupf/p9` localfs. Mount failure is non-fatal.
 
 ### Port forwarding (portfwd.go, cmd/init/portfwd.go)
 
@@ -72,8 +78,9 @@ HTTP server on `~/.lnx/status.sock` (unix socket) exposes `GET /status`, `GET /p
 
 ## Key conventions
 
-- `runDirect` uses `StdinPipe` (not `cmd.Stdin = vsockConn`) to avoid `cmd.Wait()` hanging on the never-closing terminal vsock.
+- `spliceInteractive` in status.go is the single unified path for interactive I/O — used by both the main command and `lnx exec -i` (via HTTP hijack).
+- Each exec gets its own vsock connection (host connects to guest per session on port 1027), so multiple execs can run concurrently.
 - Double Ctrl-C force-stops the VM (exit 130). Single Ctrl-C forwards SIGINT to guest.
 - The CLI bypasses cobra for guest commands: if the first arg isn't a known subcommand or flag, it goes directly to `runVM()` so flags like `-g` pass through to the guest.
 - Guest commands that aren't found print `name: command not found` (exit 127).
-- `LNX_LOG=debug` enables host-side debug logging to stderr.
+- `LNX_LOG=debug` enables host-side debug logging to `~/.lnx/lnx.log`.
