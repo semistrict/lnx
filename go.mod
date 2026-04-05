@@ -2,7 +2,7 @@ module github.com/semistrict/lnx
 
 go 1.26.1
 
-replace github.com/Code-Hex/vz/v3 => ./third_party/vz
+replace github.com/Code-Hex/vz/v3 => github.com/semistrict/vz/v3 v3.7.2-0.20260404233827-8b4f47561fdd
 
 require (
 	github.com/Code-Hex/vz/v3 v3.7.1

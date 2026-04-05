@@ -5,6 +5,10 @@
 /kernel.Image
 /rootfs.ext4
 
+# Go workspace (local override)
+go.work
+go.work.sum
+
 # Claude Code
 .claude/settings.local.json
 
