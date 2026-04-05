@@ -111,7 +111,11 @@ func run() error {
 		}
 	}
 
-	syscall.Sethostname([]byte("lnx"))
+	hostname := setup.Hostname
+	if hostname == "" {
+		hostname = "lnx"
+	}
+	syscall.Sethostname([]byte(hostname))
 
 	os.Setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	os.Setenv("TERM", "xterm-256color")
@@ -133,6 +137,10 @@ func run() error {
 		if k, v, ok := strings.Cut(kv, "="); ok {
 			os.Setenv(k, v)
 		}
+	}
+
+	if setup.SSHAgent {
+		startSSHAgentForward()
 	}
 
 	configureNetwork()
