@@ -141,6 +141,21 @@ func isSubcommandOrFlag(arg string) bool {
 func runVM(args []string) (int, error) {
 	dir := instanceDir()
 
+	// Auto-init on first run if kernel or rootfs is missing.
+	kernelPath := filepath.Join(lnxBase(), "vmlinuz")
+	rootfsPath := filepath.Join(dir, "rootfs.ext4")
+	if _, err := os.Stat(kernelPath); os.IsNotExist(err) {
+		fmt.Fprintln(os.Stderr, "first run — downloading kernel and rootfs...")
+		if err := autoInit(); err != nil {
+			return -1, fmt.Errorf("auto-init failed: %w", err)
+		}
+	} else if _, err := os.Stat(rootfsPath); os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "instance %q not initialized — downloading rootfs...\n", instanceName)
+		if err := autoInit(); err != nil {
+			return -1, fmt.Errorf("auto-init failed: %w", err)
+		}
+	}
+
 	return lnx.Run(&lnx.Config{
 		KernelPath: filepath.Join(lnxBase(), "vmlinuz"),
 		RootfsPath: filepath.Join(dir, "rootfs.ext4"),

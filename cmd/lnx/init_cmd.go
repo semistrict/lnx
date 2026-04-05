@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -79,6 +80,28 @@ func runInit(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// autoInit downloads kernel and rootfs if they don't exist.
+func autoInit() error {
+	base := lnxBase()
+	os.MkdirAll(base, 0755)
+
+	dir := instanceDir()
+	os.MkdirAll(dir, 0755)
+
+	kernelDest := filepath.Join(base, "vmlinuz")
+	if err := downloadRelease(kernelDest, "kernel.Image"); err != nil {
+		return fmt.Errorf("download kernel: %w", err)
+	}
+
+	rootfsDest := filepath.Join(dir, "rootfs.ext4")
+	if err := downloadRelease(rootfsDest, "rootfs.ext4.zst"); err != nil {
+		return fmt.Errorf("download rootfs: %w", err)
+	}
+
+	fmt.Fprintln(os.Stderr, "init complete")
+	return nil
+}
+
 func downloadRelease(dest, asset string) error {
 	if _, err := os.Stat(dest); err == nil {
 		fmt.Printf("  %s already exists, skipping\n", dest)
@@ -97,34 +120,36 @@ func downloadRelease(dest, asset string) error {
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, url)
 	}
 
+	total := resp.ContentLength
+	progress := &progressReader{r: resp.Body, total: total, label: asset}
+
 	tmp := dest + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
 
-	var reader io.Reader = resp.Body
-
 	// Decompress zstd if the asset is compressed.
 	if filepath.Ext(asset) == ".zst" {
-		// Use zstd CLI for decompression (avoids adding a Go zstd dependency).
 		zstdCmd := exec.Command("zstd", "-d", "--stdout")
-		zstdCmd.Stdin = resp.Body
+		zstdCmd.Stdin = progress
 		zstdCmd.Stdout = f
 		zstdCmd.Stderr = os.Stderr
 		if err := zstdCmd.Run(); err != nil {
 			f.Close()
 			os.Remove(tmp)
-			// Fall back to trying uncompressed download.
 			return fmt.Errorf("zstd decompress failed (install zstd: brew install zstd): %w", err)
 		}
+		progress.finish()
 		f.Close()
 		return os.Rename(tmp, dest)
 	}
 
+	var reader io.Reader = progress
+
 	// Decompress gzip if applicable.
 	if filepath.Ext(asset) == ".gz" {
-		gz, err := gzip.NewReader(resp.Body)
+		gz, err := gzip.NewReader(progress)
 		if err != nil {
 			f.Close()
 			os.Remove(tmp)
@@ -139,11 +164,47 @@ func downloadRelease(dest, asset string) error {
 		os.Remove(tmp)
 		return err
 	}
+	progress.finish()
 	if err := f.Close(); err != nil {
 		os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, dest)
+}
+
+// progressReader wraps an io.Reader and prints download progress to stderr.
+type progressReader struct {
+	r        io.Reader
+	total    int64
+	read     int64
+	label    string
+	lastPrint time.Time
+}
+
+func (p *progressReader) Read(buf []byte) (int, error) {
+	n, err := p.r.Read(buf)
+	p.read += int64(n)
+	if time.Since(p.lastPrint) > 200*time.Millisecond {
+		p.print()
+		p.lastPrint = time.Now()
+	}
+	return n, err
+}
+
+func (p *progressReader) print() {
+	readMB := float64(p.read) / (1024 * 1024)
+	if p.total > 0 {
+		totalMB := float64(p.total) / (1024 * 1024)
+		pct := float64(p.read) * 100 / float64(p.total)
+		fmt.Fprintf(os.Stderr, "\r  %s: %.1f / %.1f MB (%.0f%%)", p.label, readMB, totalMB, pct)
+	} else {
+		fmt.Fprintf(os.Stderr, "\r  %s: %.1f MB", p.label, readMB)
+	}
+}
+
+func (p *progressReader) finish() {
+	p.print()
+	fmt.Fprintln(os.Stderr)
 }
 
 func copyFile(dst, src string) error {
