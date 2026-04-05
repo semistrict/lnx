@@ -25,6 +25,8 @@ const (
 	P9Port = 1033
 	// SSHAgentPort is the vsock port for SSH agent forwarding (host listens, guest dials).
 	SSHAgentPort = 1034
+	// WaypipePort is the vsock port for GUI app forwarding via waypipe (host listens, guest dials).
+	WaypipePort = 1035
 )
 
 // Msg is the envelope for all control messages.
@@ -58,6 +60,7 @@ type Setup struct {
 	HomeDir  string   // host home dir path (e.g. /Users/ramon), mounted read-only
 	Hostname string   // guest hostname (e.g. "default.lnx")
 	SSHAgent bool     // if true, host is forwarding SSH agent on SSHAgentPort
+	GUI      bool     // if true, start waypipe server for GUI app forwarding
 	Shares   []string // extra virtiofs shares to mount read-write (absolute paths)
 }
 

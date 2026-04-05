@@ -83,6 +83,7 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 			Shares:        cfg.Shares,
 			Hostname:      cfg.Hostname,
 			SSHAgent:      cfg.SSHAgent,
+			GUI:           cfg.GUI,
 			SocketDir:     cfg.SocketDir,
 		}
 	}
@@ -187,6 +188,7 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		HomeDir:  u.HomeDir,
 		Hostname: hostname,
 		SSHAgent: sshAgent,
+		GUI:      cfg.GUI,
 		Shares:   cfg.Shares,
 	}
 
@@ -432,6 +434,17 @@ func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, setupMsg *prot
 		}
 	}
 
+	var gui *guiState
+	if setupMsg.GUI {
+		waypipeListener, err := sock.Listen(protocol.WaypipePort)
+		if err != nil {
+			slog.Warn("gui vsock listen failed", "error", err)
+		} else {
+			gui = &guiState{listener: waypipeListener}
+			go gui.run()
+		}
+	}
+
 	pf := newPortForwarder(sock)
 	go func() {
 		conn, err := portFwdListener.Accept()
@@ -475,6 +488,9 @@ func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, setupMsg *prot
 	}()
 
 	cleanup := func() {
+		if gui != nil {
+			gui.close()
+		}
 		pf.close()
 		api.close()
 		if sshAgentListener != nil {

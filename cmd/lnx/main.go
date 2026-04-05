@@ -18,6 +18,7 @@ import (
 var doCheckpoint bool
 var doEphemeral bool
 var doSSHAgent bool
+var doGUI bool
 
 // instanceName is the resolved instance name. Set from --instance flag or LNX_INSTANCE env.
 var instanceName = "default"
@@ -53,6 +54,7 @@ func init() {
 	rootCmd.Flags().BoolVarP(&doCheckpoint, "checkpoint", "c", false, "snapshot rootfs before starting the VM")
 	rootCmd.Flags().BoolVar(&doEphemeral, "ephemeral", false, "clone rootfs to a temp file; discard on exit")
 	rootCmd.Flags().BoolVar(&doSSHAgent, "ssh-agent", false, "forward host SSH agent into the guest")
+	rootCmd.Flags().BoolVar(&doGUI, "gui", false, "enable GUI app support (per-app native macOS windows)")
 
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		// Cobra has parsed flags. Update instanceFlag if --instance was explicitly passed.
@@ -109,6 +111,9 @@ func stripLnxFlags(args []string) []string {
 		case a == "--ssh-agent":
 			doSSHAgent = true
 			i++
+		case a == "--gui":
+			doGUI = true
+			i++
 		case a == "--checkpoint" || a == "-c":
 			doCheckpoint = true
 			i++
@@ -158,6 +163,13 @@ func runVM(args []string) (int, error) {
 		}
 	}
 
+	// Download GUI binaries if --gui is enabled (before daemon spawn so user sees progress).
+	if doGUI {
+		if err := ensureGUIBinaries(); err != nil {
+			return -1, fmt.Errorf("gui setup: %w", err)
+		}
+	}
+
 	// Check if a VM is already running for this instance.
 	if !vmIsRunning() {
 		// Spawn daemon in background.
@@ -204,6 +216,9 @@ func spawnDaemon() error {
 	}
 	if doSSHAgent {
 		daemonArgs = append(daemonArgs, "--ssh-agent")
+	}
+	if doGUI {
+		daemonArgs = append(daemonArgs, "--gui")
 	}
 
 	cmd := exec.Command(self, daemonArgs...)

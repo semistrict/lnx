@@ -13,7 +13,7 @@ Run Linux GUI apps from lnx with each app appearing as a native macOS window. No
 |    +-- terminal session (same as today)                      |
 |    +-- cocoa-way (creates NSWindow per Wayland surface)      |
 |    +-- waypipe client <----+                                 |
-|                             | vsock port 1034                |
+|                             | vsock port 1035                |
 +-----------------------------+--------------------------------+
 |  Linux Guest                |                                |
 |    +-- waypipe server ------+                                |
@@ -41,12 +41,16 @@ Run Linux GUI apps from lnx with each app appearing as a native macOS window. No
 
 ## Implementation
 
-### 1. cocoa-way binary management
+### 1. Host binary management
 
-- Stored at `~/.lnx/bin/cocoa-way`
-- Hardcoded download URL in source code (GitHub release)
-- Downloaded on first `lnx --gui` use, same pattern as kernel/rootfs auto-init
-- Version-pinned in source to avoid breaking changes
+Two binaries required on the macOS host, installed via Homebrew:
+- **cocoa-way** — macOS Wayland compositor (creates NSWindow per surface)
+- **waypipe-darwin** — macOS port of waypipe (deserializes Wayland protocol, connects to cocoa-way)
+
+`lnx --gui` checks PATH for both binaries. If missing, prints install instructions:
+```
+brew tap J-x-Z/tap && brew install cocoa-way waypipe-darwin
+```
 
 ### 2. Rootfs changes
 
@@ -56,9 +60,9 @@ Add to rootfs build:
 - `foot` — lightweight Wayland terminal (for testing)
 - Mesa with software rendering (llvmpipe) — no GPU needed
 
-### 3. New vsock port (1034)
+### 3. New vsock port (1035)
 
-- Add `WaypipePort = 1034` to `internal/protocol/protocol.go`
+- Add `WaypipePort = 1035` to `internal/protocol/protocol.go` (1034 is SSHAgentPort)
 - Carries waypipe wire protocol between guest and host
 
 ### 4. Guest init changes
@@ -72,11 +76,11 @@ When `Setup.GUI` is true:
 ### 5. Host-side process management
 
 On VM boot when `Config.GUI` is true:
-- Accept vsock connection on port 1034
-- Spawn `cocoa-way` process (creates a Wayland socket on the host side)
-- Spawn `waypipe client` connected to cocoa-way's Wayland socket and the vsock
+- Accept vsock connection on port 1035
+- Start `cocoa-way` (creates Wayland socket in a temp XDG_RUNTIME_DIR)
+- Create a unix socket relay between the vsock connection and `waypipe-darwin`
+- Start `waypipe-darwin --socket <relay-path> client` with WAYLAND_DISPLAY pointing to cocoa-way
 - Both are child processes, killed on VM shutdown
-- Proxy the vsock connection to waypipe client's stdin/stdout (or use waypipe's native vsock support on host side too, if available through the Virtualization.framework vsock)
 
 ### 6. Config and protocol changes
 
@@ -88,7 +92,7 @@ type Config struct {
 }
 
 // internal/protocol/protocol.go
-const WaypipePort = 1034
+const WaypipePort = 1035
 
 // Setup message
 type Setup struct {

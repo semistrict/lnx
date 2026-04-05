@@ -22,6 +22,7 @@ var daemonCmd = &cobra.Command{
 			Checkpoint: doCheckpoint,
 			Ephemeral:  doEphemeral,
 			SSHAgent:   doSSHAgent,
+			GUI:        doGUI,
 			Shares:     loadShares(dir),
 			SocketDir:  dir,
 		})
@@ -32,5 +33,6 @@ func init() {
 	daemonCmd.Flags().BoolVarP(&doCheckpoint, "checkpoint", "c", false, "snapshot rootfs before starting")
 	daemonCmd.Flags().BoolVar(&doEphemeral, "ephemeral", false, "clone rootfs to a temp file; discard on exit")
 	daemonCmd.Flags().BoolVar(&doSSHAgent, "ssh-agent", false, "forward host SSH agent into the guest")
+	daemonCmd.Flags().BoolVar(&doGUI, "gui", false, "enable GUI app support")
 	rootCmd.AddCommand(daemonCmd)
 }

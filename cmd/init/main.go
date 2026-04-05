@@ -157,6 +157,10 @@ func run() error {
 		startSSHAgentForward()
 	}
 
+	if setup.GUI {
+		startGUIForwarding()
+	}
+
 	installSystemctlShim()
 	configureNetwork()
 	writeResolvConf()

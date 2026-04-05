@@ -58,6 +58,11 @@ type Config struct {
 	// is never locked, so multiple ephemeral VMs can run concurrently.
 	Ephemeral bool
 
+	// GUI enables GUI app support. The guest runs waypipe server and the host
+	// runs cocoa-way + waypipe-darwin to display each Linux GUI app as a native
+	// macOS window.
+	GUI bool
+
 	// SocketDir overrides the directory for status.sock.
 	// If empty, defaults to the directory containing RootfsPath.
 	// Useful for ephemeral mode where the rootfs is in a temp dir but
