@@ -2,3 +2,6 @@
 	path = third_party/vz
 	url = https://github.com/semistrict/vz.git
 	branch = lnx
+[submodule "third_party/cocoa-way"]
+	path = third_party/cocoa-way
+	url = https://github.com/J-x-Z/cocoa-way.git

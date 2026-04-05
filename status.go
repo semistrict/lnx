@@ -206,6 +206,11 @@ func (s *apiServer) WaitIdle() {
 	}
 }
 
+// WaitStop blocks until stop is requested (ignores idle).
+func (s *apiServer) WaitStop() {
+	<-s.stopCh
+}
+
 // setStatusConn stores the guest's status vsock connection.
 func (s *apiServer) setStatusConn(conn net.Conn) {
 	s.statusMu.Lock()

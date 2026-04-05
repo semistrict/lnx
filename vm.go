@@ -311,8 +311,14 @@ func RunDaemon(cfg *Config) error {
 
 	slog.Info("daemon ready, waiting for exec sessions")
 
-	// Block until idle (all execs finished) or stop requested.
-	b.vs.api.WaitIdle()
+	if cfg.GUI {
+		// GUI mode: don't idle-shutdown — keep running until explicitly stopped.
+		// The GUI infrastructure (cocoa-way, waypipe relay) needs the VM alive.
+		b.vs.api.WaitStop()
+	} else {
+		// Block until idle (all execs finished) or stop requested.
+		b.vs.api.WaitIdle()
+	}
 
 	slog.Info("daemon shutting down (idle)")
 	b.close(0)

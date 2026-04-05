@@ -79,10 +79,14 @@ func (g *guiState) run() {
 
 	// 2. Start cocoa-way compositor.
 	home, _ := os.UserHomeDir()
-	cocoaWayBin, _ := exec.LookPath("cocoa-way")
+	cocoaWayBin := findGUIBin("cocoa-way")
 	g.cocoaWay = exec.Command(cocoaWayBin)
-	cwLog, err := os.Create(filepath.Join(home, ".lnx", "cocoa-way.log"))
-	if err == nil {
+	g.cocoaWay.Env = append(os.Environ(), "RUST_LOG=debug")
+	cwLogPath := filepath.Join(home, ".lnx", "cocoa-way.log")
+	cwLog, err := os.Create(cwLogPath)
+	if err != nil {
+		slog.Error("gui: failed to create cocoa-way log", "path", cwLogPath, "error", err)
+	} else {
 		g.cocoaWay.Stdout = cwLog
 		g.cocoaWay.Stderr = cwLog
 	}
@@ -104,7 +108,7 @@ func (g *guiState) run() {
 
 	// 3. Start waypipe client. It creates a unix socket and listens for server connections.
 	wpSocketPath := filepath.Join(g.tmpDir, "waypipe-client.sock")
-	waypipeBin, _ := exec.LookPath("waypipe")
+	waypipeBin := findGUIBin("waypipe")
 	g.waypipe = exec.Command(waypipeBin, "-d", "-s", wpSocketPath, "client")
 	g.waypipe.Env = append(os.Environ(),
 		"XDG_RUNTIME_DIR="+cocoaWayRuntimeDir,
@@ -156,6 +160,17 @@ func (g *guiState) run() {
 		<-done
 		slog.Info("gui: relay closed")
 	}()
+}
+
+// findGUIBin looks for a binary in ~/.lnx/bin/ first, then PATH.
+func findGUIBin(name string) string {
+	home, _ := os.UserHomeDir()
+	localPath := filepath.Join(home, ".lnx", "bin", name)
+	if _, err := os.Stat(localPath); err == nil {
+		return localPath
+	}
+	path, _ := exec.LookPath(name)
+	return path
 }
 
 func waitForFile(path string, timeout time.Duration) bool {
