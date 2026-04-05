@@ -26,26 +26,49 @@ const vsockLogPort = 1025
 
 var hostLogOnce sync.Once
 
-// Run executes a command inside a Linux VM and blocks until it exits.
-// args is a command vector (like exec): args[0] is the program, args[1:] are arguments.
-// Returns the guest process exit code.
-func Run(cfg *Config, args ...string) (int, error) {
+// bootedVM holds a booted VM and its infrastructure, ready for exec sessions.
+type bootedVM struct {
+	vm       *vz.VirtualMachine
+	vs       *vsockState
+	ctrlConn net.Conn
+	ctrlEnc  *gob.Encoder
+	cwd      string
+	// ephCleanup removes the ephemeral temp dir (nil if not ephemeral).
+	ephCleanup func()
+	lock       *lockFile
+}
+
+// close shuts down the VM and releases all resources.
+func (b *bootedVM) close(exitCode int) {
+	b.ctrlConn.Close()
+	shutdownVM(b.vm, exitCode, b.vs.cleanup)
+	b.lock.unlock()
+	if b.ephCleanup != nil {
+		b.ephCleanup()
+	}
+}
+
+// bootVM handles the shared VM boot sequence: validate, ephemeral clone, lock,
+// checkpoint, initramfs, VM config, start, control connection, setup message.
+func bootVM(cfg *Config) (*bootedVM, error) {
 	initHostLoggingFromEnv()
 
 	if err := validatePaths(cfg); err != nil {
-		return -1, err
+		return nil, err
 	}
 
+	var ephCleanup func()
 	if cfg.Ephemeral {
 		tmpDir, err := os.MkdirTemp("", "lnx-ephemeral-*")
 		if err != nil {
-			return -1, fmt.Errorf("create ephemeral dir: %w", err)
+			return nil, fmt.Errorf("create ephemeral dir: %w", err)
 		}
-		defer os.RemoveAll(tmpDir)
+		ephCleanup = func() { os.RemoveAll(tmpDir) }
 
 		ephRootfs := filepath.Join(tmpDir, "rootfs.ext4")
 		if err := unix.Clonefile(cfg.RootfsPath, ephRootfs, 0); err != nil {
-			return -1, fmt.Errorf("clone ephemeral rootfs: %w", err)
+			ephCleanup()
+			return nil, fmt.Errorf("clone ephemeral rootfs: %w", err)
 		}
 		cfg = &Config{
 			KernelPath:    cfg.KernelPath,
@@ -60,25 +83,30 @@ func Run(cfg *Config, args ...string) (int, error) {
 			Shares:        cfg.Shares,
 			Hostname:      cfg.Hostname,
 			SSHAgent:      cfg.SSHAgent,
+			SocketDir:     cfg.SocketDir,
 		}
 	}
 
 	lock, err := lockRootfs(cfg.RootfsPath)
 	if err != nil {
-		return -1, err
+		if ephCleanup != nil {
+			ephCleanup()
+		}
+		return nil, err
 	}
-	defer lock.unlock()
 
 	if cfg.Checkpoint {
 		cpDir := cfg.CheckpointDir
 		if cpDir == "" {
 			cpDir = filepath.Join(filepath.Dir(cfg.RootfsPath), "checkpoints")
 		}
-		cpPath, err := checkpoint(cfg.RootfsPath, cpDir)
-		if err != nil {
-			return -1, fmt.Errorf("checkpoint: %w", err)
+		if _, err := checkpoint(cfg.RootfsPath, cpDir); err != nil {
+			lock.unlock()
+			if ephCleanup != nil {
+				ephCleanup()
+			}
+			return nil, fmt.Errorf("checkpoint: %w", err)
 		}
-		fmt.Fprintf(os.Stderr, "checkpoint: %s\n", cpPath)
 	}
 
 	initrdDir := filepath.Dir(cfg.RootfsPath)
@@ -87,39 +115,51 @@ func Run(cfg *Config, args ...string) (int, error) {
 	}
 	initrdPath, err := writeInitramfs(initrdDir)
 	if err != nil {
-		return -1, fmt.Errorf("write initramfs: %w", err)
+		lock.unlock()
+		if ephCleanup != nil {
+			ephCleanup()
+		}
+		return nil, fmt.Errorf("write initramfs: %w", err)
 	}
 
 	cwd := cfg.CWD
 	if cwd == "" {
 		cwd, err = os.Getwd()
 		if err != nil {
-			return -1, fmt.Errorf("getwd: %w", err)
+			lock.unlock()
+			if ephCleanup != nil {
+				ephCleanup()
+			}
+			return nil, fmt.Errorf("getwd: %w", err)
 		}
 	}
 
 	u, err := user.Current()
 	if err != nil {
-		return -1, fmt.Errorf("get current user: %w", err)
+		lock.unlock()
+		if ephCleanup != nil {
+			ephCleanup()
+		}
+		return nil, fmt.Errorf("get current user: %w", err)
 	}
 	uid, _ := strconv.Atoi(u.Uid)
 
 	swapPath := filepath.Join(filepath.Dir(cfg.RootfsPath), "swap.img")
 	if err := ensureSwapFile(swapPath, cfg.memoryBytes()); err != nil {
-		return -1, fmt.Errorf("swap file: %w", err)
+		lock.unlock()
+		if ephCleanup != nil {
+			ephCleanup()
+		}
+		return nil, fmt.Errorf("swap file: %w", err)
 	}
 
 	vmConfig, err := buildVMConfig(cfg, initrdPath, cwd, swapPath, u.HomeDir)
 	if err != nil {
-		return -1, err
-	}
-
-	// Auto-detect interactive mode based on whether stdin is a terminal.
-	interactive := term.IsTerminal(int(os.Stdin.Fd()))
-
-	vm, err := vz.NewVirtualMachine(vmConfig)
-	if err != nil {
-		return -1, fmt.Errorf("create vm: %w", err)
+		lock.unlock()
+		if ephCleanup != nil {
+			ephCleanup()
+		}
+		return nil, err
 	}
 
 	hostname := cfg.Hostname
@@ -129,13 +169,13 @@ func Run(cfg *Config, args ...string) (int, error) {
 
 	sshAgent := cfg.SSHAgent && os.Getenv("SSH_AUTH_SOCK") != ""
 	if cfg.SSHAgent && !sshAgent {
-		fmt.Fprintln(os.Stderr, "warning: --ssh-agent requested but SSH_AUTH_SOCK is not set")
+		slog.Warn("--ssh-agent requested but SSH_AUTH_SOCK is not set")
 	}
 	if sshAgent {
 		if n, err := countSSHKeys(os.Getenv("SSH_AUTH_SOCK")); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: cannot query SSH agent: %v\n", err)
+			slog.Warn("cannot query SSH agent", "error", err)
 		} else if n == 0 {
-			fmt.Fprintln(os.Stderr, "warning: SSH agent has no identities loaded — run 'ssh-add' on the host")
+			slog.Warn("SSH agent has no identities loaded")
 		}
 	}
 
@@ -150,31 +190,79 @@ func Run(cfg *Config, args ...string) (int, error) {
 		Shares:   cfg.Shares,
 	}
 
-	vs, err := setupVsock(vm, filepath.Dir(cfg.RootfsPath), cfg.RootfsPath, setupMsg)
+	vm, err := vz.NewVirtualMachine(vmConfig)
 	if err != nil {
-		return -1, err
+		lock.unlock()
+		if ephCleanup != nil {
+			ephCleanup()
+		}
+		return nil, fmt.Errorf("create vm: %w", err)
+	}
+
+	sockDir := cfg.socketDir()
+	vs, err := setupVsock(vm, sockDir, cfg.RootfsPath, setupMsg)
+	if err != nil {
+		lock.unlock()
+		if ephCleanup != nil {
+			ephCleanup()
+		}
+		return nil, err
 	}
 	if err := vm.Start(); err != nil {
 		vs.cleanup()
-		return -1, fmt.Errorf("start vm: %w", err)
+		lock.unlock()
+		if ephCleanup != nil {
+			ephCleanup()
+		}
+		return nil, fmt.Errorf("start vm: %w", err)
 	}
 
-	// Wait for control connection, send setup message.
 	ctrlConn := <-vs.ctrlConnCh
 	if ctrlConn == nil {
 		vs.cleanup()
-		return -1, fmt.Errorf("control connection failed")
+		lock.unlock()
+		if ephCleanup != nil {
+			ephCleanup()
+		}
+		return nil, fmt.Errorf("control connection failed")
 	}
 	enc := gob.NewEncoder(ctrlConn)
 	if err := enc.Encode(protocol.Msg{Setup: setupMsg}); err != nil {
 		ctrlConn.Close()
 		vs.cleanup()
-		return -1, fmt.Errorf("send setup: %w", err)
+		lock.unlock()
+		if ephCleanup != nil {
+			ephCleanup()
+		}
+		return nil, fmt.Errorf("send setup: %w", err)
 	}
-	forceQuitCh := make(chan struct{})
-	go forwardSignals(ctrlConn, enc, forceQuitCh)
 
-	// Run the command through the exec path — same as `lnx exec`.
+	return &bootedVM{
+		vm:         vm,
+		vs:         vs,
+		ctrlConn:   ctrlConn,
+		ctrlEnc:    enc,
+		cwd:        cwd,
+		ephCleanup: ephCleanup,
+		lock:       lock,
+	}, nil
+}
+
+// Run executes a command inside a Linux VM and blocks until it exits.
+// args is a command vector (like exec): args[0] is the program, args[1:] are arguments.
+// Returns the guest process exit code.
+func Run(cfg *Config, args ...string) (int, error) {
+	b, err := bootVM(cfg)
+	if err != nil {
+		return -1, err
+	}
+
+	forceQuitCh := make(chan struct{})
+	go forwardSignals(b.ctrlConn, b.ctrlEnc, forceQuitCh)
+
+	// Auto-detect interactive mode based on whether stdin is a terminal.
+	interactive := term.IsTerminal(int(os.Stdin.Fd()))
+
 	var rows, cols uint16
 	if interactive {
 		fd := int(os.Stdin.Fd())
@@ -191,9 +279,9 @@ func Run(cfg *Config, args ...string) (int, error) {
 		}
 	}
 
-	exitCode := vs.api.runExec(&protocol.ExecReq{
+	exitCode := b.vs.api.runExec(&protocol.ExecReq{
 		Args: args,
-		CWD:  cwd,
+		CWD:  b.cwd,
 		PTY:  interactive,
 		Rows: rows,
 		Cols: cols,
@@ -206,10 +294,27 @@ func Run(cfg *Config, args ...string) (int, error) {
 	default:
 	}
 
-	// Shut down the VM by closing the control connection.
-	ctrlConn.Close()
+	b.close(exitCode)
+	return exitCode, nil
+}
 
-	return shutdownVM(vm, exitCode, vs.cleanup)
+// RunDaemon boots a VM and runs it as a background daemon with no initial command.
+// It blocks until all exec sessions have finished (idle) or Stop is requested
+// via the API. Returns nil on clean shutdown.
+func RunDaemon(cfg *Config) error {
+	b, err := bootVM(cfg)
+	if err != nil {
+		return err
+	}
+
+	slog.Info("daemon ready, waiting for exec sessions")
+
+	// Block until idle (all execs finished) or stop requested.
+	b.vs.api.WaitIdle()
+
+	slog.Info("daemon shutting down (idle)")
+	b.close(0)
+	return nil
 }
 
 // vsockState holds the vsock infrastructure created during VM setup.

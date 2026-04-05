@@ -11,7 +11,9 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 	"github.com/mdlayher/vsock"
@@ -47,6 +49,56 @@ func startExecServer() {
 	}()
 }
 
+// execSession holds per-session state for signal/resize forwarding.
+type execSession struct {
+	proc  *os.Process
+	ptyFd *os.File
+	mu    sync.Mutex
+}
+
+func (s *execSession) setProcess(p *os.Process) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.proc = p
+}
+
+func (s *execSession) setPTY(f *os.File) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ptyFd = f
+}
+
+// readControlMessages reads ExecSignal and ExecResize messages from the gob
+// decoder and applies them to this session's process/PTY. Runs until the
+// connection closes or an error occurs.
+func (s *execSession) readControlMessages(dec *gob.Decoder) {
+	for {
+		var msg protocol.Msg
+		if err := dec.Decode(&msg); err != nil {
+			return
+		}
+		if msg.ExecSignal != nil {
+			s.mu.Lock()
+			proc := s.proc
+			s.mu.Unlock()
+			if proc != nil {
+				_ = proc.Signal(syscall.Signal(msg.ExecSignal.Sig))
+			}
+		}
+		if msg.ExecResize != nil {
+			s.mu.Lock()
+			f := s.ptyFd
+			s.mu.Unlock()
+			if f != nil {
+				_ = unix.IoctlSetWinsize(int(f.Fd()), unix.TIOCSWINSZ, &unix.Winsize{
+					Row: msg.ExecResize.Rows,
+					Col: msg.ExecResize.Cols,
+				})
+			}
+		}
+	}
+}
+
 func handleExecConn(conn *vsock.Conn, interactiveLn *vsock.Listener) {
 	defer conn.Close()
 	enc := gob.NewEncoder(conn)
@@ -60,15 +112,18 @@ func handleExecConn(conn *vsock.Conn, interactiveLn *vsock.Listener) {
 		return
 	}
 
+	sess := &execSession{}
+	go sess.readControlMessages(dec)
+
 	if msg.ExecReq.PTY {
-		runExecPTY(enc, msg.ExecReq, interactiveLn)
+		runExecPTY(enc, msg.ExecReq, interactiveLn, sess)
 	} else {
-		runExecPipe(enc, msg.ExecReq)
+		runExecPipe(enc, msg.ExecReq, sess)
 	}
 }
 
 // runExecPTY handles an interactive exec request with a PTY.
-func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener) {
+func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener, sess *execSession) {
 	if len(req.Args) == 0 {
 		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
 		return
@@ -107,6 +162,9 @@ func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener) {
 	}
 	defer ptmx.Close()
 
+	// Report guest PID to host.
+	enc.Encode(protocol.Msg{ExecStarted: &protocol.ExecStarted{PID: cmd.Process.Pid}})
+
 	if req.Rows > 0 && req.Cols > 0 {
 		unix.IoctlSetWinsize(int(ptmx.Fd()), unix.TIOCSWINSZ, &unix.Winsize{
 			Row: req.Rows,
@@ -114,11 +172,9 @@ func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener) {
 		})
 	}
 
-	// Register PTY for resize and process for signals from control connection.
-	setControlPTY(ptmx)
-	defer setControlPTY(nil)
-	setControlProcess(cmd.Process)
-	defer setControlProcess(nil)
+	// Register PTY and process with the per-session handler for signals/resize.
+	sess.setPTY(ptmx)
+	sess.setProcess(cmd.Process)
 
 	// Accept connection from host for raw terminal I/O.
 	vsockConn, err := ln.Accept()
@@ -141,12 +197,29 @@ func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener) {
 	vsockConn.Close()
 	<-done
 
+	// Connection dropped. If the process is still running, give it a chance
+	// to exit gracefully (SIGHUP, like a terminal hangup), then force-kill.
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+
+	// Try SIGHUP first (terminal hangup — shells handle this).
+	cmd.Process.Signal(syscall.SIGHUP)
+
 	exitCode := 0
-	if err := cmd.Wait(); err != nil {
+	select {
+	case err := <-waitCh:
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
-		} else {
+		} else if err != nil {
 			exitCode = 127
+		}
+	case <-time.After(3 * time.Second):
+		cmd.Process.Kill()
+		err := <-waitCh
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else if err != nil {
+			exitCode = 137
 		}
 	}
 
@@ -205,7 +278,7 @@ func lookupSupplementaryGroups(uid int) []uint32 {
 }
 
 // runExecPipe handles a non-interactive exec request with piped stdout/stderr.
-func runExecPipe(enc *gob.Encoder, req *protocol.ExecReq) {
+func runExecPipe(enc *gob.Encoder, req *protocol.ExecReq, sess *execSession) {
 	if len(req.Args) == 0 {
 		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
 		return
@@ -249,6 +322,11 @@ func runExecPipe(enc *gob.Encoder, req *protocol.ExecReq) {
 		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
 		return
 	}
+
+	// Report guest PID to host.
+	enc.Encode(protocol.Msg{ExecStarted: &protocol.ExecStarted{PID: cmd.Process.Pid}})
+
+	sess.setProcess(cmd.Process)
 
 	done := make(chan struct{}, 2)
 	stream := func(r io.Reader, isStderr bool) {

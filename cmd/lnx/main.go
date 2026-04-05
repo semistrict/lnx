@@ -3,12 +3,16 @@ package main
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 
-	"github.com/semistrict/lnx"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 var doCheckpoint bool
@@ -41,8 +45,6 @@ var rootCmd = &cobra.Command{
 }
 
 func init() {
-	lnx.InitBinary = initBinary
-
 	// Apply env var before registering the flag so it becomes the default.
 	if env := os.Getenv("LNX_INSTANCE"); env != "" {
 		instanceName = env
@@ -156,15 +158,68 @@ func runVM(args []string) (int, error) {
 		}
 	}
 
-	return lnx.Run(&lnx.Config{
-		KernelPath: filepath.Join(lnxBase(), "vmlinuz"),
-		RootfsPath: filepath.Join(dir, "rootfs.ext4"),
-		Hostname:   instanceName + ".lnx",
-		Checkpoint: doCheckpoint,
-		Ephemeral:  doEphemeral,
-		SSHAgent:   doSSHAgent,
-		Shares:     loadShares(dir),
-	}, args...)
+	// Check if a VM is already running for this instance.
+	if !vmIsRunning() {
+		// Spawn daemon in background.
+		if err := spawnDaemon(); err != nil {
+			return -1, err
+		}
+		if err := waitForVM(60 * time.Second); err != nil {
+			return -1, err
+		}
+	}
+
+	// Exec into the running VM.
+	interactive := term.IsTerminal(int(os.Stdin.Fd()))
+	if interactive {
+		return execInteractive(args)
+	}
+	return execNonInteractive(args)
+}
+
+// vmIsRunning checks if a VM daemon is running for the current instance.
+func vmIsRunning() bool {
+	sockPath := filepath.Join(instanceDir(), "status.sock")
+	conn, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// spawnDaemon starts the VM daemon as a background process.
+func spawnDaemon() error {
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("find executable: %w", err)
+	}
+
+	daemonArgs := []string{"_daemon", "--instance", instanceName}
+	if doCheckpoint {
+		daemonArgs = append(daemonArgs, "--checkpoint")
+	}
+	if doEphemeral {
+		daemonArgs = append(daemonArgs, "--ephemeral")
+	}
+	if doSSHAgent {
+		daemonArgs = append(daemonArgs, "--ssh-agent")
+	}
+
+	cmd := exec.Command(self, daemonArgs...)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.Stdin = nil
+	// Detach from the parent process group so the daemon survives.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start daemon: %w", err)
+	}
+
+	// Release the process so it doesn't become a zombie.
+	cmd.Process.Release()
+	return nil
 }
 
 func initHostLogging() {

@@ -36,8 +36,11 @@ type Msg struct {
 	StatusReq      *StatusReq
 	StatusResp     *StatusResp
 	ExecReq        *ExecReq
+	ExecStarted    *ExecStarted
 	ExecOutput     *ExecOutput
 	ExecDone       *ExecDone
+	ExecSignal     *ExecSignal
+	ExecResize     *ExecResize
 	CheckpointReq  *CheckpointReq
 	CheckpointResp *CheckpointResp
 	OpenURLReq     *OpenURLReq
@@ -97,6 +100,12 @@ type ExecReq struct {
 	Cols uint16
 }
 
+// ExecStarted is sent by the guest after a command starts, reporting the guest PID.
+// Sent on the per-session exec gob connection (port 1027).
+type ExecStarted struct {
+	PID int
+}
+
 // ExecOutput streams command output from guest to host.
 type ExecOutput struct {
 	Stdout []byte
@@ -125,6 +134,19 @@ type OpenURLReq struct {
 // OpenURLResp reports the result of opening a URL.
 type OpenURLResp struct {
 	Error string // non-empty on failure
+}
+
+// ExecSignal tells the guest to forward a signal to a specific exec session's process.
+// Sent on the per-session exec gob connection (port 1027).
+type ExecSignal struct {
+	Sig int // syscall.Signal value
+}
+
+// ExecResize tells the guest to resize a specific exec session's PTY.
+// Sent on the per-session exec gob connection (port 1027).
+type ExecResize struct {
+	Rows uint16
+	Cols uint16
 }
 
 // PortForward notifies the host of the current set of listening TCP ports in the guest.

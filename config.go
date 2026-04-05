@@ -2,6 +2,7 @@ package lnx
 
 import (
 	"encoding/binary"
+	"path/filepath"
 	"syscall"
 )
 
@@ -56,6 +57,19 @@ type Config struct {
 	// before booting. The clone is deleted on exit. The original rootfs
 	// is never locked, so multiple ephemeral VMs can run concurrently.
 	Ephemeral bool
+
+	// SocketDir overrides the directory for status.sock.
+	// If empty, defaults to the directory containing RootfsPath.
+	// Useful for ephemeral mode where the rootfs is in a temp dir but
+	// the socket must be in the instance dir for clients to find it.
+	SocketDir string
+}
+
+func (c *Config) socketDir() string {
+	if c.SocketDir != "" {
+		return c.SocketDir
+	}
+	return filepath.Dir(c.RootfsPath)
 }
 
 func (c *Config) cpus() uint {

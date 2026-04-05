@@ -33,29 +33,35 @@ All communication uses virtio-vsock (no serial console for I/O). Ports are defin
 
 | Port | Purpose | Encoding |
 |------|---------|----------|
-| 1024 | Control (setup, signals, resize) | gob |
+| 1024 | Control (setup; VM-level lifecycle only) | gob |
 | 1025 | Guest → host logging | JSON lines |
 | 1026 | Status queries | gob |
-| 1027 | Exec commands (host connects per session via `VirtioSocketDevice.Connect`) | gob |
+| 1027 | Exec commands + per-session signals/resize (host connects per session) | gob |
 | 1028 | Guest → host requests (checkpoint, open URL) | gob |
 | 1030 | Port forward notifications | gob |
 | 1031 | Port forward data (host connects via `VirtioSocketDevice.Connect`) | raw bytes with 2-byte port header |
 | 1032 | Interactive exec PTY I/O (host connects via `VirtioSocketDevice.Connect`) | raw bytes |
 | 1033 | 9P file server (host home dir, read-only) | 9P2000.L |
+| 1034 | SSH agent forwarding (host listens, guest dials) | SSH agent protocol |
 
 The `Msg` envelope in protocol.go has exactly one non-nil field per message.
 
-### VM lifecycle (vm.go)
+### VM lifecycle — daemon model (vm.go)
 
-1. Lock rootfs (flock), optionally checkpoint (APFS clonefile)
-2. Write initramfs from embedded init binary
-3. Build VM config: kernel, initrd, serial→/dev/null, disks, virtiofs shares, vsock, NAT network
-4. Set terminal raw mode (interactive), query initial window size
-5. Start VM, set up vsock listeners for all ports
-6. Guest init boots, dials host on port 1024, receives `Setup` message (user, env, cwd)
-7. Guest mounts rootfs, sets up user, starts services (exec server, status server, port forwarder)
-8. Host sends `ExecReq` on port 1027; interactive I/O flows over port 1032; signals/resize over port 1024
-9. Host closes control connection → guest powers off
+The VM runs as a background daemon process. All `lnx <command>` invocations are exec clients.
+
+1. Client checks `~/.lnx/instances/<name>/status.sock` for a running daemon
+2. If no daemon: client spawns `lnx _daemon --instance <name>` in the background, waits for `status.sock`
+3. Daemon boots: lock rootfs (flock), write initramfs, build VM config, start VM
+4. Guest init boots, dials host on port 1024, receives `Setup` message
+5. Guest starts services (exec server, status server, port forwarder)
+6. Daemon listens on `status.sock`
+7. Client connects via WebSocket (`GET /exec/ws`) or HTTP (`POST /exec`)
+8. Multiple clients can exec concurrently — each gets its own vsock connection on port 1027
+9. Signals/resize are per-session via `ExecSignal`/`ExecResize` messages on the gob connection
+10. Interactive I/O uses WebSocket: binary frames = PTY data, text frames = signals/resize/exit_code
+11. When all exec sessions finish (active count → 0), daemon shuts down automatically
+12. `lnx stop` can also shut down the daemon via `POST /stop`
 
 ### Filesystem mounts
 
@@ -68,7 +74,14 @@ Guest scans `/proc/net/tcp` every 2s for listening ports, sends updates to host 
 
 ### Host API server (status.go)
 
-HTTP server on `~/.lnx/status.sock` (unix socket) exposes `GET /status`, `GET /ports`, `POST /exec`. CLI commands (`lnx status`, `lnx exec`, `lnx ports list`) are thin HTTP clients.
+HTTP server on `~/.lnx/instances/<name>/status.sock` (unix socket) exposes:
+- `GET /status` — VM status (uptime, memory, disk, load)
+- `GET /ports` — forwarded ports
+- `POST /exec` — non-interactive exec (NDJSON streaming response)
+- `GET /exec/ws` — interactive exec over WebSocket (binary frames = PTY, text frames = control)
+- `POST /stop` — shut down the daemon
+
+CLI commands (`lnx status`, `lnx ports list`, `lnx stop`) are thin HTTP clients. `lnx <command>` uses `/exec/ws` for interactive or `/exec` for non-interactive.
 
 ## Test structure
 
@@ -99,9 +112,11 @@ When a test or feature doesn't work, check the **data flow** first, not the buil
 
 ## Key conventions
 
-- `spliceInteractive` in status.go is the single unified path for interactive I/O — used by both the main command and `lnx exec -i` (via HTTP hijack).
+- All interactive I/O goes through WebSocket (`handleExecWS` in status.go). Binary frames carry PTY data, text frames carry JSON control messages (signals, resize, exit_code).
 - Each exec gets its own vsock connection (host connects to guest per session on port 1027), so multiple execs can run concurrently.
-- Double Ctrl-C force-stops the VM (exit 130). Single Ctrl-C forwards SIGINT to guest.
+- Signals and resize are per-session via `ExecSignal`/`ExecResize` gob messages on port 1027, not the control connection.
+- Double Ctrl-C force-quits the current session (exit 130). If it was the last session, the daemon shuts down.
 - The CLI bypasses cobra for guest commands: if the first arg isn't a known subcommand or flag, it goes directly to `runVM()` so flags like `-g` pass through to the guest.
 - Guest commands that aren't found print `name: command not found` (exit 127).
 - `LNX_LOG=debug` enables host-side debug logging to `~/.lnx/lnx.log`.
+- The `_daemon` subcommand is hidden/internal — never invoke it directly. It's spawned by `runVM()` when no VM is running.

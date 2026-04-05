@@ -11,11 +11,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	vz "github.com/Code-Hex/vz/v3"
+	"nhooyr.io/websocket"
 
 	"github.com/semistrict/lnx/internal/protocol"
 )
@@ -55,6 +58,42 @@ type apiServer struct {
 
 	sockPath string
 	listener net.Listener
+
+	// Session tracking for daemon mode.
+	activeExecs atomic.Int64
+	idleCh      chan struct{} // closed when active count drops from 1→0
+	idleOnce    sync.Once    // ensures idleCh is closed exactly once
+	stopCh      chan struct{} // closed when /stop is called
+
+	sessionsMu sync.RWMutex
+	sessions   map[string]*SessionInfo
+	sessionSeq atomic.Int64
+}
+
+// SessionInfo describes an active exec session.
+type SessionInfo struct {
+	ID        string    `json:"id"`
+	Args      []string  `json:"args"`
+	PTY       bool      `json:"pty"`
+	StartTime time.Time `json:"start_time"`
+	ClientPID int       `json:"client_pid,omitempty"`
+	GuestPID  int       `json:"guest_pid,omitempty"`
+
+	// Internal: gob encoder to send signals to the guest process.
+	// encMu serializes writes; gob.Encoder is not goroutine-safe.
+	encMu   sync.Mutex
+	execEnc *gob.Encoder
+
+	// Internal: connections to close when killing the session.
+	execConn  net.Conn // gob exec connection (port 1027)
+	vsockConn net.Conn // raw PTY vsock connection (port 1032), nil for non-PTY
+}
+
+// encodeExec sends a gob message on the session's exec connection, safely.
+func (s *SessionInfo) encodeExec(msg protocol.Msg) error {
+	s.encMu.Lock()
+	defer s.encMu.Unlock()
+	return s.execEnc.Encode(msg)
 }
 
 func newAPIServer(args []string, user, rootfsPath string) *apiServer {
@@ -63,6 +102,107 @@ func newAPIServer(args []string, user, rootfsPath string) *apiServer {
 		user:       user,
 		rootfsPath: rootfsPath,
 		startTime:  time.Now(),
+		idleCh:     make(chan struct{}),
+		stopCh:     make(chan struct{}),
+		sessions:   make(map[string]*SessionInfo),
+	}
+}
+
+// registerSession creates a new session entry and returns its ID.
+func (s *apiServer) registerSession(args []string, pty bool, clientPID int, execEnc *gob.Encoder, execConn net.Conn) string {
+	id := fmt.Sprintf("s%d", s.sessionSeq.Add(1))
+	s.sessionsMu.Lock()
+	s.sessions[id] = &SessionInfo{
+		ID:        id,
+		Args:      args,
+		PTY:       pty,
+		StartTime: time.Now(),
+		ClientPID: clientPID,
+		execEnc:   execEnc,
+		execConn:  execConn,
+	}
+	s.sessionsMu.Unlock()
+	s.activeExecs.Add(1)
+	return id
+}
+
+// setSessionVsockConn stores the PTY vsock connection for a session.
+func (s *apiServer) setSessionVsockConn(id string, conn net.Conn) {
+	s.sessionsMu.Lock()
+	if sess, ok := s.sessions[id]; ok {
+		sess.vsockConn = conn
+	}
+	s.sessionsMu.Unlock()
+}
+
+// setSessionGuestPID records the guest PID for a session.
+func (s *apiServer) setSessionGuestPID(id string, pid int) {
+	s.sessionsMu.Lock()
+	if sess, ok := s.sessions[id]; ok {
+		sess.GuestPID = pid
+	}
+	s.sessionsMu.Unlock()
+}
+
+// closeSession forcefully closes a session's connections, causing the
+// WebSocket handler and guest exec to clean up. Returns false if not found.
+func (s *apiServer) closeSession(id string) bool {
+	s.sessionsMu.RLock()
+	sess, ok := s.sessions[id]
+	s.sessionsMu.RUnlock()
+	if !ok {
+		return false
+	}
+	if sess.vsockConn != nil {
+		sess.vsockConn.Close()
+	}
+	if sess.execConn != nil {
+		sess.execConn.Close()
+	}
+	return true
+}
+
+// signalSession sends a signal to a session's guest process. Returns false if not found.
+func (s *apiServer) signalSession(id string, sig int) bool {
+	s.sessionsMu.RLock()
+	sess, ok := s.sessions[id]
+	s.sessionsMu.RUnlock()
+	if !ok || sess.execEnc == nil {
+		return false
+	}
+	sess.encodeExec(protocol.Msg{ExecSignal: &protocol.ExecSignal{Sig: sig}})
+	return true
+}
+
+// unregisterSession removes a session and decrements the exec counter.
+// If the counter drops to zero, idleCh is closed.
+func (s *apiServer) unregisterSession(id string) {
+	s.sessionsMu.Lock()
+	delete(s.sessions, id)
+	s.sessionsMu.Unlock()
+	if s.activeExecs.Add(-1) == 0 {
+		s.idleOnce.Do(func() { close(s.idleCh) })
+	}
+}
+
+// execStarted increments the active exec counter (for non-tracked sessions like Run()).
+func (s *apiServer) execStarted() {
+	s.activeExecs.Add(1)
+}
+
+// execFinished decrements the active exec counter. If it drops to zero,
+// idleCh is closed to signal the daemon to shut down.
+func (s *apiServer) execFinished() {
+	if s.activeExecs.Add(-1) == 0 {
+		s.idleOnce.Do(func() { close(s.idleCh) })
+	}
+}
+
+// WaitIdle blocks until there are no active exec sessions, or stop is requested.
+func (s *apiServer) WaitIdle() {
+	select {
+	case <-s.idleCh:
+	case <-s.stopCh:
 	}
 }
 
@@ -176,6 +316,10 @@ func (s *apiServer) listenUnix(sockPath string) error {
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /ports", s.handlePorts)
 	mux.HandleFunc("POST /exec", s.handleExec)
+	mux.HandleFunc("GET /exec/ws", s.handleExecWS)
+	mux.HandleFunc("GET /sessions", s.handleSessions)
+	mux.HandleFunc("POST /sessions/kill", s.handleSessionKill)
+	mux.HandleFunc("POST /stop", s.handleStop)
 
 	go http.Serve(ln, mux)
 	return nil
@@ -231,13 +375,14 @@ func (s *apiServer) handlePorts(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(ports)
 }
 
-// ExecRequest is the JSON body for POST /exec.
+// ExecRequest is the JSON body for POST /exec and the first WebSocket text frame.
 type ExecRequest struct {
-	Args []string `json:"args"`
-	Env  []string `json:"env,omitempty"`
-	PTY  bool     `json:"pty,omitempty"`
-	Rows uint16   `json:"rows,omitempty"`
-	Cols uint16   `json:"cols,omitempty"`
+	Args      []string `json:"args"`
+	Env       []string `json:"env,omitempty"`
+	PTY       bool     `json:"pty,omitempty"`
+	Rows      uint16   `json:"rows,omitempty"`
+	Cols      uint16   `json:"cols,omitempty"`
+	ClientPID int      `json:"client_pid,omitempty"`
 }
 
 func (s *apiServer) handleExec(w http.ResponseWriter, r *http.Request) {
@@ -258,6 +403,9 @@ func (s *apiServer) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 	defer execConn.Close()
 
+	sessID := s.registerSession(req.Args, req.PTY, req.ClientPID, execEnc, execConn)
+	defer s.unregisterSession(sessID)
+
 	if err := execEnc.Encode(protocol.Msg{ExecReq: &protocol.ExecReq{
 		Args: req.Args,
 		Env:  req.Env,
@@ -270,14 +418,14 @@ func (s *apiServer) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.PTY {
-		s.handleExecInteractive(w, r, execDec)
-	} else {
-		s.handleExecStream(w, execDec)
+		http.Error(w, "use GET /exec/ws for interactive exec", http.StatusBadRequest)
+		return
 	}
+	s.handleExecStream(w, execDec, sessID)
 }
 
 // handleExecStream handles non-interactive exec via NDJSON streaming.
-func (s *apiServer) handleExecStream(w http.ResponseWriter, execDec *gob.Decoder) {
+func (s *apiServer) handleExecStream(w http.ResponseWriter, execDec *gob.Decoder, sessID string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
@@ -300,6 +448,10 @@ func (s *apiServer) handleExecStream(w http.ResponseWriter, execDec *gob.Decoder
 			return
 		}
 
+		if msg.ExecStarted != nil {
+			s.setSessionGuestPID(sessID, msg.ExecStarted.PID)
+		}
+
 		if msg.ExecOutput != nil {
 			if len(msg.ExecOutput.Stdout) > 0 {
 				enc.Encode(map[string]string{"stdout": string(msg.ExecOutput.Stdout)})
@@ -319,24 +471,229 @@ func (s *apiServer) handleExecStream(w http.ResponseWriter, execDec *gob.Decoder
 	}
 }
 
-// handleExecInteractive handles interactive exec with PTY via HTTP hijack.
-func (s *apiServer) handleExecInteractive(w http.ResponseWriter, r *http.Request, execDec *gob.Decoder) {
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "hijack not supported", http.StatusInternalServerError)
-		return
-	}
-	conn, buf, err := hj.Hijack()
+// handleExecWS handles interactive exec over WebSocket.
+// Binary frames carry raw PTY data. Text frames carry JSON control messages:
+//
+//	Client → Server: {"signal": N} or {"resize": {"rows": R, "cols": C}}
+//	Server → Client: {"exit_code": N}
+func (s *apiServer) handleExecWS(w http.ResponseWriter, r *http.Request) {
+	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		// Allow any origin since this is a local unix socket.
+		InsecureSkipVerify: true,
+	})
 	if err != nil {
-		slog.Debug("exec hijack failed", "error", err)
+		slog.Debug("websocket accept failed", "error", err)
 		return
 	}
-	defer conn.Close()
+	defer ws.CloseNow()
+	ws.SetReadLimit(-1) // no limit on PTY data
 
-	buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n")
-	buf.Flush()
+	ctx := r.Context()
 
-	s.spliceInteractive(conn, execDec, nil)
+	// Read the first text message as the ExecRequest.
+	_, data, err := ws.Read(ctx)
+	if err != nil {
+		slog.Debug("websocket read exec request failed", "error", err)
+		return
+	}
+	var req ExecRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		ws.Close(websocket.StatusInvalidFramePayloadData, "bad exec request: "+err.Error())
+		return
+	}
+	if len(req.Args) == 0 {
+		ws.Close(websocket.StatusInvalidFramePayloadData, "args required")
+		return
+	}
+
+	execEnc, execDec, execConn, err := s.connectExec()
+	if err != nil {
+		ws.Close(websocket.StatusInternalError, "guest exec connect: "+err.Error())
+		return
+	}
+	defer execConn.Close()
+
+	sessID := s.registerSession(req.Args, true, req.ClientPID, execEnc, execConn)
+	defer s.unregisterSession(sessID)
+
+	// Look up the session for thread-safe encoder access.
+	s.sessionsMu.RLock()
+	sess := s.sessions[sessID]
+	s.sessionsMu.RUnlock()
+
+	if err := sess.encodeExec(protocol.Msg{ExecReq: &protocol.ExecReq{
+		Args: req.Args,
+		Env:  req.Env,
+		PTY:  true,
+		Rows: req.Rows,
+		Cols: req.Cols,
+	}}); err != nil {
+		ws.Close(websocket.StatusInternalError, "send exec request: "+err.Error())
+		return
+	}
+
+	// Connect to guest PTY via vsock.
+	var vsockConn net.Conn
+	for i := 0; i < 300; i++ {
+		vsockConn, err = s.sock.Connect(protocol.ExecInteractivePort)
+		if err == nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if vsockConn == nil {
+		ws.Close(websocket.StatusInternalError, "exec interactive connect failed")
+		return
+	}
+	defer vsockConn.Close()
+	s.setSessionVsockConn(sessID, vsockConn)
+
+	// Read text frames (signals/resize) from client and forward to guest gob connection.
+	// Read binary frames (stdin) from client and write to guest PTY vsock.
+	go func() {
+		for {
+			typ, data, err := ws.Read(ctx)
+			if err != nil {
+				// Client disconnected — close both the PTY vsock and the
+				// exec gob connection so the guest cleans up and
+				// execDec.Decode() unblocks.
+				vsockConn.Close()
+				execConn.Close()
+				return
+			}
+			switch typ {
+			case websocket.MessageBinary:
+				vsockConn.Write(data)
+			case websocket.MessageText:
+				var ctrl wsControl
+				if err := json.Unmarshal(data, &ctrl); err != nil {
+					continue
+				}
+				if ctrl.Signal != nil {
+					sess.encodeExec(protocol.Msg{ExecSignal: &protocol.ExecSignal{Sig: *ctrl.Signal}})
+				}
+				if ctrl.Resize != nil {
+					sess.encodeExec(protocol.Msg{ExecResize: &protocol.ExecResize{
+						Rows: ctrl.Resize.Rows,
+						Cols: ctrl.Resize.Cols,
+					}})
+				}
+			}
+		}
+	}()
+
+	// Read guest PTY output and send as binary frames.
+	go func() {
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := vsockConn.Read(buf)
+			if n > 0 {
+				if werr := ws.Write(ctx, websocket.MessageBinary, buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Wait for ExecStarted then ExecDone from guest.
+	exitCode := -1
+	for {
+		var msg protocol.Msg
+		if err := execDec.Decode(&msg); err != nil {
+			break
+		}
+		if msg.ExecStarted != nil {
+			s.setSessionGuestPID(sessID, msg.ExecStarted.PID)
+		}
+		if msg.ExecDone != nil {
+			exitCode = msg.ExecDone.ExitCode
+			break
+		}
+	}
+
+	// Send exit code to client as text frame.
+	exitMsg, _ := json.Marshal(map[string]int{"exit_code": exitCode})
+	ws.Write(ctx, websocket.MessageText, exitMsg)
+	ws.Close(websocket.StatusNormalClosure, "")
+}
+
+// wsControl is the JSON structure for WebSocket text frames from client.
+type wsControl struct {
+	Signal *int      `json:"signal,omitempty"`
+	Resize *wsResize `json:"resize,omitempty"`
+}
+
+type wsResize struct {
+	Rows uint16 `json:"rows"`
+	Cols uint16 `json:"cols"`
+}
+
+// handleSessions returns all active exec sessions as JSON, sorted by start time.
+func (s *apiServer) handleSessions(w http.ResponseWriter, r *http.Request) {
+	s.sessionsMu.RLock()
+	sessions := make([]*SessionInfo, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
+	s.sessionsMu.RUnlock()
+
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].StartTime.Before(sessions[j].StartTime)
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(sessions)
+}
+
+// SessionKillRequest is the JSON body for POST /sessions/kill.
+type SessionKillRequest struct {
+	ID    string `json:"id"`
+	Signal int    `json:"signal"`
+	Close bool   `json:"close,omitempty"` // also close connections to force teardown
+}
+
+// handleSessionKill sends a signal to a session's guest process.
+// If Close is true, also forcefully closes the session's connections.
+func (s *apiServer) handleSessionKill(w http.ResponseWriter, r *http.Request) {
+	var req SessionKillRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.ID == "" {
+		http.Error(w, "id required", http.StatusBadRequest)
+		return
+	}
+	if req.Signal == 0 {
+		req.Signal = 15 // SIGTERM
+	}
+
+	if !s.signalSession(req.ID, req.Signal) {
+		http.Error(w, "session not found: "+req.ID, http.StatusNotFound)
+		return
+	}
+
+	if req.Close {
+		s.closeSession(req.ID)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "signal sent"})
+}
+
+// handleStop shuts down the VM daemon.
+func (s *apiServer) handleStop(w http.ResponseWriter, r *http.Request) {
+	select {
+	case <-s.stopCh:
+		// Already stopping.
+	default:
+		close(s.stopCh)
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintln(w, "stopping")
 }
 
 // runExec runs a command on the guest. Creates a new vsock exec connection
@@ -351,6 +708,9 @@ func (s *apiServer) runExec(req *protocol.ExecReq, interactive bool, forceQuitCh
 		return -1
 	}
 	defer execConn.Close()
+
+	s.execStarted()
+	defer s.execFinished()
 
 	if err := execEnc.Encode(protocol.Msg{ExecReq: req}); err != nil {
 		slog.Debug("exec encode failed", "error", err)
