@@ -7,10 +7,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/semistrict/lnx"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -18,6 +20,7 @@ import (
 var doCheckpoint bool
 var doEphemeral bool
 var doSSHAgent bool
+var doGUI bool
 
 // instanceName is the resolved instance name. Set from --instance flag or LNX_INSTANCE env.
 var instanceName = "default"
@@ -53,6 +56,7 @@ func init() {
 	rootCmd.Flags().BoolVarP(&doCheckpoint, "checkpoint", "c", false, "snapshot rootfs before starting the VM")
 	rootCmd.Flags().BoolVar(&doEphemeral, "ephemeral", false, "clone rootfs to a temp file; discard on exit")
 	rootCmd.Flags().BoolVar(&doSSHAgent, "ssh-agent", false, "forward host SSH agent into the guest")
+	rootCmd.Flags().BoolVar(&doGUI, "gui", false, "open a native macOS graphics window for the VM")
 
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		// Cobra has parsed flags. Update instanceFlag if --instance was explicitly passed.
@@ -77,6 +81,19 @@ func main() {
 	// This lets `lnx --ephemeral bash -l` bypass cobra so `-l`
 	// isn't misinterpreted as a flag.
 	guestArgs := stripLnxFlags(os.Args[1:])
+
+	// --gui runs the VM in the foreground with a native macOS graphics window.
+	// Must stay on the main thread for AppKit.
+	if doGUI {
+		runtime.LockOSThread()
+		lnx.InitBinary = initBinary
+		if err := runGUI(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	if len(guestArgs) > 0 && !isSubcommandOrFlag(guestArgs[0]) {
 		if os.Getenv("LNX_INSTANCE") != "" {
 			instanceFlag = true
@@ -109,6 +126,9 @@ func stripLnxFlags(args []string) []string {
 		case a == "--ssh-agent":
 			doSSHAgent = true
 			i++
+		case a == "--gui":
+			doGUI = true
+			i++
 		case a == "--checkpoint" || a == "-c":
 			doCheckpoint = true
 			i++
@@ -138,6 +158,37 @@ func isSubcommandOrFlag(arg string) bool {
 		}
 	}
 	return false
+}
+
+// runGUI boots a VM with a graphics window in the foreground.
+// Blocks until the window is closed.
+func runGUI() error {
+	dir := instanceDir()
+
+	kernelPath := filepath.Join(lnxBase(), "vmlinuz")
+	rootfsPath := filepath.Join(dir, "rootfs.ext4")
+	if _, err := os.Stat(kernelPath); os.IsNotExist(err) {
+		fmt.Fprintln(os.Stderr, "first run — downloading kernel and rootfs...")
+		if err := autoInit(); err != nil {
+			return fmt.Errorf("auto-init failed: %w", err)
+		}
+	} else if _, err := os.Stat(rootfsPath); os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "instance %q not initialized — downloading rootfs...\n", instanceName)
+		if err := autoInit(); err != nil {
+			return fmt.Errorf("auto-init failed: %w", err)
+		}
+	}
+
+	return lnx.RunGUI(&lnx.Config{
+		KernelPath: filepath.Join(lnxBase(), "vmlinuz"),
+		RootfsPath: filepath.Join(dir, "rootfs.ext4"),
+		Hostname:   instanceName + ".lnx",
+		Checkpoint: doCheckpoint,
+		Ephemeral:  doEphemeral,
+		SSHAgent:   doSSHAgent,
+		Shares:     loadShares(dir),
+		SocketDir:  dir,
+	})
 }
 
 func runVM(args []string) (int, error) {

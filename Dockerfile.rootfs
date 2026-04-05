@@ -32,9 +32,14 @@ RUN chroot /rootfs apt-get install -y --no-install-recommends \
 RUN chroot /rootfs apt-get install -y --no-install-recommends \
     podman buildah skopeo uidmap slirp4netns fuse-overlayfs
 
-# Layer 8: cleanup
+# Layer 8: GUI (compositor + terminal for --gui mode)
+RUN chroot /rootfs apt-get install -y --no-install-recommends \
+    cage foot mesa-utils libgl1-mesa-dri seatd
+
+# Layer 9: cleanup
 RUN chroot /rootfs apt-get clean && rm -rf /rootfs/var/lib/apt/lists/*
 
-# Layer 9: build ext4
-RUN truncate -s 4G /rootfs.ext4 && \
-    mke2fs -t ext4 -d /rootfs -L lnx /rootfs.ext4
+# Layer 10: build ext4
+# Use ^orphan_file,^metadata_csum_seed for kernel 7.0 compat.
+RUN truncate -s 16G /rootfs.ext4 && \
+    mke2fs -t ext4 -O ^orphan_file,^metadata_csum_seed -d /rootfs -L lnx /rootfs.ext4

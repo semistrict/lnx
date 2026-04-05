@@ -109,6 +109,35 @@ func attachNetwork(vmConfig *vz.VirtualMachineConfiguration) error {
 	return nil
 }
 
+// attachGraphics adds a virtio-gpu device with a 1920x1200 scanout,
+// plus USB keyboard and pointing device for input from the graphics window.
+func attachGraphics(vmConfig *vz.VirtualMachineConfiguration) error {
+	graphicsConfig, err := vz.NewVirtioGraphicsDeviceConfiguration()
+	if err != nil {
+		return fmt.Errorf("graphics config: %w", err)
+	}
+	scanout, err := vz.NewVirtioGraphicsScanoutConfiguration(2560, 1600)
+	if err != nil {
+		return fmt.Errorf("scanout config: %w", err)
+	}
+	graphicsConfig.SetScanouts(scanout)
+	vmConfig.SetGraphicsDevicesVirtualMachineConfiguration([]vz.GraphicsDeviceConfiguration{graphicsConfig})
+
+	keyboard, err := vz.NewUSBKeyboardConfiguration()
+	if err != nil {
+		return fmt.Errorf("keyboard config: %w", err)
+	}
+	vmConfig.SetKeyboardsVirtualMachineConfiguration([]vz.KeyboardConfiguration{keyboard})
+
+	pointing, err := vz.NewUSBScreenCoordinatePointingDeviceConfiguration()
+	if err != nil {
+		return fmt.Errorf("pointing config: %w", err)
+	}
+	vmConfig.SetPointingDevicesVirtualMachineConfiguration([]vz.PointingDeviceConfiguration{pointing})
+
+	return nil
+}
+
 func attachMisc(vmConfig *vz.VirtualMachineConfiguration) error {
 	entropy, err := vz.NewVirtioEntropyDeviceConfiguration()
 	if err != nil {

@@ -58,6 +58,10 @@ type Config struct {
 	// is never locked, so multiple ephemeral VMs can run concurrently.
 	Ephemeral bool
 
+	// GUI opens a native macOS graphics window showing the VM's display.
+	// Requires a kernel with CONFIG_DRM_VIRTIO_GPU and a compositor in the rootfs.
+	GUI bool
+
 	// SocketDir overrides the directory for status.sock.
 	// If empty, defaults to the directory containing RootfsPath.
 	// Useful for ephemeral mode where the rootfs is in a temp dir but

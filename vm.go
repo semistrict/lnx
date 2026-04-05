@@ -83,6 +83,7 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 			Shares:        cfg.Shares,
 			Hostname:      cfg.Hostname,
 			SSHAgent:      cfg.SSHAgent,
+			GUI:           cfg.GUI,
 			SocketDir:     cfg.SocketDir,
 		}
 	}
@@ -187,6 +188,7 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		HomeDir:  u.HomeDir,
 		Hostname: hostname,
 		SSHAgent: sshAgent,
+		GUI:      cfg.GUI,
 		Shares:   cfg.Shares,
 	}
 
@@ -317,6 +319,38 @@ func RunDaemon(cfg *Config) error {
 	return nil
 }
 
+// RunGUI boots a VM with a virtio-gpu display and opens a native macOS
+// graphics window. Must be called from a goroutine with runtime.LockOSThread()
+// (typically the main goroutine). Blocks until the window is closed.
+func RunGUI(cfg *Config) error {
+	cfg.GUI = true
+	b, err := bootVM(cfg)
+	if err != nil {
+		return err
+	}
+
+	forceQuitCh := make(chan struct{})
+	go forwardSignals(b.ctrlConn, b.ctrlEnc, forceQuitCh)
+
+	hostname := cfg.Hostname
+	if hostname == "" {
+		hostname = "lnx"
+	}
+
+	slog.Info("starting graphics window")
+
+	// StartGraphicApplication runs [NSApp run] — blocks until window closes.
+	if err := b.vm.StartGraphicApplication(1280, 800,
+		vz.WithWindowTitle(hostname),
+	); err != nil {
+		b.close(1)
+		return fmt.Errorf("start graphic application: %w", err)
+	}
+
+	b.close(0)
+	return nil
+}
+
 // vsockState holds the vsock infrastructure created during VM setup.
 type vsockState struct {
 	ctrlConnCh <-chan net.Conn
@@ -326,6 +360,10 @@ type vsockState struct {
 
 func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.VirtualMachineConfiguration, error) {
 	cmdline := fmt.Sprintf("console=hvc0 quiet lnx.epoch=%d", time.Now().Unix())
+	if cfg.GUI {
+		// Prevent fbcon from grabbing DRM master so the compositor can use it.
+		cmdline += " fbcon=map:"
+	}
 
 	bootLoader, err := vz.NewLinuxBootLoader(
 		cfg.KernelPath,
@@ -341,13 +379,17 @@ func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.
 		return nil, fmt.Errorf("vm config: %w", err)
 	}
 
-	for _, attach := range []func(*vz.VirtualMachineConfiguration) error{
+	attachFns := []func(*vz.VirtualMachineConfiguration) error{
 		attachSerial,
 		func(c *vz.VirtualMachineConfiguration) error { return attachDisks(c, cfg.RootfsPath, swapPath) },
 		func(c *vz.VirtualMachineConfiguration) error { return attachShares(c, cwd, cfg.Shares) },
 		attachNetwork,
 		attachMisc,
-	} {
+	}
+	if cfg.GUI {
+		attachFns = append(attachFns, attachGraphics)
+	}
+	for _, attach := range attachFns {
 		if err := attach(vmConfig); err != nil {
 			return nil, err
 		}

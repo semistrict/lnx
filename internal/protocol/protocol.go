@@ -58,6 +58,7 @@ type Setup struct {
 	HomeDir  string   // host home dir path (e.g. /Users/ramon), mounted read-only
 	Hostname string   // guest hostname (e.g. "default.lnx")
 	SSHAgent bool     // if true, host is forwarding SSH agent on SSHAgentPort
+	GUI      bool     // if true, a virtio-gpu display is attached — start a compositor
 	Shares   []string // extra virtiofs shares to mount read-write (absolute paths)
 }
 
