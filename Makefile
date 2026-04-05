@@ -22,7 +22,7 @@ help:
 
 # Cross-compile guest init binary (linux/arm64)
 cmd/lnx/init:
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o $@ ./cmd/init
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o $@ ./cmd/init
 
 # Build host binary with embedded init
 lnx: cmd/lnx/init
@@ -59,7 +59,7 @@ test-integration: cmd/lnx/init
 
 # Install to $GOPATH/bin
 install: cmd/lnx/init
-	go install -ldflags '-extldflags "-Wl,-no_warn_duplicate_libraries"' ./cmd/lnx
+	go build -ldflags '-extldflags "-Wl,-no_warn_duplicate_libraries"' -o "$$(go env GOPATH)/bin/lnx" ./cmd/lnx
 	codesign --entitlements entitlements.plist --force -s - "$$(go env GOPATH)/bin/lnx"
 
 clean:

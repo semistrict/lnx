@@ -65,7 +65,7 @@ func TestPTY_MainInteractive(t *testing.T) {
 
 	term := midterm.NewTerminal(24, 80)
 
-	cmd := exec.Command(bin, "bash", "-l")
+	cmd := exec.Command(bin, "--ephemeral", "bash", "-l")
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 80})
 	require.NoError(t, err)
 	defer ptmx.Close()

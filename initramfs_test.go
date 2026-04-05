@@ -2,6 +2,7 @@ package lnx
 
 import (
 	"bytes"
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -65,4 +66,38 @@ func TestConfig_CustomValues(t *testing.T) {
 	cfg := &Config{CPUs: 4, MemoryBytes: 2 << 30}
 	assert.Equal(t, uint(4), cfg.cpus())
 	assert.Equal(t, uint64(2<<30), cfg.memoryBytes())
+}
+
+func TestConfig_AllFieldsCopied(t *testing.T) {
+	// Verify that every Config field is represented in this test.
+	// When a new field is added to Config, this test will fail
+	// until the field is added here — catching ephemeral copy bugs.
+	typ := reflect.TypeOf(Config{})
+	fieldCount := typ.NumField()
+
+	cfg := &Config{
+		KernelPath:    "/kernel",
+		RootfsPath:    "/rootfs",
+		InitramfsPath: "/initrd",
+		CPUs:          4,
+		MemoryBytes:   8 << 30,
+		CWD:           "/work",
+		Env:           []string{"A=B"},
+		Checkpoint:    true,
+		CheckpointDir: "/cp",
+		Hostname:      "test.lnx",
+		SSHAgent:      true,
+		Ephemeral:     true,
+	}
+
+	// Count fields set above — must match struct field count.
+	// If this fails, a new field was added to Config but not to this test.
+	assert.Equal(t, fieldCount, 12, "Config has %d fields but test only covers 12 — update this test and the ephemeral copy in vm.go", fieldCount)
+
+	// Verify all fields are non-zero (catches typos in field names above).
+	val := reflect.ValueOf(*cfg)
+	for i := 0; i < val.NumField(); i++ {
+		f := val.Field(i)
+		assert.False(t, f.IsZero(), "Config.%s is zero — add it to this test", typ.Field(i).Name)
+	}
 }

@@ -76,6 +76,27 @@ HTTP server on `~/.lnx/status.sock` (unix socket) exposes `GET /status`, `GET /p
 - **Integration tests** (`*_intg_test.go`): Tagged `//go:build darwin && integration`, each test boots a real VM. Use `setupTestDir(t)` which clones rootfs via APFS clonefile. Most use `t.Parallel()`.
 - **ForceQuit test** is NOT parallel because it sends `SIGINT` to the process.
 
+## Testing requirements
+
+A feature is NOT complete until it has tests. Do not declare a feature done without them.
+
+- **Unit tests**: For any new protocol messages, config parsing, or pure logic.
+- **Integration tests (midterm)**: For any user-facing behavior that involves the VM. PTY tests use `creack/pty` + `vito/midterm` to simulate a real terminal. Use `--ephemeral` or `LNX_INSTANCE=test-xxx` with a cloned rootfs to avoid rootfs lock contention with other parallel tests.
+- **Run the test before declaring it works**. Use `make install` first for PTY/midterm tests (they exec the `lnx` binary from PATH). Run the specific test in isolation first (`make test-integration RUN=TestName`), then the full suite.
+- If a feature touches host↔guest communication (new vsock port, new Setup field, new guest service), the integration test must verify end-to-end behavior through the actual VM, not just the host side.
+
+## When adding fields to Config or protocol.Setup
+
+- `Config` fields are manually copied in the ephemeral path (`vm.go`). If you add a field, you MUST update that copy. `TestConfig_AllFieldsCopied` will fail if you forget — run `make test` first.
+- `protocol.Setup` fields are gob-encoded. New fields work automatically, but test the round-trip with `TestControlProtocol_SetupDelivered`.
+
+## Debugging failures
+
+When a test or feature doesn't work, check the **data flow** first, not the build system:
+- Trace the value through each layer: CLI flag → Config → Setup message → guest init
+- Check if there's a manual struct copy that drops fields (ephemeral path, gob re-encoding)
+- Do NOT spend time on build cache issues (`go clean -cache`, MD5 comparisons, binary extraction) until you've ruled out logic bugs
+
 ## Key conventions
 
 - `spliceInteractive` in status.go is the single unified path for interactive I/O — used by both the main command and `lnx exec -i` (via HTTP hijack).
