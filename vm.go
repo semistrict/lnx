@@ -16,6 +16,7 @@ import (
 	"time"
 
 	vz "github.com/Code-Hex/vz/v3"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 
 	"github.com/semistrict/lnx/internal/protocol"
@@ -33,6 +34,32 @@ func Run(cfg *Config, args ...string) (int, error) {
 
 	if err := validatePaths(cfg); err != nil {
 		return -1, err
+	}
+
+	if cfg.Ephemeral {
+		tmpDir, err := os.MkdirTemp("", "lnx-ephemeral-*")
+		if err != nil {
+			return -1, fmt.Errorf("create ephemeral dir: %w", err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		ephRootfs := filepath.Join(tmpDir, "rootfs.ext4")
+		if err := unix.Clonefile(cfg.RootfsPath, ephRootfs, 0); err != nil {
+			return -1, fmt.Errorf("clone ephemeral rootfs: %w", err)
+		}
+		cfg = &Config{
+			KernelPath:    cfg.KernelPath,
+			RootfsPath:    ephRootfs,
+			InitramfsPath: cfg.InitramfsPath,
+			CPUs:          cfg.CPUs,
+			MemoryBytes:   cfg.MemoryBytes,
+			CWD:           cfg.CWD,
+			Env:           cfg.Env,
+			Checkpoint:    cfg.Checkpoint,
+			CheckpointDir: cfg.CheckpointDir,
+			Hostname:      cfg.Hostname,
+			SSHAgent:      cfg.SSHAgent,
+		}
 	}
 
 	lock, err := lockRootfs(cfg.RootfsPath)
@@ -53,7 +80,7 @@ func Run(cfg *Config, args ...string) (int, error) {
 		fmt.Fprintf(os.Stderr, "checkpoint: %s\n", cpPath)
 	}
 
-	initrdDir := filepath.Dir(cfg.KernelPath)
+	initrdDir := filepath.Dir(cfg.RootfsPath)
 	if cfg.InitramfsPath != "" {
 		initrdDir = filepath.Dir(cfg.InitramfsPath)
 	}
@@ -94,12 +121,21 @@ func Run(cfg *Config, args ...string) (int, error) {
 		return -1, fmt.Errorf("create vm: %w", err)
 	}
 
+	hostname := cfg.Hostname
+	if hostname == "" {
+		hostname = "lnx"
+	}
+
+	sshAgent := cfg.SSHAgent && os.Getenv("SSH_AUTH_SOCK") != ""
+
 	setupMsg := &protocol.Setup{
-		CWD:     cwd,
-		Env:     buildGuestEnv(cfg.Env),
-		User:    u.Username,
-		UID:     uid,
-		HomeDir: u.HomeDir,
+		CWD:      cwd,
+		Env:      buildGuestEnv(cfg.Env),
+		User:     u.Username,
+		UID:      uid,
+		HomeDir:  u.HomeDir,
+		Hostname: hostname,
+		SSHAgent: sshAgent,
 	}
 
 	vs, err := setupVsock(vm, filepath.Dir(cfg.RootfsPath), cfg.RootfsPath, setupMsg)
@@ -149,7 +185,7 @@ func Run(cfg *Config, args ...string) (int, error) {
 		PTY:  interactive,
 		Rows: rows,
 		Cols: cols,
-	}, interactive)
+	}, interactive, forceQuitCh)
 
 	// Check if force quit happened (double Ctrl-C).
 	select {
@@ -268,6 +304,17 @@ func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, setupMsg *prot
 	}
 	start9PServer(p9Listener, setupMsg.HomeDir)
 
+	var sshAgentListener net.Listener
+	if setupMsg.SSHAgent {
+		var err error
+		sshAgentListener, err = sock.Listen(protocol.SSHAgentPort)
+		if err != nil {
+			slog.Warn("ssh agent vsock listen failed", "error", err)
+		} else {
+			startSSHAgentProxy(sshAgentListener, os.Getenv("SSH_AUTH_SOCK"))
+		}
+	}
+
 	pf := newPortForwarder(sock)
 	go func() {
 		conn, err := portFwdListener.Accept()
@@ -313,6 +360,9 @@ func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, setupMsg *prot
 	cleanup := func() {
 		pf.close()
 		api.close()
+		if sshAgentListener != nil {
+			sshAgentListener.Close()
+		}
 		p9Listener.Close()
 		portFwdListener.Close()
 		guestCtrlListener.Close()

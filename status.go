@@ -336,14 +336,15 @@ func (s *apiServer) handleExecInteractive(w http.ResponseWriter, r *http.Request
 	buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n")
 	buf.Flush()
 
-	s.spliceInteractive(conn, execDec)
+	s.spliceInteractive(conn, execDec, nil)
 }
 
 // runExec runs a command on the guest. Creates a new vsock exec connection
 // per call so multiple execs can run concurrently.
 // For interactive (PTY) mode, it splices os.Stdin/os.Stdout with the guest PTY.
+// forceQuitCh is passed to spliceInteractive for raw-mode double-Ctrl-C detection.
 // Returns the exit code.
-func (s *apiServer) runExec(req *protocol.ExecReq, interactive bool) int {
+func (s *apiServer) runExec(req *protocol.ExecReq, interactive bool, forceQuitCh chan struct{}) int {
 	execEnc, execDec, execConn, err := s.connectExec()
 	if err != nil {
 		slog.Info("exec connect failed", "error", err)
@@ -358,7 +359,7 @@ func (s *apiServer) runExec(req *protocol.ExecReq, interactive bool) int {
 
 	if interactive {
 		// Wrap os.Stdin/os.Stdout as a ReadWriter for spliceInteractive.
-		return s.spliceInteractive(readWriter{os.Stdin, os.Stdout}, execDec)
+		return s.spliceInteractive(readWriter{os.Stdin, os.Stdout}, execDec, forceQuitCh)
 	}
 	return readExecOutput(execDec, os.Stdout, os.Stderr)
 }
@@ -394,7 +395,10 @@ func readExecOutput(execDec *gob.Decoder, stdout, stderr io.Writer) int {
 // spliceInteractive connects to the guest PTY via vsock and splices
 // raw bytes between rw (stdin/stdout or hijacked HTTP conn) and the PTY.
 // Used by both the main command and `lnx exec -i`.
-func (s *apiServer) spliceInteractive(rw io.ReadWriter, execDec *gob.Decoder) int {
+//
+// forceQuitCh, if non-nil, is closed when a double Ctrl-C is detected in the
+// raw byte stream (needed because term.MakeRaw disables ISIG).
+func (s *apiServer) spliceInteractive(rw io.ReadWriter, execDec *gob.Decoder, forceQuitCh chan struct{}) int {
 	var vsockConn net.Conn
 	for i := 0; i < 300; i++ {
 		var err error
@@ -410,14 +414,55 @@ func (s *apiServer) spliceInteractive(rw io.ReadWriter, execDec *gob.Decoder) in
 	}
 	defer vsockConn.Close()
 
-	go io.Copy(vsockConn, rw)
+	reader := io.Reader(rw)
+	if forceQuitCh != nil {
+		reader = &ctrlCReader{r: rw, conn: vsockConn, forceQuitCh: forceQuitCh}
+	}
+	go io.Copy(vsockConn, reader)
 	io.Copy(rw, vsockConn)
+
+	// If force quit was triggered, don't wait for the exec done message —
+	// the guest process may still be alive (e.g. trapping signals).
+	if forceQuitCh != nil {
+		select {
+		case <-forceQuitCh:
+			return -1
+		default:
+		}
+	}
 
 	var msg protocol.Msg
 	if err := execDec.Decode(&msg); err == nil && msg.ExecDone != nil {
 		return msg.ExecDone.ExitCode
 	}
 	return -1
+}
+
+// ctrlCReader wraps a reader and detects double Ctrl-C (0x03) in raw mode.
+// When detected, it closes the vsock connection to force-quit the VM.
+// Individual Ctrl-C bytes are still forwarded to the guest.
+type ctrlCReader struct {
+	r           io.Reader
+	conn        net.Conn
+	forceQuitCh chan struct{}
+	lastCtrlC   time.Time
+}
+
+func (c *ctrlCReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	for i := 0; i < n; i++ {
+		if p[i] == 0x03 { // Ctrl-C
+			now := time.Now()
+			if !c.lastCtrlC.IsZero() && now.Sub(c.lastCtrlC) < time.Second {
+				fmt.Fprintln(os.Stderr, "\r\nforce quit")
+				close(c.forceQuitCh)
+				c.conn.Close()
+				return 0, io.EOF
+			}
+			c.lastCtrlC = now
+		}
+	}
+	return n, err
 }
 
 func (s *apiServer) close() {
