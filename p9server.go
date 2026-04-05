@@ -18,7 +18,7 @@ func start9PServer(listener net.Listener, rootPath string) {
 		}
 		slog.Debug("9p client connected")
 
-		s := p9.NewServer(localfs.Attacher(rootPath))
+		s := p9.NewServer(&filteredAttacher{inner: localfs.Attacher(rootPath)})
 		s.Handle(conn, conn)
 	}()
 }
