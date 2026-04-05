@@ -41,6 +41,10 @@ type Config struct {
 	// Defaults to ~/.lnx/checkpoints/.
 	CheckpointDir string
 
+	// Shares is a list of extra host directories to share read-write via virtiofs.
+	// Each path is mounted in the guest at the same absolute path.
+	Shares []string
+
 	// Hostname is the guest hostname. Defaults to "lnx".
 	Hostname string
 

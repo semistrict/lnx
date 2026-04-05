@@ -90,6 +90,15 @@ func mountCWD(cwdPath string) error {
 	return nil
 }
 
+func mountShare(path, tag string) error {
+	target := "/mnt" + path
+	os.MkdirAll(target, 0755)
+	if err := syscall.Mount(tag, target, "virtiofs", 0, ""); err != nil {
+		return fmt.Errorf("mount virtiofs share %s on %s: %w", tag, target, err)
+	}
+	return nil
+}
+
 func mountInNewRoot() error {
 	for _, m := range []struct{ src, dst, fstype string }{
 		{"/proc", "/mnt/proc", "proc"},

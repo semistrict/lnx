@@ -55,6 +55,7 @@ type Setup struct {
 	HomeDir  string   // host home dir path (e.g. /Users/ramon), mounted read-only
 	Hostname string   // guest hostname (e.g. "default.lnx")
 	SSHAgent bool     // if true, host is forwarding SSH agent on SSHAgentPort
+	Shares   []string // extra virtiofs shares to mount read-write (absolute paths)
 }
 
 // Resize tells the guest to update the PTY window size.

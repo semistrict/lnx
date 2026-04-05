@@ -148,6 +148,7 @@ func runVM(args []string) (int, error) {
 		Checkpoint: doCheckpoint,
 		Ephemeral:  doEphemeral,
 		SSHAgent:   doSSHAgent,
+		Shares:     loadShares(dir),
 	}, args...)
 }
 

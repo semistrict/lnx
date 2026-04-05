@@ -57,6 +57,7 @@ func Run(cfg *Config, args ...string) (int, error) {
 			Env:           cfg.Env,
 			Checkpoint:    cfg.Checkpoint,
 			CheckpointDir: cfg.CheckpointDir,
+			Shares:        cfg.Shares,
 			Hostname:      cfg.Hostname,
 			SSHAgent:      cfg.SSHAgent,
 		}
@@ -127,6 +128,16 @@ func Run(cfg *Config, args ...string) (int, error) {
 	}
 
 	sshAgent := cfg.SSHAgent && os.Getenv("SSH_AUTH_SOCK") != ""
+	if cfg.SSHAgent && !sshAgent {
+		fmt.Fprintln(os.Stderr, "warning: --ssh-agent requested but SSH_AUTH_SOCK is not set")
+	}
+	if sshAgent {
+		if n, err := countSSHKeys(os.Getenv("SSH_AUTH_SOCK")); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: cannot query SSH agent: %v\n", err)
+		} else if n == 0 {
+			fmt.Fprintln(os.Stderr, "warning: SSH agent has no identities loaded — run 'ssh-add' on the host")
+		}
+	}
 
 	setupMsg := &protocol.Setup{
 		CWD:      cwd,
@@ -136,6 +147,7 @@ func Run(cfg *Config, args ...string) (int, error) {
 		HomeDir:  u.HomeDir,
 		Hostname: hostname,
 		SSHAgent: sshAgent,
+		Shares:   cfg.Shares,
 	}
 
 	vs, err := setupVsock(vm, filepath.Dir(cfg.RootfsPath), cfg.RootfsPath, setupMsg)
@@ -227,7 +239,7 @@ func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.
 	for _, attach := range []func(*vz.VirtualMachineConfiguration) error{
 		attachSerial,
 		func(c *vz.VirtualMachineConfiguration) error { return attachDisks(c, cfg.RootfsPath, swapPath) },
-		func(c *vz.VirtualMachineConfiguration) error { return attachShares(c, cwd) },
+		func(c *vz.VirtualMachineConfiguration) error { return attachShares(c, cwd, cfg.Shares) },
 		attachNetwork,
 		attachMisc,
 	} {

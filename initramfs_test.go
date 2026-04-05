@@ -85,6 +85,7 @@ func TestConfig_AllFieldsCopied(t *testing.T) {
 		Env:           []string{"A=B"},
 		Checkpoint:    true,
 		CheckpointDir: "/cp",
+		Shares:        []string{"/extra"},
 		Hostname:      "test.lnx",
 		SSHAgent:      true,
 		Ephemeral:     true,
@@ -92,7 +93,7 @@ func TestConfig_AllFieldsCopied(t *testing.T) {
 
 	// Count fields set above — must match struct field count.
 	// If this fails, a new field was added to Config but not to this test.
-	assert.Equal(t, fieldCount, 12, "Config has %d fields but test only covers 12 — update this test and the ephemeral copy in vm.go", fieldCount)
+	assert.Equal(t, fieldCount, 13, "Config has %d fields but test only covers 13 — update this test and the ephemeral copy in vm.go", fieldCount)
 
 	// Verify all fields are non-zero (catches typos in field names above).
 	val := reflect.ValueOf(*cfg)

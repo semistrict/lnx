@@ -88,6 +88,11 @@ func run() error {
 			return err
 		}
 	}
+	for i, path := range setup.Shares {
+		if err := mountShare(path, fmt.Sprintf("share%d", i)); err != nil {
+			slog.Warn("share mount failed", "path", path, "error", err)
+		}
+	}
 	if err := mountInNewRoot(); err != nil {
 		return err
 	}
