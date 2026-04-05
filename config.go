@@ -40,6 +40,18 @@ type Config struct {
 	// CheckpointDir is where checkpoint clones are stored.
 	// Defaults to ~/.lnx/checkpoints/.
 	CheckpointDir string
+
+	// Hostname is the guest hostname. Defaults to "lnx".
+	Hostname string
+
+	// SSHAgent forwards the host's SSH agent into the guest.
+	// Requires SSH_AUTH_SOCK to be set on the host.
+	SSHAgent bool
+
+	// Ephemeral clones the rootfs to a temp file via APFS clonefile
+	// before booting. The clone is deleted on exit. The original rootfs
+	// is never locked, so multiple ephemeral VMs can run concurrently.
+	Ephemeral bool
 }
 
 func (c *Config) cpus() uint {

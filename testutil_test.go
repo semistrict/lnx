@@ -19,12 +19,16 @@ func setupTestDir(t *testing.T) string {
 	t.Helper()
 
 	home, _ := os.UserHomeDir()
-	srcDir := filepath.Join(home, ".lnx")
+	base := filepath.Join(home, ".lnx")
 
-	for _, name := range []string{"vmlinuz", "rootfs.ext4"} {
-		if _, err := os.Stat(filepath.Join(srcDir, name)); err != nil {
-			t.Skipf("skipping: %s not found in ~/.lnx (run 'lnx init' first)", name)
-		}
+	kernelPath := filepath.Join(base, "vmlinuz")
+	if _, err := os.Stat(kernelPath); err != nil {
+		t.Skipf("skipping: vmlinuz not found in ~/.lnx (run 'lnx init' first)")
+	}
+
+	rootfsPath := filepath.Join(base, "instances", "default", "rootfs.ext4")
+	if _, err := os.Stat(rootfsPath); err != nil {
+		t.Skipf("skipping: rootfs.ext4 not found in ~/.lnx/instances/default/ (run 'lnx init' first)")
 	}
 
 	initPath := filepath.Join("cmd", "lnx", "init")
@@ -41,13 +45,9 @@ func setupTestDir(t *testing.T) string {
 	require.NoError(t, err)
 	t.Cleanup(func() { os.RemoveAll(dir) })
 
-	os.Symlink(filepath.Join(srcDir, "vmlinuz"), filepath.Join(dir, "vmlinuz"))
+	os.Symlink(kernelPath, filepath.Join(dir, "vmlinuz"))
 
-	err = unix.Clonefile(
-		filepath.Join(srcDir, "rootfs.ext4"),
-		filepath.Join(dir, "rootfs.ext4"),
-		0,
-	)
+	err = unix.Clonefile(rootfsPath, filepath.Join(dir, "rootfs.ext4"), 0)
 	require.NoError(t, err)
 
 	return dir

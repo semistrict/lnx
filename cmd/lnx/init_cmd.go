@@ -13,6 +13,7 @@ var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Install pre-built kernel and rootfs into ~/.lnx",
 	Long: `Copies pre-built kernel (kernel.Image) and rootfs (rootfs.ext4) into ~/.lnx/.
+Kernel is stored at ~/.lnx/vmlinuz (shared). Rootfs goes into the instance directory.
 
 Build the artifacts first with: make kernel rootfs`,
 	RunE: runInit,
@@ -30,16 +31,21 @@ func init() {
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
-	dir := lnxDir()
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	base := lnxBase()
+	if err := os.MkdirAll(base, 0755); err != nil {
 		return fmt.Errorf("create ~/.lnx: %w", err)
 	}
 
-	kernelDest := filepath.Join(dir, "vmlinuz")
+	kernelDest := filepath.Join(base, "vmlinuz")
 	if err := copyFile(kernelDest, kernelFile); err != nil {
 		return fmt.Errorf("copy kernel: %w", err)
 	}
 	fmt.Printf("  kernel: %s\n", kernelDest)
+
+	dir := instanceDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("create instance dir: %w", err)
+	}
 
 	rootfsDest := filepath.Join(dir, "rootfs.ext4")
 	if err := copyFile(rootfsDest, rootfsFile); err != nil {

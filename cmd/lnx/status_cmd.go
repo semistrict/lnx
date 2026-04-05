@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/semistrict/lnx"
 	"github.com/spf13/cobra"
 )
@@ -24,12 +25,49 @@ func init() {
 }
 
 func runStatus(cmd *cobra.Command, args []string) error {
+	// If no explicit --instance, show all running instances.
+	if !instanceFlag {
+		return runStatusAll()
+	}
+	return runStatusOne(instanceName)
+}
+
+var instanceHeader = lipgloss.NewStyle().
+	Bold(true).
+	Foreground(lipgloss.Color("6")).
+	BorderStyle(lipgloss.NormalBorder()).
+	BorderBottom(true).
+	BorderForeground(lipgloss.Color("8")).
+	MarginBottom(1)
+
+func runStatusAll() error {
+	running := runningInstances()
+	if len(running) == 0 {
+		fmt.Println("no VM running")
+		return nil
+	}
+
+	for i, name := range running {
+		if i > 0 {
+			fmt.Println()
+		}
+		if len(running) > 1 {
+			fmt.Println(instanceHeader.Render(name))
+		}
+		if err := runStatusOne(name); err != nil {
+			fmt.Printf("  error: %v\n", err)
+		}
+	}
+	return nil
+}
+
+func runStatusOne(name string) error {
 	url := "http://localhost/status"
 	if showDmesg {
 		url += "?dmesg=1"
 	}
 
-	resp, err := apiClient().Get(url)
+	resp, err := apiClientFor(name).Get(url)
 	if err != nil {
 		if isNoVM(err) {
 			fmt.Println("no VM running")
@@ -51,9 +89,13 @@ func runStatus(cmd *cobra.Command, args []string) error {
 func printStatus(r *lnx.StatusResponse) {
 	uptime := time.Duration(r.UptimeSecs * float64(time.Second))
 
-	fmt.Printf("Command:  %s\n", strings.Join(r.Command, " "))
-	fmt.Printf("User:     %s\n", r.User)
-	fmt.Printf("Uptime:   %s\n", uptime.Truncate(time.Second))
+	kv := func(label, value string) {
+		fmt.Printf("%s  %s\n", labelStyle.Width(10).Align(lipgloss.Right).Render(label), valueStyle.Render(value))
+	}
+
+	kv("Command", strings.Join(r.Command, " "))
+	kv("User", r.User)
+	kv("Uptime", uptime.Truncate(time.Second).String())
 
 	if r.MemTotalKB > 0 {
 		memUsedMB := float64(r.MemTotalKB-r.MemAvailKB) / 1024
@@ -62,28 +104,28 @@ func printStatus(r *lnx.StatusResponse) {
 		if r.MemTotalKB > 0 {
 			pct = float64(r.MemTotalKB-r.MemAvailKB) * 100 / float64(r.MemTotalKB)
 		}
-		fmt.Printf("Memory:   %.1f / %.1f MB (%.0f%%)\n", memUsedMB, memTotalMB, pct)
+		kv("Memory", fmt.Sprintf("%.1f / %.1f MB (%.0f%%)", memUsedMB, memTotalMB, pct))
 	}
 
 	if r.SwapTotalKB > 0 {
 		swapUsedMB := float64(r.SwapTotalKB-r.SwapFreeKB) / 1024
 		swapTotalMB := float64(r.SwapTotalKB) / 1024
 		pct := float64(r.SwapTotalKB-r.SwapFreeKB) * 100 / float64(r.SwapTotalKB)
-		fmt.Printf("Swap:     %.1f / %.1f MB (%.0f%%)\n", swapUsedMB, swapTotalMB, pct)
+		kv("Swap", fmt.Sprintf("%.1f / %.1f MB (%.0f%%)", swapUsedMB, swapTotalMB, pct))
 	}
 
 	if r.DiskTotalKB > 0 {
 		diskUsedGB := float64(r.DiskUsedKB) / 1024 / 1024
 		diskTotalGB := float64(r.DiskTotalKB) / 1024 / 1024
 		pct := float64(r.DiskUsedKB) * 100 / float64(r.DiskTotalKB)
-		fmt.Printf("Disk:     %.1f / %.1f GB (%.0f%%)\n", diskUsedGB, diskTotalGB, pct)
+		kv("Disk", fmt.Sprintf("%.1f / %.1f GB (%.0f%%)", diskUsedGB, diskTotalGB, pct))
 	}
 
 	if r.LoadAvg != "" {
-		fmt.Printf("Load:     %s\n", r.LoadAvg)
+		kv("Load", r.LoadAvg)
 	}
 
 	if r.Dmesg != "" {
-		fmt.Printf("\n--- dmesg ---\n%s", r.Dmesg)
+		fmt.Printf("\n%s\n%s", dimStyle.Render("--- dmesg ---"), r.Dmesg)
 	}
 }

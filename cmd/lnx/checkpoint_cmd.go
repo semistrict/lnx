@@ -26,7 +26,7 @@ func init() {
 }
 
 func runCheckpointList(cmd *cobra.Command, args []string) error {
-	dir := filepath.Join(lnxDir(), "checkpoints")
+	dir := filepath.Join(instanceDir(), "checkpoints")
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -53,13 +53,15 @@ func runCheckpointList(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	t := newTable("NAME", "SIZE")
 	for _, e := range checkpoints {
 		info, err := e.Info()
 		if err != nil {
 			continue
 		}
 		sizeMB := float64(info.Size()) / 1024 / 1024
-		fmt.Printf("%-40s  %7.1f MB\n", e.Name(), sizeMB)
+		t.Row(e.Name(), fmt.Sprintf("%.1f MB", sizeMB))
 	}
+	fmt.Println(t)
 	return nil
 }

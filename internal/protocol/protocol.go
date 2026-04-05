@@ -23,6 +23,8 @@ const (
 	ExecInteractivePort = 1032
 	// P9Port is the vsock port for the 9P file server (host listens, guest dials).
 	P9Port = 1033
+	// SSHAgentPort is the vsock port for SSH agent forwarding (host listens, guest dials).
+	SSHAgentPort = 1034
 )
 
 // Msg is the envelope for all control messages.
@@ -46,11 +48,13 @@ type Msg struct {
 // Sent once on the control connection at boot. No command args — commands
 // are executed via the exec connection.
 type Setup struct {
-	CWD     string
-	Env     []string // KEY=VALUE pairs
-	User    string   // guest username (matches host)
-	UID     int      // guest UID (matches host)
-	HomeDir string   // host home dir path (e.g. /Users/ramon), mounted read-only
+	CWD      string
+	Env      []string // KEY=VALUE pairs
+	User     string   // guest username (matches host)
+	UID      int      // guest UID (matches host)
+	HomeDir  string   // host home dir path (e.g. /Users/ramon), mounted read-only
+	Hostname string   // guest hostname (e.g. "default.lnx")
+	SSHAgent bool     // if true, host is forwarding SSH agent on SSHAgentPort
 }
 
 // Resize tells the guest to update the PTY window size.

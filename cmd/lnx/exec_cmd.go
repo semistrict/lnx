@@ -141,7 +141,7 @@ func runExecInteractive(args []string) error {
 	}
 
 	// Connect to the unix socket directly for raw I/O.
-	sockPath := filepath.Join(lnxDir(), "status.sock")
+	sockPath := filepath.Join(instanceDir(), "status.sock")
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
 		if isNoVM(err) {

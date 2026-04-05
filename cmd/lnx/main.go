@@ -12,6 +12,14 @@ import (
 )
 
 var doCheckpoint bool
+var doEphemeral bool
+var doSSHAgent bool
+
+// instanceName is the resolved instance name. Set from --instance flag or LNX_INSTANCE env.
+var instanceName = "default"
+
+// instanceFlag tracks whether --instance was explicitly set (flag or env var).
+var instanceFlag bool
 
 var rootCmd = &cobra.Command{
 	Use:           "lnx [flags] [command [args...]]",
@@ -20,6 +28,9 @@ var rootCmd = &cobra.Command{
 	SilenceErrors: true,
 	Args:          cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if len(args) == 0 {
+			args = []string{"bash", "-l"}
+		}
 		exitCode, err := runVM(args)
 		if err != nil {
 			return err
@@ -31,7 +42,25 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	lnx.InitBinary = initBinary
+
+	// Apply env var before registering the flag so it becomes the default.
+	if env := os.Getenv("LNX_INSTANCE"); env != "" {
+		instanceName = env
+	}
+	rootCmd.PersistentFlags().StringVar(&instanceName, "instance", instanceName, "VM instance name (default: \"default\")")
 	rootCmd.Flags().BoolVarP(&doCheckpoint, "checkpoint", "c", false, "snapshot rootfs before starting the VM")
+	rootCmd.Flags().BoolVar(&doEphemeral, "ephemeral", false, "clone rootfs to a temp file; discard on exit")
+	rootCmd.Flags().BoolVar(&doSSHAgent, "ssh-agent", false, "forward host SSH agent into the guest")
+
+	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		// Cobra has parsed flags. Update instanceFlag if --instance was explicitly passed.
+		if f := rootCmd.PersistentFlags().Lookup("instance"); f != nil && f.Changed {
+			instanceFlag = true
+		} else if os.Getenv("LNX_INSTANCE") != "" {
+			instanceFlag = true
+		}
+		return nil
+	}
 }
 
 func main() {
@@ -42,10 +71,15 @@ func main() {
 		os.Args = append(os.Args, "bash", "-l")
 	}
 
-	// If the first arg is not a known subcommand or flag, bypass cobra
-	// entirely so flags like -g aren't intercepted.
-	if len(os.Args) > 1 && !isSubcommandOrFlag(os.Args[1]) {
-		exitCode, err := runVM(os.Args[1:])
+	// Strip known lnx flags from args to find the guest command.
+	// This lets `lnx --ephemeral bash -l` bypass cobra so `-l`
+	// isn't misinterpreted as a flag.
+	guestArgs := stripLnxFlags(os.Args[1:])
+	if len(guestArgs) > 0 && !isSubcommandOrFlag(guestArgs[0]) {
+		if os.Getenv("LNX_INSTANCE") != "" {
+			instanceFlag = true
+		}
+		exitCode, err := runVM(guestArgs)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -57,6 +91,39 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+// stripLnxFlags removes known lnx flags from args before the guest command,
+// applying their values to package vars, and returns the remaining args.
+// Stops parsing at the first non-flag argument (the guest command).
+func stripLnxFlags(args []string) []string {
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		switch {
+		case a == "--ephemeral":
+			doEphemeral = true
+			i++
+		case a == "--ssh-agent":
+			doSSHAgent = true
+			i++
+		case a == "--checkpoint" || a == "-c":
+			doCheckpoint = true
+			i++
+		case a == "--instance" && i+1 < len(args):
+			instanceName = args[i+1]
+			instanceFlag = true
+			i += 2
+		case strings.HasPrefix(a, "--instance="):
+			instanceName = strings.TrimPrefix(a, "--instance=")
+			instanceFlag = true
+			i++
+		default:
+			// First non-flag arg — everything from here is the guest command.
+			return append([]string(nil), args[i:]...)
+		}
+	}
+	return nil
 }
 
 func isSubcommandOrFlag(arg string) bool {
@@ -72,12 +139,15 @@ func isSubcommandOrFlag(arg string) bool {
 }
 
 func runVM(args []string) (int, error) {
-	dir := lnxDir()
+	dir := instanceDir()
 
 	return lnx.Run(&lnx.Config{
-		KernelPath: filepath.Join(dir, "vmlinuz"),
+		KernelPath: filepath.Join(lnxBase(), "vmlinuz"),
 		RootfsPath: filepath.Join(dir, "rootfs.ext4"),
+		Hostname:   instanceName + ".lnx",
 		Checkpoint: doCheckpoint,
+		Ephemeral:  doEphemeral,
+		SSHAgent:   doSSHAgent,
 	}, args...)
 }
 
@@ -92,11 +162,7 @@ func initHostLogging() {
 		level = slog.LevelError
 	}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return
-	}
-	logDir := filepath.Join(home, ".lnx")
+	logDir := instanceDir()
 	os.MkdirAll(logDir, 0755)
 	f, err := os.OpenFile(filepath.Join(logDir, "lnx.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
@@ -105,7 +171,13 @@ func initHostLogging() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: level})))
 }
 
-func lnxDir() string {
+// lnxBase returns the base lnx directory (~/.lnx).
+func lnxBase() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".lnx")
+}
+
+// instanceDir returns the directory for the current instance (~/.lnx/instances/<name>).
+func instanceDir() string {
+	return filepath.Join(lnxBase(), "instances", instanceName)
 }
