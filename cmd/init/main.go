@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +25,12 @@ const (
 )
 
 func main() {
+	// Busybox-style dispatch: if invoked as "systemctl", run that instead.
+	base := filepath.Base(os.Args[0])
+	if base == "systemctl" {
+		os.Exit(runSystemctl(os.Args[1:]))
+	}
+
 	if err := run(); err != nil {
 		slog.Error("init failed", "error", err)
 	}
@@ -100,6 +107,8 @@ func run() error {
 		return err
 	}
 
+	mountCgroups()
+
 	if out, err := exec.Command("/sbin/resize2fs", "/dev/vda").CombinedOutput(); err != nil {
 		slog.Warn("resize2fs failed", "error", err, "output", string(out))
 	} else {
@@ -148,10 +157,12 @@ func run() error {
 		startSSHAgentForward()
 	}
 
+	installSystemctlShim()
 	configureNetwork()
 	writeResolvConf()
 	installBashDefaults()
 	installXdgOpen()
+	startEnabledServices()
 	startStatusServer()
 	startExecServer()
 	startGuestControlServer()
@@ -253,6 +264,7 @@ func setupUser(username string, uid int) {
 	// Skip if user was already created in a prior boot.
 	if data, err := os.ReadFile("/etc/passwd"); err == nil {
 		if strings.Contains(string(data), username+":") {
+			addUserToGroups(username)
 			return
 		}
 	}
@@ -269,6 +281,61 @@ func setupUser(username string, uid int) {
 
 	os.MkdirAll("/etc/sudoers.d", 0755)
 	os.WriteFile("/etc/sudoers.d/lnx", []byte(username+" ALL=(ALL) NOPASSWD: ALL\n"), 0440)
+
+	addUserToGroups(username)
+}
+
+// addUserToGroups adds the user to well-known system groups (docker, etc.)
+// if they exist on the rootfs. Runs on every boot since groups may be
+// added by package installs between boots.
+func addUserToGroups(username string) {
+	groups := []string{"docker", "sudo", "adm"}
+	data, err := os.ReadFile("/etc/group")
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(data), "\n")
+	changed := false
+	for i, line := range lines {
+		parts := strings.SplitN(line, ":", 4)
+		if len(parts) != 4 {
+			continue
+		}
+		groupName := parts[0]
+		members := parts[3]
+		found := false
+		for _, g := range groups {
+			if groupName == g {
+				found = true
+				break
+			}
+		}
+		if !found {
+			continue
+		}
+		// Check if user is already a member.
+		memberList := strings.Split(members, ",")
+		alreadyMember := false
+		for _, m := range memberList {
+			if m == username {
+				alreadyMember = true
+				break
+			}
+		}
+		if alreadyMember {
+			continue
+		}
+		if members == "" {
+			parts[3] = username
+		} else {
+			parts[3] = members + "," + username
+		}
+		lines[i] = strings.Join(parts, ":")
+		changed = true
+	}
+	if changed {
+		os.WriteFile("/etc/group", []byte(strings.Join(lines, "\n")), 0644)
+	}
 }
 
 func appendFile(path, line string) {

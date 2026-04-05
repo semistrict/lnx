@@ -5,6 +5,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 	"syscall"
 
 	"github.com/mdlayher/vsock"
@@ -96,6 +97,26 @@ func mountShare(path, tag string) error {
 	if err := syscall.Mount(tag, target, "virtiofs", 0, ""); err != nil {
 		return fmt.Errorf("mount virtiofs share %s on %s: %w", tag, target, err)
 	}
+	return nil
+}
+
+func mountCgroups() error {
+	os.MkdirAll("/sys/fs/cgroup", 0755)
+	// Use cgroup v1 hybrid: tmpfs base with individual controllers.
+	// Docker requires the devices cgroup which doesn't exist in pure cgroup v2.
+	if err := syscall.Mount("tmpfs", "/sys/fs/cgroup", "tmpfs", 0, ""); err != nil {
+		return fmt.Errorf("mount cgroup tmpfs: %w", err)
+	}
+	controllers := []string{"cpu,cpuacct", "memory", "devices", "freezer", "pids", "blkio", "cpuset", "net_cls,net_prio", "perf_event", "hugetlb"}
+	for _, c := range controllers {
+		name := strings.Split(c, ",")[0] // use first name for dir
+		dir := "/sys/fs/cgroup/" + name
+		os.MkdirAll(dir, 0755)
+		syscall.Mount("cgroup", dir, "cgroup", 0, c)
+	}
+	// Mount cgroup2 for unified hierarchy support.
+	os.MkdirAll("/sys/fs/cgroup/unified", 0755)
+	syscall.Mount("cgroup2", "/sys/fs/cgroup/unified", "cgroup2", 0, "")
 	return nil
 }
 

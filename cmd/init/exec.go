@@ -4,10 +4,13 @@ package main
 
 import (
 	"encoding/gob"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/creack/pty"
@@ -87,8 +90,9 @@ func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener) {
 	if setupUID > 0 {
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Credential: &syscall.Credential{
-				Uid: uint32(setupUID),
-				Gid: uint32(setupUID),
+				Uid:    uint32(setupUID),
+				Gid:    uint32(setupUID),
+				Groups: lookupSupplementaryGroups(setupUID),
 			},
 		}
 	}
@@ -160,6 +164,46 @@ func commandNotFound(enc *gob.Encoder, args []string, err error) {
 	}
 }
 
+// lookupSupplementaryGroups reads /etc/group to find all groups that contain
+// the user with the given UID. Returns the group IDs for use in Credential.Groups.
+func lookupSupplementaryGroups(uid int) []uint32 {
+	// Find the username for this UID from /etc/passwd.
+	var username string
+	if data, err := os.ReadFile("/etc/passwd"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			parts := strings.SplitN(line, ":", 4)
+			if len(parts) >= 3 {
+				if uidStr := parts[2]; uidStr == fmt.Sprintf("%d", uid) {
+					username = parts[0]
+					break
+				}
+			}
+		}
+	}
+	if username == "" {
+		return nil
+	}
+
+	var groups []uint32
+	if data, err := os.ReadFile("/etc/group"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			parts := strings.SplitN(line, ":", 4)
+			if len(parts) != 4 {
+				continue
+			}
+			for _, member := range strings.Split(parts[3], ",") {
+				if strings.TrimSpace(member) == username {
+					if gid, err := strconv.Atoi(parts[2]); err == nil {
+						groups = append(groups, uint32(gid))
+					}
+					break
+				}
+			}
+		}
+	}
+	return groups
+}
+
 // runExecPipe handles a non-interactive exec request with piped stdout/stderr.
 func runExecPipe(enc *gob.Encoder, req *protocol.ExecReq) {
 	if len(req.Args) == 0 {
@@ -183,8 +227,9 @@ func runExecPipe(enc *gob.Encoder, req *protocol.ExecReq) {
 	if setupUID > 0 {
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Credential: &syscall.Credential{
-				Uid: uint32(setupUID),
-				Gid: uint32(setupUID),
+				Uid:    uint32(setupUID),
+				Gid:    uint32(setupUID),
+				Groups: lookupSupplementaryGroups(setupUID),
 			},
 		}
 	}
