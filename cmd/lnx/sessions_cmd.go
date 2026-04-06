@@ -55,7 +55,7 @@ func runSessionsListAll() error {
 
 	type row struct {
 		instance string
-		session  lnx.SessionInfo
+		session  *lnx.SessionInfo
 	}
 
 	var rows []row
@@ -64,8 +64,8 @@ func runSessionsListAll() error {
 		if err != nil {
 			continue
 		}
-		for _, s := range sessions {
-			rows = append(rows, row{instance: name, session: s})
+		for i := range sessions {
+			rows = append(rows, row{instance: name, session: &sessions[i]})
 		}
 	}
 
@@ -79,7 +79,8 @@ func runSessionsListAll() error {
 	})
 
 	t := newTable("INSTANCE", "ID", "TYPE", "COMMAND", "LOCAL PID", "REMOTE PID", "AGE")
-	for _, r := range rows {
+	for i := range rows {
+		r := &rows[i]
 		id := r.instance + "_" + r.session.ID
 		t.Row(r.instance, id, formatSessionKind(r.session.Kind), formatCommand(r.session.Args), formatPID(r.session.ClientPID), formatPID(r.session.GuestPID), formatAge(time.Since(r.session.StartTime)))
 	}
@@ -107,7 +108,8 @@ func runSessionsListOne(name string) error {
 	})
 
 	t := newTable("ID", "TYPE", "COMMAND", "LOCAL PID", "REMOTE PID", "AGE")
-	for _, s := range sessions {
+	for i := range sessions {
+		s := &sessions[i]
 		t.Row(s.ID, formatSessionKind(s.Kind), formatCommand(s.Args), formatPID(s.ClientPID), formatPID(s.GuestPID), formatAge(time.Since(s.StartTime)))
 	}
 	fmt.Println(t)
@@ -168,8 +170,8 @@ func runSessionsKill(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 		found := false
-		for _, s := range sessions {
-			if s.ID == sessID {
+		for i := range sessions {
+			if sessions[i].ID == sessID {
 				found = true
 				break
 			}
