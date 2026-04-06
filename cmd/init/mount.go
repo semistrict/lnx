@@ -85,8 +85,12 @@ func mountHome(homeDir string) error {
 func mountCWD(cwdPath string) error {
 	target := "/mnt" + cwdPath
 	os.MkdirAll(target, 0755)
-	if err := syscall.Mount("cwd", target, "virtiofs", 0, ""); err != nil {
-		return fmt.Errorf("mount virtiofs on %s: %w", target, err)
+	// Try virtiofs first (Virtualization.framework), fall back to 9P (QEMU).
+	if err := syscall.Mount("cwd", target, "virtiofs", 0, ""); err == nil {
+		return nil
+	}
+	if err := syscall.Mount("cwd", target, "9p", 0, "trans=virtio,version=9p2000.L,msize=1048576"); err != nil {
+		return fmt.Errorf("mount cwd on %s (tried virtiofs and 9p): %w", target, err)
 	}
 	return nil
 }
@@ -94,8 +98,12 @@ func mountCWD(cwdPath string) error {
 func mountShare(path, tag string) error {
 	target := "/mnt" + path
 	os.MkdirAll(target, 0755)
-	if err := syscall.Mount(tag, target, "virtiofs", 0, ""); err != nil {
-		return fmt.Errorf("mount virtiofs share %s on %s: %w", tag, target, err)
+	// Try virtiofs first (Virtualization.framework), fall back to 9P (QEMU).
+	if err := syscall.Mount(tag, target, "virtiofs", 0, ""); err == nil {
+		return nil
+	}
+	if err := syscall.Mount(tag, target, "9p", 0, "trans=virtio,version=9p2000.L,msize=1048576"); err != nil {
+		return fmt.Errorf("mount share %s on %s (tried virtiofs and 9p): %w", tag, target, err)
 	}
 	return nil
 }

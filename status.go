@@ -17,7 +17,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	vz "github.com/Code-Hex/vz/v3"
 	"nhooyr.io/websocket"
 
 	"github.com/semistrict/lnx/internal/protocol"
@@ -59,7 +58,7 @@ type apiServer struct {
 
 	guestCtrlConn net.Conn
 
-	sock *vz.VirtioSocketDevice
+	sock VsockDevice
 	pf   *portForwarder
 
 	sockPath string

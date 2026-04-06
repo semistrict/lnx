@@ -28,7 +28,8 @@ var hostLogOnce sync.Once
 
 // bootedVM holds a booted VM and its infrastructure, ready for exec sessions.
 type bootedVM struct {
-	vm       *vz.VirtualMachine
+	vm       *vz.VirtualMachine // nil when using QEMU backend
+	qemu     *qemuVM           // nil when using VZ backend
 	vs       *vsockState
 	ctrlConn net.Conn
 	ctrlEnc  *gob.Encoder
@@ -41,7 +42,12 @@ type bootedVM struct {
 // close shuts down the VM and releases all resources.
 func (b *bootedVM) close(exitCode int) {
 	b.ctrlConn.Close()
-	shutdownVM(b.vm, exitCode, b.vs.cleanup)
+	if b.qemu != nil {
+		b.vs.cleanup()
+		b.qemu.shutdown(exitCode)
+	} else {
+		shutdownVM(b.vm, exitCode, b.vs.cleanup)
+	}
 	b.lock.unlock()
 	if b.ephCleanup != nil {
 		b.ephCleanup()
@@ -155,15 +161,6 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		return nil, fmt.Errorf("swap file: %w", err)
 	}
 
-	vmConfig, err := buildVMConfig(cfg, initrdPath, cwd, swapPath, u.HomeDir)
-	if err != nil {
-		lock.unlock()
-		if ephCleanup != nil {
-			ephCleanup()
-		}
-		return nil, err
-	}
-
 	hostname := cfg.Hostname
 	if hostname == "" {
 		hostname = "lnx"
@@ -193,55 +190,86 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		Shares:   cfg.Shares,
 	}
 
-	vm, err := vz.NewVirtualMachine(vmConfig)
-	if err != nil {
-		lock.unlock()
-		if ephCleanup != nil {
-			ephCleanup()
-		}
-		return nil, fmt.Errorf("create vm: %w", err)
-	}
-
-	sockDir := cfg.socketDir()
-	vs, err := setupVsock(vm, sockDir, cfg.RootfsPath, setupMsg, cfg.InitialHoldID)
-	if err != nil {
+	bail := func(err error) (*bootedVM, error) {
 		lock.unlock()
 		if ephCleanup != nil {
 			ephCleanup()
 		}
 		return nil, err
 	}
-	if err := vm.Start(); err != nil {
-		vs.cleanup()
-		lock.unlock()
-		if ephCleanup != nil {
-			ephCleanup()
+
+	sockDir := cfg.socketDir()
+
+	var (
+		vsockDev VsockDevice
+		vmObj    *vz.VirtualMachine
+		qemuObj  *qemuVM
+	)
+
+	if useQEMU() {
+		// --- QEMU backend ---
+		args, vsockPath, err := buildQEMUArgs(cfg, initrdPath, cwd, swapPath, time.Now().Unix())
+		if err != nil {
+			return bail(err)
 		}
-		return nil, fmt.Errorf("start vm: %w", err)
+		qemuObj, err = startQEMU(args, vsockPath)
+		if err != nil {
+			return bail(fmt.Errorf("start qemu: %w", err))
+		}
+		vsockDev = newQEMUVsock(vsockPath)
+	} else {
+		// --- VZ backend ---
+		vmConfig, err := buildVMConfig(cfg, initrdPath, cwd, swapPath, u.HomeDir)
+		if err != nil {
+			return bail(err)
+		}
+		vmObj, err = vz.NewVirtualMachine(vmConfig)
+		if err != nil {
+			return bail(fmt.Errorf("create vm: %w", err))
+		}
+		socketDevices := vmObj.SocketDevices()
+		if len(socketDevices) == 0 {
+			return bail(fmt.Errorf("no vsock devices"))
+		}
+		vsockDev = newVZVsock(socketDevices[0])
+	}
+
+	vs, err := setupVsockGeneric(vsockDev, sockDir, cfg.RootfsPath, setupMsg, cfg.InitialHoldID)
+	if err != nil {
+		if qemuObj != nil {
+			qemuObj.shutdown(1)
+		}
+		return bail(err)
+	}
+
+	if vmObj != nil {
+		if err := vmObj.Start(); err != nil {
+			vs.cleanup()
+			return bail(fmt.Errorf("start vm: %w", err))
+		}
 	}
 
 	ctrlConn := <-vs.ctrlConnCh
 	if ctrlConn == nil {
 		vs.cleanup()
-		lock.unlock()
-		if ephCleanup != nil {
-			ephCleanup()
+		if qemuObj != nil {
+			qemuObj.shutdown(1)
 		}
-		return nil, fmt.Errorf("control connection failed")
+		return bail(fmt.Errorf("control connection failed"))
 	}
 	enc := gob.NewEncoder(ctrlConn)
 	if err := enc.Encode(protocol.Msg{Setup: setupMsg}); err != nil {
 		ctrlConn.Close()
 		vs.cleanup()
-		lock.unlock()
-		if ephCleanup != nil {
-			ephCleanup()
+		if qemuObj != nil {
+			qemuObj.shutdown(1)
 		}
-		return nil, fmt.Errorf("send setup: %w", err)
+		return bail(fmt.Errorf("send setup: %w", err))
 	}
 
 	return &bootedVM{
-		vm:         vm,
+		vm:         vmObj,
+		qemu:       qemuObj,
 		vs:         vs,
 		ctrlConn:   ctrlConn,
 		ctrlEnc:    enc,
@@ -367,13 +395,7 @@ func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.
 	return vmConfig, nil
 }
 
-func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, setupMsg *protocol.Setup, initialHoldID string) (*vsockState, error) {
-	socketDevices := vm.SocketDevices()
-	if len(socketDevices) == 0 {
-		return nil, fmt.Errorf("no vsock devices")
-	}
-	sock := socketDevices[0]
-
+func setupVsockGeneric(sock VsockDevice, logDir, rootfsPath string, setupMsg *protocol.Setup, initialHoldID string) (*vsockState, error) {
 	logListener, err := sock.Listen(vsockLogPort)
 	if err != nil {
 		return nil, fmt.Errorf("vsock log listen: %w", err)

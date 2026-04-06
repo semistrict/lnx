@@ -9,14 +9,12 @@ import (
 	"net"
 	"sync"
 
-	vz "github.com/Code-Hex/vz/v3"
-
 	"github.com/semistrict/lnx/internal/protocol"
 )
 
 // portForwarder manages automatic port forwarding from guest to host.
 type portForwarder struct {
-	sock *vz.VirtioSocketDevice
+	sock VsockDevice
 
 	mu        sync.Mutex
 	listeners map[uint16]*forwardedPort // guest port -> listener
@@ -29,7 +27,7 @@ type forwardedPort struct {
 	done      chan struct{}
 }
 
-func newPortForwarder(sock *vz.VirtioSocketDevice) *portForwarder {
+func newPortForwarder(sock VsockDevice) *portForwarder {
 	return &portForwarder{
 		sock:      sock,
 		listeners: make(map[uint16]*forwardedPort),
