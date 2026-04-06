@@ -91,6 +91,37 @@ func TestPTY_MainInteractive(t *testing.T) {
 	}
 }
 
+func TestPTY_CommandNotFoundShowsError(t *testing.T) {
+	t.Parallel()
+
+	bin := lnxBin()
+	if bin == "" {
+		t.Skip("lnx not in PATH")
+	}
+
+	term := midterm.NewTerminal(24, 80)
+
+	cmd := exec.Command(bin, "--ephemeral", "asdfsadfsa")
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 80})
+	require.NoError(t, err)
+	defer ptmx.Close()
+
+	go feedTerminal(term, ptmx)
+	waitFor(t, term, "asdfsadfsa: command not found", 10*time.Second)
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case err := <-done:
+		var exitErr *exec.ExitError
+		require.ErrorAs(t, err, &exitErr)
+		require.Equal(t, 127, exitErr.ExitCode())
+	case <-time.After(5 * time.Second):
+		t.Fatal("command-not-found run did not exit within 5s")
+	}
+}
+
 func TestPTY_SecondSession(t *testing.T) {
 	t.Parallel()
 

@@ -9,6 +9,7 @@ import (
 
 var doGUI bool
 var daemonHoldID string
+var doRoot bool
 
 var daemonCmd = &cobra.Command{
 	Use:    "_daemon",
@@ -34,6 +35,7 @@ var daemonCmd = &cobra.Command{
 			Checkpoint:    doCheckpoint,
 			Ephemeral:     doEphemeral,
 			SSHAgent:      doSSHAgent,
+			Root:          doRoot,
 			GUI:           doGUI,
 			InitialHoldID: daemonHoldID,
 			Shares:        loadShares(dir),
@@ -46,9 +48,11 @@ func init() {
 	daemonCmd.Flags().BoolVarP(&doCheckpoint, "checkpoint", "c", false, "snapshot rootfs before starting")
 	daemonCmd.Flags().BoolVar(&doEphemeral, "ephemeral", false, "clone rootfs to a temp file; discard on exit")
 	daemonCmd.Flags().BoolVar(&doSSHAgent, "ssh-agent", false, "forward host SSH agent into the guest")
+	daemonCmd.Flags().BoolVar(&doRoot, "root", false, "run guest commands as root")
 	daemonCmd.Flags().BoolVar(&doGUI, "gui", false, "start graphical desktop")
 	daemonCmd.Flags().StringVar(&daemonHoldID, "hold-id", "", "internal initial hold id")
 	_ = daemonCmd.Flags().MarkHidden("gui")
 	_ = daemonCmd.Flags().MarkHidden("hold-id")
+	_ = daemonCmd.Flags().MarkHidden("root")
 	rootCmd.AddCommand(daemonCmd)
 }

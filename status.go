@@ -27,6 +27,7 @@ import (
 type StatusResponse struct {
 	Command     []string `json:"command"`
 	User        string   `json:"user"`
+	Ready       bool     `json:"ready"`
 	UptimeSecs  float64  `json:"uptime_secs"`
 	MemTotalKB  uint64   `json:"mem_total_kb"`
 	MemAvailKB  uint64   `json:"mem_avail_kb"`
@@ -400,6 +401,7 @@ func (s *apiServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		slog.Debug("status guest query failed", "error", err)
 		resp.UptimeSecs = time.Since(s.startTime).Seconds()
 	} else {
+		resp.Ready = true
 		resp.UptimeSecs = guestResp.UptimeSecs
 		resp.MemTotalKB = guestResp.MemTotalKB
 		resp.MemAvailKB = guestResp.MemAvailKB
@@ -528,6 +530,7 @@ func (s *apiServer) handleHoldUpdate(w http.ResponseWriter, r *http.Request) {
 type ExecRequest struct {
 	Args      []string `json:"args"`
 	Env       []string `json:"env,omitempty"`
+	CWD       string   `json:"cwd,omitempty"`
 	PTY       bool     `json:"pty,omitempty"`
 	Rows      uint16   `json:"rows,omitempty"`
 	Cols      uint16   `json:"cols,omitempty"`
@@ -558,6 +561,7 @@ func (s *apiServer) handleExec(w http.ResponseWriter, r *http.Request) {
 	if err := execEnc.Encode(protocol.Msg{ExecReq: &protocol.ExecReq{
 		Args: req.Args,
 		Env:  req.Env,
+		CWD:  req.CWD,
 		PTY:  req.PTY,
 		Rows: req.Rows,
 		Cols: req.Cols,
@@ -673,12 +677,45 @@ func (s *apiServer) handleExecWS(w http.ResponseWriter, r *http.Request) {
 	if err := sess.encodeExec(protocol.Msg{ExecReq: &protocol.ExecReq{
 		Args: req.Args,
 		Env:  req.Env,
+		CWD:  req.CWD,
 		PTY:  true,
 		Rows: req.Rows,
 		Cols: req.Cols,
 	}}); err != nil {
 		ws.Close(websocket.StatusInternalError, "send exec request: "+err.Error())
 		return
+	}
+
+	// Handle guest responses that can arrive before a PTY vsock exists, such as
+	// command-not-found failures from pty.Start.
+	for {
+		var msg protocol.Msg
+		if err := execDec.Decode(&msg); err != nil {
+			ws.Close(websocket.StatusInternalError, "exec startup failed")
+			return
+		}
+		if msg.ExecOutput != nil {
+			if len(msg.ExecOutput.Stdout) > 0 {
+				if err := ws.Write(ctx, websocket.MessageBinary, msg.ExecOutput.Stdout); err != nil {
+					return
+				}
+			}
+			if len(msg.ExecOutput.Stderr) > 0 {
+				if err := ws.Write(ctx, websocket.MessageBinary, msg.ExecOutput.Stderr); err != nil {
+					return
+				}
+			}
+		}
+		if msg.ExecStarted != nil {
+			s.setSessionGuestPID(sessID, msg.ExecStarted.PID)
+			break
+		}
+		if msg.ExecDone != nil {
+			exitMsg, _ := json.Marshal(map[string]int{"exit_code": msg.ExecDone.ExitCode})
+			_ = ws.Write(ctx, websocket.MessageText, exitMsg)
+			ws.Close(websocket.StatusNormalClosure, "")
+			return
+		}
 	}
 
 	// Connect to guest PTY via vsock.
@@ -754,8 +791,17 @@ func (s *apiServer) handleExecWS(w http.ResponseWriter, r *http.Request) {
 		if err := execDec.Decode(&msg); err != nil {
 			break
 		}
-		if msg.ExecStarted != nil {
-			s.setSessionGuestPID(sessID, msg.ExecStarted.PID)
+		if msg.ExecOutput != nil {
+			if len(msg.ExecOutput.Stdout) > 0 {
+				if err := ws.Write(ctx, websocket.MessageBinary, msg.ExecOutput.Stdout); err != nil {
+					break
+				}
+			}
+			if len(msg.ExecOutput.Stderr) > 0 {
+				if err := ws.Write(ctx, websocket.MessageBinary, msg.ExecOutput.Stderr); err != nil {
+					break
+				}
+			}
 		}
 		if msg.ExecDone != nil {
 			exitCode = msg.ExecDone.ExitCode
@@ -917,6 +963,7 @@ func readExecOutput(execDec *gob.Decoder, stdout, stderr io.Writer) int {
 	for {
 		var msg protocol.Msg
 		if err := execDec.Decode(&msg); err != nil {
+			slog.Debug("read exec output failed", "error", err)
 			return -1
 		}
 		if msg.ExecOutput != nil {

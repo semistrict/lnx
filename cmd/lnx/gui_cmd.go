@@ -21,6 +21,7 @@ import (
 )
 
 var guiWindowHoldID string
+var guiForeground bool
 
 var guiCmd = &cobra.Command{
 	Use:   "gui",
@@ -52,6 +53,7 @@ func init() {
 	guiCmd.Flags().BoolVarP(&doCheckpoint, "checkpoint", "c", false, "snapshot rootfs before starting the VM")
 	guiCmd.Flags().BoolVar(&doEphemeral, "ephemeral", false, "clone rootfs to a temp file; discard on exit")
 	guiCmd.Flags().BoolVar(&doSSHAgent, "ssh-agent", false, "forward host SSH agent into the guest")
+	guiCmd.Flags().BoolVar(&guiForeground, "foreground", false, "Run in the foreground")
 	rootCmd.AddCommand(guiCmd)
 
 	guiWindowCmd.Flags().StringVar(&guiWindowHoldID, "hold-id", "", "internal GUI hold id")
@@ -84,6 +86,10 @@ func runGUIBackground() error {
 		if err := waitForVM(60 * time.Second); err != nil {
 			return err
 		}
+	}
+
+	if guiForeground {
+		return runGUIWindowHelper(holdID)
 	}
 
 	if err := spawnGUIWindowHelper(holdID); err != nil {
@@ -241,6 +247,21 @@ func configureBackgroundCommand(cmd *exec.Cmd) {
 		cmd.Stdout = devNull
 		cmd.Stderr = devNull
 	}
+	cmd.Env = filteredChildEnv(cmd.Env)
+}
+
+func filteredChildEnv(env []string) []string {
+	if len(env) == 0 {
+		env = os.Environ()
+	}
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "_GO_DAEMON=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 func newGUIHoldID() string {

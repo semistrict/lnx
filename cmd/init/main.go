@@ -165,6 +165,7 @@ func run() error {
 	configureNetwork()
 	writeResolvConf()
 	installBashDefaults()
+	patchBrokenProfileScripts()
 	installXdgOpen()
 	startEnabledServices()
 	startStatusServer()
@@ -413,6 +414,56 @@ fi
 `
 	os.MkdirAll("/etc/profile.d", 0755)
 	os.WriteFile("/etc/profile.d/lnx-bashrc.sh", []byte(script), 0644)
+}
+
+// patchBrokenProfileScripts fixes vendor shell init behavior that assumes a
+// full systemd/journald environment. Without this, every interactive shell
+// prints noisy "Failed to create stream fd" errors on startup.
+func patchBrokenProfileScripts() {
+	const path = "/usr/share/im-config/initializer"
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	content := string(data)
+
+	const oldLogger = `if [ -e /usr/bin/systemd-cat ] ; then
+    LOGGER='/usr/bin/systemd-cat -p 6 -t "im-config" echo'
+elif [ -e /usr/bin/logger ] ; then
+`
+	const newLogger = `if [ -e /usr/bin/systemd-cat ] && { [ -S /run/systemd/journal/stdout ] || [ -S /run/systemd/journal/socket ]; } ; then
+    LOGGER='/usr/bin/systemd-cat -p 6 -t "im-config" echo'
+elif [ -e /usr/bin/logger ] && [ -S /dev/log ] ; then
+`
+	if strings.Contains(content, oldLogger) {
+		content = strings.Replace(content, oldLogger, newLogger, 1)
+	}
+
+	const oldDebug = `logger_debug() {
+    if [ -n "$IM_CONFIG_VERBOSE" ]; then
+        eval "$LOGGER \"$1\""
+    fi
+}
+`
+	const newDebug = `logger_debug() {
+    case "$IM_CONFIG_VERBOSE" in
+        1|yes|true|on)
+            eval "$LOGGER \"$1\""
+            ;;
+    esac
+}
+`
+	if strings.Contains(content, oldDebug) {
+		content = strings.Replace(content, oldDebug, newDebug, 1)
+	}
+
+	if content == string(data) {
+		return
+	}
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		slog.Warn("failed to patch profile script", "path", path, "error", err)
+	}
 }
 
 // installXdgOpen writes a shim that forwards xdg-open calls to the host

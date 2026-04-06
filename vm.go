@@ -78,6 +78,7 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 			MemoryBytes:   cfg.MemoryBytes,
 			CWD:           cfg.CWD,
 			Env:           cfg.Env,
+			Root:          cfg.Root,
 			Checkpoint:    cfg.Checkpoint,
 			CheckpointDir: cfg.CheckpointDir,
 			Shares:        cfg.Shares,
@@ -145,6 +146,14 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		return nil, fmt.Errorf("get current user: %w", err)
 	}
 	uid, _ := strconv.Atoi(u.Uid)
+	setupUser := u.Username
+	setupUID := uid
+	setupHome := u.HomeDir
+	if cfg.Root {
+		setupUser = ""
+		setupUID = 0
+		setupHome = ""
+	}
 
 	swapPath := filepath.Join(filepath.Dir(cfg.RootfsPath), "swap.img")
 	if err := ensureSwapFile(swapPath, cfg.memoryBytes()); err != nil {
@@ -184,9 +193,9 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 	setupMsg := &protocol.Setup{
 		CWD:      cwd,
 		Env:      buildGuestEnv(cfg.Env),
-		User:     u.Username,
-		UID:      uid,
-		HomeDir:  u.HomeDir,
+		User:     setupUser,
+		UID:      setupUID,
+		HomeDir:  setupHome,
 		Hostname: hostname,
 		SSHAgent: sshAgent,
 		GUI:      cfg.GUI,

@@ -33,6 +33,10 @@ type Config struct {
 	// to the guest, merged with the filtered host environment.
 	Env []string
 
+	// Root runs guest commands as root instead of mirroring the host user.
+	// When true, no host home directory is mounted into the guest.
+	Root bool
+
 	// Checkpoint clones the rootfs before starting the VM.
 	// The clone is stored under CheckpointDir with a timestamped name.
 	// Requires APFS (macOS).
