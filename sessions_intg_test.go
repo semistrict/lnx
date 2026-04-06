@@ -41,7 +41,7 @@ func TestPTY_SessionsKillGraceful(t *testing.T) {
 
 	// Verify session appears.
 	require.Eventually(t, func() bool {
-		return len(fetchSessionsAPI(t) ) > 0
+		return len(fetchSessionsAPI(t)) > 0
 	}, 10*time.Second, 500*time.Millisecond, "session never appeared in sessions list")
 
 	sessions := fetchSessionsAPI(t)

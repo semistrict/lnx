@@ -174,10 +174,10 @@ func downloadRelease(dest, asset string) error {
 
 // progressReader wraps an io.Reader and prints download progress to stderr.
 type progressReader struct {
-	r        io.Reader
-	total    int64
-	read     int64
-	label    string
+	r         io.Reader
+	total     int64
+	read      int64
+	label     string
 	lastPrint time.Time
 }
 
