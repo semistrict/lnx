@@ -157,6 +157,10 @@ func run() error {
 		startSSHAgentForward()
 	}
 
+	if setup.GUI {
+		startGUI()
+	}
+
 	installSystemctlShim()
 	configureNetwork()
 	writeResolvConf()
@@ -261,16 +265,18 @@ func setClockFromEpoch(epochStr string) {
 }
 
 func setupUser(username string, uid int) {
+	home := "/home/" + username
+
 	// Skip if user was already created in a prior boot.
 	if data, err := os.ReadFile("/etc/passwd"); err == nil {
 		if strings.Contains(string(data), username+":") {
 			addUserToGroups(username)
+			chownGuestHome(home, uid, uid)
 			return
 		}
 	}
 
 	gid := uid
-	home := "/home/" + username
 
 	appendFile("/etc/passwd", fmt.Sprintf("%s:x:%d:%d::%s:/bin/bash\n", username, uid, gid, home))
 	appendFile("/etc/shadow", fmt.Sprintf("%s:!::0:99999:7:::\n", username))
@@ -283,6 +289,15 @@ func setupUser(username string, uid int) {
 	os.WriteFile("/etc/sudoers.d/lnx", []byte(username+" ALL=(ALL) NOPASSWD: ALL\n"), 0440)
 
 	addUserToGroups(username)
+	chownGuestHome(home, uid, gid)
+}
+
+func chownGuestHome(home string, uid, gid int) {
+	if isHostBackedMount(home) {
+		slog.Info("skip recursive home chown on shared mount", "path", home)
+		return
+	}
+	chownTree(home, uid, gid)
 }
 
 // addUserToGroups adds the user to well-known system groups (docker, etc.)
@@ -336,6 +351,46 @@ func addUserToGroups(username string) {
 	if changed {
 		os.WriteFile("/etc/group", []byte(strings.Join(lines, "\n")), 0644)
 	}
+}
+
+func chownTree(root string, uid, gid int) {
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		_ = os.Lchown(path, uid, gid)
+		return nil
+	})
+}
+
+func isHostBackedMount(path string) bool {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return false
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, " - ", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		left := strings.Fields(parts[0])
+		if len(left) < 5 || left[4] != path {
+			continue
+		}
+		right := strings.Fields(parts[1])
+		if len(right) == 0 {
+			continue
+		}
+		switch right[0] {
+		case "9p", "virtiofs", "fuse.virtiofs":
+			return true
+		}
+	}
+	return false
 }
 
 func appendFile(path, line string) {

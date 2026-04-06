@@ -83,6 +83,8 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 			Shares:        cfg.Shares,
 			Hostname:      cfg.Hostname,
 			SSHAgent:      cfg.SSHAgent,
+			GUI:           cfg.GUI,
+			InitialHoldID: cfg.InitialHoldID,
 			SocketDir:     cfg.SocketDir,
 		}
 	}
@@ -187,6 +189,7 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		HomeDir:  u.HomeDir,
 		Hostname: hostname,
 		SSHAgent: sshAgent,
+		GUI:      cfg.GUI,
 		Shares:   cfg.Shares,
 	}
 
@@ -200,7 +203,7 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 	}
 
 	sockDir := cfg.socketDir()
-	vs, err := setupVsock(vm, sockDir, cfg.RootfsPath, setupMsg)
+	vs, err := setupVsock(vm, sockDir, cfg.RootfsPath, setupMsg, cfg.InitialHoldID)
 	if err != nil {
 		lock.unlock()
 		if ephCleanup != nil {
@@ -307,12 +310,10 @@ func RunDaemon(cfg *Config) error {
 		return err
 	}
 
-	slog.Info("daemon ready, waiting for exec sessions")
-
-	// Block until idle (all execs finished) or stop requested.
+	slog.Info("daemon ready, waiting for exec sessions", "gui", cfg.GUI, "initial_hold_id", cfg.InitialHoldID, "active_execs", b.vs.api.activeExecs.Load())
 	b.vs.api.WaitIdle()
 
-	slog.Info("daemon shutting down (idle)")
+	slog.Info("daemon shutting down (idle)", "active_execs", b.vs.api.activeExecs.Load())
 	b.close(0)
 	return nil
 }
@@ -366,7 +367,7 @@ func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.
 	return vmConfig, nil
 }
 
-func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, setupMsg *protocol.Setup) (*vsockState, error) {
+func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, setupMsg *protocol.Setup, initialHoldID string) (*vsockState, error) {
 	socketDevices := vm.SocketDevices()
 	if len(socketDevices) == 0 {
 		return nil, fmt.Errorf("no vsock devices")
@@ -441,7 +442,7 @@ func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, setupMsg *prot
 		pf.run(conn)
 	}()
 
-	api := newAPIServer(nil, setupMsg.User, rootfsPath)
+	api := newAPIServer(nil, setupMsg.User, rootfsPath, setupMsg.GUI, initialHoldID)
 	api.sock = sock
 	api.pf = pf
 	go func() {

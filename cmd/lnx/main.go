@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -190,6 +189,10 @@ func vmIsRunning() bool {
 
 // spawnDaemon starts the VM daemon as a background process.
 func spawnDaemon() error {
+	return spawnDaemonWithOptions("", false)
+}
+
+func spawnDaemonWithOptions(initialHoldID string, gui bool) error {
 	self, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("find executable: %w", err)
@@ -205,13 +208,15 @@ func spawnDaemon() error {
 	if doSSHAgent {
 		daemonArgs = append(daemonArgs, "--ssh-agent")
 	}
+	if gui {
+		daemonArgs = append(daemonArgs, "--gui")
+	}
+	if initialHoldID != "" {
+		daemonArgs = append(daemonArgs, "--hold-id", initialHoldID)
+	}
 
 	cmd := exec.Command(self, daemonArgs...)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	cmd.Stdin = nil
-	// Detach from the parent process group so the daemon survives.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	configureBackgroundCommand(cmd)
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start daemon: %w", err)

@@ -137,6 +137,8 @@ func mountInNewRoot() error {
 	syscall.Mount("devpts", "/mnt/dev/pts", "devpts", 0, "newinstance,ptmxmode=0666")
 	os.Remove("/mnt/dev/ptmx")
 	os.Symlink("pts/ptmx", "/mnt/dev/ptmx")
+	os.MkdirAll("/mnt/dev/shm", 1777)
+	syscall.Mount("tmpfs", "/mnt/dev/shm", "tmpfs", 0, "")
 	return nil
 }
 

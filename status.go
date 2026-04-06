@@ -38,6 +38,11 @@ type StatusResponse struct {
 	Dmesg       string   `json:"dmesg,omitempty"`
 }
 
+type GUIStatusResponse struct {
+	Enabled bool   `json:"enabled"`
+	Path    string `json:"path,omitempty"`
+}
+
 // apiServer manages the guest vsock connections and the host unix
 // socket HTTP server for status queries and exec requests.
 type apiServer struct {
@@ -45,6 +50,7 @@ type apiServer struct {
 	user       string
 	startTime  time.Time
 	rootfsPath string
+	guiEnabled bool
 
 	statusMu   sync.Mutex
 	statusEnc  *gob.Encoder
@@ -62,17 +68,21 @@ type apiServer struct {
 	// Session tracking for daemon mode.
 	activeExecs atomic.Int64
 	idleCh      chan struct{} // closed when active count drops from 1→0
-	idleOnce    sync.Once    // ensures idleCh is closed exactly once
+	idleOnce    sync.Once     // ensures idleCh is closed exactly once
 	stopCh      chan struct{} // closed when /stop is called
 
 	sessionsMu sync.RWMutex
 	sessions   map[string]*SessionInfo
 	sessionSeq atomic.Int64
+
+	holdsMu sync.Mutex
+	holds   map[string]*HoldInfo
 }
 
-// SessionInfo describes an active exec session.
+// SessionInfo describes an active session.
 type SessionInfo struct {
 	ID        string    `json:"id"`
+	Kind      string    `json:"kind,omitempty"`
 	Args      []string  `json:"args"`
 	PTY       bool      `json:"pty"`
 	StartTime time.Time `json:"start_time"`
@@ -89,6 +99,14 @@ type SessionInfo struct {
 	vsockConn net.Conn // raw PTY vsock connection (port 1032), nil for non-PTY
 }
 
+type HoldInfo struct {
+	ID            string
+	Kind          string
+	StartTime     time.Time
+	ClientPID     int
+	ControlSocket string
+}
+
 // encodeExec sends a gob message on the session's exec connection, safely.
 func (s *SessionInfo) encodeExec(msg protocol.Msg) error {
 	s.encMu.Lock()
@@ -96,16 +114,23 @@ func (s *SessionInfo) encodeExec(msg protocol.Msg) error {
 	return s.execEnc.Encode(msg)
 }
 
-func newAPIServer(args []string, user, rootfsPath string) *apiServer {
-	return &apiServer{
+func newAPIServer(args []string, user, rootfsPath string, guiEnabled bool, initialHoldID string) *apiServer {
+	s := &apiServer{
 		args:       args,
 		user:       user,
 		rootfsPath: rootfsPath,
+		guiEnabled: guiEnabled,
 		startTime:  time.Now(),
 		idleCh:     make(chan struct{}),
 		stopCh:     make(chan struct{}),
 		sessions:   make(map[string]*SessionInfo),
+		holds:      make(map[string]*HoldInfo),
 	}
+	if initialHoldID != "" {
+		s.holds[initialHoldID] = &HoldInfo{ID: initialHoldID, Kind: "gui", StartTime: time.Now()}
+		s.activeExecs.Add(1)
+	}
+	return s
 }
 
 // registerSession creates a new session entry and returns its ID.
@@ -114,6 +139,7 @@ func (s *apiServer) registerSession(args []string, pty bool, clientPID int, exec
 	s.sessionsMu.Lock()
 	s.sessions[id] = &SessionInfo{
 		ID:        id,
+		Kind:      "exec",
 		Args:      args,
 		PTY:       pty,
 		StartTime: time.Now(),
@@ -198,12 +224,44 @@ func (s *apiServer) execFinished() {
 	}
 }
 
+func (s *apiServer) acquireHold(id, kind string) string {
+	s.holdsMu.Lock()
+	defer s.holdsMu.Unlock()
+	if id == "" {
+		id = fmt.Sprintf("s%d", time.Now().UnixNano())
+	}
+	if _, exists := s.holds[id]; exists {
+		return id
+	}
+	s.holds[id] = &HoldInfo{ID: id, Kind: kind, StartTime: time.Now()}
+	s.activeExecs.Add(1)
+	return id
+}
+
+func (s *apiServer) releaseHold(id string) bool {
+	s.holdsMu.Lock()
+	defer s.holdsMu.Unlock()
+	if _, ok := s.holds[id]; !ok {
+		return false
+	}
+	delete(s.holds, id)
+	if s.activeExecs.Add(-1) == 0 {
+		s.idleOnce.Do(func() { close(s.idleCh) })
+	}
+	return true
+}
+
 // WaitIdle blocks until there are no active exec sessions, or stop is requested.
 func (s *apiServer) WaitIdle() {
 	select {
 	case <-s.idleCh:
 	case <-s.stopCh:
 	}
+}
+
+// WaitStop blocks until stop is requested (ignores idle).
+func (s *apiServer) WaitStop() {
+	<-s.stopCh
 }
 
 // setStatusConn stores the guest's status vsock connection.
@@ -314,11 +372,15 @@ func (s *apiServer) listenUnix(sockPath string) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /status", s.handleStatus)
+	mux.HandleFunc("GET /gui", s.handleGUIStatus)
 	mux.HandleFunc("GET /ports", s.handlePorts)
 	mux.HandleFunc("POST /exec", s.handleExec)
 	mux.HandleFunc("GET /exec/ws", s.handleExecWS)
 	mux.HandleFunc("GET /sessions", s.handleSessions)
 	mux.HandleFunc("POST /sessions/kill", s.handleSessionKill)
+	mux.HandleFunc("POST /holds/acquire", s.handleHoldAcquire)
+	mux.HandleFunc("POST /holds/update", s.handleHoldUpdate)
+	mux.HandleFunc("POST /holds/release", s.handleHoldRelease)
 	mux.HandleFunc("POST /stop", s.handleStop)
 
 	go http.Serve(ln, mux)
@@ -353,10 +415,38 @@ func (s *apiServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+func (s *apiServer) handleGUIStatus(w http.ResponseWriter, r *http.Request) {
+	resp := GUIStatusResponse{Enabled: s.guiEnabled}
+	if s.guiEnabled {
+		resp.Path = "/vnc.html?autoconnect=true&resize=remote"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
 // PortEntry describes a single forwarded port.
 type PortEntry struct {
 	Guest uint16 `json:"guest"`
 	Host  uint16 `json:"host"`
+}
+
+type HoldAcquireRequest struct {
+	ID   string `json:"id,omitempty"`
+	Kind string `json:"kind,omitempty"`
+}
+
+type HoldAcquireResponse struct {
+	ID string `json:"id"`
+}
+
+type HoldReleaseRequest struct {
+	ID string `json:"id"`
+}
+
+type HoldUpdateRequest struct {
+	ID            string `json:"id"`
+	ClientPID     int    `json:"client_pid,omitempty"`
+	ControlSocket string `json:"control_socket,omitempty"`
 }
 
 func (s *apiServer) handlePorts(w http.ResponseWriter, r *http.Request) {
@@ -373,6 +463,65 @@ func (s *apiServer) handlePorts(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(ports)
+}
+
+func (s *apiServer) handleHoldAcquire(w http.ResponseWriter, r *http.Request) {
+	var req HoldAcquireRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	id := s.acquireHold(req.ID, req.Kind)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(HoldAcquireResponse{ID: id})
+}
+
+func (s *apiServer) handleHoldRelease(w http.ResponseWriter, r *http.Request) {
+	var req HoldReleaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.ID == "" {
+		http.Error(w, "id required", http.StatusBadRequest)
+		return
+	}
+	if !s.releaseHold(req.ID) {
+		http.Error(w, "hold not found: "+req.ID, http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "released"})
+}
+
+func (s *apiServer) handleHoldUpdate(w http.ResponseWriter, r *http.Request) {
+	var req HoldUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.ID == "" {
+		http.Error(w, "id required", http.StatusBadRequest)
+		return
+	}
+
+	s.holdsMu.Lock()
+	hold := s.holds[req.ID]
+	if hold != nil && req.ClientPID > 0 {
+		hold.ClientPID = req.ClientPID
+	}
+	if hold != nil && req.ControlSocket != "" {
+		hold.ControlSocket = req.ControlSocket
+	}
+	s.holdsMu.Unlock()
+
+	if hold == nil {
+		http.Error(w, "hold not found: "+req.ID, http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
 }
 
 // ExecRequest is the JSON body for POST /exec and the first WebSocket text frame.
@@ -631,7 +780,7 @@ type wsResize struct {
 	Cols uint16 `json:"cols"`
 }
 
-// handleSessions returns all active exec sessions as JSON, sorted by start time.
+// handleSessions returns all active sessions as JSON, sorted by start time.
 func (s *apiServer) handleSessions(w http.ResponseWriter, r *http.Request) {
 	s.sessionsMu.RLock()
 	sessions := make([]*SessionInfo, 0, len(s.sessions))
@@ -639,6 +788,18 @@ func (s *apiServer) handleSessions(w http.ResponseWriter, r *http.Request) {
 		sessions = append(sessions, sess)
 	}
 	s.sessionsMu.RUnlock()
+
+	s.holdsMu.Lock()
+	for _, hold := range s.holds {
+		sessions = append(sessions, &SessionInfo{
+			ID:        hold.ID,
+			Kind:      hold.Kind,
+			Args:      []string{hold.Kind},
+			StartTime: hold.StartTime,
+			ClientPID: hold.ClientPID,
+		})
+	}
+	s.holdsMu.Unlock()
 
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].StartTime.Before(sessions[j].StartTime)
@@ -650,12 +811,13 @@ func (s *apiServer) handleSessions(w http.ResponseWriter, r *http.Request) {
 
 // SessionKillRequest is the JSON body for POST /sessions/kill.
 type SessionKillRequest struct {
-	ID    string `json:"id"`
+	ID     string `json:"id"`
 	Signal int    `json:"signal"`
-	Close bool   `json:"close,omitempty"` // also close connections to force teardown
+	Close  bool   `json:"close,omitempty"` // also close connections to force teardown
 }
 
-// handleSessionKill sends a signal to a session's guest process.
+// handleSessionKill sends a signal to a session's guest process, or releases
+// a hold-backed session such as the GUI window.
 // If Close is true, also forcefully closes the session's connections.
 func (s *apiServer) handleSessionKill(w http.ResponseWriter, r *http.Request) {
 	var req SessionKillRequest
@@ -672,7 +834,26 @@ func (s *apiServer) handleSessionKill(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !s.signalSession(req.ID, req.Signal) {
-		http.Error(w, "session not found: "+req.ID, http.StatusNotFound)
+		s.holdsMu.Lock()
+		hold := s.holds[req.ID]
+		s.holdsMu.Unlock()
+		if hold == nil {
+			http.Error(w, "session not found: "+req.ID, http.StatusNotFound)
+			return
+		}
+		if hold.ControlSocket != "" {
+			conn, err := net.DialTimeout("unix", hold.ControlSocket, 500*time.Millisecond)
+			if err == nil {
+				_, _ = conn.Write([]byte("close\n"))
+				conn.Close()
+			} else {
+				s.releaseHold(req.ID)
+			}
+		} else {
+			s.releaseHold(req.ID)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "signal sent"})
 		return
 	}
 

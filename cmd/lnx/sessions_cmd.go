@@ -17,18 +17,18 @@ import (
 
 var sessionsCmd = &cobra.Command{
 	Use:   "sessions",
-	Short: "Manage exec sessions",
+	Short: "Manage active sessions",
 }
 
 var sessionsListCmd = &cobra.Command{
 	Use:   "list",
-	Short: "List active exec sessions",
+	Short: "List active sessions",
 	RunE:  runSessionsList,
 }
 
 var sessionsKillCmd = &cobra.Command{
 	Use:   "kill <id>",
-	Short: "Kill an exec session (SIGTERM, then SIGKILL after 10s)",
+	Short: "Kill an active session",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runSessionsKill,
 }
@@ -78,10 +78,10 @@ func runSessionsListAll() error {
 		return rows[i].session.StartTime.Before(rows[j].session.StartTime)
 	})
 
-	t := newTable("INSTANCE", "ID", "COMMAND", "LOCAL PID", "REMOTE PID", "AGE")
+	t := newTable("INSTANCE", "ID", "TYPE", "COMMAND", "LOCAL PID", "REMOTE PID", "AGE")
 	for _, r := range rows {
 		id := r.instance + "_" + r.session.ID
-		t.Row(r.instance, id, formatCommand(r.session.Args), formatPID(r.session.ClientPID), formatPID(r.session.GuestPID), formatAge(time.Since(r.session.StartTime)))
+		t.Row(r.instance, id, formatSessionKind(r.session.Kind), formatCommand(r.session.Args), formatPID(r.session.ClientPID), formatPID(r.session.GuestPID), formatAge(time.Since(r.session.StartTime)))
 	}
 	fmt.Println(t)
 	return nil
@@ -106,16 +106,16 @@ func runSessionsListOne(name string) error {
 		return sessions[i].StartTime.Before(sessions[j].StartTime)
 	})
 
-	t := newTable("ID", "COMMAND", "LOCAL PID", "REMOTE PID", "AGE")
+	t := newTable("ID", "TYPE", "COMMAND", "LOCAL PID", "REMOTE PID", "AGE")
 	for _, s := range sessions {
-		t.Row(s.ID, formatCommand(s.Args), formatPID(s.ClientPID), formatPID(s.GuestPID), formatAge(time.Since(s.StartTime)))
+		t.Row(s.ID, formatSessionKind(s.Kind), formatCommand(s.Args), formatPID(s.ClientPID), formatPID(s.GuestPID), formatAge(time.Since(s.StartTime)))
 	}
 	fmt.Println(t)
 	return nil
 }
 
-// runSessionsKill sends SIGTERM to both local and remote process, waits 10s,
-// then sends SIGKILL if the session is still alive.
+// runSessionsKill sends SIGTERM to exec sessions and releases hold-backed
+// sessions like the GUI immediately.
 func runSessionsKill(cmd *cobra.Command, args []string) error {
 	id := args[0]
 
@@ -123,6 +123,31 @@ func runSessionsKill(cmd *cobra.Command, args []string) error {
 	inst, sessID := parseSessionID(id)
 
 	client := apiClientFor(inst)
+	sessions, err := fetchSessions(inst)
+	if err != nil {
+		if isNoVM(err) {
+			return nil
+		}
+		return err
+	}
+	var target *lnx.SessionInfo
+	for i := range sessions {
+		if sessions[i].ID == sessID {
+			target = &sessions[i]
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("session %s not found", id)
+	}
+
+	if target.Kind != "" && target.Kind != "exec" {
+		if err := sendSessionSignal(client, sessID, int(syscall.SIGKILL), true); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "killed %s session %s\n", target.Kind, id)
+		return nil
+	}
 
 	// Send SIGTERM + SIGHUP to guest process. SIGHUP is needed because
 	// interactive shells (bash) ignore SIGTERM by default.
@@ -201,6 +226,13 @@ func formatPID(pid int) string {
 		return fmt.Sprintf("%d", pid)
 	}
 	return "-"
+}
+
+func formatSessionKind(kind string) string {
+	if kind == "" {
+		return "exec"
+	}
+	return kind
 }
 
 func formatAge(d time.Duration) string {

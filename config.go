@@ -58,6 +58,13 @@ type Config struct {
 	// is never locked, so multiple ephemeral VMs can run concurrently.
 	Ephemeral bool
 
+	// GUI starts a headless Wayland desktop with VNC, accessible via noVNC in the browser.
+	GUI bool
+
+	// InitialHoldID keeps the daemon alive until the holder releases it.
+	// Used by background GUI sessions so the VM stays up while the window is open.
+	InitialHoldID string
+
 	// SocketDir overrides the directory for status.sock.
 	// If empty, defaults to the directory containing RootfsPath.
 	// Useful for ephemeral mode where the rootfs is in a temp dir but
