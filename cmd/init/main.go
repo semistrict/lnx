@@ -3,8 +3,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/gob"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -29,6 +31,10 @@ func main() {
 	base := filepath.Base(os.Args[0])
 	if base == "systemctl" {
 		os.Exit(runSystemctl(os.Args[1:]))
+	}
+	if base == "systemd-cat" {
+		initLogging()
+		os.Exit(runSystemdCat(os.Args[1:]))
 	}
 
 	if err := run(); err != nil {
@@ -158,6 +164,7 @@ func run() error {
 	}
 
 	installSystemctlShim()
+	installSystemdCatShim()
 	configureNetwork()
 	writeResolvConf()
 	installBashDefaults()
@@ -173,6 +180,84 @@ func run() error {
 	// Block until the host closes the control connection.
 	<-ctrlDone
 	return nil
+}
+
+func runSystemdCat(args []string) int {
+	var cmdArgs []string
+	identifier := "systemd-cat"
+	priority := "6"
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			cmdArgs = args[i+1:]
+			break
+		}
+		if strings.HasPrefix(arg, "-") {
+			switch arg {
+			case "-t", "--identifier":
+				if i+1 < len(args) {
+					identifier = args[i+1]
+					i++
+				}
+			case "-p", "--priority":
+				if i+1 < len(args) {
+					priority = args[i+1]
+					i++
+				}
+			case "--level-prefix":
+				if i+1 < len(args) {
+					i++
+				}
+			}
+			continue
+		}
+		cmdArgs = args[i:]
+		break
+	}
+
+	if len(cmdArgs) == 0 {
+		data, _ := io.ReadAll(os.Stdin)
+		logSystemdCatOutput(identifier, priority, data)
+		return 0
+	}
+
+	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
+	cmd.Stdin = os.Stdin
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		logSystemdCatOutput(identifier, priority, out.Bytes())
+		if ee, ok := err.(*exec.ExitError); ok {
+			return ee.ExitCode()
+		}
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	logSystemdCatOutput(identifier, priority, out.Bytes())
+	return 0
+}
+
+func logSystemdCatOutput(identifier, priority string, data []byte) {
+	text := strings.TrimSpace(string(data))
+	if text == "" {
+		return
+	}
+	attrs := []any{"identifier", identifier, "priority", priority}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		switch priority {
+		case "0", "1", "2", "3":
+			slog.Error(line, attrs...)
+		case "4":
+			slog.Warn(line, attrs...)
+		default:
+			slog.Info(line, attrs...)
+		}
+	}
 }
 
 // controlReader reads Signal and Resize messages from the host.

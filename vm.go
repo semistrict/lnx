@@ -325,7 +325,7 @@ type vsockState struct {
 }
 
 func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.VirtualMachineConfiguration, error) {
-	cmdline := fmt.Sprintf("console=hvc0 quiet lnx.epoch=%d", time.Now().Unix())
+	cmdline := fmt.Sprintf("quiet lnx.epoch=%d", time.Now().Unix())
 
 	bootLoader, err := vz.NewLinuxBootLoader(
 		cfg.KernelPath,
@@ -342,7 +342,6 @@ func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.
 	}
 
 	for _, attach := range []func(*vz.VirtualMachineConfiguration) error{
-		attachSerial,
 		func(c *vz.VirtualMachineConfiguration) error { return attachDisks(c, cfg.RootfsPath, swapPath) },
 		func(c *vz.VirtualMachineConfiguration) error { return attachShares(c, cwd, cfg.Shares) },
 		attachNetwork,

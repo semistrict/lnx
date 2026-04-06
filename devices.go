@@ -2,31 +2,9 @@ package lnx
 
 import (
 	"fmt"
-	"os"
 
 	vz "github.com/Code-Hex/vz/v3"
 )
-
-// attachSerial sets up the virtio serial console (hvc0) routed to /dev/null.
-// Terminal I/O uses vsock instead; serial exists only for kernel boot messages.
-func attachSerial(vmConfig *vz.VirtualMachineConfiguration) error {
-	devNull, err := os.OpenFile("/dev/null", os.O_RDWR, 0)
-	if err != nil {
-		return fmt.Errorf("open /dev/null: %w", err)
-	}
-	attachment, err := vz.NewFileHandleSerialPortAttachment(devNull, devNull)
-	if err != nil {
-		devNull.Close()
-		return fmt.Errorf("serial attachment: %w", err)
-	}
-	config, err := vz.NewVirtioConsoleDeviceSerialPortConfiguration(attachment)
-	if err != nil {
-		devNull.Close()
-		return fmt.Errorf("serial config: %w", err)
-	}
-	vmConfig.SetSerialPortsVirtualMachineConfiguration([]*vz.VirtioConsoleDeviceSerialPortConfiguration{config})
-	return nil
-}
 
 // attachDisks attaches the rootfs as /dev/vda and a swap image as /dev/vdb.
 func attachDisks(vmConfig *vz.VirtualMachineConfiguration, rootfsPath, swapPath string) error {

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // startLogReceiver listens on vsockLogPort and appends received log lines
@@ -17,29 +18,40 @@ func startLogReceiver(listener interface {
 }, logDir string) func() {
 	logPath := filepath.Join(logDir, "lnx.log")
 	done := make(chan struct{})
+	var wg sync.WaitGroup
 
 	go func() {
-		defer close(done)
-
-		conn, err := listener.Accept()
-		if err != nil {
-			slog.Debug("log accept failed", "error", err)
-			return
-		}
-		slog.Debug("log accepted")
-		defer conn.Close()
-
 		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "lnx: open log file: %v\n", err)
+			close(done)
 			return
 		}
 		defer f.Close()
+		defer close(done)
 
-		scanner := bufio.NewScanner(conn)
-		for scanner.Scan() {
-			fmt.Fprintln(f, scanner.Text())
+		var mu sync.Mutex
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				slog.Debug("log accept failed", "error", err)
+				break
+			}
+			slog.Debug("log accepted")
+			wg.Add(1)
+			go func(conn net.Conn) {
+				defer wg.Done()
+				defer conn.Close()
+
+				scanner := bufio.NewScanner(conn)
+				for scanner.Scan() {
+					mu.Lock()
+					fmt.Fprintln(f, scanner.Text())
+					mu.Unlock()
+				}
+			}(conn)
 		}
+		wg.Wait()
 	}()
 
 	return func() {

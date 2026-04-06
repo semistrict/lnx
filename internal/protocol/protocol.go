@@ -25,6 +25,9 @@ const (
 	P9Port = 1033
 	// SSHAgentPort is the vsock port for SSH agent forwarding (host listens, guest dials).
 	SSHAgentPort = 1034
+	// GuestHTTPPort is the vsock port the guest listens on for host->guest HTTP access
+	// to guest-local control/debug endpoints.
+	GuestHTTPPort = 1035
 )
 
 // Msg is the envelope for all control messages.

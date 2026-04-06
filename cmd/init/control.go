@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"sync"
 
@@ -44,11 +45,39 @@ func startGuestControlServer() {
 		dec: gob.NewDecoder(hostConn),
 	}
 
+	mux := newGuestControlMux(gc)
+
+	go http.Serve(ln, mux)
+
+	vsockLn, err := vsock.Listen(protocol.GuestHTTPPort, nil)
+	if err != nil {
+		slog.Warn("guest control vsock listen failed", "error", err, "port", protocol.GuestHTTPPort)
+		return
+	}
+	go http.Serve(vsockLn, mux)
+}
+
+func newGuestControlMux(gc *guestControl) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /checkpoint", gc.handleCheckpoint)
 	mux.HandleFunc("POST /open", gc.handleOpen)
-
-	go http.Serve(ln, mux)
+	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("POST /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+	for _, name := range []string{
+		"allocs",
+		"block",
+		"goroutine",
+		"heap",
+		"mutex",
+		"threadcreate",
+	} {
+		mux.Handle("GET /debug/pprof/"+name, pprof.Handler(name))
+	}
+	return mux
 }
 
 type guestControl struct {

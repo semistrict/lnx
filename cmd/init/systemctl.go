@@ -44,6 +44,15 @@ func installSystemctlShim() {
 	os.MkdirAll(logDir, 0755)
 }
 
+// installSystemdCatShim points systemd-cat at the embedded init binary.
+// When invoked as "systemd-cat", main() dispatches to runSystemdCat().
+func installSystemdCatShim() {
+	os.Remove("/usr/bin/systemd-cat")
+	if err := os.Symlink("/usr/local/bin/lnx-init", "/usr/bin/systemd-cat"); err != nil {
+		slog.Warn("failed to install systemd-cat shim", "error", err)
+	}
+}
+
 // runSystemctl implements a minimal systemctl that parses systemd unit files.
 func runSystemctl(args []string) int {
 	// Strip flags that systemd clients pass.

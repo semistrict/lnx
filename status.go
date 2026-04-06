@@ -1,6 +1,7 @@
 package lnx
 
 import (
+	"context"
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -62,7 +64,7 @@ type apiServer struct {
 	// Session tracking for daemon mode.
 	activeExecs atomic.Int64
 	idleCh      chan struct{} // closed when active count drops from 1→0
-	idleOnce    sync.Once    // ensures idleCh is closed exactly once
+	idleOnce    sync.Once     // ensures idleCh is closed exactly once
 	stopCh      chan struct{} // closed when /stop is called
 
 	sessionsMu sync.RWMutex
@@ -320,9 +322,63 @@ func (s *apiServer) listenUnix(sockPath string) error {
 	mux.HandleFunc("GET /sessions", s.handleSessions)
 	mux.HandleFunc("POST /sessions/kill", s.handleSessionKill)
 	mux.HandleFunc("POST /stop", s.handleStop)
+	mux.HandleFunc("/guest/debug/pprof/", s.handleGuestPprofProxy)
+	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("POST /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+	for _, name := range []string{
+		"allocs",
+		"block",
+		"goroutine",
+		"heap",
+		"mutex",
+		"threadcreate",
+	} {
+		mux.Handle("GET /debug/pprof/"+name, pprof.Handler(name))
+	}
 
 	go http.Serve(ln, mux)
 	return nil
+}
+
+func (s *apiServer) handleGuestPprofProxy(w http.ResponseWriter, r *http.Request) {
+	if s.sock == nil {
+		http.Error(w, "guest vsock unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	targetURL := "http://guest" + strings.TrimPrefix(r.URL.RequestURI(), "/guest")
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("build proxy request: %v", err), http.StatusInternalServerError)
+		return
+	}
+	req.Header = r.Header.Clone()
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return s.sock.Connect(protocol.GuestHTTPPort)
+			},
+		},
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("guest pprof proxy: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vals := range resp.Header {
+		for _, v := range vals {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
 }
 
 func (s *apiServer) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -650,9 +706,9 @@ func (s *apiServer) handleSessions(w http.ResponseWriter, r *http.Request) {
 
 // SessionKillRequest is the JSON body for POST /sessions/kill.
 type SessionKillRequest struct {
-	ID    string `json:"id"`
+	ID     string `json:"id"`
 	Signal int    `json:"signal"`
-	Close bool   `json:"close,omitempty"` // also close connections to force teardown
+	Close  bool   `json:"close,omitempty"` // also close connections to force teardown
 }
 
 // handleSessionKill sends a signal to a session's guest process.
