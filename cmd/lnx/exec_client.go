@@ -205,8 +205,11 @@ func execInteractive(args []string) (int, error) {
 }
 
 // waitForVM polls status.sock until the daemon is ready, up to timeout.
+// If the daemon exits with an error, it reads error.log for diagnostics.
 func waitForVM(timeout time.Duration) error {
-	sockPath := filepath.Join(instanceDir(), "status.sock")
+	dir := instanceDir()
+	sockPath := filepath.Join(dir, "status.sock")
+	errPath := filepath.Join(dir, "error.log")
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
@@ -214,7 +217,15 @@ func waitForVM(timeout time.Duration) error {
 			conn.Close()
 			return nil
 		}
+		// Check if the daemon wrote an error before exiting.
+		if data, ferr := os.ReadFile(errPath); ferr == nil && len(data) > 0 {
+			return fmt.Errorf("VM failed to start: %s", strings.TrimSpace(string(data)))
+		}
 		time.Sleep(200 * time.Millisecond)
+	}
+	// One last check for error.log.
+	if data, err := os.ReadFile(errPath); err == nil && len(data) > 0 {
+		return fmt.Errorf("VM failed to start: %s", strings.TrimSpace(string(data)))
 	}
 	return fmt.Errorf("timed out waiting for VM to start")
 }

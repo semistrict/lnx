@@ -2,6 +2,7 @@ package lnx
 
 import (
 	"fmt"
+	"path/filepath"
 
 	vz "github.com/Code-Hex/vz/v3"
 )
@@ -84,6 +85,20 @@ func attachNetwork(vmConfig *vz.VirtualMachineConfiguration) error {
 		return fmt.Errorf("network config: %w", err)
 	}
 	vmConfig.SetNetworkDevicesVirtualMachineConfiguration([]*vz.VirtioNetworkDeviceConfiguration{netConfig})
+	return nil
+}
+
+func attachSerialConsole(vmConfig *vz.VirtualMachineConfiguration, logDir string) error {
+	logPath := filepath.Join(logDir, "serial.log")
+	attachment, err := vz.NewFileSerialPortAttachment(logPath, false)
+	if err != nil {
+		return fmt.Errorf("serial port attachment: %w", err)
+	}
+	serial, err := vz.NewVirtioConsoleDeviceSerialPortConfiguration(attachment)
+	if err != nil {
+		return fmt.Errorf("serial port config: %w", err)
+	}
+	vmConfig.SetSerialPortsVirtualMachineConfiguration([]*vz.VirtioConsoleDeviceSerialPortConfiguration{serial})
 	return nil
 }
 

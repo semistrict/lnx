@@ -24,8 +24,10 @@ The guest init is cross-compiled (`CGO_ENABLED=0 GOOS=linux GOARCH=arm64`) and e
 
 ### Two binaries, one repo
 
-- **Host binary** (`cmd/lnx/`): macOS CLI that creates and manages VMs. Uses `github.com/Code-Hex/vz/v3` (fork at `github.com/semistrict/vz`, local checkout in `third_party/vz/`). `go.mod` points to the remote fork; a gitignored `go.work` overrides with the local submodule for development.
+- **Host binary** (`cmd/lnx/`): macOS CLI that creates and manages VMs via `github.com/Code-Hex/vz/v3` (Go bindings for Virtualization.framework).
 - **Guest init** (`cmd/init/`): Linux binary that runs as PID 1 inside the VM. All files have `//go:build linux`.
+
+`go.mod` replaces `Code-Hex/vz/v3` with the `semistrict/vz` fork. A gitignored `go.work` file overrides this with the local `third_party/vz/` submodule for development. If you need to modify the vz bindings, work in `third_party/vz/`.
 
 ### Host ↔ Guest communication over vsock
 
@@ -43,6 +45,7 @@ All communication uses virtio-vsock (no serial console for I/O). Ports are defin
 | 1032 | Interactive exec PTY I/O (host connects via `VirtioSocketDevice.Connect`) | raw bytes |
 | 1033 | 9P file server (host home dir, read-only) | 9P2000.L |
 | 1034 | SSH agent forwarding (host listens, guest dials) | SSH agent protocol |
+| 1035 | Guest HTTP debug endpoints (host → guest) | HTTP |
 
 The `Msg` envelope in protocol.go has exactly one non-nil field per message.
 
@@ -67,6 +70,14 @@ The VM runs as a background daemon process. All `lnx <command>` invocations are 
 
 - **CWD**: virtiofs share, mounted read-write in the guest at the same path as the host.
 - **Home directory**: 9P over vsock (port 1033), mounted read-only. Host serves via `hugelgupf/p9` localfs. Mount failure is non-fatal.
+
+### 9P security filtering (p9filter.go)
+
+The home directory 9P share blocks sensitive paths via `blockedDirs` in p9filter.go (`.ssh`, `.gnupg`, `.aws`, `.docker`, `.kube`, browser profiles, keychains, etc.). Walk and Readdir calls return `EACCES` for blocked paths. CWD and extra virtiofs shares have no filtering.
+
+### Guest networking (internal/lnxnet/)
+
+Pure Go network stack used by the guest init: ARP, DHCP, ethernet frame handling, IPv4, TCP, UDP, and bridge. No CGO, runs inside the VM.
 
 ### Port forwarding (portfwd.go, cmd/init/portfwd.go)
 

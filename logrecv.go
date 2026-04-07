@@ -8,7 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
+
+var logReceiverShutdownTimeout = time.Second
 
 // startLogReceiver listens on vsockLogPort and appends received log lines
 // to ~/.lnx/lnx.log. Returns a cleanup function.
@@ -55,6 +58,11 @@ func startLogReceiver(listener interface {
 	}()
 
 	return func() {
-		<-done
+		_ = listener.Close()
+		select {
+		case <-done:
+		case <-time.After(logReceiverShutdownTimeout):
+			slog.Warn("log receiver shutdown timed out")
+		}
 	}
 }

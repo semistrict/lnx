@@ -190,6 +190,9 @@ func vmIsRunning() bool {
 
 // spawnDaemon starts the VM daemon as a background process.
 func spawnDaemon() error {
+	// Remove stale error log from any previous daemon run.
+	os.Remove(filepath.Join(instanceDir(), "error.log"))
+
 	self, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("find executable: %w", err)

@@ -217,14 +217,46 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		return nil, fmt.Errorf("start vm: %w", err)
 	}
 
-	ctrlConn := <-vs.ctrlConnCh
+	// Wait for the guest to connect on the control port, with a timeout.
+	// Also watch for VM state changes (crash/stop) so we don't wait forever.
+	var ctrlConn net.Conn
+	stateCh := vm.StateChangedNotify()
+	bootTimer := time.NewTimer(30 * time.Second)
+	defer bootTimer.Stop()
+waitBoot:
+	for {
+		select {
+		case ctrlConn = <-vs.ctrlConnCh:
+			break waitBoot
+		case state := <-stateCh:
+			switch state {
+			case vz.VirtualMachineStateRunning, vz.VirtualMachineStateStarting:
+				continue // expected transient states
+			default:
+				vs.cleanup()
+				lock.unlock()
+				if ephCleanup != nil {
+					ephCleanup()
+				}
+				return nil, fmt.Errorf("VM entered state %v during boot\n%s", state, serialLogTail(sockDir))
+			}
+		case <-bootTimer.C:
+			vs.cleanup()
+			vm.Stop()
+			lock.unlock()
+			if ephCleanup != nil {
+				ephCleanup()
+			}
+			return nil, fmt.Errorf("guest did not connect within 30s\n%s", serialLogTail(sockDir))
+		}
+	}
 	if ctrlConn == nil {
 		vs.cleanup()
 		lock.unlock()
 		if ephCleanup != nil {
 			ephCleanup()
 		}
-		return nil, fmt.Errorf("control connection failed")
+		return nil, fmt.Errorf("control connection failed\n%s", serialLogTail(sockDir))
 	}
 	enc := gob.NewEncoder(ctrlConn)
 	if err := enc.Encode(protocol.Msg{Setup: setupMsg}); err != nil {
@@ -325,7 +357,7 @@ type vsockState struct {
 }
 
 func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.VirtualMachineConfiguration, error) {
-	cmdline := fmt.Sprintf("quiet lnx.epoch=%d", time.Now().Unix())
+	cmdline := fmt.Sprintf("console=hvc0 lnx.epoch=%d", time.Now().Unix())
 
 	bootLoader, err := vz.NewLinuxBootLoader(
 		cfg.KernelPath,
@@ -341,9 +373,23 @@ func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.
 		return nil, fmt.Errorf("vm config: %w", err)
 	}
 
+	if vz.IsNestedVirtualizationSupported() {
+		platform, err := vz.NewGenericPlatformConfiguration()
+		if err != nil {
+			return nil, fmt.Errorf("platform config: %w", err)
+		}
+		if err := platform.SetNestedVirtualizationEnabled(true); err != nil {
+			return nil, fmt.Errorf("enable nested virtualization: %w", err)
+		}
+		vmConfig.SetPlatformVirtualMachineConfiguration(platform)
+	}
+
 	for _, attach := range []func(*vz.VirtualMachineConfiguration) error{
 		func(c *vz.VirtualMachineConfiguration) error { return attachDisks(c, cfg.RootfsPath, swapPath) },
 		func(c *vz.VirtualMachineConfiguration) error { return attachShares(c, cwd, cfg.Shares) },
+		func(c *vz.VirtualMachineConfiguration) error {
+			return attachSerialConsole(c, cfg.socketDir())
+		},
 		attachNetwork,
 		attachMisc,
 	} {
@@ -623,4 +669,18 @@ func excludeEnvKey(key string) bool {
 		}
 	}
 	return false
+}
+
+// serialLogTail returns the last few lines of serial.log for error diagnostics.
+func serialLogTail(dir string) string {
+	data, err := os.ReadFile(filepath.Join(dir, "serial.log"))
+	if err != nil || len(data) == 0 {
+		return "serial.log: (not available)"
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	const maxLines = 20
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return "serial.log:\n" + strings.Join(lines, "\n")
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 
 	"github.com/semistrict/lnx"
@@ -15,7 +16,7 @@ var daemonCmd = &cobra.Command{
 		lnx.InitBinary = initBinary
 		dir := instanceDir()
 
-		return lnx.RunDaemon(&lnx.Config{
+		err := lnx.RunDaemon(&lnx.Config{
 			KernelPath: filepath.Join(lnxBase(), "vmlinuz"),
 			RootfsPath: filepath.Join(dir, "rootfs.ext4"),
 			Hostname:   instanceName + ".lnx",
@@ -25,6 +26,15 @@ var daemonCmd = &cobra.Command{
 			Shares:     loadShares(dir),
 			SocketDir:  dir,
 		})
+		if err != nil {
+			// Write the error to a file so it's visible even when
+			// stderr is nil (daemon spawned by the client).
+			errPath := filepath.Join(dir, "error.log")
+			os.WriteFile(errPath, []byte(err.Error()+"\n"), 0644)
+			return err
+		}
+		os.Remove(filepath.Join(dir, "error.log"))
+		return nil
 	},
 }
 
