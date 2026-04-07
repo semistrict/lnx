@@ -1,4 +1,4 @@
-.PHONY: all cmd/lnx/init lnx kernel rootfs test test-integration install clean help
+.PHONY: all cmd/lnx/init lnx lnx-linux kernel rootfs test test-integration install clean help
 
 all: lnx
 
@@ -7,7 +7,8 @@ help:
 	@echo ""
 	@echo "Build:"
 	@echo "  all              Build the lnx binary (default)"
-	@echo "  lnx              Build the lnx binary with codesign"
+	@echo "  lnx              Build the lnx binary with codesign (macOS)"
+	@echo "  lnx-linux        Build the lnx binary for Linux/arm64"
 	@echo "  install          Install to \$$GOPATH/bin"
 	@echo "  kernel           Build the Linux kernel in Docker"
 	@echo "  rootfs           Build the ext4 rootfs image in Docker"
@@ -28,6 +29,10 @@ cmd/lnx/init:
 lnx: cmd/lnx/init
 	go build -ldflags '-extldflags "-Wl,-no_warn_duplicate_libraries"' -o $@ ./cmd/lnx
 	codesign --entitlements entitlements.plist --force -s - $@
+
+# Build Linux binary (no codesign needed)
+lnx-linux: cmd/lnx/init
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o $@ ./cmd/lnx
 
 # Build kernel in Docker
 kernel:
@@ -63,4 +68,4 @@ install: cmd/lnx/init
 	codesign --entitlements entitlements.plist --force -s - "$$(go env GOPATH)/bin/lnx"
 
 clean:
-	rm -f lnx cmd/lnx/init kernel.Image rootfs.ext4
+	rm -f lnx lnx-linux cmd/lnx/init kernel.Image rootfs.ext4

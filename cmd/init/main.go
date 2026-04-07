@@ -97,12 +97,12 @@ func run() error {
 		}
 	}
 	if setup.CWD != "" {
-		if err := mountCWD(setup.CWD); err != nil {
+		if err := mountCWD(setup.CWD, setup.ShareMethod); err != nil {
 			return err
 		}
 	}
 	for i, path := range setup.Shares {
-		if err := mountShare(path, fmt.Sprintf("share%d", i)); err != nil {
+		if err := mountShare(path, fmt.Sprintf("share%d", i), setup.ShareMethod, i); err != nil {
 			slog.Warn("share mount failed", "path", path, "error", err)
 		}
 	}
@@ -114,6 +114,7 @@ func run() error {
 	}
 
 	mountCgroups()
+	writeNestedDrivesMapping(setup)
 
 	if out, err := exec.Command("/sbin/resize2fs", "/dev/vda").CombinedOutput(); err != nil {
 		slog.Warn("resize2fs failed", "error", err, "output", string(out))

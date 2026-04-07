@@ -1,3 +1,5 @@
+//go:build darwin
+
 package lnx
 
 import (
@@ -7,8 +9,11 @@ import (
 	vz "github.com/Code-Hex/vz/v3"
 )
 
-// attachDisks attaches the rootfs as /dev/vda and a swap image as /dev/vdb.
-func attachDisks(vmConfig *vz.VirtualMachineConfiguration, rootfsPath, swapPath string) error {
+// attachDisks attaches the rootfs as /dev/vda, swap as /dev/vdb, and any
+// nested instance rootfs files as /dev/vdc, /dev/vdd, etc.
+func attachDisks(vmConfig *vz.VirtualMachineConfiguration, rootfsPath, swapPath string, nested []NestedRootfs) error {
+	var devices []vz.StorageDeviceConfiguration
+
 	rootAttach, err := vz.NewDiskImageStorageDeviceAttachment(rootfsPath, false)
 	if err != nil {
 		return fmt.Errorf("root disk attachment: %w", err)
@@ -17,6 +22,7 @@ func attachDisks(vmConfig *vz.VirtualMachineConfiguration, rootfsPath, swapPath 
 	if err != nil {
 		return fmt.Errorf("root block device: %w", err)
 	}
+	devices = append(devices, rootBlock)
 
 	swapAttach, err := vz.NewDiskImageStorageDeviceAttachment(swapPath, false)
 	if err != nil {
@@ -26,8 +32,22 @@ func attachDisks(vmConfig *vz.VirtualMachineConfiguration, rootfsPath, swapPath 
 	if err != nil {
 		return fmt.Errorf("swap block device: %w", err)
 	}
+	devices = append(devices, swapBlock)
 
-	vmConfig.SetStorageDevicesVirtualMachineConfiguration([]vz.StorageDeviceConfiguration{rootBlock, swapBlock})
+	// Nested instance rootfs drives.
+	for _, nr := range nested {
+		attach, err := vz.NewDiskImageStorageDeviceAttachment(nr.RootfsPath, false)
+		if err != nil {
+			return fmt.Errorf("nested disk %s attachment: %w", nr.InstanceName, err)
+		}
+		block, err := vz.NewVirtioBlockDeviceConfiguration(attach)
+		if err != nil {
+			return fmt.Errorf("nested disk %s block device: %w", nr.InstanceName, err)
+		}
+		devices = append(devices, block)
+	}
+
+	vmConfig.SetStorageDevicesVirtualMachineConfiguration(devices)
 	return nil
 }
 

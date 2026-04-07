@@ -28,6 +28,13 @@ const (
 	// GuestHTTPPort is the vsock port the guest listens on for host->guest HTTP access
 	// to guest-local control/debug endpoints.
 	GuestHTTPPort = 1035
+
+	// P9CWDPort is the vsock port for 9P CWD share (host listens, guest dials).
+	// Used on Linux (Firecracker) where virtiofs is unavailable.
+	P9CWDPort = 1036
+	// P9ShareBasePort is the first vsock port for extra 9P shares.
+	// Share i uses port P9ShareBasePort + i.
+	P9ShareBasePort = 1037
 )
 
 // Msg is the envelope for all control messages.
@@ -61,7 +68,23 @@ type Setup struct {
 	HomeDir  string   // host home dir path (e.g. /Users/ramon), mounted read-only
 	Hostname string   // guest hostname (e.g. "default.lnx")
 	SSHAgent bool     // if true, host is forwarding SSH agent on SSHAgentPort
-	Shares   []string // extra virtiofs shares to mount read-write (absolute paths)
+	Shares   []string // extra shares to mount read-write (absolute paths)
+
+	// ShareMethod is "virtiofs" (macOS/VZ) or "9p" (Linux/Firecracker).
+	// Tells the guest how to mount CWD and extra shares.
+	ShareMethod string
+
+	// NestedDrives maps nested instance names to block device paths.
+	// Each nested instance rootfs is attached as a virtio-blk device
+	// (e.g., "default.default" → "/dev/vdc"). The guest writes this
+	// mapping so nested lnx can find its rootfs device.
+	NestedDrives []NestedDrive
+}
+
+// NestedDrive maps a nested instance name to its block device in the guest.
+type NestedDrive struct {
+	InstanceName string // e.g., "default.default"
+	DevicePath   string // e.g., "/dev/vdc"
 }
 
 // Resize tells the guest to update the PTY window size.

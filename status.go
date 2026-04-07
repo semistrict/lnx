@@ -19,11 +19,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	vz "github.com/Code-Hex/vz/v3"
 	"nhooyr.io/websocket"
 
 	"github.com/semistrict/lnx/internal/protocol"
 )
+
+// idleTimeout is how long the daemon waits after the last exec session
+// finishes before shutting down. This allows back-to-back commands like
+// `lnx echo hello && lnx echo world` to reuse the same VM.
+const idleTimeout = 5 * time.Second
 
 // StatusResponse is the JSON structure served to `lnx status` clients.
 type StatusResponse struct {
@@ -55,7 +59,7 @@ type apiServer struct {
 
 	guestCtrlConn net.Conn
 
-	sock *vz.VirtioSocketDevice
+	sock VsockDevice
 	pf   *portForwarder
 
 	sockPath string
@@ -63,8 +67,9 @@ type apiServer struct {
 
 	// Session tracking for daemon mode.
 	activeExecs atomic.Int64
-	idleCh      chan struct{} // closed when active count drops from 1→0
-	idleOnce    sync.Once     // ensures idleCh is closed exactly once
+	idleMu      sync.Mutex    // protects idleTimer and idleCh close
+	idleTimer   *time.Timer   // runs after last exec finishes; fires to close idleCh
+	idleCh      chan struct{} // closed when idle timeout expires
 	stopCh      chan struct{} // closed when /stop is called
 
 	sessionsMu sync.RWMutex
@@ -124,7 +129,9 @@ func (s *apiServer) registerSession(args []string, pty bool, clientPID int, exec
 		execConn:  execConn,
 	}
 	s.sessionsMu.Unlock()
-	s.activeExecs.Add(1)
+	if s.activeExecs.Add(1) == 1 {
+		s.cancelIdleTimer()
+	}
 	return id
 }
 
@@ -177,26 +184,66 @@ func (s *apiServer) signalSession(id string, sig int) bool {
 }
 
 // unregisterSession removes a session and decrements the exec counter.
-// If the counter drops to zero, idleCh is closed.
+// If the counter drops to zero, the idle timer is started.
 func (s *apiServer) unregisterSession(id string) {
 	s.sessionsMu.Lock()
 	delete(s.sessions, id)
 	s.sessionsMu.Unlock()
 	if s.activeExecs.Add(-1) == 0 {
-		s.idleOnce.Do(func() { close(s.idleCh) })
+		s.startIdleTimer()
 	}
 }
 
 // execStarted increments the active exec counter (for non-tracked sessions like Run()).
+// If the counter was zero (idle timer may be running), the timer is cancelled.
 func (s *apiServer) execStarted() {
-	s.activeExecs.Add(1)
+	if s.activeExecs.Add(1) == 1 {
+		s.cancelIdleTimer()
+	}
 }
 
 // execFinished decrements the active exec counter. If it drops to zero,
-// idleCh is closed to signal the daemon to shut down.
+// the idle timer is started.
 func (s *apiServer) execFinished() {
 	if s.activeExecs.Add(-1) == 0 {
-		s.idleOnce.Do(func() { close(s.idleCh) })
+		s.startIdleTimer()
+	}
+}
+
+// startIdleTimer begins the idle countdown. If the timer fires without
+// being cancelled by a new exec session, idleCh is closed and the daemon
+// will shut down.
+func (s *apiServer) startIdleTimer() {
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+
+	select {
+	case <-s.idleCh:
+		return // already shut down
+	default:
+	}
+
+	s.idleTimer = time.AfterFunc(idleTimeout, func() {
+		s.idleMu.Lock()
+		defer s.idleMu.Unlock()
+		if s.activeExecs.Load() == 0 {
+			select {
+			case <-s.idleCh:
+			default:
+				slog.Info("idle timeout expired, shutting down")
+				close(s.idleCh)
+			}
+		}
+	})
+}
+
+// cancelIdleTimer stops a pending idle timer if one is running.
+func (s *apiServer) cancelIdleTimer() {
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	if s.idleTimer != nil {
+		s.idleTimer.Stop()
+		s.idleTimer = nil
 	}
 }
 
@@ -311,6 +358,9 @@ func (s *apiServer) listenUnix(sockPath string) error {
 	if err != nil {
 		return fmt.Errorf("listen unix %s: %w", sockPath, err)
 	}
+	// Make the socket world-accessible so non-root clients can connect
+	// (the daemon may run as root while clients run as the regular user).
+	os.Chmod(sockPath, 0666)
 	s.sockPath = sockPath
 	s.listener = ln
 

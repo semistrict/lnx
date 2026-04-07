@@ -42,16 +42,46 @@ func mountRootfs() error {
 	return nil
 }
 
-// mountHome mounts the host home directory via 9P over vsock.
-// The guest dials the host's 9P server, duplicates the fd (to take it
-// out of Go's runtime poller), and passes it to the kernel 9p mount.
+// mountHome mounts the host home directory via 9P over vsock (read-only).
 func mountHome(homeDir string) error {
-	conn, err := vsock.Dial(vsockHostCID, protocol.P9Port, nil)
+	target := "/mnt" + homeDir
+	os.MkdirAll(target, 0755)
+	return mount9P(target, protocol.P9Port, true)
+}
+
+func mountCWD(cwdPath, method string) error {
+	target := "/mnt" + cwdPath
+	os.MkdirAll(target, 0755)
+
+	if method == "9p" {
+		return mount9P(target, protocol.P9CWDPort, false)
+	}
+	if err := syscall.Mount("cwd", target, "virtiofs", 0, ""); err != nil {
+		return fmt.Errorf("mount virtiofs cwd on %s: %w", target, err)
+	}
+	return nil
+}
+
+func mountShare(path, tag, method string, index int) error {
+	target := "/mnt" + path
+	os.MkdirAll(target, 0755)
+
+	if method == "9p" {
+		return mount9P(target, protocol.P9ShareBasePort+uint32(index), false)
+	}
+	if err := syscall.Mount(tag, target, "virtiofs", 0, ""); err != nil {
+		return fmt.Errorf("mount virtiofs share %s on %s: %w", tag, target, err)
+	}
+	return nil
+}
+
+// mount9P dials a 9P server on the host via vsock and mounts it at target.
+func mount9P(target string, port uint32, readOnly bool) error {
+	conn, err := vsock.Dial(vsockHostCID, port, nil)
 	if err != nil {
-		return fmt.Errorf("vsock dial 9p: %w", err)
+		return fmt.Errorf("vsock dial 9p port %d: %w", port, err)
 	}
 
-	// Dup the fd so the kernel owns a copy independent of Go's poller.
 	rawConn, err := conn.SyscallConn()
 	if err != nil {
 		conn.Close()
@@ -63,39 +93,19 @@ func mountHome(homeDir string) error {
 	rawConn.Control(func(f uintptr) {
 		fd, dupErr = syscall.Dup(int(f))
 	})
-	// Close the original Go-managed connection now that we have a dup.
 	conn.Close()
 	if dupErr != nil {
 		return fmt.Errorf("9p dup fd: %w", dupErr)
 	}
 
-	target := "/mnt" + homeDir
-	os.MkdirAll(target, 0755)
-
+	var flags uintptr
+	if readOnly {
+		flags = syscall.MS_RDONLY
+	}
 	opts := fmt.Sprintf("trans=fd,rfdno=%d,wfdno=%d,version=9p2000.L,msize=1048576", fd, fd)
-	if err := syscall.Mount("home", target, "9p", syscall.MS_RDONLY, opts); err != nil {
+	if err := syscall.Mount("9p", target, "9p", flags, opts); err != nil {
 		syscall.Close(fd)
-		return fmt.Errorf("mount home 9p on %s: %w", target, err)
-	}
-
-	// Don't close fd — the kernel holds it for the mount.
-	return nil
-}
-
-func mountCWD(cwdPath string) error {
-	target := "/mnt" + cwdPath
-	os.MkdirAll(target, 0755)
-	if err := syscall.Mount("cwd", target, "virtiofs", 0, ""); err != nil {
-		return fmt.Errorf("mount virtiofs on %s: %w", target, err)
-	}
-	return nil
-}
-
-func mountShare(path, tag string) error {
-	target := "/mnt" + path
-	os.MkdirAll(target, 0755)
-	if err := syscall.Mount(tag, target, "virtiofs", 0, ""); err != nil {
-		return fmt.Errorf("mount virtiofs share %s on %s: %w", tag, target, err)
+		return fmt.Errorf("mount 9p on %s (port %d): %w", target, port, err)
 	}
 	return nil
 }

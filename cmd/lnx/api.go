@@ -13,11 +13,21 @@ import (
 
 // apiClientFor returns an HTTP client that talks to a specific instance's unix socket.
 func apiClientFor(name string) *http.Client {
-	sockPath := filepath.Join(lnxBase(), "instances", name, "status.sock")
+	sockPaths := []string{
+		filepath.Join(lnxBase(), "instances", name, "status.sock"),
+		filepath.Join("/var/lib/lnx/instances", name, "status.sock"),
+		filepath.Join("/var/run/lnx", name, "status.sock"),
+	}
 	return &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return net.DialTimeout("unix", sockPath, 2*time.Second)
+				for _, sp := range sockPaths {
+					conn, err := net.DialTimeout("unix", sp, 2*time.Second)
+					if err == nil {
+						return conn, nil
+					}
+				}
+				return nil, fmt.Errorf("no status socket for instance %q", name)
 			},
 		},
 	}
@@ -25,7 +35,7 @@ func apiClientFor(name string) *http.Client {
 
 // apiClient returns an HTTP client for the current --instance.
 func apiClient() *http.Client {
-	return apiClientFor(instanceName)
+	return apiClientFor(qualifiedInstanceName())
 }
 
 // runningInstances returns a list of instance names that have a reachable status.sock.

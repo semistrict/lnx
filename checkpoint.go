@@ -5,8 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // checkpoint clones the rootfs to the checkpoint directory.
@@ -19,8 +17,8 @@ func checkpoint(rootfsPath, checkpointDir string) (string, error) {
 	name := time.Now().Format("2006-01-02T15-04-05")
 	dst := filepath.Join(checkpointDir, name+".ext4")
 
-	if err := unix.Clonefile(rootfsPath, dst, 0); err != nil {
-		return "", fmt.Errorf("clonefile %s -> %s: %w", rootfsPath, dst, err)
+	if err := cloneFile(rootfsPath, dst); err != nil {
+		return "", fmt.Errorf("clone %s -> %s: %w", rootfsPath, dst, err)
 	}
 
 	return dst, nil

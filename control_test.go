@@ -16,13 +16,17 @@ func TestControlProtocol_SetupDelivered(t *testing.T) {
 	defer guestConn.Close()
 
 	setup := &protocol.Setup{
-		CWD:      "/tmp",
-		User:     "ramon",
-		UID:      501,
-		HomeDir:  "/Users/ramon",
-		Env:      []string{"FOO=bar"},
-		Hostname: "default.lnx",
-		SSHAgent: true,
+		CWD:         "/tmp",
+		User:        "ramon",
+		UID:         501,
+		HomeDir:     "/Users/ramon",
+		Env:         []string{"FOO=bar"},
+		Hostname:    "default.lnx",
+		SSHAgent:    true,
+		ShareMethod: "virtiofs",
+		NestedDrives: []protocol.NestedDrive{
+			{InstanceName: "default.default", DevicePath: "/dev/vdc"},
+		},
 	}
 
 	go func() {
@@ -41,6 +45,10 @@ func TestControlProtocol_SetupDelivered(t *testing.T) {
 	assert.Equal(t, []string{"FOO=bar"}, msg.Setup.Env)
 	assert.Equal(t, "default.lnx", msg.Setup.Hostname)
 	assert.True(t, msg.Setup.SSHAgent)
+	assert.Equal(t, "virtiofs", msg.Setup.ShareMethod)
+	require.Len(t, msg.Setup.NestedDrives, 1)
+	assert.Equal(t, "default.default", msg.Setup.NestedDrives[0].InstanceName)
+	assert.Equal(t, "/dev/vdc", msg.Setup.NestedDrives[0].DevicePath)
 }
 
 func TestControlProtocol_SignalDelivered(t *testing.T) {

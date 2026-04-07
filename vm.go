@@ -15,8 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	vz "github.com/Code-Hex/vz/v3"
-	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 
 	"github.com/semistrict/lnx/internal/protocol"
@@ -28,7 +26,7 @@ var hostLogOnce sync.Once
 
 // bootedVM holds a booted VM and its infrastructure, ready for exec sessions.
 type bootedVM struct {
-	vm       *vz.VirtualMachine
+	vm       VirtualMachine
 	vs       *vsockState
 	ctrlConn net.Conn
 	ctrlEnc  *gob.Encoder
@@ -66,7 +64,7 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		ephCleanup = func() { os.RemoveAll(tmpDir) }
 
 		ephRootfs := filepath.Join(tmpDir, "rootfs.ext4")
-		if err := unix.Clonefile(cfg.RootfsPath, ephRootfs, 0); err != nil {
+		if err := cloneFile(cfg.RootfsPath, ephRootfs); err != nil {
 			ephCleanup()
 			return nil, fmt.Errorf("clone ephemeral rootfs: %w", err)
 		}
@@ -84,6 +82,7 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 			Hostname:      cfg.Hostname,
 			SSHAgent:      cfg.SSHAgent,
 			SocketDir:     cfg.SocketDir,
+			NestedRootfs:  cfg.NestedRootfs,
 		}
 	}
 
@@ -109,7 +108,14 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		}
 	}
 
-	initrdDir := filepath.Dir(cfg.RootfsPath)
+	// Use socketDir as the work directory for derived files when rootfs
+	// is a block device (filepath.Dir("/dev/vdc") = "/dev", not writable).
+	workDir := filepath.Dir(cfg.RootfsPath)
+	if strings.HasPrefix(cfg.RootfsPath, "/dev/") {
+		workDir = cfg.socketDir()
+	}
+
+	initrdDir := workDir
 	if cfg.InitramfsPath != "" {
 		initrdDir = filepath.Dir(cfg.InitramfsPath)
 	}
@@ -144,22 +150,13 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 	}
 	uid, _ := strconv.Atoi(u.Uid)
 
-	swapPath := filepath.Join(filepath.Dir(cfg.RootfsPath), "swap.img")
+	swapPath := filepath.Join(workDir, "swap.img")
 	if err := ensureSwapFile(swapPath, cfg.memoryBytes()); err != nil {
 		lock.unlock()
 		if ephCleanup != nil {
 			ephCleanup()
 		}
 		return nil, fmt.Errorf("swap file: %w", err)
-	}
-
-	vmConfig, err := buildVMConfig(cfg, initrdPath, cwd, swapPath, u.HomeDir)
-	if err != nil {
-		lock.unlock()
-		if ephCleanup != nil {
-			ephCleanup()
-		}
-		return nil, err
 	}
 
 	hostname := cfg.Hostname
@@ -179,28 +176,50 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		}
 	}
 
-	setupMsg := &protocol.Setup{
-		CWD:      cwd,
-		Env:      buildGuestEnv(cfg.Env),
-		User:     u.Username,
-		UID:      uid,
-		HomeDir:  u.HomeDir,
-		Hostname: hostname,
-		SSHAgent: sshAgent,
-		Shares:   cfg.Shares,
+	// Pass LNX_PARENT so nested lnx instances know their parent.
+	parentInstance := os.Getenv("LNX_INSTANCE")
+	if parentInstance == "" {
+		parentInstance = "default"
+	}
+	if existing := os.Getenv("LNX_PARENT"); existing != "" {
+		parentInstance = existing + "." + parentInstance
 	}
 
-	vm, err := vz.NewVirtualMachine(vmConfig)
+	// Build nested drive mapping: each nested rootfs gets a device starting at vdc.
+	var nestedDrives []protocol.NestedDrive
+	for i, nr := range cfg.NestedRootfs {
+		devLetter := 'c' + rune(i) // vdc, vdd, vde, ...
+		nestedDrives = append(nestedDrives, protocol.NestedDrive{
+			InstanceName: nr.InstanceName,
+			DevicePath:   fmt.Sprintf("/dev/vd%c", devLetter),
+		})
+	}
+
+	setupMsg := &protocol.Setup{
+		CWD:          cwd,
+		Env:          buildGuestEnv(cfg.Env),
+		User:         u.Username,
+		UID:          uid,
+		HomeDir:      u.HomeDir,
+		Hostname:     hostname,
+		SSHAgent:     sshAgent,
+		Shares:       cfg.Shares,
+		ShareMethod:  shareMethod(),
+		NestedDrives: nestedDrives,
+	}
+	setupMsg.Env = append(setupMsg.Env, "LNX_PARENT="+parentInstance)
+
+	vm, err := buildVM(cfg, initrdPath, cwd, swapPath, u.HomeDir)
 	if err != nil {
 		lock.unlock()
 		if ephCleanup != nil {
 			ephCleanup()
 		}
-		return nil, fmt.Errorf("create vm: %w", err)
+		return nil, err
 	}
 
 	sockDir := cfg.socketDir()
-	vs, err := setupVsock(vm, sockDir, cfg.RootfsPath, setupMsg)
+	vs, err := setupVsock(vm.VsockDevice(), sockDir, cfg.RootfsPath, setupMsg)
 	if err != nil {
 		lock.unlock()
 		if ephCleanup != nil {
@@ -230,7 +249,7 @@ waitBoot:
 			break waitBoot
 		case state := <-stateCh:
 			switch state {
-			case vz.VirtualMachineStateRunning, vz.VirtualMachineStateStarting:
+			case VMStateRunning, VMStateStarting:
 				continue // expected transient states
 			default:
 				vs.cleanup()
@@ -356,68 +375,7 @@ type vsockState struct {
 	cleanup    func()
 }
 
-func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.VirtualMachineConfiguration, error) {
-	cmdline := fmt.Sprintf("console=hvc0 lnx.epoch=%d", time.Now().Unix())
-
-	bootLoader, err := vz.NewLinuxBootLoader(
-		cfg.KernelPath,
-		vz.WithCommandLine(cmdline),
-		vz.WithInitrd(initrdPath),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("boot loader: %w", err)
-	}
-
-	vmConfig, err := vz.NewVirtualMachineConfiguration(bootLoader, cfg.cpus(), cfg.memoryBytes())
-	if err != nil {
-		return nil, fmt.Errorf("vm config: %w", err)
-	}
-
-	if vz.IsNestedVirtualizationSupported() {
-		platform, err := vz.NewGenericPlatformConfiguration()
-		if err != nil {
-			return nil, fmt.Errorf("platform config: %w", err)
-		}
-		if err := platform.SetNestedVirtualizationEnabled(true); err != nil {
-			return nil, fmt.Errorf("enable nested virtualization: %w", err)
-		}
-		vmConfig.SetPlatformVirtualMachineConfiguration(platform)
-	}
-
-	for _, attach := range []func(*vz.VirtualMachineConfiguration) error{
-		func(c *vz.VirtualMachineConfiguration) error { return attachDisks(c, cfg.RootfsPath, swapPath) },
-		func(c *vz.VirtualMachineConfiguration) error { return attachShares(c, cwd, cfg.Shares) },
-		func(c *vz.VirtualMachineConfiguration) error {
-			return attachSerialConsole(c, cfg.socketDir())
-		},
-		attachNetwork,
-		attachMisc,
-	} {
-		if err := attach(vmConfig); err != nil {
-			return nil, err
-		}
-	}
-
-	vsockConfig, err := vz.NewVirtioSocketDeviceConfiguration()
-	if err != nil {
-		return nil, fmt.Errorf("vsock config: %w", err)
-	}
-	vmConfig.SetSocketDevicesVirtualMachineConfiguration([]vz.SocketDeviceConfiguration{vsockConfig})
-
-	if ok, err := vmConfig.Validate(); !ok || err != nil {
-		return nil, fmt.Errorf("validate config: %w", err)
-	}
-
-	return vmConfig, nil
-}
-
-func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, setupMsg *protocol.Setup) (*vsockState, error) {
-	socketDevices := vm.SocketDevices()
-	if len(socketDevices) == 0 {
-		return nil, fmt.Errorf("no vsock devices")
-	}
-	sock := socketDevices[0]
-
+func setupVsock(sock VsockDevice, logDir, rootfsPath string, setupMsg *protocol.Setup) (*vsockState, error) {
 	logListener, err := sock.Listen(vsockLogPort)
 	if err != nil {
 		return nil, fmt.Errorf("vsock log listen: %w", err)
@@ -465,6 +423,30 @@ func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, setupMsg *prot
 		return nil, fmt.Errorf("vsock 9p listen: %w", err)
 	}
 	start9PServer(p9Listener, setupMsg.HomeDir)
+
+	// Additional 9P servers for CWD and shares when virtiofs is unavailable.
+	var p9ShareListeners []net.Listener
+	if setupMsg.ShareMethod == "9p" {
+		// CWD share.
+		cwdListener, err := sock.Listen(protocol.P9CWDPort)
+		if err != nil {
+			slog.Warn("vsock cwd 9p listen failed", "error", err)
+		} else {
+			start9PServerUnfiltered(cwdListener, setupMsg.CWD)
+			p9ShareListeners = append(p9ShareListeners, cwdListener)
+		}
+
+		// Extra shares.
+		for i, path := range setupMsg.Shares {
+			shareListener, err := sock.Listen(protocol.P9ShareBasePort + uint32(i))
+			if err != nil {
+				slog.Warn("vsock share 9p listen failed", "path", path, "error", err)
+				continue
+			}
+			start9PServerUnfiltered(shareListener, path)
+			p9ShareListeners = append(p9ShareListeners, shareListener)
+		}
+	}
 
 	var sshAgentListener net.Listener
 	if setupMsg.SSHAgent {
@@ -525,6 +507,9 @@ func setupVsock(vm *vz.VirtualMachine, logDir, rootfsPath string, setupMsg *prot
 		if sshAgentListener != nil {
 			sshAgentListener.Close()
 		}
+		for _, l := range p9ShareListeners {
+			l.Close()
+		}
 		p9Listener.Close()
 		portFwdListener.Close()
 		guestCtrlListener.Close()
@@ -569,27 +554,6 @@ func forwardSignals(conn net.Conn, enc *gob.Encoder, forceQuitCh chan struct{}) 
 			}})
 		}
 	}
-}
-
-func shutdownVM(vm *vz.VirtualMachine, exitCode int, cleanup func()) (int, error) {
-	defer cleanup()
-
-	if exitCode == 130 {
-		vm.Stop()
-		return exitCode, nil
-	}
-
-	vm.RequestStop()
-	stateCh := vm.StateChangedNotify()
-	select {
-	case <-time.After(3 * time.Second):
-		vm.Stop()
-	case state := <-stateCh:
-		if state != vz.VirtualMachineStateStopped {
-			vm.Stop()
-		}
-	}
-	return exitCode, nil
 }
 
 func validatePaths(cfg *Config) error {

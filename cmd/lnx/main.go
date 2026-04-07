@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -120,6 +119,9 @@ func stripLnxFlags(args []string) []string {
 			instanceName = strings.TrimPrefix(a, "--instance=")
 			instanceFlag = true
 			i++
+		case a == "--":
+			// Explicit end of lnx flags — everything after is the guest command.
+			return append([]string(nil), args[i+1:]...)
 		default:
 			// First non-flag arg — everything from here is the guest command.
 			return append([]string(nil), args[i:]...)
@@ -179,19 +181,37 @@ func runVM(args []string) (int, error) {
 
 // vmIsRunning checks if a VM daemon is running for the current instance.
 func vmIsRunning() bool {
-	sockPath := filepath.Join(instanceDir(), "status.sock")
-	conn, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
-	if err != nil {
-		return false
+	for _, sockPath := range statusSockPaths() {
+		conn, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return true
+		}
 	}
-	conn.Close()
-	return true
+	return false
+}
+
+// statusSockPaths returns the possible locations for status.sock.
+// Normal instances use the instance dir; nested instances use a local work dir.
+func statusSockPaths() []string {
+	qname := qualifiedInstanceName()
+	return []string{
+		filepath.Join(instanceDir(), "status.sock"),
+		filepath.Join("/var/lib/lnx/instances", qname, "status.sock"),
+		filepath.Join("/var/run/lnx", qname, "status.sock"),
+	}
 }
 
 // spawnDaemon starts the VM daemon as a background process.
 func spawnDaemon() error {
-	// Remove stale error log from any previous daemon run.
+	// Remove stale error/spawn logs from any previous daemon run.
+	// These may be owned by root (daemon runs as root), so try both.
+	qname := qualifiedInstanceName()
+	workDir := filepath.Join("/var/lib/lnx/instances", qname)
 	os.Remove(filepath.Join(instanceDir(), "error.log"))
+	os.Remove(filepath.Join(workDir, "error.log"))
+	os.Remove(filepath.Join(workDir, "daemon-spawn.log"))
+	os.MkdirAll(workDir, 0777)
 
 	self, err := os.Executable()
 	if err != nil {
@@ -209,16 +229,24 @@ func spawnDaemon() error {
 		daemonArgs = append(daemonArgs, "--ssh-agent")
 	}
 
-	cmd := exec.Command(self, daemonArgs...)
+	cmd := buildDaemonCmd(self, daemonArgs)
+	// Capture daemon stderr for debugging if it fails to start.
+	daemonLogDir := filepath.Join("/var/lib/lnx/instances", qname)
+	os.MkdirAll(daemonLogDir, 0755)
+	if f, err := os.Create(filepath.Join(daemonLogDir, "daemon-spawn.log")); err == nil {
+		cmd.Stderr = f
+		// f is intentionally not closed — the daemon process owns it.
+	}
 	cmd.Stdout = nil
-	cmd.Stderr = nil
 	cmd.Stdin = nil
 	// Detach from the parent process group so the daemon survives.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start daemon: %w", err)
+		return fmt.Errorf("start daemon %v: %w", cmd.Args, err)
 	}
+
+	slog.Debug("daemon spawned", "pid", cmd.Process.Pid, "args", cmd.Args)
 
 	// Release the process so it doesn't become a zombie.
 	cmd.Process.Release()
@@ -252,6 +280,17 @@ func lnxBase() string {
 }
 
 // instanceDir returns the directory for the current instance (~/.lnx/instances/<name>).
+// When LNX_PARENT is set (nested VM), the instance name is prefixed:
+// e.g., LNX_PARENT=default + instanceName=default → "default.default".
 func instanceDir() string {
-	return filepath.Join(lnxBase(), "instances", instanceName)
+	return filepath.Join(lnxBase(), "instances", qualifiedInstanceName())
+}
+
+// qualifiedInstanceName returns the instance name with parent prefix if nested.
+func qualifiedInstanceName() string {
+	parent := os.Getenv("LNX_PARENT")
+	if parent == "" {
+		return instanceName
+	}
+	return parent + "." + instanceName
 }

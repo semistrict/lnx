@@ -207,25 +207,43 @@ func execInteractive(args []string) (int, error) {
 // waitForVM polls status.sock until the daemon is ready, up to timeout.
 // If the daemon exits with an error, it reads error.log for diagnostics.
 func waitForVM(timeout time.Duration) error {
-	dir := instanceDir()
-	sockPath := filepath.Join(dir, "status.sock")
-	errPath := filepath.Join(dir, "error.log")
+	sockPaths := statusSockPaths()
+	// Only check error.log paths the daemon can write to.
+	// For nested instances (LNX_PARENT set), the instance dir may be
+	// on a read-only mount with stale logs from previous attempts.
+	qname := qualifiedInstanceName()
+	var errPaths []string
+	if os.Getenv("LNX_PARENT") != "" {
+		errPaths = []string{filepath.Join("/var/lib/lnx/instances", qname, "error.log")}
+	} else {
+		errPaths = []string{filepath.Join(instanceDir(), "error.log")}
+	}
+
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
-		if err == nil {
-			conn.Close()
-			return nil
+		for _, sp := range sockPaths {
+			conn, err := net.DialTimeout("unix", sp, 500*time.Millisecond)
+			if err == nil {
+				conn.Close()
+				return nil
+			}
 		}
-		// Check if the daemon wrote an error before exiting.
-		if data, ferr := os.ReadFile(errPath); ferr == nil && len(data) > 0 {
-			return fmt.Errorf("VM failed to start: %s", strings.TrimSpace(string(data)))
+		if msg := readFirstErrorLog(errPaths); msg != "" {
+			return fmt.Errorf("VM failed to start: %s", msg)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	// One last check for error.log.
-	if data, err := os.ReadFile(errPath); err == nil && len(data) > 0 {
-		return fmt.Errorf("VM failed to start: %s", strings.TrimSpace(string(data)))
+	if msg := readFirstErrorLog(errPaths); msg != "" {
+		return fmt.Errorf("VM failed to start: %s", msg)
 	}
 	return fmt.Errorf("timed out waiting for VM to start")
+}
+
+func readFirstErrorLog(paths []string) string {
+	for _, p := range paths {
+		if data, err := os.ReadFile(p); err == nil && len(data) > 0 {
+			return strings.TrimSpace(string(data))
+		}
+	}
+	return ""
 }

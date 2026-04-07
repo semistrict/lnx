@@ -5,11 +5,39 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
-	"golang.org/x/sys/unix"
 )
+
+// findDefaultRootfs returns the path to a default rootfs to clone from.
+// Tries the un-prefixed "default" first (host's rootfs, always available
+// via the ~/.lnx share), then the qualified name for this nesting level.
+func findDefaultRootfs() string {
+	candidates := []string{
+		filepath.Join(lnxBase(), "instances", "default", "rootfs.ext4"),
+	}
+	qualified := qualifyName("default")
+	if qualified != "default" {
+		candidates = append(candidates, filepath.Join(lnxBase(), "instances", qualified, "rootfs.ext4"))
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// qualifyName prefixes an instance name with LNX_PARENT when nested.
+func qualifyName(name string) string {
+	parent := os.Getenv("LNX_PARENT")
+	if parent == "" {
+		return name
+	}
+	return parent + "." + name
+}
 
 var instanceCmd = &cobra.Command{
 	Use:   "instance",
@@ -106,7 +134,7 @@ func runInstanceList(cmd *cobra.Command, args []string) error {
 }
 
 func runInstanceCreate(cmd *cobra.Command, args []string) error {
-	name := args[0]
+	name := qualifyName(args[0])
 	if name == "default" {
 		return fmt.Errorf("cannot create instance named 'default' (use 'lnx init' instead)")
 	}
@@ -116,9 +144,11 @@ func runInstanceCreate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("instance %q already exists", name)
 	}
 
-	defaultRootfs := filepath.Join(lnxBase(), "instances", "default", "rootfs.ext4")
-	if _, err := os.Stat(defaultRootfs); os.IsNotExist(err) {
-		return fmt.Errorf("default instance not found — run 'lnx init' first")
+	// Find the source rootfs: try the host's "default" first (always available
+	// via ~/.lnx share), then fall back to the qualified name for this nesting level.
+	defaultRootfs := findDefaultRootfs()
+	if defaultRootfs == "" {
+		return fmt.Errorf("no default rootfs found — run 'lnx init' first")
 	}
 
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -126,7 +156,7 @@ func runInstanceCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	dst := filepath.Join(dir, "rootfs.ext4")
-	if err := unix.Clonefile(defaultRootfs, dst, 0); err != nil {
+	if err := cloneRootfs(defaultRootfs, dst); err != nil {
 		os.RemoveAll(dir)
 		return fmt.Errorf("clone rootfs: %w", err)
 	}
@@ -136,7 +166,7 @@ func runInstanceCreate(cmd *cobra.Command, args []string) error {
 }
 
 func runInstanceInit(cmd *cobra.Command, args []string) error {
-	name := args[0]
+	name := qualifyName(args[0])
 	dir := filepath.Join(lnxBase(), "instances", name)
 
 	if _, err := os.Stat(filepath.Join(dir, "rootfs.ext4")); err == nil {
@@ -167,12 +197,12 @@ func runInstanceInit(cmd *cobra.Command, args []string) error {
 		}
 	} else {
 		// Clone from default instance if it exists.
-		defaultRootfs := filepath.Join(lnxBase(), "instances", "default", "rootfs.ext4")
-		if _, err := os.Stat(defaultRootfs); os.IsNotExist(err) {
+		defaultRootfs := findDefaultRootfs()
+		if defaultRootfs == "" {
 			os.RemoveAll(dir)
-			return fmt.Errorf("no --rootfs specified and default instance not found — run 'lnx init' first")
+			return fmt.Errorf("no --rootfs specified and no default rootfs found — run 'lnx init' first")
 		}
-		if err := unix.Clonefile(defaultRootfs, rootfsDest, 0); err != nil {
+		if err := cloneRootfs(defaultRootfs, rootfsDest); err != nil {
 			os.RemoveAll(dir)
 			return fmt.Errorf("clone rootfs from default: %w", err)
 		}
@@ -184,7 +214,7 @@ func runInstanceInit(cmd *cobra.Command, args []string) error {
 }
 
 func runInstanceDelete(cmd *cobra.Command, args []string) error {
-	name := args[0]
+	name := qualifyName(args[0])
 	if name == "default" {
 		return fmt.Errorf("cannot delete the default instance")
 	}
@@ -206,10 +236,10 @@ func runInstanceDelete(cmd *cobra.Command, args []string) error {
 	lockPath := filepath.Join(dir, "rootfs.ext4.lock")
 	if f, err := os.OpenFile(lockPath, os.O_RDWR, 0); err == nil {
 		defer f.Close()
-		if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 			return fmt.Errorf("instance %q rootfs is locked — another process may be using it", name)
 		}
-		unix.Flock(int(f.Fd()), unix.LOCK_UN)
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 	}
 
 	if err := os.RemoveAll(dir); err != nil {

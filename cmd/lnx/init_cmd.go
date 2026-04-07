@@ -76,11 +76,28 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("  rootfs: %s\n", rootfsDest)
 
+	if err := downloadFirecracker(); err != nil {
+		return err
+	}
+
+	// Install the Firecracker kernel for nested VM support.
+	fcKernelDest := filepath.Join(base, "vmlinuz-firecracker")
+	if _, err := os.Stat(fcKernelDest); os.IsNotExist(err) {
+		// Try to download from release, or copy from local repo.
+		if err := downloadRelease(fcKernelDest, "vmlinuz-firecracker"); err != nil {
+			fmt.Fprintf(os.Stderr, "  vmlinuz-firecracker: skipped (%v)\n", err)
+		}
+	} else {
+		fmt.Printf("  vmlinuz-firecracker: %s (already exists)\n", fcKernelDest)
+	}
+
 	fmt.Println("lnx init complete")
 	return nil
 }
 
 // autoInit downloads kernel and rootfs if they don't exist.
+// When running nested (LNX_PARENT is set), clones from the host's
+// default rootfs instead of downloading.
 func autoInit() error {
 	base := lnxBase()
 	os.MkdirAll(base, 0755)
@@ -94,8 +111,22 @@ func autoInit() error {
 	}
 
 	rootfsDest := filepath.Join(dir, "rootfs.ext4")
-	if err := downloadRelease(rootfsDest, "rootfs.ext4.zst"); err != nil {
-		return fmt.Errorf("download rootfs: %w", err)
+	if _, err := os.Stat(rootfsDest); os.IsNotExist(err) {
+		// Try to clone from an existing default rootfs first (fast, works nested).
+		if src := findDefaultRootfs(); src != "" {
+			fmt.Fprintf(os.Stderr, "  cloning rootfs from %s\n", src)
+			if err := cloneRootfs(src, rootfsDest); err != nil {
+				return fmt.Errorf("clone rootfs: %w", err)
+			}
+		} else {
+			if err := downloadRelease(rootfsDest, "rootfs.ext4.zst"); err != nil {
+				return fmt.Errorf("download rootfs: %w", err)
+			}
+		}
+	}
+
+	if err := downloadFirecracker(); err != nil {
+		return fmt.Errorf("download firecracker: %w", err)
 	}
 
 	fmt.Fprintln(os.Stderr, "init complete")
@@ -205,6 +236,57 @@ func (p *progressReader) print() {
 func (p *progressReader) finish() {
 	p.print()
 	fmt.Fprintln(os.Stderr)
+}
+
+const firecrackerVersion = "v1.12.0"
+
+// downloadFirecracker downloads the Firecracker binary for nested VM support.
+// Always downloads the Linux arm64 binary (on macOS it's used inside the guest).
+func downloadFirecracker() error {
+	binDir := filepath.Join(lnxBase(), "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		return fmt.Errorf("create bin dir: %w", err)
+	}
+
+	fcPath := filepath.Join(binDir, "firecracker")
+	if _, err := os.Stat(fcPath); err == nil {
+		fmt.Printf("  firecracker: %s (already exists)\n", fcPath)
+		return nil
+	}
+
+	url := fmt.Sprintf(
+		"https://github.com/firecracker-microvm/firecracker/releases/download/%s/firecracker-%s-aarch64.tgz",
+		firecrackerVersion, firecrackerVersion,
+	)
+	fmt.Printf("  downloading firecracker %s\n", firecrackerVersion)
+
+	// Download and extract to a temp dir, then copy the binary.
+	tmpDir, err := os.MkdirTemp("", "lnx-fc-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cmd := exec.Command("sh", "-c",
+		fmt.Sprintf("curl -fSL %q | tar xz --strip-components=1 -C %q --wildcards '*/firecracker-*-aarch64'",
+			url, tmpDir))
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("download: %w", err)
+	}
+
+	// The extracted binary has the version in its name.
+	extracted := filepath.Join(tmpDir, fmt.Sprintf("firecracker-%s-aarch64", firecrackerVersion))
+	if err := copyFile(fcPath, extracted); err != nil {
+		return fmt.Errorf("copy firecracker: %w", err)
+	}
+	if err := os.Chmod(fcPath, 0755); err != nil {
+		return fmt.Errorf("chmod firecracker: %w", err)
+	}
+
+	fmt.Printf("  firecracker: %s\n", fcPath)
+	return nil
 }
 
 func copyFile(dst, src string) error {

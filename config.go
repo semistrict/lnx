@@ -1,10 +1,6 @@
 package lnx
 
-import (
-	"encoding/binary"
-	"path/filepath"
-	"syscall"
-)
+import "path/filepath"
 
 // Config holds the configuration for a VM instance.
 type Config struct {
@@ -63,6 +59,16 @@ type Config struct {
 	// Useful for ephemeral mode where the rootfs is in a temp dir but
 	// the socket must be in the instance dir for clients to find it.
 	SocketDir string
+
+	// NestedRootfs is a list of rootfs file paths for nested VM instances.
+	// Each is attached as an additional virtio-blk device (vdc, vdd, ...).
+	NestedRootfs []NestedRootfs
+}
+
+// NestedRootfs pairs a nested instance name with its rootfs file path.
+type NestedRootfs struct {
+	InstanceName string // e.g., "default.default"
+	RootfsPath   string // host path to the rootfs file
 }
 
 func (c *Config) socketDir() string {
@@ -86,10 +92,3 @@ func (c *Config) memoryBytes() uint64 {
 	return c.MemoryBytes
 }
 
-func hostMemoryBytes() uint64 {
-	val, err := syscall.Sysctl("hw.memsize")
-	if err != nil || len(val) < 8 {
-		return 4 << 30 // fallback: 4 GiB
-	}
-	return binary.LittleEndian.Uint64([]byte(val[:8]))
-}

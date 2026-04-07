@@ -1,9 +1,11 @@
 # Build artifacts
 /lnx
+/lnx-linux
 /init
 /cmd/lnx/init
 /kernel.Image
 /rootfs.ext4
+/vmlinuz-for-firecracker
 
 # Go workspace (local override)
 go.work
