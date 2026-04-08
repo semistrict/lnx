@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/tar"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -58,7 +60,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("copy kernel: %w", err)
 		}
 	} else {
-		if err := downloadRelease(kernelDest, "kernel.Image"); err != nil {
+		if err := downloadKernelRelease(kernelDest); err != nil {
 			return fmt.Errorf("download kernel: %w", err)
 		}
 	}
@@ -106,7 +108,7 @@ func autoInit() error {
 	os.MkdirAll(dir, 0755)
 
 	kernelDest := filepath.Join(base, "vmlinuz")
-	if err := downloadRelease(kernelDest, "kernel.Image"); err != nil {
+	if err := downloadKernelRelease(kernelDest); err != nil {
 		return fmt.Errorf("download kernel: %w", err)
 	}
 
@@ -203,12 +205,24 @@ func downloadRelease(dest, asset string) error {
 	return os.Rename(tmp, dest)
 }
 
+func downloadKernelRelease(dest string) error {
+	var errs []string
+	for _, asset := range []string{"kernel.Image", "vmlinuz.gz"} {
+		if err := downloadRelease(dest, asset); err == nil {
+			return nil
+		} else {
+			errs = append(errs, fmt.Sprintf("%s: %v", asset, err))
+		}
+	}
+	return fmt.Errorf("%s", strings.Join(errs, "; "))
+}
+
 // progressReader wraps an io.Reader and prints download progress to stderr.
 type progressReader struct {
-	r        io.Reader
-	total    int64
-	read     int64
-	label    string
+	r         io.Reader
+	total     int64
+	read      int64
+	label     string
 	lastPrint time.Time
 }
 
@@ -259,30 +273,71 @@ func downloadFirecracker() error {
 		firecrackerVersion, firecrackerVersion,
 	)
 	fmt.Printf("  downloading firecracker %s\n", firecrackerVersion)
-
-	// Download and extract to a temp dir, then copy the binary.
-	tmpDir, err := os.MkdirTemp("", "lnx-fc-*")
+	resp, err := http.Get(url)
 	if err != nil {
-		return err
+		return fmt.Errorf("download firecracker: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
-
-	cmd := exec.Command("sh", "-c",
-		fmt.Sprintf("curl -fSL %q | tar xz --strip-components=1 -C %q --wildcards '*/firecracker-*-aarch64'",
-			url, tmpDir))
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("download: %w", err)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download firecracker: HTTP %d: %s", resp.StatusCode, url)
 	}
 
-	// The extracted binary has the version in its name.
-	extracted := filepath.Join(tmpDir, fmt.Sprintf("firecracker-%s-aarch64", firecrackerVersion))
-	if err := copyFile(fcPath, extracted); err != nil {
-		return fmt.Errorf("copy firecracker: %w", err)
+	progress := &progressReader{r: resp.Body, total: resp.ContentLength, label: "firecracker"}
+	gz, err := gzip.NewReader(progress)
+	if err != nil {
+		return fmt.Errorf("decode firecracker archive: %w", err)
 	}
-	if err := os.Chmod(fcPath, 0755); err != nil {
+	defer gz.Close()
+
+	tmp := fcPath + ".tmp"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return fmt.Errorf("create firecracker temp file: %w", err)
+	}
+
+	targetName := fmt.Sprintf("firecracker-%s-aarch64", firecrackerVersion)
+	found := false
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			out.Close()
+			os.Remove(tmp)
+			return fmt.Errorf("read firecracker archive: %w", err)
+		}
+		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
+			continue
+		}
+		if filepath.Base(hdr.Name) != targetName {
+			continue
+		}
+		if _, err := io.Copy(out, tr); err != nil {
+			out.Close()
+			os.Remove(tmp)
+			return fmt.Errorf("extract firecracker binary: %w", err)
+		}
+		found = true
+		break
+	}
+	progress.finish()
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("close firecracker temp file: %w", err)
+	}
+	if !found {
+		os.Remove(tmp)
+		return fmt.Errorf("extract firecracker binary: %s not found in archive", targetName)
+	}
+	if err := os.Chmod(tmp, 0755); err != nil {
+		os.Remove(tmp)
 		return fmt.Errorf("chmod firecracker: %w", err)
+	}
+	if err := os.Rename(tmp, fcPath); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("install firecracker: %w", err)
 	}
 
 	fmt.Printf("  firecracker: %s\n", fcPath)

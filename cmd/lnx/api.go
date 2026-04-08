@@ -67,7 +67,8 @@ func runningInstances() []string {
 func isNoVM(err error) bool {
 	s := err.Error()
 	return strings.Contains(s, "no such file") ||
-		strings.Contains(s, "connection refused")
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "no status socket")
 }
 
 // noVMError wraps the "no VM running" message.

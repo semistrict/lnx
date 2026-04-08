@@ -39,9 +39,9 @@ kernel:
 	docker build --platform linux/arm64 -f Dockerfile.kernel -t lnx-kernel .
 	docker rm -f lnx-kernel-extract 2>/dev/null; true
 	docker create --name lnx-kernel-extract lnx-kernel true
-	docker cp lnx-kernel-extract:/build/arch/arm64/boot/Image kernel.Image
+	docker cp lnx-kernel-extract:/build/arch/arm64/boot/Image vmlinuz
 	docker rm lnx-kernel-extract
-	@echo "Kernel built: kernel.Image"
+	@echo "Kernel built: vmlinuz"
 
 # Build rootfs ext4 image in Docker
 rootfs:
@@ -68,4 +68,4 @@ install: cmd/lnx/init
 	codesign --entitlements entitlements.plist --force -s - "$$(go env GOPATH)/bin/lnx"
 
 clean:
-	rm -f lnx lnx-linux cmd/lnx/init kernel.Image rootfs.ext4
+	rm -f lnx lnx-linux cmd/lnx/init vmlinuz vmlinuz.gz rootfs.ext4

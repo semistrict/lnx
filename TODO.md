@@ -18,7 +18,6 @@ Experimental Linux/KVM backend (`LNX_EXPERIMENTS=linux_host`). Basic non-interac
 
 ## Known issues
 
-- [ ] `downloadFirecracker()` uses `tar --wildcards` which BSD tar (macOS) doesn't support — works on Linux but `lnx init` on macOS will fail to download Firecracker
 - [ ] Nested client logging writes to read-only 9P mount (silently fails, not harmful)
 - [ ] TAP device cleanup is best-effort — if Firecracker crashes, stale TAP may block next boot until outer VM restarts
 - [ ] Nested VM requires `sudo` for daemon (handled automatically, but NOPASSWD sudoers required)

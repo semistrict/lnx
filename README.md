@@ -12,7 +12,7 @@ Then download or build a kernel and rootfs:
 
 ```
 make kernel rootfs
-lnx init --kernel kernel.Image --rootfs rootfs.ext4
+lnx init --kernel vmlinuz --rootfs rootfs.ext4
 ```
 
 ## Usage
@@ -64,6 +64,7 @@ Docker auto-starts on boot. No `sudo` needed for `docker` commands.
 ```
 lnx status                        # VM status (all running instances)
 lnx ports list                    # forwarded ports
+lnx expose web:8080 --as=:8081    # expose web:8080 on localhost:8081
 lnx exec [-i] command             # exec into a running VM
 lnx disk grow 16G                 # grow rootfs (resized on next boot)
 lnx checkpoints list              # list rootfs checkpoints

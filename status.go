@@ -67,6 +67,7 @@ type apiServer struct {
 
 	// Session tracking for daemon mode.
 	activeExecs atomic.Int64
+	pinRefs     atomic.Int64
 	idleMu      sync.Mutex    // protects idleTimer and idleCh close
 	idleTimer   *time.Timer   // runs after last exec finishes; fires to close idleCh
 	idleCh      chan struct{} // closed when idle timeout expires
@@ -226,7 +227,7 @@ func (s *apiServer) startIdleTimer() {
 	s.idleTimer = time.AfterFunc(idleTimeout, func() {
 		s.idleMu.Lock()
 		defer s.idleMu.Unlock()
-		if s.activeExecs.Load() == 0 {
+		if s.activeExecs.Load() == 0 && s.pinRefs.Load() == 0 {
 			select {
 			case <-s.idleCh:
 			default:
@@ -252,6 +253,23 @@ func (s *apiServer) WaitIdle() {
 	select {
 	case <-s.idleCh:
 	case <-s.stopCh:
+	}
+}
+
+func (s *apiServer) pin() {
+	if s.pinRefs.Add(1) == 1 {
+		s.cancelIdleTimer()
+	}
+}
+
+func (s *apiServer) unpin() {
+	n := s.pinRefs.Add(-1)
+	if n < 0 {
+		s.pinRefs.Store(0)
+		n = 0
+	}
+	if n == 0 && s.activeExecs.Load() == 0 {
+		s.startIdleTimer()
 	}
 }
 
@@ -367,6 +385,9 @@ func (s *apiServer) listenUnix(sockPath string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /ports", s.handlePorts)
+	mux.HandleFunc("POST /expose/host", s.handleExposeHost)
+	mux.HandleFunc("POST /expose/host/remove", s.handleRemoveExposeHost)
+	mux.HandleFunc("POST /guest/expose", s.handleGuestExpose)
 	mux.HandleFunc("POST /exec", s.handleExec)
 	mux.HandleFunc("GET /exec/ws", s.handleExecWS)
 	mux.HandleFunc("GET /sessions", s.handleSessions)
@@ -465,20 +486,162 @@ type PortEntry struct {
 	Host  uint16 `json:"host"`
 }
 
+type ExposeHostRequest struct {
+	GuestPort uint16 `json:"guest_port"`
+	HostPort  uint16 `json:"host_port,omitempty"`
+	Visible   bool   `json:"visible,omitempty"`
+}
+
+type ExposeHostResponse struct {
+	HostPort uint16 `json:"host_port"`
+	Created  bool   `json:"created"`
+}
+
+type RemoveExposeHostRequest struct {
+	HostPort uint16 `json:"host_port"`
+}
+
+type GuestExposeRequest struct {
+	ListenPort uint16 `json:"listen_port"`
+	Host       string `json:"host"`
+	HostPort   uint16 `json:"host_port"`
+}
+
+type GuestExposeResponse struct {
+	Created bool `json:"created"`
+}
+
 func (s *apiServer) handlePorts(w http.ResponseWriter, r *http.Request) {
 	var ports []PortEntry
 	if s.pf != nil {
-		s.pf.mu.Lock()
-		for _, fp := range s.pf.listeners {
-			ports = append(ports, PortEntry{Guest: fp.guestPort, Host: fp.hostPort})
-		}
-		s.pf.mu.Unlock()
+		ports = s.pf.listVisiblePorts()
 	}
 	if ports == nil {
 		ports = []PortEntry{}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(ports)
+}
+
+func (s *apiServer) handleExposeHost(w http.ResponseWriter, r *http.Request) {
+	if s.pf == nil {
+		http.Error(w, "port forwarding unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req ExposeHostRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.GuestPort == 0 {
+		http.Error(w, "guest_port required", http.StatusBadRequest)
+		return
+	}
+
+	hostPort, created, err := s.pf.exposeHost(req.GuestPort, req.HostPort, req.Visible)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	if created {
+		s.pin()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ExposeHostResponse{HostPort: hostPort, Created: created})
+}
+
+func (s *apiServer) handleRemoveExposeHost(w http.ResponseWriter, r *http.Request) {
+	if s.pf == nil {
+		http.Error(w, "port forwarding unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req RemoveExposeHostRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.HostPort == 0 {
+		http.Error(w, "host_port required", http.StatusBadRequest)
+		return
+	}
+	if !s.pf.removeHost(req.HostPort) {
+		http.Error(w, fmt.Sprintf("no manual host forward for port %d", req.HostPort), http.StatusNotFound)
+		return
+	}
+	s.unpin()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *apiServer) handleGuestExpose(w http.ResponseWriter, r *http.Request) {
+	if s.sock == nil {
+		http.Error(w, "guest vsock unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req GuestExposeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.ListenPort == 0 || req.HostPort == 0 || req.Host == "" {
+		http.Error(w, "listen_port, host, and host_port are required", http.StatusBadRequest)
+		return
+	}
+
+	var resp GuestExposeResponse
+	if err := s.proxyGuestJSON(r.Context(), "/tcp/expose", req, &resp); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	if resp.Created {
+		s.pin()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *apiServer) proxyGuestJSON(ctx context.Context, path string, body any, respBody any) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal guest request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://guest"+path, strings.NewReader(string(payload)))
+	if err != nil {
+		return fmt.Errorf("build guest request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return s.sock.Connect(protocol.GuestHTTPPort)
+			},
+		},
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("guest request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		data, _ := io.ReadAll(resp.Body)
+		msg := strings.TrimSpace(string(data))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return fmt.Errorf("guest request failed: %s", msg)
+	}
+	if respBody != nil {
+		if err := json.NewDecoder(resp.Body).Decode(respBody); err != nil && err != io.EOF {
+			return fmt.Errorf("decode guest response: %w", err)
+		}
+	}
+	return nil
 }
 
 // ExecRequest is the JSON body for POST /exec and the first WebSocket text frame.

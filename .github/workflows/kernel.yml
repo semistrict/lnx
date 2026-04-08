@@ -19,12 +19,13 @@ jobs:
         run: |
           docker buildx build --platform linux/arm64 -f Dockerfile.kernel -t lnx-kernel --load .
           docker create --name lnx-kernel-extract lnx-kernel true
-          docker cp lnx-kernel-extract:/build/arch/arm64/boot/Image kernel.Image
+          docker cp lnx-kernel-extract:/build/arch/arm64/boot/Image vmlinuz
           docker rm lnx-kernel-extract
-          ls -lh kernel.Image
+          gzip -9 vmlinuz
+          ls -lh vmlinuz.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: kernel.Image
-          path: kernel.Image
+          name: vmlinuz.gz
+          path: vmlinuz.gz

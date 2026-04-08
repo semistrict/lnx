@@ -319,6 +319,7 @@ func runExecPipe(enc *gob.Encoder, req *protocol.ExecReq, sess *execSession) {
 	}
 
 	if err := cmd.Start(); err != nil {
+		commandNotFound(enc, req.Args, err)
 		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
 		return
 	}

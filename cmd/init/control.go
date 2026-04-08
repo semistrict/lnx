@@ -6,6 +6,7 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -61,6 +62,7 @@ func newGuestControlMux(gc *guestControl) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /checkpoint", gc.handleCheckpoint)
 	mux.HandleFunc("POST /open", gc.handleOpen)
+	mux.HandleFunc("POST /tcp/expose", gc.handleTCPExpose)
 	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
 	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
 	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
@@ -84,6 +86,25 @@ type guestControl struct {
 	mu  sync.Mutex
 	enc *gob.Encoder
 	dec *gob.Decoder
+}
+
+type guestTCPExpose struct {
+	listenPort uint16
+	host       string
+	hostPort   uint16
+	listener   net.Listener
+}
+
+var (
+	guestTCPExposeMu sync.Mutex
+	guestTCPExposes  = map[uint16]*guestTCPExpose{}
+)
+
+func guestInternalPort(port uint16) bool {
+	guestTCPExposeMu.Lock()
+	defer guestTCPExposeMu.Unlock()
+	_, ok := guestTCPExposes[port]
+	return ok
 }
 
 func (gc *guestControl) handleCheckpoint(w http.ResponseWriter, r *http.Request) {
@@ -156,4 +177,99 @@ func (gc *guestControl) handleOpen(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (gc *guestControl) handleTCPExpose(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ListenPort uint16 `json:"listen_port"`
+		Host       string `json:"host"`
+		HostPort   uint16 `json:"host_port"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.ListenPort == 0 || req.Host == "" || req.HostPort == 0 {
+		http.Error(w, "listen_port, host, and host_port are required", http.StatusBadRequest)
+		return
+	}
+
+	guestTCPExposeMu.Lock()
+	if existing, ok := guestTCPExposes[req.ListenPort]; ok && existing != nil {
+		if existing.host == req.Host && existing.hostPort == req.HostPort {
+			guestTCPExposeMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]bool{"created": false})
+			return
+		}
+		guestTCPExposeMu.Unlock()
+		http.Error(w, fmt.Sprintf("port %d is already exposed", req.ListenPort), http.StatusConflict)
+		return
+	}
+	guestTCPExposeMu.Unlock()
+
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", req.ListenPort))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("listen on port %d: %v", req.ListenPort, err), http.StatusConflict)
+		return
+	}
+
+	expose := &guestTCPExpose{
+		listenPort: req.ListenPort,
+		host:       req.Host,
+		hostPort:   req.HostPort,
+		listener:   ln,
+	}
+
+	guestTCPExposeMu.Lock()
+	if existing, ok := guestTCPExposes[req.ListenPort]; ok && existing != nil {
+		guestTCPExposeMu.Unlock()
+		_ = ln.Close()
+		if existing.host == req.Host && existing.hostPort == req.HostPort {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]bool{"created": false})
+			return
+		}
+		http.Error(w, fmt.Sprintf("port %d is already exposed", req.ListenPort), http.StatusConflict)
+		return
+	}
+	guestTCPExposes[req.ListenPort] = expose
+	guestTCPExposeMu.Unlock()
+
+	go expose.acceptLoop()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"created": true})
+}
+
+func (e *guestTCPExpose) acceptLoop() {
+	for {
+		conn, err := e.listener.Accept()
+		if err != nil {
+			return
+		}
+		go e.forward(conn)
+	}
+}
+
+func (e *guestTCPExpose) forward(src net.Conn) {
+	defer src.Close()
+
+	dst, err := net.Dial("tcp", net.JoinHostPort(e.host, itoa(int(e.hostPort))))
+	if err != nil {
+		return
+	}
+	defer dst.Close()
+
+	done := make(chan struct{})
+	go func() {
+		io.Copy(dst, src)
+		if tc, ok := dst.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+		close(done)
+	}()
+	io.Copy(src, dst)
+	_ = src.Close()
+	<-done
 }

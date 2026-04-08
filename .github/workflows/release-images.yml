@@ -23,14 +23,15 @@ jobs:
         run: |
           docker buildx build --platform linux/arm64 -f Dockerfile.kernel -t lnx-kernel --load .
           docker create --name lnx-kernel-extract lnx-kernel true
-          docker cp lnx-kernel-extract:/build/arch/arm64/boot/Image kernel.Image
+          docker cp lnx-kernel-extract:/build/arch/arm64/boot/Image vmlinuz
           docker rm lnx-kernel-extract
+          gzip -9 vmlinuz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: kernel.Image
-          path: kernel.Image
+          name: vmlinuz.gz
+          path: vmlinuz.gz
 
   rootfs:
     runs-on: ubuntu-latest
@@ -68,7 +69,7 @@ jobs:
       - name: Download kernel
         uses: actions/download-artifact@v7
         with:
-          name: kernel.Image
+          name: vmlinuz.gz
 
       - name: Download rootfs
         uses: actions/download-artifact@v7
@@ -83,10 +84,10 @@ jobs:
           body: |
             Pre-built kernel and rootfs images for lnx.
 
-            - `kernel.Image` — Linux kernel (arm64)
+            - `vmlinuz.gz` — Linux kernel (arm64, gzip compressed)
             - `rootfs.ext4.zst` — Ubuntu rootfs (zstd compressed)
 
             Install with: `lnx init`
           files: |
-            kernel.Image
+            vmlinuz.gz
             rootfs.ext4.zst

@@ -122,7 +122,7 @@ func getListeningPorts() []uint16 {
 				continue
 			}
 			port := hexToUint16(parts[1])
-			if port > 0 {
+			if port > 0 && !guestInternalPort(port) {
 				seen[port] = true
 			}
 		}
