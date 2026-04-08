@@ -49,8 +49,6 @@ github.com/hugelgupf/vmtest v0.0.0-20230810222836-f8c8e381617c h1:4A+BVHylCBQPxl
 github.com/hugelgupf/vmtest v0.0.0-20230810222836-f8c8e381617c/go.mod h1:d2FMzS0rIF+3Daufcw660EZfTJihdNPeEwBBJgO4Ap0=
 github.com/inconshreveable/mousetrap v1.1.0 h1:wN+x4NVGpMsO7ErUn/mUI3vEoE6Jt13X2s0bqwp9tc8=
 github.com/inconshreveable/mousetrap v1.1.0/go.mod h1:vpF70FUmC8bwa3OWnCshd2FqLfsEA9PFc4w1p2J65bw=
-github.com/insomniacslk/dhcp v0.0.0-20230731140434-0f9eb93a696c h1:P/3mFnHCv1A/ej4m8pF5EB6FUt9qEL2Q9lfrcUNwCYs=
-github.com/insomniacslk/dhcp v0.0.0-20230731140434-0f9eb93a696c/go.mod h1:7474bZ1YNCvarT6WFKie4kEET6J0KYRDC4XJqqXzQW4=
 github.com/insomniacslk/dhcp v0.0.0-20260407060928-11b94ed970f2 h1:G3irkWwmpl0vH/nn83K2AHqLUZweC7XAONuwXy/w9Co=
 github.com/insomniacslk/dhcp v0.0.0-20260407060928-11b94ed970f2/go.mod h1:qfvBmyDNp+/liLEYWRvqny/PEz9hGe2Dz833eXILSmo=
 github.com/josharian/native v1.0.1-0.20221213033349-c1e37c09b531/go.mod h1:7X/raswPFr05uY3HiLlYeyQntB6OO7E/d2Cu7qoaN2w=

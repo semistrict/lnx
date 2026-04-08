@@ -3,6 +3,10 @@
 package lnx_test
 
 import (
+	"bytes"
+	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -53,6 +57,63 @@ func waitFor(t testing.TB, term *midterm.Terminal, want string, timeout time.Dur
 func lnxBin() string {
 	p, _ := exec.LookPath("lnx")
 	return p
+}
+
+type shellStep struct {
+	input string
+	wait  time.Duration
+}
+
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+func runInteractiveShellTranscript(t *testing.T, steps []shellStep) string {
+	t.Helper()
+
+	cmd := exec.Command("zsh", "-i")
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 100})
+	require.NoError(t, err)
+	defer ptmx.Close()
+	defer cmd.Process.Kill()
+
+	var out bytes.Buffer
+	doneRead := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(&out, ptmx)
+		close(doneRead)
+	}()
+
+	time.Sleep(time.Second)
+	for _, step := range steps {
+		_, err := ptmx.WriteString(step.input)
+		require.NoError(t, err)
+		time.Sleep(step.wait)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("interactive zsh session did not exit within 5s")
+	}
+
+	_ = ptmx.Close()
+	select {
+	case <-doneRead:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out reading zsh transcript")
+	}
+
+	return out.String()
 }
 
 func TestPTY_MainInteractive(t *testing.T) {
@@ -170,7 +231,37 @@ func TestPTY_InteractiveCommandNotFoundShowsMessage(t *testing.T) {
 	select {
 	case err := <-done:
 		require.Error(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("interactive command-not-found did not exit within 5s")
+		case <-time.After(5 * time.Second):
+			t.Fatal("interactive command-not-found did not exit within 5s")
+		}
 	}
+
+func TestPTY_BackgroundCommandMatchesPlainShellBehavior(t *testing.T) {
+	t.Parallel()
+
+	bin := lnxBin()
+	if bin == "" {
+		t.Skip("lnx not in PATH")
+	}
+
+	port := freeTCPPort(t)
+	plainTranscript := runInteractiveShellTranscript(t, []shellStep{
+		{input: fmt.Sprintf("python3 -m http.server %d &\n", port), wait: time.Second},
+		{input: "jobs\n", wait: 500 * time.Millisecond},
+		{input: "kill %1\n", wait: time.Second},
+		{input: "exit\n", wait: 500 * time.Millisecond},
+	})
+	require.Contains(t, plainTranscript, "running    python3 -m http.server")
+	require.NotContains(t, plainTranscript, "suspended (tty output)")
+
+	port = freeTCPPort(t)
+	lnxTranscript := runInteractiveShellTranscript(t, []shellStep{
+		{input: fmt.Sprintf("lnx python3 -m http.server %d &\n", port), wait: time.Second},
+		{input: "jobs\n", wait: 500 * time.Millisecond},
+		{input: "kill %1\n", wait: time.Second},
+		{input: "exit\n", wait: 500 * time.Millisecond},
+	})
+
+	require.Contains(t, lnxTranscript, "running    lnx python3 -m http.server")
+	require.NotContains(t, lnxTranscript, "suspended (tty output)")
 }
