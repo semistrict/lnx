@@ -52,6 +52,7 @@ func startExecServer() {
 // execSession holds per-session state for signal/resize forwarding.
 type execSession struct {
 	proc  *os.Process
+	pgid  int
 	ptyFd *os.File
 	mu    sync.Mutex
 }
@@ -60,12 +61,33 @@ func (s *execSession) setProcess(p *os.Process) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.proc = p
+	s.pgid = 0
+	if p != nil {
+		if pgid, err := syscall.Getpgid(p.Pid); err == nil {
+			s.pgid = pgid
+		}
+	}
 }
 
 func (s *execSession) setPTY(f *os.File) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ptyFd = f
+}
+
+func (s *execSession) signal(sig syscall.Signal) error {
+	s.mu.Lock()
+	proc := s.proc
+	pgid := s.pgid
+	s.mu.Unlock()
+
+	if pgid > 0 {
+		return syscall.Kill(-pgid, sig)
+	}
+	if proc != nil {
+		return proc.Signal(sig)
+	}
+	return nil
 }
 
 // readControlMessages reads ExecSignal and ExecResize messages from the gob
@@ -78,12 +100,7 @@ func (s *execSession) readControlMessages(dec *gob.Decoder) {
 			return
 		}
 		if msg.ExecSignal != nil {
-			s.mu.Lock()
-			proc := s.proc
-			s.mu.Unlock()
-			if proc != nil {
-				_ = proc.Signal(syscall.Signal(msg.ExecSignal.Sig))
-			}
+			_ = s.signal(syscall.Signal(msg.ExecSignal.Sig))
 		}
 		if msg.ExecResize != nil {
 			s.mu.Lock()
@@ -154,6 +171,7 @@ func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener, ses
 
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
+		slog.Warn("exec pty start failed", "args", req.Args, "error", err)
 		if len(req.Args) > 0 {
 			commandNotFound(enc, req.Args, err)
 		}
@@ -179,7 +197,7 @@ func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener, ses
 	// Accept connection from host for raw terminal I/O.
 	vsockConn, err := ln.Accept()
 	if err != nil {
-		slog.Debug("exec interactive accept failed", "error", err)
+		slog.Warn("exec interactive accept failed", "args", req.Args, "error", err)
 		cmd.Process.Kill()
 		cmd.Wait()
 		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
@@ -203,7 +221,7 @@ func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener, ses
 	go func() { waitCh <- cmd.Wait() }()
 
 	// Try SIGHUP first (terminal hangup — shells handle this).
-	cmd.Process.Signal(syscall.SIGHUP)
+	_ = sess.signal(syscall.SIGHUP)
 
 	exitCode := 0
 	select {
@@ -214,7 +232,7 @@ func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener, ses
 			exitCode = 127
 		}
 	case <-time.After(3 * time.Second):
-		cmd.Process.Kill()
+		_ = sess.signal(syscall.SIGKILL)
 		err := <-waitCh
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()

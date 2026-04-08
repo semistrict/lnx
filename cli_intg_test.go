@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -43,4 +44,25 @@ func TestCLI_MissingCommand(t *testing.T) {
 	require.True(t, ok, "expected process exit error, got %T: %v", err, err)
 	assert.Equal(t, 127, exitErr.ExitCode())
 	assert.Contains(t, stderr.String(), "doesnotexist42: command not found")
+}
+
+func TestCLI_FollowupExecsAgainstRunningVM(t *testing.T) {
+	bin := lnxBin()
+	if bin == "" {
+		t.Skip("lnx not in PATH")
+	}
+
+	inst := "test-followup-exec"
+	createClonedInstance(t, inst)
+	registerInstanceStopCleanup(t, bin, inst)
+
+	cmd, stderr, done := startTimedInstance(t, bin, inst, 8*time.Second)
+	t.Cleanup(func() { cleanupStreamingCLI(t, cmd, done, stderr) })
+
+	for i := 0; i < 5; i++ {
+		out := runCLISuccess(t, bin, "--instance", inst, "cat", "/etc/os-release")
+		assert.Contains(t, out, `PRETTY_NAME="Ubuntu Resolute Raccoon (development branch)"`)
+	}
+
+	waitForProcessSuccess(t, done, 12*time.Second, stderr.String())
 }

@@ -39,8 +39,9 @@ type bootedVM struct {
 // close shuts down the VM and releases all resources.
 func (b *bootedVM) close(exitCode int) {
 	b.ctrlConn.Close()
-	shutdownVM(b.vm, exitCode, b.vs.cleanup)
+	shutdownVM(b.vm, exitCode)
 	b.lock.unlock()
+	b.vs.cleanup()
 	if b.ephCleanup != nil {
 		b.ephCleanup()
 	}

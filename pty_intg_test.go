@@ -144,3 +144,33 @@ func TestPTY_SecondSession(t *testing.T) {
 		t.Fatal("first session did not exit within 5s")
 	}
 }
+
+func TestPTY_InteractiveCommandNotFoundShowsMessage(t *testing.T) {
+	t.Parallel()
+
+	bin := lnxBin()
+	if bin == "" {
+		t.Skip("lnx not in PATH")
+	}
+
+	term := midterm.NewTerminal(24, 100)
+
+	cmd := exec.Command(bin, "omx")
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 100})
+	require.NoError(t, err)
+	defer ptmx.Close()
+	defer cmd.Process.Kill()
+
+	go feedTerminal(term, ptmx)
+
+	waitFor(t, term, "omx: command not found", 10*time.Second)
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("interactive command-not-found did not exit within 5s")
+	}
+}

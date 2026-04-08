@@ -120,7 +120,7 @@ func (vm *firecrackerVM) configure(cfg *Config, initrdPath, cwd, swapPath, homeD
 
 	// 2. Machine config.
 	if err := vm.apiPut("/machine-config", map[string]any{
-		"vcpu_count":  cfg.cpus(),
+		"vcpu_count":   cfg.cpus(),
 		"mem_size_mib": cfg.memoryBytes() / (1024 * 1024),
 	}); err != nil {
 		return fmt.Errorf("machine config: %w", err)
@@ -161,9 +161,9 @@ func (vm *firecrackerVM) configure(cfg *Config, initrdPath, cwd, swapPath, homeD
 
 	// 6. Network interface.
 	if err := vm.apiPut("/network-interfaces/eth0", map[string]any{
-		"iface_id":       "eth0",
-		"host_dev_name":  "lnxtap0",
-		"guest_mac":      "06:00:AC:10:00:02",
+		"iface_id":      "eth0",
+		"host_dev_name": "lnxtap0",
+		"guest_mac":     "06:00:AC:10:00:02",
 	}); err != nil {
 		return fmt.Errorf("network interface: %w", err)
 	}
@@ -230,9 +230,7 @@ func (vm *firecrackerVM) VsockDevice() VsockDevice {
 }
 
 // shutdownVM gracefully shuts down a Firecracker VM.
-func shutdownVM(vm VirtualMachine, exitCode int, cleanup func()) {
-	defer cleanup()
-
+func shutdownVM(vm VirtualMachine, exitCode int) {
 	if exitCode == 130 {
 		vm.Stop()
 		return

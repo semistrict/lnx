@@ -1,6 +1,7 @@
 package lnx
 
 import (
+	"bytes"
 	"context"
 	"encoding/gob"
 	"encoding/json"
@@ -130,9 +131,6 @@ func (s *apiServer) registerSession(args []string, pty bool, clientPID int, exec
 		execConn:  execConn,
 	}
 	s.sessionsMu.Unlock()
-	if s.activeExecs.Add(1) == 1 {
-		s.cancelIdleTimer()
-	}
 	return id
 }
 
@@ -190,9 +188,6 @@ func (s *apiServer) unregisterSession(id string) {
 	s.sessionsMu.Lock()
 	delete(s.sessions, id)
 	s.sessionsMu.Unlock()
-	if s.activeExecs.Add(-1) == 0 {
-		s.startIdleTimer()
-	}
 }
 
 // execStarted increments the active exec counter (for non-tracked sessions like Run()).
@@ -665,6 +660,9 @@ func (s *apiServer) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.execStarted()
+	defer s.execFinished()
+
 	execEnc, execDec, execConn, err := s.connectExec()
 	if err != nil {
 		http.Error(w, "guest exec connect: "+err.Error(), http.StatusServiceUnavailable)
@@ -775,6 +773,9 @@ func (s *apiServer) handleExecWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.execStarted()
+	defer s.execFinished()
+
 	execEnc, execDec, execConn, err := s.connectExec()
 	if err != nil {
 		ws.Close(websocket.StatusInternalError, "guest exec connect: "+err.Error())
@@ -877,6 +878,18 @@ func (s *apiServer) handleExecWS(w http.ResponseWriter, r *http.Request) {
 		if msg.ExecStarted != nil {
 			s.setSessionGuestPID(sessID, msg.ExecStarted.PID)
 		}
+		if msg.ExecOutput != nil {
+			if len(msg.ExecOutput.Stdout) > 0 {
+				if err := ws.Write(ctx, websocket.MessageBinary, terminalizeNewlines(msg.ExecOutput.Stdout)); err != nil {
+					break
+				}
+			}
+			if len(msg.ExecOutput.Stderr) > 0 {
+				if err := ws.Write(ctx, websocket.MessageBinary, terminalizeNewlines(msg.ExecOutput.Stderr)); err != nil {
+					break
+				}
+			}
+		}
 		if msg.ExecDone != nil {
 			exitCode = msg.ExecDone.ExitCode
 			break
@@ -898,6 +911,22 @@ type wsControl struct {
 type wsResize struct {
 	Rows uint16 `json:"rows"`
 	Cols uint16 `json:"cols"`
+}
+
+func terminalizeNewlines(data []byte) []byte {
+	if !bytes.Contains(data, []byte{'\n'}) {
+		return data
+	}
+	var out []byte
+	out = make([]byte, 0, len(data)+8)
+	for i, b := range data {
+		if b == '\n' && (i == 0 || data[i-1] != '\r') {
+			out = append(out, '\r', '\n')
+			continue
+		}
+		out = append(out, b)
+	}
+	return out
 }
 
 // handleSessions returns all active exec sessions as JSON, sorted by start time.

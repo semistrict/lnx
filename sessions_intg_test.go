@@ -5,6 +5,7 @@ package lnx_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"testing"
@@ -41,7 +42,7 @@ func TestPTY_SessionsKillGraceful(t *testing.T) {
 
 	// Verify session appears.
 	require.Eventually(t, func() bool {
-		return len(fetchSessionsAPI(t) ) > 0
+		return len(fetchSessionsAPI(t)) > 0
 	}, 10*time.Second, 500*time.Millisecond, "session never appeared in sessions list")
 
 	sessions := fetchSessionsAPI(t)
@@ -134,12 +135,46 @@ func TestPTY_SessionsKillForce(t *testing.T) {
 	}
 }
 
+func TestPTY_SessionsKillForce_AllowsRestart(t *testing.T) {
+	bin := lnxBin()
+	if bin == "" {
+		t.Skip("lnx not in PATH")
+	}
+
+	inst := fmt.Sprintf("test-sessions-restart-%d", time.Now().UnixNano())
+	createClonedInstance(t, inst)
+	registerInstanceStopCleanup(t, bin, inst)
+
+	cmd, lines, stderr, done := startStreamingCLI(t, bin, "--instance", inst, "sh", "-c", "trap '' TERM HUP; echo READY; while true; do sleep 1; done")
+	waitForCLIOutput(t, lines, "READY", 20*time.Second, stderr)
+	t.Cleanup(func() { cleanupStreamingCLI(t, cmd, done, stderr) })
+
+	require.Eventually(t, func() bool {
+		return len(fetchSessionsAPIFor(t, inst)) > 0
+	}, 10*time.Second, 500*time.Millisecond, "session never appeared")
+
+	sessions := fetchSessionsAPIFor(t, inst)
+	require.NotEmpty(t, sessions)
+	sessID := sessions[0].ID
+
+	killOut, err := exec.Command(bin, "sessions", "kill", inst+"_"+sessID).CombinedOutput()
+	require.NoError(t, err, "sessions kill failed: %s", killOut)
+	assert.Contains(t, string(killOut), "SIGKILL")
+
+	waitForNoVMRunning(t, bin, inst, 12*time.Second)
+	runCLISuccess(t, bin, "--instance", inst, "true")
+}
+
 // fetchSessionsCLI queries sessions via the HTTP API directly (not the CLI binary,
 // which would need instance flag parsing).
 func fetchSessionsAPI(t *testing.T) []lnx.SessionInfo {
+	return fetchSessionsAPIFor(t, "default")
+}
+
+func fetchSessionsAPIFor(t *testing.T, instance string) []lnx.SessionInfo {
 	t.Helper()
 	home, _ := os.UserHomeDir()
-	sockPath := home + "/.lnx/instances/default/status.sock"
+	sockPath := home + "/.lnx/instances/" + instance + "/status.sock"
 
 	cmd := exec.Command("curl", "-s", "--unix-socket", sockPath, "http://localhost/sessions")
 	out, err := cmd.Output()

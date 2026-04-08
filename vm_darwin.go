@@ -138,9 +138,7 @@ func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.
 }
 
 // shutdownVM gracefully stops a Darwin VM.
-func shutdownVM(vm VirtualMachine, exitCode int, cleanup func()) {
-	defer cleanup()
-
+func shutdownVM(vm VirtualMachine, exitCode int) {
 	if exitCode == 130 {
 		vm.Stop()
 		return

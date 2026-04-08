@@ -121,6 +121,7 @@ func runSessionsKill(cmd *cobra.Command, args []string) error {
 
 	// Parse "instance_sN" format to determine instance and session ID.
 	inst, sessID := parseSessionID(id)
+	clientPID := sessionClientPID(inst, sessID)
 
 	client := apiClientFor(inst)
 
@@ -140,6 +141,7 @@ func runSessionsKill(cmd *cobra.Command, args []string) error {
 		sessions, err := fetchSessions(inst)
 		if err != nil {
 			// VM shut down or unreachable — session is gone.
+			terminateLocalClient(clientPID)
 			return nil
 		}
 		found := false
@@ -150,6 +152,7 @@ func runSessionsKill(cmd *cobra.Command, args []string) error {
 			}
 		}
 		if !found {
+			terminateLocalClient(clientPID)
 			return nil
 		}
 	}
@@ -158,6 +161,7 @@ func runSessionsKill(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stderr, "session %s still alive, sending SIGKILL\n", id)
 
 	sendSessionSignal(client, sessID, int(syscall.SIGKILL), true)
+	terminateLocalClient(clientPID)
 
 	return nil
 }
@@ -186,6 +190,41 @@ func sendSessionSignal(client *http.Client, sessID string, sig int, closeConn bo
 		return fmt.Errorf("session %s not found", sessID)
 	}
 	return nil
+}
+
+func sessionClientPID(instance, sessID string) int {
+	sessions, err := fetchSessions(instance)
+	if err != nil {
+		return 0
+	}
+	for _, s := range sessions {
+		if s.ID == sessID {
+			return s.ClientPID
+		}
+	}
+	return 0
+}
+
+func terminateLocalClient(pid int) {
+	if pid <= 0 || pid == os.Getpid() {
+		return
+	}
+	if !processExists(pid) {
+		return
+	}
+	_ = syscall.Kill(pid, syscall.SIGTERM)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !processExists(pid) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+}
+
+func processExists(pid int) bool {
+	return syscall.Kill(pid, 0) == nil
 }
 
 func formatCommand(args []string) string {

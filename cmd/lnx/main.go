@@ -1,9 +1,11 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -173,10 +175,20 @@ func runVM(args []string) (int, error) {
 
 	// Exec into the running VM.
 	interactive := term.IsTerminal(int(os.Stdin.Fd()))
-	if interactive {
-		return execInteractive(args)
+	execOnce := func() (int, error) {
+		if interactive {
+			return execInteractive(args)
+		}
+		return execNonInteractive(args)
 	}
-	return execNonInteractive(args)
+
+	exitCode, err := execOnce()
+	if shouldRetryExec(err) {
+		if restartErr := restartDaemon(); restartErr == nil {
+			return execOnce()
+		}
+	}
+	return exitCode, err
 }
 
 // vmIsRunning checks if a VM daemon is running for the current instance.
@@ -251,6 +263,43 @@ func spawnDaemon() error {
 	// Release the process so it doesn't become a zombie.
 	cmd.Process.Release()
 	return nil
+}
+
+func shouldRetryExec(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isNoVM(err) {
+		return true
+	}
+	if errors.Is(err, errExecTerminatedUnexpectedly) {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "connect to VM:")
+}
+
+func restartDaemon() error {
+	if vmIsRunning() {
+		req, err := http.NewRequest(http.MethodPost, "http://localhost/stop", nil)
+		if err == nil {
+			resp, stopErr := apiClient().Do(req)
+			if stopErr == nil && resp != nil {
+				resp.Body.Close()
+			}
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for vmIsRunning() && time.Now().Before(deadline) {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	if vmIsRunning() {
+		return fmt.Errorf("VM did not stop cleanly for restart")
+	}
+	if err := spawnDaemon(); err != nil {
+		return err
+	}
+	return waitForVM(60 * time.Second)
 }
 
 func initHostLogging() {

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -19,6 +20,8 @@ import (
 	"golang.org/x/term"
 	"nhooyr.io/websocket"
 )
+
+var errExecTerminatedUnexpectedly = errors.New("exec terminated unexpectedly")
 
 // execNonInteractive runs a non-interactive command via POST /exec with NDJSON streaming.
 func execNonInteractive(args []string) (int, error) {
@@ -56,6 +59,7 @@ func execNonInteractive(args []string) (int, error) {
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
 	exitCode := -1
+	sawExitCode := false
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		var msg map[string]json.RawMessage
@@ -74,7 +78,14 @@ func execNonInteractive(args []string) (int, error) {
 		}
 		if raw, ok := msg["exit_code"]; ok {
 			json.Unmarshal(raw, &exitCode)
+			sawExitCode = true
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		return -1, fmt.Errorf("read exec stream: %w", err)
+	}
+	if !sawExitCode || exitCode < 0 {
+		return -1, errExecTerminatedUnexpectedly
 	}
 	return exitCode, nil
 }
@@ -176,6 +187,10 @@ func execInteractive(args []string) (int, error) {
 
 	// Read WebSocket messages: binary = PTY output, text = exit_code.
 	exitCode := -1
+	sawExitCode := false
+	var last byte
+	var prev byte
+	sawOutput := false
 	for {
 		typ, data, err := ws.Read(ctx)
 		if err != nil {
@@ -184,11 +199,19 @@ func execInteractive(args []string) (int, error) {
 		switch typ {
 		case websocket.MessageBinary:
 			os.Stdout.Write(data)
+			if len(data) > 0 {
+				sawOutput = true
+				if len(data) >= 2 {
+					prev = data[len(data)-2]
+				}
+				last = data[len(data)-1]
+			}
 		case websocket.MessageText:
 			var msg map[string]json.RawMessage
 			if err := json.Unmarshal(data, &msg); err == nil {
 				if raw, ok := msg["exit_code"]; ok {
 					json.Unmarshal(raw, &exitCode)
+					sawExitCode = true
 				}
 			}
 		}
@@ -201,6 +224,13 @@ func execInteractive(args []string) (int, error) {
 	default:
 	}
 
+	if sawOutput && last == '\n' && prev != '\r' {
+		_, _ = os.Stdout.Write([]byte{'\r'})
+	}
+
+	if !sawExitCode || exitCode < 0 {
+		return -1, errExecTerminatedUnexpectedly
+	}
 	return exitCode, nil
 }
 

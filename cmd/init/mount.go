@@ -20,6 +20,7 @@ func mountInitialFS() error {
 		{"proc", "/proc", "proc", 0},
 		{"sysfs", "/sys", "sysfs", 0},
 		{"devtmpfs", "/dev", "devtmpfs", 0},
+		{"tmpfs", "/dev/shm", "tmpfs", 0},
 		{"tmpfs", "/tmp", "tmpfs", 0},
 		{"tmpfs", "/run", "tmpfs", 0},
 	}
@@ -135,6 +136,7 @@ func mountInNewRoot() error {
 		{"/proc", "/mnt/proc", "proc"},
 		{"/sys", "/mnt/sys", "sysfs"},
 		{"/dev", "/mnt/dev", "devtmpfs"},
+		{"/dev/shm", "/mnt/dev/shm", "tmpfs"},
 		{"/tmp", "/mnt/tmp", "tmpfs"},
 		{"/run", "/mnt/run", "tmpfs"},
 	} {
