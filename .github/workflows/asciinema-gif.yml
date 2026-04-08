@@ -1,0 +1,42 @@
+name: Build asciinema GIF
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "docs/asciinema/**"
+      - ".github/workflows/asciinema-gif.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/asciinema/**"
+      - ".github/workflows/asciinema-gif.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig1-dev libfreetype6-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install agg
+        run: cargo install --locked --git https://github.com/asciinema/agg
+
+      - name: Render GIF
+        run: ./render-gif.sh
+        working-directory: docs/asciinema
+
+      - name: Upload GIF artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: asciinema-gif
+          path: docs/asciinema/out/ingress-demo.gif
+          retention-days: 14
