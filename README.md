@@ -65,6 +65,8 @@ Docker auto-starts on boot. No `sudo` needed for `docker` commands.
 lnx status                        # VM status (all running instances)
 lnx ports list                    # forwarded ports
 lnx expose web:8080 --as=:8081    # expose web:8080 on localhost:8081
+lnx ingress enable                # install .lnx resolver and local HTTP ingress
+curl http://p8080.dev.lnx/        # route to dev:8080 (VM must already be running)
 lnx exec [-i] command             # exec into a running VM
 lnx disk grow 16G                 # grow rootfs (resized on next boot)
 lnx checkpoints list              # list rootfs checkpoints
