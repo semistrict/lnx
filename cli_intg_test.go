@@ -66,3 +66,24 @@ func TestCLI_FollowupExecsAgainstRunningVM(t *testing.T) {
 
 	waitForProcessSuccess(t, done, 12*time.Second, stderr.String())
 }
+
+func TestCLI_StopWaitsUntilVMStops(t *testing.T) {
+	bin, err := filepath.Abs("lnx")
+	require.NoError(t, err)
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("skipping: repo lnx binary not found at %s", bin)
+	}
+
+	inst := "test-stop-waits"
+	createClonedInstance(t, inst)
+	registerInstanceStopCleanup(t, bin, inst)
+
+	runCLISuccess(t, bin, "--instance", inst, "true")
+
+	stopOut := runCLISuccess(t, bin, "--instance", inst, "stop")
+	assert.Contains(t, stopOut, "VM stopped")
+
+	statusOut, err := runCLI(bin, "--instance", inst, "status")
+	require.NoError(t, err)
+	assert.Contains(t, statusOut, "no VM running")
+}

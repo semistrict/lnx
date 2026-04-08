@@ -167,7 +167,6 @@ func run() error {
 	installSystemctlShim()
 	installSystemdCatShim()
 	configureNetwork()
-	writeResolvConf()
 	installBashDefaults()
 	installXdgOpen()
 	startEnabledServices()
