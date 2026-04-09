@@ -87,3 +87,57 @@ func TestCLI_StopWaitsUntilVMStops(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, statusOut, "no VM running")
 }
+
+func TestCLI_EnvNotForwardedByDefault(t *testing.T) {
+	bin, err := filepath.Abs("lnx")
+	require.NoError(t, err)
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("skipping: repo lnx binary not found at %s", bin)
+	}
+
+	env := append(os.Environ(), "LNX_TEST_ENV=secret")
+	out, err := runCLIEnv(bin, env, "--ephemeral", "sh", "-lc", `test -z "${LNX_TEST_ENV:-}" && echo OK`)
+	require.NoError(t, err, out)
+	assert.Contains(t, out, "OK")
+}
+
+func TestCLI_EnvForwardSpecificVar(t *testing.T) {
+	bin, err := filepath.Abs("lnx")
+	require.NoError(t, err)
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("skipping: repo lnx binary not found at %s", bin)
+	}
+
+	env := append(os.Environ(), "LNX_TEST_ENV=secret")
+	out, err := runCLIEnv(bin, env, "--ephemeral", "--env", "LNX_TEST_ENV", "sh", "-lc", `test "$LNX_TEST_ENV" = secret && echo OK`)
+	require.NoError(t, err, out)
+	assert.Contains(t, out, "OK")
+}
+
+func TestCLI_EnvForwardAll(t *testing.T) {
+	bin, err := filepath.Abs("lnx")
+	require.NoError(t, err)
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("skipping: repo lnx binary not found at %s", bin)
+	}
+
+	env := append(os.Environ(), "LNX_TEST_ENV=secret", "LNX_TEST_ENV2=second")
+	out, err := runCLIEnv(bin, env, "--ephemeral", "--env-all", "sh", "-lc", `test "$LNX_TEST_ENV" = secret && test "$LNX_TEST_ENV2" = second && echo OK`)
+	require.NoError(t, err, out)
+	assert.Contains(t, out, "OK")
+}
+
+func TestCLI_EnvForwardFromFile(t *testing.T) {
+	bin, err := filepath.Abs("lnx")
+	require.NoError(t, err)
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("skipping: repo lnx binary not found at %s", bin)
+	}
+
+	envFile := filepath.Join(t.TempDir(), ".env")
+	require.NoError(t, os.WriteFile(envFile, []byte("LNX_FILE_ENV=secret\nLNX_FILE_ENV2=\"quoted value\"\n"), 0644))
+
+	out, err := runCLIEnv(bin, os.Environ(), "--ephemeral", "--env", "@"+envFile, "sh", "-lc", `test "$LNX_FILE_ENV" = secret && test "$LNX_FILE_ENV2" = "quoted value" && echo OK`)
+	require.NoError(t, err, out)
+	assert.Contains(t, out, "OK")
+}

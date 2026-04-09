@@ -25,8 +25,8 @@ type Config struct {
 	// at the same path via virtiofs. Defaults to os.Getwd().
 	CWD string
 
-	// Env is a list of extra KEY=VALUE environment variables to pass
-	// to the guest, merged with the filtered host environment.
+	// Env is a list of extra KEY=VALUE environment variables to set
+	// in the guest at boot.
 	Env []string
 
 	// Checkpoint clones the rootfs before starting the VM.
@@ -91,4 +91,3 @@ func (c *Config) memoryBytes() uint64 {
 	}
 	return c.MemoryBytes
 }
-

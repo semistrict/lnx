@@ -25,7 +25,12 @@ var errExecTerminatedUnexpectedly = errors.New("exec terminated unexpectedly")
 
 // execNonInteractive runs a non-interactive command via POST /exec with NDJSON streaming.
 func execNonInteractive(args []string) (int, error) {
-	body, err := json.Marshal(lnx.ExecRequest{Args: args, ClientPID: os.Getpid()})
+	env, err := execEnv()
+	if err != nil {
+		return -1, err
+	}
+
+	body, err := json.Marshal(lnx.ExecRequest{Args: args, Env: env, ClientPID: os.Getpid()})
 	if err != nil {
 		return -1, err
 	}
@@ -92,6 +97,11 @@ func execNonInteractive(args []string) (int, error) {
 
 // execInteractive runs an interactive command via WebSocket.
 func execInteractive(args []string) (int, error) {
+	env, err := execEnv()
+	if err != nil {
+		return -1, err
+	}
+
 	fd := int(os.Stdin.Fd())
 	var rows, cols uint16
 	if term.IsTerminal(fd) {
@@ -122,6 +132,7 @@ func execInteractive(args []string) (int, error) {
 	// Send exec request as first text message.
 	reqJSON, _ := json.Marshal(lnx.ExecRequest{
 		Args:      args,
+		Env:       env,
 		PTY:       true,
 		Rows:      rows,
 		Cols:      cols,

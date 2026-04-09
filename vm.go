@@ -198,7 +198,7 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 
 	setupMsg := &protocol.Setup{
 		CWD:          cwd,
-		Env:          buildGuestEnv(cfg.Env),
+		Env:          append([]string(nil), cfg.Env...),
 		User:         u.Username,
 		UID:          uid,
 		HomeDir:      u.HomeDir,
@@ -592,20 +592,6 @@ func initHostLoggingFromEnv() {
 	})
 }
 
-// buildGuestEnv filters the host environment and merges in extra vars.
-func buildGuestEnv(extra []string) []string {
-	var env []string
-	for _, kv := range os.Environ() {
-		key, _, _ := strings.Cut(kv, "=")
-		if excludeEnvKey(key) {
-			continue
-		}
-		env = append(env, kv)
-	}
-	env = append(env, extra...)
-	return env
-}
-
 // ensureSwapFile creates a sparse swap file if it doesn't exist or is the wrong size.
 func ensureSwapFile(path string, size uint64) error {
 	if info, err := os.Stat(path); err == nil && uint64(info.Size()) == size {
@@ -617,23 +603,6 @@ func ensureSwapFile(path string, size uint64) error {
 	}
 	defer f.Close()
 	return f.Truncate(int64(size))
-}
-
-func excludeEnvKey(key string) bool {
-	switch key {
-	case "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM",
-		"SSH_AUTH_SOCK", "DISPLAY",
-		"SECURITYSESSIONID", "LaunchInstanceID", "COMMAND_MODE",
-		"LANG", "LC_ALL", "LC_CTYPE", "LC_COLLATE", "LC_MESSAGES",
-		"LC_MONETARY", "LC_NUMERIC", "LC_TIME":
-		return true
-	}
-	for _, prefix := range []string{"__CF_", "APPLE_", "XPC_"} {
-		if strings.HasPrefix(key, prefix) {
-			return true
-		}
-	}
-	return false
 }
 
 // serialLogTail returns the last few lines of serial.log for error diagnostics.

@@ -54,6 +54,8 @@ func init() {
 	rootCmd.Flags().BoolVarP(&doCheckpoint, "checkpoint", "c", false, "snapshot rootfs before starting the VM")
 	rootCmd.Flags().BoolVar(&doEphemeral, "ephemeral", false, "clone rootfs to a temp file; discard on exit")
 	rootCmd.Flags().BoolVar(&doSSHAgent, "ssh-agent", false, "forward host SSH agent into the guest")
+	rootCmd.Flags().StringArrayVarP(&forwardEnv, "env", "e", nil, "forward a host env var, set KEY=VALUE, or load dotenv vars from @file")
+	rootCmd.Flags().BoolVar(&forwardAllEnv, "env-all", false, "forward all host environment variables into this guest command")
 
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		// Cobra has parsed flags. Update instanceFlag if --instance was explicitly passed.
@@ -109,6 +111,18 @@ func stripLnxFlags(args []string) []string {
 			i++
 		case a == "--ssh-agent":
 			doSSHAgent = true
+			i++
+		case a == "--env-all":
+			forwardAllEnv = true
+			i++
+		case a == "--env" || a == "-e":
+			if i+1 >= len(args) {
+				return append([]string(nil), args[i:]...)
+			}
+			forwardEnv = append(forwardEnv, args[i+1])
+			i += 2
+		case strings.HasPrefix(a, "--env="):
+			forwardEnv = append(forwardEnv, strings.TrimPrefix(a, "--env="))
 			i++
 		case a == "--checkpoint" || a == "-c":
 			doCheckpoint = true
