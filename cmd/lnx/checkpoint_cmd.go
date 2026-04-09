@@ -20,9 +20,31 @@ var checkpointListCmd = &cobra.Command{
 	RunE:  runCheckpointList,
 }
 
+var checkpointCreateCmd = &cobra.Command{
+	Use:   "create [name]",
+	Short: "Create a checkpoint for the current instance",
+	Args:  cobra.MaximumNArgs(1),
+	RunE:  runCheckpointCreate,
+}
+
 func init() {
-	checkpointCmd.AddCommand(checkpointListCmd)
+	checkpointCmd.AddCommand(checkpointListCmd, checkpointCreateCmd)
 	rootCmd.AddCommand(checkpointCmd)
+}
+
+func runCheckpointCreate(cmd *cobra.Command, args []string) error {
+	name := ""
+	if len(args) == 1 {
+		name = args[0]
+	}
+
+	cpPath, err := createInstanceCheckpoint(instanceDir(), qualifiedInstanceName(), name)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("created checkpoint %q\n", filepath.Base(cpPath))
+	return nil
 }
 
 func runCheckpointList(cmd *cobra.Command, args []string) error {

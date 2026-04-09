@@ -1,4 +1,4 @@
-.PHONY: all cmd/lnx/init lnx lnx-linux kernel rootfs test test-integration install clean help
+.PHONY: all cmd/lnx/init lnx lnx-linux kernel rootfs test test-integration install deps-macos clean help
 
 all: lnx
 
@@ -15,9 +15,10 @@ help:
 	@echo ""
 	@echo "Test:"
 	@echo "  test             Run unit tests (any platform)"
-	@echo "  test-integration Run integration tests (macOS, needs kernel+rootfs)"
+	@echo "  test-integration Run integration tests (macOS, optional TEST=regex filter)"
 	@echo ""
 	@echo "Other:"
+	@echo "  deps-macos       Install local macOS dependencies (currently zstd)"
 	@echo "  clean            Remove build artifacts"
 	@echo "  help             Show this help"
 
@@ -57,15 +58,19 @@ test:
 	go test -v ./...
 
 # Integration tests (macOS only, needs kernel+rootfs+init in place)
-# Usage: make test-integration [RUN=TestName]
-test-integration: cmd/lnx/init
+# Usage: make test-integration [TEST=Regex]
+test-integration: lnx
 	go build -o /tmp/lnx-codesign ./cmd/codesign
-	go test -v -timeout 180s -tags integration -exec /tmp/lnx-codesign $(if $(RUN),-run '$(RUN)') ./...
+	PATH="$(PWD):$$PATH" go test -v -timeout 180s -tags integration -exec /tmp/lnx-codesign $(if $(TEST),-run '$(TEST)') ./...
 
 # Install to $GOPATH/bin
 install: cmd/lnx/init
 	go build -ldflags '-extldflags "-Wl,-no_warn_duplicate_libraries"' -o "$$(go env GOPATH)/bin/lnx" ./cmd/lnx
 	codesign --entitlements entitlements.plist --force -s - "$$(go env GOPATH)/bin/lnx"
+
+# Install local macOS dependencies used by lnx.
+deps-macos:
+	brew install zstd
 
 clean:
 	rm -f lnx lnx-linux cmd/lnx/init vmlinuz vmlinuz.gz rootfs.ext4

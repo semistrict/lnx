@@ -13,6 +13,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"sync"
+	"syscall"
 
 	"github.com/mdlayher/vsock"
 	"github.com/semistrict/lnx/internal/protocol"
@@ -108,10 +109,20 @@ func guestInternalPort(port uint16) bool {
 }
 
 func (gc *guestControl) handleCheckpoint(w http.ResponseWriter, r *http.Request) {
+	syscall.Sync()
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
 	gc.mu.Lock()
 	defer gc.mu.Unlock()
 
-	if err := gc.enc.Encode(protocol.Msg{CheckpointReq: &protocol.CheckpointReq{}}); err != nil {
+	if err := gc.enc.Encode(protocol.Msg{CheckpointReq: &protocol.CheckpointReq{Name: req.Name}}); err != nil {
 		http.Error(w, fmt.Sprintf("send checkpoint request: %v", err), http.StatusInternalServerError)
 		return
 	}

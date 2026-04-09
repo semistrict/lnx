@@ -14,7 +14,7 @@ Experimental Linux/KVM backend (`LNX_EXPERIMENTS=linux_host`). Basic non-interac
 - [ ] Internet connectivity from inside nested VM (TAP + NAT configured but unverified)
 - [ ] Checkpoint / ephemeral mode
 - [ ] Multiple concurrent exec sessions
-- [ ] `lnx instance create/delete` for nested instances
+- [ ] `lnx clone` / `lnx instance delete` for nested instances
 
 ## Known issues
 

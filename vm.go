@@ -361,10 +361,29 @@ func RunDaemon(cfg *Config) error {
 
 	slog.Info("daemon ready, waiting for exec sessions")
 
+	go func() {
+		for state := range b.vm.StateChangedNotify() {
+			switch state {
+			case VMStateStarting, VMStateRunning:
+				slog.Debug("vm state changed", "state", state)
+			case VMStateStopped:
+				slog.Warn("vm stopped while daemon was still running")
+				b.vs.api.requestStop("vm stopped while daemon was still running", "state", state)
+				return
+			default:
+				slog.Warn("vm entered unexpected state while daemon was still running", "state", state)
+				b.vs.api.requestStop("vm entered unexpected state while daemon was still running", "state", state)
+				return
+			}
+		}
+		slog.Warn("vm state channel closed while daemon was still running")
+		b.vs.api.requestStop("vm state channel closed while daemon was still running")
+	}()
+
 	// Block until idle (all execs finished) or stop requested.
 	b.vs.api.WaitIdle()
 
-	slog.Info("daemon shutting down (idle)")
+	slog.Info("daemon shutting down")
 	b.close(0)
 	return nil
 }

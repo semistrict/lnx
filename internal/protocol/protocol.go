@@ -144,7 +144,9 @@ type ExecDone struct {
 }
 
 // CheckpointReq asks the host to snapshot the rootfs.
-type CheckpointReq struct{}
+type CheckpointReq struct {
+	Name string // optional checkpoint basename without or with .ext4 suffix
+}
 
 // CheckpointResp reports the result of a checkpoint.
 type CheckpointResp struct {

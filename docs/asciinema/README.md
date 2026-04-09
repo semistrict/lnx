@@ -5,7 +5,7 @@ This is the terminal-first version of the lnx ingress walkthrough.
 It focuses only on the shell flow:
 
 - `lnx init`
-- `lnx instance create dev`
+- `lnx clone dev`
 - scaffold a Vite app
 - run the dev server inside the VM
 - `lnx ingress enable`

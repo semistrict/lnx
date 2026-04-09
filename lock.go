@@ -13,6 +13,11 @@ type lockFile struct {
 	pidPath string
 }
 
+// RootfsLock is an exported wrapper around the rootfs lock.
+type RootfsLock struct {
+	inner *lockFile
+}
+
 // lockRootfs takes an exclusive flock on a .lock file next to the rootfs.
 // If a stale lock file exists from a crashed process, the flock will
 // succeed (kernel releases flocks on process death) and we clean up.
@@ -43,6 +48,23 @@ func lockRootfs(rootfsPath string) (*lockFile, error) {
 	}
 
 	return &lockFile{lockFd: f, pidPath: pidPath}, nil
+}
+
+// LockRootfs takes an exclusive flock on a .lock file next to the rootfs.
+func LockRootfs(rootfsPath string) (*RootfsLock, error) {
+	lock, err := lockRootfs(rootfsPath)
+	if err != nil {
+		return nil, err
+	}
+	return &RootfsLock{inner: lock}, nil
+}
+
+// Unlock releases the rootfs lock.
+func (l *RootfsLock) Unlock() {
+	if l == nil {
+		return
+	}
+	l.inner.unlock()
 }
 
 func (l *lockFile) unlock() {

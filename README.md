@@ -30,7 +30,7 @@ lnx --instance dev bash -l       # named instance
 Each instance gets its own rootfs, sockets, logs, and checkpoints under `~/.lnx/instances/<name>/`.
 
 ```
-lnx instance create dev           # clone default rootfs
+lnx clone dev                     # clone from the default instance
 lnx instance list                  # show all instances
 lnx --instance dev bash -l         # boot a specific instance
 lnx instance delete dev            # remove an instance
@@ -70,4 +70,15 @@ curl http://p8080.dev.lnx/        # route to dev:8080 (VM must already be runnin
 lnx exec [-i] command             # exec into a running VM
 lnx disk grow 16G                 # grow rootfs (resized on next boot)
 lnx checkpoints list              # list rootfs checkpoints
+```
+
+Manual `.lnx` ingress test:
+
+```sh
+# Terminal 1
+lnx python3 -m http.server 5173
+
+# Terminal 2
+sudo lnx ingress enable
+curl http://p5173.default.lnx/
 ```

@@ -56,6 +56,9 @@ func TestCLI_Ingress_EnableStatusAndProxy(t *testing.T) {
 	t.Cleanup(func() { cleanupStreamingCLI(t, srcCmd, srcDone, srcStderr) })
 
 	enableOut := runCLISuccessEnv(t, bin, env, "ingress", "enable")
+	assert.Contains(t, enableOut, "writing "+filepath.Join(resolverDir, "lnx"))
+	assert.Contains(t, enableOut, "starting dns on 127.0.0.1:15354")
+	assert.Contains(t, enableOut, "starting http on 127.0.0.1:18080")
 	assert.Contains(t, enableOut, "ingress enabled for .lnx")
 
 	resolverPath := filepath.Join(resolverDir, "lnx")
@@ -76,6 +79,7 @@ func TestCLI_Ingress_EnableStatusAndProxy(t *testing.T) {
 	assert.Contains(t, body, payload)
 
 	disableOut := runCLISuccessEnv(t, bin, env, "ingress", "disable")
+	assert.Contains(t, disableOut, "removing "+filepath.Join(resolverDir, "lnx"))
 	assert.Contains(t, disableOut, "ingress disabled")
 
 	statusAfter := runCLISuccessEnv(t, bin, env, "ingress", "status")

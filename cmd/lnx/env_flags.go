@@ -14,7 +14,15 @@ var forwardAllEnv bool
 
 func execEnv() ([]string, error) {
 	if forwardAllEnv {
-		return append([]string(nil), os.Environ()...), nil
+		var env []string
+		for _, kv := range os.Environ() {
+			key, _, _ := strings.Cut(kv, "=")
+			if excludePreservedEnvKey(key) {
+				continue
+			}
+			env = append(env, kv)
+		}
+		return env, nil
 	}
 
 	env := make([]string, 0, len(forwardEnv))
@@ -41,6 +49,21 @@ func execEnv() ([]string, error) {
 		env = append(env, spec+"="+value)
 	}
 	return env, nil
+}
+
+func excludePreservedEnvKey(key string) bool {
+	switch key {
+	case "HOME", "PATH", "PWD", "OLDPWD", "TMPDIR", "SHELL",
+		"SSH_AUTH_SOCK", "DISPLAY", "XDG_RUNTIME_DIR",
+		"SECURITYSESSIONID", "LaunchInstanceID", "COMMAND_MODE":
+		return true
+	}
+	for _, prefix := range []string{"DYLD_", "__CF_", "APPLE_", "XPC_"} {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func loadDotenv(path string) ([]string, error) {

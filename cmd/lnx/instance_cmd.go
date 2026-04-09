@@ -1,13 +1,20 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/semistrict/lnx"
 	"github.com/spf13/cobra"
 )
 
@@ -51,11 +58,11 @@ var instanceListCmd = &cobra.Command{
 	RunE:  runInstanceList,
 }
 
-var instanceCreateCmd = &cobra.Command{
-	Use:   "create <name>",
-	Short: "Create a new instance by cloning default's rootfs",
+var cloneCmd = &cobra.Command{
+	Use:   "clone <name>",
+	Short: "Clone the current source instance into a new instance",
 	Args:  cobra.ExactArgs(1),
-	RunE:  runInstanceCreate,
+	RunE:  runInstanceClone,
 }
 
 var instanceInitCmd = &cobra.Command{
@@ -75,19 +82,21 @@ var instanceDeleteCmd = &cobra.Command{
 }
 
 var (
-	instInitKernel string
-	instInitRootfs string
+	instInitKernel  string
+	instInitRootfs  string
+	cloneCheckpoint string
 )
 
 func init() {
 	instanceInitCmd.Flags().StringVar(&instInitKernel, "kernel", "", "path to kernel Image (copies to shared location)")
 	instanceInitCmd.Flags().StringVar(&instInitRootfs, "rootfs", "", "path to rootfs ext4 image")
+	cloneCmd.Flags().StringVar(&cloneCheckpoint, "checkpoint", "", "clone from an existing or newly created named checkpoint of the source instance")
 
 	instanceCmd.AddCommand(instanceListCmd)
-	instanceCmd.AddCommand(instanceCreateCmd)
 	instanceCmd.AddCommand(instanceInitCmd)
 	instanceCmd.AddCommand(instanceDeleteCmd)
 	rootCmd.AddCommand(instanceCmd)
+	rootCmd.AddCommand(cloneCmd)
 }
 
 func runInstanceList(cmd *cobra.Command, args []string) error {
@@ -133,10 +142,10 @@ func runInstanceList(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func runInstanceCreate(cmd *cobra.Command, args []string) error {
+func runInstanceClone(cmd *cobra.Command, args []string) error {
 	name := qualifyName(args[0])
 	if name == "default" {
-		return fmt.Errorf("cannot create instance named 'default' (use 'lnx init' instead)")
+		return fmt.Errorf("cannot clone into instance named 'default' (use 'lnx init' instead)")
 	}
 
 	dir := filepath.Join(lnxBase(), "instances", name)
@@ -144,24 +153,37 @@ func runInstanceCreate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("instance %q already exists", name)
 	}
 
-	// Find the source rootfs: try the host's "default" first (always available
-	// via ~/.lnx share), then fall back to the qualified name for this nesting level.
-	defaultRootfs := findDefaultRootfs()
-	if defaultRootfs == "" {
-		return fmt.Errorf("no default rootfs found — run 'lnx init' first")
+	sourceName := qualifiedInstanceName()
+	checkpointName := cloneCheckpoint
+	sourceDir, sourceResolvedName, err := resolveCloneSourceDir(sourceName)
+	if err != nil {
+		return err
 	}
 
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("create instance dir: %w", err)
 	}
 
-	dst := filepath.Join(dir, "rootfs.ext4")
-	if err := cloneRootfs(defaultRootfs, dst); err != nil {
-		os.RemoveAll(dir)
-		return fmt.Errorf("clone rootfs: %w", err)
+	checkpointPath, err := checkpointPathForClone(sourceDir, sourceResolvedName, checkpointName)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return err
 	}
 
-	fmt.Printf("created instance %q\n", name)
+	if err := cloneRootfs(checkpointPath, filepath.Join(dir, "rootfs.ext4")); err != nil {
+		_ = os.RemoveAll(dir)
+		return fmt.Errorf("clone rootfs: %w", err)
+	}
+	if err := cloneInstanceMetadata(sourceDir, dir); err != nil {
+		_ = os.RemoveAll(dir)
+		return fmt.Errorf("clone metadata: %w", err)
+	}
+
+	if checkpointName == "" {
+		fmt.Printf("created instance %q from %q\n", name, sourceResolvedName)
+	} else {
+		fmt.Printf("created instance %q from %q\n", name, sourceResolvedName+":"+checkpointName)
+	}
 	return nil
 }
 
@@ -248,4 +270,160 @@ func runInstanceDelete(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("deleted instance %q\n", name)
 	return nil
+}
+
+func resolveCloneSourceDir(source string) (string, string, error) {
+	var candidates []string
+	if source == "default" {
+		candidates = append(candidates, "default")
+		if qualified := qualifyName("default"); qualified != "default" {
+			candidates = append(candidates, qualified)
+		}
+	} else {
+		candidates = append(candidates, qualifyName(source))
+	}
+
+	for _, name := range candidates {
+		dir := filepath.Join(lnxBase(), "instances", name)
+		if _, err := os.Stat(filepath.Join(dir, "rootfs.ext4")); err == nil {
+			return dir, name, nil
+		}
+	}
+	if source == "default" {
+		return "", "", fmt.Errorf("no default rootfs found — run 'lnx init' first")
+	}
+	return "", "", fmt.Errorf("instance %q does not exist", qualifyName(source))
+}
+
+func checkpointPathForClone(sourceDir, sourceName, checkpointName string) (string, error) {
+	if checkpointName != "" {
+		return resolveNamedCheckpoint(sourceDir, checkpointName)
+	}
+	return createInstanceCheckpoint(sourceDir, sourceName, "")
+}
+
+func resolveNamedCheckpoint(sourceDir, checkpointName string) (string, error) {
+	dir := filepath.Join(sourceDir, "checkpoints")
+	candidates := []string{checkpointName}
+	if filepath.Ext(checkpointName) != ".ext4" {
+		candidates = append(candidates, checkpointName+".ext4")
+	}
+	for _, candidate := range candidates {
+		path := filepath.Join(dir, candidate)
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("checkpoint %q not found", checkpointName)
+}
+
+func createInstanceCheckpoint(sourceDir, sourceName, checkpointName string) (string, error) {
+	if isInstanceRunning(sourceName) {
+		return createCheckpointViaAPI(sourceName, checkpointName)
+	}
+
+	rootfsPath := filepath.Join(sourceDir, "rootfs.ext4")
+	lock, err := lnx.LockRootfs(rootfsPath)
+	if err != nil {
+		return "", fmt.Errorf("lock rootfs: %w", err)
+	}
+	defer lock.Unlock()
+
+	return lnx.CreateCheckpoint(rootfsPath, filepath.Join(sourceDir, "checkpoints"), checkpointName)
+}
+
+func createCheckpointViaAPI(instanceName, checkpointName string) (string, error) {
+	body, err := json.Marshal(map[string]string{"name": checkpointName})
+	if err != nil {
+		return "", fmt.Errorf("marshal checkpoint request: %w", err)
+	}
+
+	resp, err := apiClientFor(instanceName).Post("http://localhost/checkpoint", "application/json", bytes.NewReader(body))
+	if err != nil {
+		if isNoVM(err) {
+			return "", noVMError()
+		}
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode/100 != 2 {
+		data, _ := io.ReadAll(resp.Body)
+		msg := strings.TrimSpace(string(data))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return "", errors.New(msg)
+	}
+
+	var payload struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", fmt.Errorf("decode checkpoint response: %w", err)
+	}
+	if payload.Path == "" {
+		return "", fmt.Errorf("checkpoint response missing path")
+	}
+	return payload.Path, nil
+}
+
+func isInstanceRunning(name string) bool {
+	conn, err := net.DialTimeout("unix", filepath.Join(lnxBase(), "instances", name, "status.sock"), 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func cloneInstanceMetadata(srcDir, dstDir string) error {
+	return filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == srcDir {
+			return nil
+		}
+
+		rel, err := filepath.Rel(srcDir, path)
+		if err != nil {
+			return err
+		}
+		if shouldSkipClonedMetadata(rel, d) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		dstPath := filepath.Join(dstDir, rel)
+		if d.IsDir() {
+			return os.MkdirAll(dstPath, 0755)
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(target, dstPath)
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		return copyFile(dstPath, path)
+	})
+}
+
+func shouldSkipClonedMetadata(rel string, d fs.DirEntry) bool {
+	base := filepath.Base(rel)
+	if rel == "rootfs.ext4" || base == "checkpoints" {
+		return true
+	}
+	switch base {
+	case "status.sock", "error.log", "serial.log", "lnx.log", "initramfs.cpio", "swap.img",
+		"rootfs.ext4.lock", "rootfs.ext4.pid", "firecracker.sock", "vsock":
+		return true
+	}
+	return strings.HasPrefix(base, "vsock_")
 }

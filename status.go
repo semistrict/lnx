@@ -73,6 +73,7 @@ type apiServer struct {
 	idleTimer   *time.Timer   // runs after last exec finishes; fires to close idleCh
 	idleCh      chan struct{} // closed when idle timeout expires
 	stopCh      chan struct{} // closed when /stop is called
+	stopOnce    sync.Once
 
 	sessionsMu sync.RWMutex
 	sessions   map[string]*SessionInfo
@@ -115,6 +116,15 @@ func newAPIServer(args []string, user, rootfsPath string) *apiServer {
 		stopCh:     make(chan struct{}),
 		sessions:   make(map[string]*SessionInfo),
 	}
+}
+
+func (s *apiServer) requestStop(reason string, attrs ...any) {
+	if reason != "" {
+		slog.Warn(reason, attrs...)
+	}
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
 }
 
 // registerSession creates a new session entry and returns its ID.
@@ -287,6 +297,10 @@ func (s *apiServer) connectExec() (*gob.Encoder, *gob.Decoder, net.Conn, error) 
 		if err == nil {
 			return gob.NewEncoder(conn), gob.NewDecoder(conn), conn, nil
 		}
+		if errSuggestsDeadVM(err) {
+			s.requestStop("vm no longer live during exec connect", "error", err)
+			return nil, nil, nil, err
+		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	return nil, nil, nil, err
@@ -312,7 +326,7 @@ func (s *apiServer) handleGuestCtrl(conn net.Conn) {
 
 		if msg.CheckpointReq != nil {
 			cpDir := filepath.Join(filepath.Dir(s.rootfsPath), "checkpoints")
-			cpPath, err := checkpoint(s.rootfsPath, cpDir)
+			cpPath, err := CreateCheckpoint(s.rootfsPath, cpDir, msg.CheckpointReq.Name)
 			resp := &protocol.CheckpointResp{}
 			if err != nil {
 				resp.Error = err.Error()
@@ -380,6 +394,7 @@ func (s *apiServer) listenUnix(sockPath string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /ports", s.handlePorts)
+	mux.HandleFunc("POST /checkpoint", s.handleCheckpoint)
 	mux.HandleFunc("POST /expose/host", s.handleExposeHost)
 	mux.HandleFunc("POST /expose/host/remove", s.handleRemoveExposeHost)
 	mux.HandleFunc("POST /guest/expose", s.handleGuestExpose)
@@ -598,6 +613,38 @@ func (s *apiServer) handleGuestExpose(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+func (s *apiServer) handleCheckpoint(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	if s.sock != nil {
+		var resp struct {
+			Path string `json:"path"`
+		}
+		if err := s.proxyGuestJSON(r.Context(), "/checkpoint", req, &resp); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	cpDir := filepath.Join(filepath.Dir(s.rootfsPath), "checkpoints")
+	cpPath, err := CreateCheckpoint(s.rootfsPath, cpDir, req.Name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"path": cpPath})
+}
+
 func (s *apiServer) proxyGuestJSON(ctx context.Context, path string, body any, respBody any) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -620,6 +667,9 @@ func (s *apiServer) proxyGuestJSON(ctx context.Context, path string, body any, r
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if errSuggestsDeadVM(err) {
+			s.requestStop("vm no longer live during guest request", "path", path, "error", err)
+		}
 		return fmt.Errorf("guest request failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -637,6 +687,15 @@ func (s *apiServer) proxyGuestJSON(ctx context.Context, path string, body any, r
 		}
 	}
 	return nil
+}
+
+func errSuggestsDeadVM(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "Invalid virtual machine state") ||
+		strings.Contains(s, "no longer live")
 }
 
 // ExecRequest is the JSON body for POST /exec and the first WebSocket text frame.
@@ -984,12 +1043,7 @@ func (s *apiServer) handleSessionKill(w http.ResponseWriter, r *http.Request) {
 
 // handleStop shuts down the VM daemon.
 func (s *apiServer) handleStop(w http.ResponseWriter, r *http.Request) {
-	select {
-	case <-s.stopCh:
-		// Already stopping.
-	default:
-		close(s.stopCh)
-	}
+	s.requestStop("stop requested by client")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, "stopping")
 }

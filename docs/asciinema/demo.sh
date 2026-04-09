@@ -46,7 +46,7 @@ say $'\033[32minstalled ~/.lnx/vmlinuz\033[0m'
 say $'\033[32minstalled ~/.lnx/instances/default/rootfs.ext4\033[0m'
 pause 1
 
-run_cmd 'lnx instance create dev'
+run_cmd 'lnx clone dev'
 pause 0.4
 say $'\033[32mcreated instance "dev"\033[0m'
 pause 1

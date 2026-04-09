@@ -181,6 +181,9 @@ func runIngressEnable(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	fmt.Printf("writing %s\n", cfg.resolverPath())
+	fmt.Printf("starting dns on %s\n", cfg.DNSAddr)
+	fmt.Printf("starting http on %s\n", cfg.HTTPAddr)
 	if err := startIngressHelper(cfg); err != nil {
 		return err
 	}
@@ -202,6 +205,9 @@ func runIngressDisable(cmd *cobra.Command, args []string) error {
 	}
 
 	cfg := loadIngressConfig()
+	if pathExists(cfg.resolverPath()) {
+		fmt.Printf("removing %s\n", cfg.resolverPath())
+	}
 	stopped := false
 	if err := stopIngress(cfg); err == nil {
 		stopped = true
