@@ -20,11 +20,15 @@ var daemonCmd = &cobra.Command{
 		dir := instanceDir()
 
 		rootfsPath, socketDir := resolveRootfs(dir)
+		restore, err := loadMachineRestore(dir)
+		if err != nil {
+			return err
+		}
 
 		// Scan for nested instances to attach as block devices.
 		nested := scanNestedInstances()
 
-		err := lnx.RunDaemon(&lnx.Config{
+		cfg := &lnx.Config{
 			KernelPath:   resolveKernel(),
 			RootfsPath:   rootfsPath,
 			Hostname:     qualifiedInstanceName() + ".lnx",
@@ -34,7 +38,21 @@ var daemonCmd = &cobra.Command{
 			Shares:       loadShares(dir),
 			SocketDir:    socketDir,
 			NestedRootfs: nested,
-		})
+			Restore:      restore,
+		}
+		if restore != nil {
+			cfg.KernelPath = restore.Manifest.KernelPath
+			cfg.InitramfsPath = restore.Manifest.InitrdPath
+			cfg.CommandLine = restore.Manifest.CommandLine
+			cfg.RootfsPath = restore.Manifest.RootfsPath
+			cfg.Hostname = restore.Manifest.Hostname
+			cfg.SSHAgent = restore.Manifest.SSHAgent
+			cfg.Shares = append([]string(nil), restore.Manifest.Shares...)
+			cfg.CPUs = restore.Manifest.CPUs
+			cfg.MemoryBytes = restore.Manifest.MemoryBytes
+		}
+
+		err = lnx.RunDaemon(cfg)
 		if err != nil {
 			errPath := filepath.Join(socketDir, "error.log")
 			os.WriteFile(errPath, []byte(err.Error()+"\n"), 0644)
@@ -66,6 +84,13 @@ func resolveRootfs(instanceDir string) (rootfsPath, socketDir string) {
 
 	// Normal case: rootfs is a file in the instance directory.
 	return filepath.Join(instanceDir, "rootfs.ext4"), instanceDir
+}
+
+func loadMachineRestore(instanceDir string) (*lnx.MachineRestore, error) {
+	if !experimentEnabled("memorysnapshot") {
+		return nil, nil
+	}
+	return lnx.LoadMachineRestore(instanceDir)
 }
 
 const nestedDrivesPath = "/var/lib/lnx/nested-drives.json"

@@ -31,6 +31,10 @@ type bootedVM struct {
 	ctrlConn net.Conn
 	ctrlEnc  *gob.Encoder
 	cwd      string
+	cfg      *Config
+	initrd   string
+	swapPath string
+	setup    *protocol.Setup
 	// ephCleanup removes the ephemeral temp dir (nil if not ephemeral).
 	ephCleanup func()
 	lock       *lockFile
@@ -38,7 +42,9 @@ type bootedVM struct {
 
 // close shuts down the VM and releases all resources.
 func (b *bootedVM) close(exitCode int) {
-	b.ctrlConn.Close()
+	if b.ctrlConn != nil {
+		b.ctrlConn.Close()
+	}
 	shutdownVM(b.vm, exitCode)
 	b.lock.unlock()
 	b.vs.cleanup()
@@ -73,6 +79,7 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 			KernelPath:    cfg.KernelPath,
 			RootfsPath:    ephRootfs,
 			InitramfsPath: cfg.InitramfsPath,
+			CommandLine:   cfg.CommandLine,
 			CPUs:          cfg.CPUs,
 			MemoryBytes:   cfg.MemoryBytes,
 			CWD:           cfg.CWD,
@@ -163,6 +170,9 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 	hostname := cfg.Hostname
 	if hostname == "" {
 		hostname = "lnx"
+	}
+	if cfg.CommandLine == "" {
+		cfg.CommandLine = fmt.Sprintf("console=hvc0 lnx.epoch=%d", time.Now().Unix())
 	}
 
 	sshAgent := cfg.SSHAgent && os.Getenv("SSH_AUTH_SOCK") != ""
@@ -295,6 +305,10 @@ waitBoot:
 		ctrlConn:   ctrlConn,
 		ctrlEnc:    enc,
 		cwd:        cwd,
+		cfg:        cfg,
+		initrd:     initrdPath,
+		swapPath:   swapPath,
+		setup:      setupMsg,
 		ephCleanup: ephCleanup,
 		lock:       lock,
 	}, nil
@@ -354,9 +368,31 @@ func Run(cfg *Config, args ...string) (int, error) {
 // It blocks until all exec sessions have finished (idle) or Stop is requested
 // via the API. Returns nil on clean shutdown.
 func RunDaemon(cfg *Config) error {
+	if cfg.Restore != nil {
+		return runRestoredDaemon(cfg)
+	}
+
 	b, err := bootVM(cfg)
 	if err != nil {
 		return err
+	}
+	if vm, ok := b.vm.(SnapshotCapableVirtualMachine); ok && experimentEnabled("memorysnapshot") {
+		b.vs.api.ms = &machineSnapshotRuntime{
+			vm:          vm,
+			kernelPath:  cfg.KernelPath,
+			initrdPath:  b.initrd,
+			rootfsPath:  cfg.RootfsPath,
+			swapPath:    b.swapPath,
+			commandLine: cfg.CommandLine,
+			hostname:    b.setup.Hostname,
+			user:        b.setup.User,
+			homeDir:     b.setup.HomeDir,
+			cwd:         b.setup.CWD,
+			shares:      append([]string(nil), b.setup.Shares...),
+			sshAgent:    b.setup.SSHAgent,
+			cpus:        cfg.cpus(),
+			memoryBytes: cfg.memoryBytes(),
+		}
 	}
 
 	slog.Info("daemon ready, waiting for exec sessions")
@@ -386,6 +422,127 @@ func RunDaemon(cfg *Config) error {
 	slog.Info("daemon shutting down")
 	b.close(0)
 	return nil
+}
+
+func runRestoredDaemon(cfg *Config) error {
+	b, err := restoreDaemonVM(cfg)
+	if err != nil {
+		return err
+	}
+	if vm, ok := b.vm.(SnapshotCapableVirtualMachine); ok && experimentEnabled("memorysnapshot") {
+		b.vs.api.ms = &machineSnapshotRuntime{
+			vm:          vm,
+			kernelPath:  cfg.KernelPath,
+			initrdPath:  b.initrd,
+			rootfsPath:  cfg.RootfsPath,
+			swapPath:    b.swapPath,
+			commandLine: cfg.CommandLine,
+			hostname:    b.setup.Hostname,
+			user:        b.setup.User,
+			homeDir:     b.setup.HomeDir,
+			cwd:         b.setup.CWD,
+			shares:      append([]string(nil), b.setup.Shares...),
+			sshAgent:    b.setup.SSHAgent,
+			cpus:        cfg.cpus(),
+			memoryBytes: cfg.memoryBytes(),
+		}
+	}
+
+	slog.Info("daemon restored, waiting for exec sessions")
+
+	go func() {
+		for state := range b.vm.StateChangedNotify() {
+			switch state {
+			case VMStateStarting, VMStateRunning:
+				slog.Debug("vm state changed", "state", state)
+			case VMStateStopped:
+				slog.Warn("vm stopped while daemon was still running")
+				b.vs.api.requestStop("vm stopped while daemon was still running", "state", state)
+				return
+			default:
+				slog.Warn("vm entered unexpected state while daemon was still running", "state", state)
+				b.vs.api.requestStop("vm entered unexpected state while daemon was still running", "state", state)
+				return
+			}
+		}
+		slog.Warn("vm state channel closed while daemon was still running")
+		b.vs.api.requestStop("vm state channel closed while daemon was still running")
+	}()
+
+	if err := RemoveMachineSnapshot(cfg.socketDir()); err != nil {
+		slog.Warn("remove consumed machine snapshot failed", "error", err)
+	}
+
+	b.vs.api.WaitIdle()
+	slog.Info("daemon shutting down")
+	b.close(0)
+	return nil
+}
+
+func restoreDaemonVM(cfg *Config) (*bootedVM, error) {
+	initHostLoggingFromEnv()
+	if cfg.Restore == nil {
+		return nil, fmt.Errorf("restore config required")
+	}
+	if err := validatePaths(cfg); err != nil {
+		return nil, err
+	}
+
+	lock, err := lockRootfs(cfg.RootfsPath)
+	if err != nil {
+		return nil, err
+	}
+
+	restore := cfg.Restore.Manifest
+	setupMsg := &protocol.Setup{
+		CWD:         restore.CWD,
+		User:        restore.User,
+		HomeDir:     restore.HomeDir,
+		Hostname:    restore.Hostname,
+		SSHAgent:    restore.SSHAgent,
+		Shares:      append([]string(nil), restore.Shares...),
+		ShareMethod: shareMethod(),
+	}
+
+	vm, err := buildVM(cfg, cfg.InitramfsPath, restore.CWD, restore.SwapPath, restore.HomeDir)
+	if err != nil {
+		lock.unlock()
+		return nil, err
+	}
+
+	vs, err := setupVsock(vm.VsockDevice(), cfg.socketDir(), cfg.RootfsPath, setupMsg)
+	if err != nil {
+		lock.unlock()
+		return nil, err
+	}
+
+	svm, ok := vm.(SnapshotCapableVirtualMachine)
+	if !ok {
+		vs.cleanup()
+		lock.unlock()
+		return nil, fmt.Errorf("vm restore unsupported")
+	}
+	if err := svm.RestoreMachineStateFromURL(cfg.Restore.Manifest.StatePath); err != nil {
+		vs.cleanup()
+		lock.unlock()
+		return nil, fmt.Errorf("restore machine state: %w", err)
+	}
+	if err := svm.Resume(); err != nil {
+		vs.cleanup()
+		lock.unlock()
+		return nil, fmt.Errorf("resume restored vm: %w", err)
+	}
+
+	return &bootedVM{
+		vm:       vm,
+		vs:       vs,
+		cwd:      restore.CWD,
+		cfg:      cfg,
+		initrd:   cfg.InitramfsPath,
+		swapPath: restore.SwapPath,
+		setup:    setupMsg,
+		lock:     lock,
+	}, nil
 }
 
 // vsockState holds the vsock infrastructure created during VM setup.
@@ -481,29 +638,35 @@ func setupVsock(sock VsockDevice, logDir, rootfsPath string, setupMsg *protocol.
 
 	pf := newPortForwarder(sock)
 	go func() {
-		conn, err := portFwdListener.Accept()
-		if err != nil {
-			return
+		for {
+			conn, err := portFwdListener.Accept()
+			if err != nil {
+				return
+			}
+			go pf.run(conn)
 		}
-		pf.run(conn)
 	}()
 
 	api := newAPIServer(nil, setupMsg.User, rootfsPath)
 	api.sock = sock
 	api.pf = pf
 	go func() {
-		conn, err := statusListener.Accept()
-		if err != nil {
-			return
+		for {
+			conn, err := statusListener.Accept()
+			if err != nil {
+				return
+			}
+			api.setStatusConn(conn)
 		}
-		api.setStatusConn(conn)
 	}()
 	go func() {
-		conn, err := guestCtrlListener.Accept()
-		if err != nil {
-			return
+		for {
+			conn, err := guestCtrlListener.Accept()
+			if err != nil {
+				return
+			}
+			api.setGuestCtrlConn(conn)
 		}
-		api.setGuestCtrlConn(conn)
 	}()
 
 	sockPath := filepath.Join(logDir, "status.sock")

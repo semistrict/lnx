@@ -1,4 +1,4 @@
-.PHONY: all cmd/lnx/init lnx lnx-linux kernel rootfs test test-integration install deps-macos clean help
+.PHONY: all cmd/lnx/init lnx lnx-linux kernel rootfs test test-integration test-memorysnapshot install deps-macos clean help
 
 all: lnx
 
@@ -16,6 +16,7 @@ help:
 	@echo "Test:"
 	@echo "  test             Run unit tests (any platform)"
 	@echo "  test-integration Run integration tests (macOS, optional TEST=regex filter)"
+	@echo "  test-memorysnapshot Run focused memory snapshot integration tests (optional TEST=regex filter)"
 	@echo ""
 	@echo "Other:"
 	@echo "  deps-macos       Install local macOS dependencies (currently zstd)"
@@ -62,6 +63,10 @@ test:
 test-integration: lnx
 	go build -o /tmp/lnx-codesign ./cmd/codesign
 	PATH="$(PWD):$$PATH" go test -v -timeout 180s -tags integration -exec /tmp/lnx-codesign $(if $(TEST),-run '$(TEST)') ./...
+
+test-memorysnapshot: lnx
+	go build -o /tmp/lnx-codesign ./cmd/codesign
+	PATH="$(PWD):$$PATH" LNX_EXPERIMENTS=memorysnapshot go test -v -timeout 180s -tags integration -exec /tmp/lnx-codesign $(if $(TEST),-run '$(TEST)',-run 'TestCLI_MemoryClone(PreservesProcessState|PreservesLnxControlState)$$') ./...
 
 # Install to $GOPATH/bin
 install: cmd/lnx/init

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/mdlayher/vsock"
 	"github.com/semistrict/lnx/internal/protocol"
@@ -19,30 +20,33 @@ import (
 // startStatusServer connects to the host on the status vsock port
 // and serves StatusReq/StatusResp for the VM's lifetime.
 func startStatusServer() {
-	conn, err := vsock.Dial(vsockHostCID, protocol.StatusPort, nil)
-	if err != nil {
-		slog.Warn("status vsock dial failed", "error", err)
-		return
-	}
-
 	go func() {
-		defer conn.Close()
-		enc := gob.NewEncoder(conn)
-		dec := gob.NewDecoder(conn)
-
 		for {
-			var msg protocol.Msg
-			if err := dec.Decode(&msg); err != nil {
-				return
-			}
-			if msg.StatusReq == nil {
+			conn, err := vsock.Dial(vsockHostCID, protocol.StatusPort, nil)
+			if err != nil {
+				slog.Warn("status vsock dial failed", "error", err)
+				time.Sleep(time.Second)
 				continue
 			}
+			enc := gob.NewEncoder(conn)
+			dec := gob.NewDecoder(conn)
+			for {
+				var msg protocol.Msg
+				if err := dec.Decode(&msg); err != nil {
+					_ = conn.Close()
+					break
+				}
+				if msg.StatusReq == nil {
+					continue
+				}
 
-			resp := gatherStatus(msg.StatusReq.IncludeDmesg)
-			if err := enc.Encode(protocol.Msg{StatusResp: &resp}); err != nil {
-				return
+				resp := gatherStatus(msg.StatusReq.IncludeDmesg)
+				if err := enc.Encode(protocol.Msg{StatusResp: &resp}); err != nil {
+					_ = conn.Close()
+					break
+				}
 			}
+			time.Sleep(time.Second)
 		}
 	}()
 }

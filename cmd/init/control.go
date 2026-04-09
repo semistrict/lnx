@@ -14,6 +14,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/mdlayher/vsock"
 	"github.com/semistrict/lnx/internal/protocol"
@@ -24,28 +25,18 @@ const guestControlSock = "/var/run/lnx/control.sock"
 // startGuestControlServer dials the host on the guest control vsock port
 // and starts an HTTP server on a unix socket inside the guest.
 func startGuestControlServer() {
-	hostConn, err := vsock.Dial(vsockHostCID, protocol.GuestControlPort, nil)
-	if err != nil {
-		slog.Warn("guest control vsock dial failed", "error", err)
-		return
-	}
-
 	os.MkdirAll("/var/run/lnx", 0755)
 	os.Remove(guestControlSock)
 
 	ln, err := net.Listen("unix", guestControlSock)
 	if err != nil {
 		slog.Warn("guest control socket listen failed", "error", err)
-		hostConn.Close()
 		return
 	}
 	// Make it world-accessible so non-root users can curl it.
 	os.Chmod(guestControlSock, 0666)
 
-	gc := &guestControl{
-		enc: gob.NewEncoder(hostConn),
-		dec: gob.NewDecoder(hostConn),
-	}
+	gc := &guestControl{}
 
 	mux := newGuestControlMux(gc)
 
@@ -57,6 +48,7 @@ func startGuestControlServer() {
 		return
 	}
 	go http.Serve(vsockLn, mux)
+	go gc.connectLoop()
 }
 
 func newGuestControlMux(gc *guestControl) *http.ServeMux {
@@ -84,9 +76,53 @@ func newGuestControlMux(gc *guestControl) *http.ServeMux {
 }
 
 type guestControl struct {
-	mu  sync.Mutex
-	enc *gob.Encoder
-	dec *gob.Decoder
+	mu   sync.Mutex
+	conn net.Conn
+	enc  *gob.Encoder
+	dec  *gob.Decoder
+}
+
+func (gc *guestControl) connectLoop() {
+	for {
+		conn, err := vsock.Dial(vsockHostCID, protocol.GuestControlPort, nil)
+		if err != nil {
+			slog.Warn("guest control vsock dial failed", "error", err)
+			time.Sleep(time.Second)
+			continue
+		}
+		gc.mu.Lock()
+		if gc.conn != nil {
+			_ = gc.conn.Close()
+		}
+		gc.conn = conn
+		gc.enc = gob.NewEncoder(conn)
+		gc.dec = gob.NewDecoder(conn)
+		gc.mu.Unlock()
+		return
+	}
+}
+
+func (gc *guestControl) ensureConnLocked() error {
+	if gc.enc != nil && gc.dec != nil && gc.conn != nil {
+		return nil
+	}
+	conn, err := vsock.Dial(vsockHostCID, protocol.GuestControlPort, nil)
+	if err != nil {
+		return err
+	}
+	gc.conn = conn
+	gc.enc = gob.NewEncoder(conn)
+	gc.dec = gob.NewDecoder(conn)
+	return nil
+}
+
+func (gc *guestControl) resetConn() {
+	if gc.conn != nil {
+		_ = gc.conn.Close()
+	}
+	gc.conn = nil
+	gc.enc = nil
+	gc.dec = nil
 }
 
 type guestTCPExpose struct {
@@ -121,14 +157,20 @@ func (gc *guestControl) handleCheckpoint(w http.ResponseWriter, r *http.Request)
 
 	gc.mu.Lock()
 	defer gc.mu.Unlock()
+	if err := gc.ensureConnLocked(); err != nil {
+		http.Error(w, fmt.Sprintf("connect checkpoint request: %v", err), http.StatusInternalServerError)
+		return
+	}
 
 	if err := gc.enc.Encode(protocol.Msg{CheckpointReq: &protocol.CheckpointReq{Name: req.Name}}); err != nil {
+		gc.resetConn()
 		http.Error(w, fmt.Sprintf("send checkpoint request: %v", err), http.StatusInternalServerError)
 		return
 	}
 
 	var msg protocol.Msg
 	if err := gc.dec.Decode(&msg); err != nil {
+		gc.resetConn()
 		http.Error(w, fmt.Sprintf("read checkpoint response: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -163,14 +205,20 @@ func (gc *guestControl) handleOpen(w http.ResponseWriter, r *http.Request) {
 
 	gc.mu.Lock()
 	defer gc.mu.Unlock()
+	if err := gc.ensureConnLocked(); err != nil {
+		http.Error(w, fmt.Sprintf("connect open request: %v", err), http.StatusInternalServerError)
+		return
+	}
 
 	if err := gc.enc.Encode(protocol.Msg{OpenURLReq: &protocol.OpenURLReq{URL: req.URL}}); err != nil {
+		gc.resetConn()
 		http.Error(w, fmt.Sprintf("send open request: %v", err), http.StatusInternalServerError)
 		return
 	}
 
 	var msg protocol.Msg
 	if err := gc.dec.Decode(&msg); err != nil {
+		gc.resetConn()
 		http.Error(w, fmt.Sprintf("read open response: %v", err), http.StatusInternalServerError)
 		return
 	}

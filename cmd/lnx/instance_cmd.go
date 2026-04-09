@@ -164,6 +164,20 @@ func runInstanceClone(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("create instance dir: %w", err)
 	}
 
+	if err := cloneInstanceMetadata(sourceDir, dir); err != nil {
+		_ = os.RemoveAll(dir)
+		return fmt.Errorf("clone metadata: %w", err)
+	}
+
+	if experimentEnabled("memorysnapshot") && checkpointName == "" && isInstanceRunning(sourceResolvedName) {
+		if err := createMemoryClone(sourceResolvedName, dir); err != nil {
+			_ = os.RemoveAll(dir)
+			return err
+		}
+		fmt.Printf("created instance %q from %q (memory)\n", name, sourceResolvedName)
+		return nil
+	}
+
 	checkpointPath, err := checkpointPathForClone(sourceDir, sourceResolvedName, checkpointName)
 	if err != nil {
 		_ = os.RemoveAll(dir)
@@ -174,15 +188,32 @@ func runInstanceClone(cmd *cobra.Command, args []string) error {
 		_ = os.RemoveAll(dir)
 		return fmt.Errorf("clone rootfs: %w", err)
 	}
-	if err := cloneInstanceMetadata(sourceDir, dir); err != nil {
-		_ = os.RemoveAll(dir)
-		return fmt.Errorf("clone metadata: %w", err)
-	}
 
 	if checkpointName == "" {
 		fmt.Printf("created instance %q from %q\n", name, sourceResolvedName)
 	} else {
 		fmt.Printf("created instance %q from %q\n", name, sourceResolvedName+":"+checkpointName)
+	}
+	return nil
+}
+
+func createMemoryClone(sourceName, destDir string) error {
+	body, err := json.Marshal(map[string]string{"dest_dir": destDir})
+	if err != nil {
+		return fmt.Errorf("marshal memory clone request: %w", err)
+	}
+	resp, err := apiClientFor(sourceName).Post("http://localhost/clone-memory", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("memory clone request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 204 {
+		data, _ := io.ReadAll(resp.Body)
+		msg := strings.TrimSpace(string(data))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return fmt.Errorf("memory clone failed: %s", msg)
 	}
 	return nil
 }
@@ -417,7 +448,7 @@ func cloneInstanceMetadata(srcDir, dstDir string) error {
 
 func shouldSkipClonedMetadata(rel string, d fs.DirEntry) bool {
 	base := filepath.Base(rel)
-	if rel == "rootfs.ext4" || base == "checkpoints" {
+	if rel == "rootfs.ext4" || base == "checkpoints" || base == "machine-snapshot" {
 		return true
 	}
 	switch base {

@@ -4,9 +4,11 @@ package lnx_test
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -263,4 +265,73 @@ func TestCLI_InstanceCreateFromRunningSourceAutoCheckpoint(t *testing.T) {
 	require.ErrorIs(t, err, os.ErrNotExist)
 
 	waitForProcessSuccess(t, done, 12*time.Second, stderr.String())
+}
+
+func TestCLI_MemoryClonePreservesProcessState(t *testing.T) {
+	bin, err := filepath.Abs("lnx")
+	require.NoError(t, err)
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("skipping: repo lnx binary not found at %s", bin)
+	}
+
+	env := append(os.Environ(), "LNX_EXPERIMENTS=memorysnapshot")
+	srcInst := fmt.Sprintf("test-memory-clone-src-%d", time.Now().UnixNano())
+	dstInst := fmt.Sprintf("test-memory-clone-dst-%d", time.Now().UnixNano())
+	createClonedInstance(t, srcInst)
+	registerInstanceStopCleanup(t, bin, srcInst, dstInst)
+
+	setup := `mkdir -p /dev/shm/memclone && echo hello-from-memory >/dev/shm/memclone/file && python3 -m http.server 18273 --bind 127.0.0.1 --directory /dev/shm/memclone >/tmp/memclone-http.log 2>&1 &`
+	runCLISuccessEnv(t, bin, env, "--instance", srcInst, "sh", "-lc", setup)
+	require.Eventually(t, func() bool {
+		out, err := runCLIEnv(bin, env, "--instance", srcInst, "curl", "-s", "http://127.0.0.1:18273/file")
+		return err == nil && strings.Contains(out, "hello-from-memory")
+	}, 20*time.Second, 500*time.Millisecond)
+
+	out := runCLISuccessEnv(t, bin, env, "--instance", srcInst, "clone", dstInst)
+	assert.Contains(t, out, "(memory)")
+
+	require.Eventually(t, func() bool {
+		got, err := runCLIEnv(bin, env, "--instance", dstInst, "curl", "-s", "http://127.0.0.1:18273/file")
+		return err == nil && strings.Contains(got, "hello-from-memory")
+	}, 30*time.Second, 500*time.Millisecond)
+	require.Eventually(t, func() bool {
+		got, err := runCLIEnv(bin, env, "--instance", dstInst, "cat", "/dev/shm/memclone/file")
+		return err == nil && strings.Contains(got, "hello-from-memory")
+	}, 30*time.Second, 500*time.Millisecond)
+}
+
+func TestCLI_MemoryClonePreservesLnxControlState(t *testing.T) {
+	bin, err := filepath.Abs("lnx")
+	require.NoError(t, err)
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("skipping: repo lnx binary not found at %s", bin)
+	}
+
+	home, _ := os.UserHomeDir()
+	base := filepath.Join(home, ".lnx")
+	env := append(os.Environ(), "LNX_EXPERIMENTS=memorysnapshot")
+	srcInst := fmt.Sprintf("test-memory-lnx-src-%d", time.Now().UnixNano())
+	dstInst := fmt.Sprintf("test-memory-lnx-dst-%d", time.Now().UnixNano())
+	createClonedInstance(t, srcInst)
+	registerInstanceStopCleanup(t, bin, srcInst, dstInst)
+
+	runCLISuccessEnv(t, bin, env, "--instance", srcInst, "sh", "-lc", `python3 -m http.server 18274 --bind 127.0.0.1 >/tmp/memclone-lnx-http.log 2>&1 &`)
+	runCLISuccessEnv(t, bin, env, "--instance", srcInst, "clone", dstInst)
+
+	require.Eventually(t, func() bool {
+		got, err := runCLIEnv(bin, env, "--instance", dstInst, "status")
+		return err == nil && strings.Contains(got, "User")
+	}, 30*time.Second, 500*time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		got, err := runCLIEnv(bin, env, "--instance", dstInst, "checkpoints", "create", "after-restore")
+		return err == nil && strings.Contains(got, `created checkpoint "after-restore.ext4"`)
+	}, 30*time.Second, 500*time.Millisecond)
+	_, err = os.Stat(filepath.Join(base, "instances", dstInst, "checkpoints", "after-restore.ext4"))
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		got, err := runCLIEnv(bin, env, "--instance", dstInst, "ports", "list")
+		return err == nil && strings.Contains(got, "18274")
+	}, 30*time.Second, 500*time.Millisecond)
 }

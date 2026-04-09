@@ -177,8 +177,10 @@ func run() error {
 
 	slog.Info("guest ready", "user", setup.User, "uid", setup.UID)
 
-	// Block until the host closes the control connection.
-	<-ctrlDone
+	// Stay alive until the host stops the VM. The boot-time control
+	// connection may disappear across restore/resume and should not define
+	// the guest lifetime.
+	select {}
 	return nil
 }
 

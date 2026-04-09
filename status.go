@@ -58,10 +58,12 @@ type apiServer struct {
 	statusDec  *gob.Decoder
 	statusConn net.Conn
 
+	guestCtrlMu   sync.Mutex
 	guestCtrlConn net.Conn
 
 	sock VsockDevice
 	pf   *portForwarder
+	ms   *machineSnapshotRuntime
 
 	sockPath string
 	listener net.Listener
@@ -282,6 +284,9 @@ func (s *apiServer) unpin() {
 func (s *apiServer) setStatusConn(conn net.Conn) {
 	s.statusMu.Lock()
 	defer s.statusMu.Unlock()
+	if s.statusConn != nil {
+		_ = s.statusConn.Close()
+	}
 	s.statusConn = conn
 	s.statusEnc = gob.NewEncoder(conn)
 	s.statusDec = gob.NewDecoder(conn)
@@ -309,7 +314,12 @@ func (s *apiServer) connectExec() (*gob.Encoder, *gob.Decoder, net.Conn, error) 
 // setGuestCtrlConn stores the guest control vsock connection and starts
 // handling guest-initiated requests (checkpoint, etc).
 func (s *apiServer) setGuestCtrlConn(conn net.Conn) {
+	s.guestCtrlMu.Lock()
+	if s.guestCtrlConn != nil {
+		_ = s.guestCtrlConn.Close()
+	}
 	s.guestCtrlConn = conn
+	s.guestCtrlMu.Unlock()
 	go s.handleGuestCtrl(conn)
 }
 
@@ -395,6 +405,7 @@ func (s *apiServer) listenUnix(sockPath string) error {
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /ports", s.handlePorts)
 	mux.HandleFunc("POST /checkpoint", s.handleCheckpoint)
+	mux.HandleFunc("POST /clone-memory", s.handleCloneMemory)
 	mux.HandleFunc("POST /expose/host", s.handleExposeHost)
 	mux.HandleFunc("POST /expose/host/remove", s.handleRemoveExposeHost)
 	mux.HandleFunc("POST /guest/expose", s.handleGuestExpose)
@@ -643,6 +654,60 @@ func (s *apiServer) handleCheckpoint(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"path": cpPath})
+}
+
+func (s *apiServer) handleCloneMemory(w http.ResponseWriter, r *http.Request) {
+	if !experimentEnabled("memorysnapshot") {
+		http.Error(w, "memory snapshots are experimental; set LNX_EXPERIMENTS=memorysnapshot", http.StatusPreconditionFailed)
+		return
+	}
+	if s.ms == nil {
+		http.Error(w, "memory snapshot unavailable for this VM", http.StatusConflict)
+		return
+	}
+
+	var req struct {
+		DestDir string `json:"dest_dir"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.DestDir == "" {
+		http.Error(w, "dest_dir required", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.ms.createClone(req.DestDir, s.syncGuestFilesystems); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *apiServer) syncGuestFilesystems() error {
+	execEnc, execDec, execConn, err := s.connectExec()
+	if err != nil {
+		return fmt.Errorf("guest exec connect: %w", err)
+	}
+	defer execConn.Close()
+
+	if err := execEnc.Encode(protocol.Msg{ExecReq: &protocol.ExecReq{Args: []string{"sync"}}}); err != nil {
+		return fmt.Errorf("send sync exec request: %w", err)
+	}
+
+	for {
+		var msg protocol.Msg
+		if err := execDec.Decode(&msg); err != nil {
+			return fmt.Errorf("decode sync exec response: %w", err)
+		}
+		if msg.ExecDone != nil {
+			if msg.ExecDone.ExitCode != 0 {
+				return fmt.Errorf("sync exited with code %d", msg.ExecDone.ExitCode)
+			}
+			return nil
+		}
+	}
 }
 
 func (s *apiServer) proxyGuestJSON(ctx context.Context, path string, body any, respBody any) error {

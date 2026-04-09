@@ -11,8 +11,9 @@ import (
 
 // darwinVM implements VirtualMachine using Apple Virtualization.framework.
 type darwinVM struct {
-	vm   *vz.VirtualMachine
-	sock *vzVsockDevice
+	vm     *vz.VirtualMachine
+	config *vz.VirtualMachineConfiguration
+	sock   *vzVsockDevice
 }
 
 func (d *darwinVM) Start() error {
@@ -25,6 +26,27 @@ func (d *darwinVM) Stop() error {
 
 func (d *darwinVM) RequestStop() error {
 	_, err := d.vm.RequestStop()
+	return err
+}
+
+func (d *darwinVM) Pause() error {
+	return d.vm.Pause()
+}
+
+func (d *darwinVM) Resume() error {
+	return d.vm.Resume()
+}
+
+func (d *darwinVM) SaveMachineStateToPath(path string) error {
+	return d.vm.SaveMachineStateToPath(path)
+}
+
+func (d *darwinVM) RestoreMachineStateFromURL(path string) error {
+	return d.vm.RestoreMachineStateFromURL(path)
+}
+
+func (d *darwinVM) ValidateSaveRestoreSupport() error {
+	_, err := d.config.ValidateSaveRestoreSupport()
 	return err
 }
 
@@ -75,13 +97,17 @@ func buildVM(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (VirtualMac
 	}
 
 	return &darwinVM{
-		vm:   vm,
-		sock: &vzVsockDevice{dev: socketDevices[0]},
+		vm:     vm,
+		config: vmConfig,
+		sock:   &vzVsockDevice{dev: socketDevices[0]},
 	}, nil
 }
 
 func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.VirtualMachineConfiguration, error) {
-	cmdline := fmt.Sprintf("console=hvc0 lnx.epoch=%d", time.Now().Unix())
+	cmdline := cfg.CommandLine
+	if cmdline == "" {
+		cmdline = fmt.Sprintf("console=hvc0 lnx.epoch=%d", time.Now().Unix())
+	}
 
 	bootLoader, err := vz.NewLinuxBootLoader(
 		cfg.KernelPath,

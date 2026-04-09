@@ -19,18 +19,10 @@ import (
 // startPortForwarder scans for listening TCP ports and notifies the host.
 // It also listens on a vsock port for incoming forwarded connections from the host.
 func startPortForwarder() {
-	// Control connection: notify host of port changes.
-	ctrlConn, err := vsock.Dial(vsockHostCID, protocol.PortForwardPort, nil)
-	if err != nil {
-		slog.Warn("port forward vsock dial failed", "error", err)
-		return
-	}
-
 	// Data listener: host connects here to forward TCP connections.
 	dataLn, err := vsock.Listen(protocol.PortForwardDataPort, nil)
 	if err != nil {
 		slog.Warn("port forward data listen failed", "error", err)
-		ctrlConn.Close()
 		return
 	}
 
@@ -38,23 +30,32 @@ func startPortForwarder() {
 	go acceptForwardedConns(dataLn)
 
 	// Scan for listening ports and notify host.
-	go scanPorts(ctrlConn)
+	go scanPortsLoop()
 }
 
-func scanPorts(conn net.Conn) {
-	enc := gob.NewEncoder(conn)
-	var prev []uint16
-
+func scanPortsLoop() {
 	for {
-		ports := getListeningPorts()
-		if !portsEqual(prev, ports) {
-			if err := enc.Encode(protocol.PortForward{Ports: ports}); err != nil {
-				slog.Debug("port forward encode failed", "error", err)
-				return
-			}
-			prev = ports
+		conn, err := vsock.Dial(vsockHostCID, protocol.PortForwardPort, nil)
+		if err != nil {
+			slog.Warn("port forward vsock dial failed", "error", err)
+			time.Sleep(time.Second)
+			continue
 		}
-		time.Sleep(2 * time.Second)
+		enc := gob.NewEncoder(conn)
+		var prev []uint16
+		for {
+			ports := getListeningPorts()
+			if !portsEqual(prev, ports) {
+				if err := enc.Encode(protocol.PortForward{Ports: ports}); err != nil {
+					slog.Debug("port forward encode failed", "error", err)
+					_ = conn.Close()
+					break
+				}
+				prev = ports
+			}
+			time.Sleep(2 * time.Second)
+		}
+		time.Sleep(time.Second)
 	}
 }
 

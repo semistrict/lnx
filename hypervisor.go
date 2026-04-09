@@ -32,3 +32,12 @@ type VirtualMachine interface {
 	StateChangedNotify() <-chan VMState
 	VsockDevice() VsockDevice
 }
+
+type SnapshotCapableVirtualMachine interface {
+	VirtualMachine
+	Pause() error
+	Resume() error
+	RestoreMachineStateFromURL(path string) error
+	SaveMachineStateToPath(path string) error
+	ValidateSaveRestoreSupport() error
+}

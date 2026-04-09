@@ -14,6 +14,10 @@ type Config struct {
 	// If empty, defaults to the same directory as KernelPath.
 	InitramfsPath string
 
+	// CommandLine is the exact kernel command line to use. If empty, lnx
+	// generates the default command line for a fresh boot.
+	CommandLine string
+
 	// CPUs is the number of virtual CPUs. Defaults to 2.
 	CPUs uint
 
@@ -63,6 +67,10 @@ type Config struct {
 	// NestedRootfs is a list of rootfs file paths for nested VM instances.
 	// Each is attached as an additional virtio-blk device (vdc, vdd, ...).
 	NestedRootfs []NestedRootfs
+
+	// Restore points to a previously created machine snapshot bundle to
+	// restore instead of cold-booting the VM. Experimental.
+	Restore *MachineRestore
 }
 
 // NestedRootfs pairs a nested instance name with its rootfs file path.
