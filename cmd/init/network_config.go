@@ -3,9 +3,17 @@ package main
 import (
 	"fmt"
 	"net"
+	"os"
 	"strings"
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
+)
+
+const (
+	linuxHostGuestCIDR  = "192.168.64.2/24"
+	linuxHostGatewayIP  = "192.168.64.1"
+	linuxHostResolvConf = "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+	linuxHostExperiment = "linux_host"
 )
 
 func cidrForLease(ip net.IP, mask net.IPMask) (string, error) {
@@ -43,4 +51,17 @@ func resolvConfForLease(ack *dhcpv4.DHCPv4) string {
 		return ""
 	}
 	return strings.Join(lines, "\n") + "\n"
+}
+
+func experimentEnabled(name string) bool {
+	raw := os.Getenv("LNX_EXPERIMENTS")
+	if raw == "" {
+		return false
+	}
+	for _, part := range strings.Split(raw, ",") {
+		if strings.TrimSpace(part) == name {
+			return true
+		}
+	}
+	return false
 }

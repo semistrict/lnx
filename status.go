@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/gob"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -24,6 +25,8 @@ import (
 
 	"github.com/semistrict/lnx/internal/protocol"
 )
+
+var launchHostURLOpener = defaultLaunchHostURLOpener
 
 // idleTimeout is how long the daemon waits after the last exec session
 // finishes before shutting down. This allows back-to-back commands like
@@ -48,10 +51,14 @@ type StatusResponse struct {
 // apiServer manages the guest vsock connections and the host unix
 // socket HTTP server for status queries and exec requests.
 type apiServer struct {
-	args       []string
-	user       string
-	startTime  time.Time
-	rootfsPath string
+	args                       []string
+	user                       string
+	startTime                  time.Time
+	rootfsPath                 string
+	swapPath                   string
+	instanceDir                string
+	snapshotter                MemorySnapshotter
+	proxyMemorySnapshotToGuest bool
 
 	statusMu   sync.Mutex
 	statusEnc  *gob.Encoder
@@ -106,15 +113,25 @@ func (s *SessionInfo) encodeExec(msg protocol.Msg) error {
 	return s.execEnc.Encode(msg)
 }
 
-func newAPIServer(args []string, user, rootfsPath string) *apiServer {
+func newAPIServer(args []string, user, rootfsPath string, extra ...string) *apiServer {
+	dir := ""
+	swapPath := ""
+	if len(extra) > 0 {
+		dir = extra[0]
+	}
+	if len(extra) > 1 {
+		swapPath = extra[1]
+	}
 	return &apiServer{
-		args:       args,
-		user:       user,
-		rootfsPath: rootfsPath,
-		startTime:  time.Now(),
-		idleCh:     make(chan struct{}),
-		stopCh:     make(chan struct{}),
-		sessions:   make(map[string]*SessionInfo),
+		args:        args,
+		user:        user,
+		rootfsPath:  rootfsPath,
+		swapPath:    swapPath,
+		instanceDir: dir,
+		startTime:   time.Now(),
+		idleCh:      make(chan struct{}),
+		stopCh:      make(chan struct{}),
+		sessions:    make(map[string]*SessionInfo),
 	}
 }
 
@@ -285,6 +302,7 @@ func (s *apiServer) setStatusConn(conn net.Conn) {
 	s.statusConn = conn
 	s.statusEnc = gob.NewEncoder(conn)
 	s.statusDec = gob.NewDecoder(conn)
+	slog.Info("guest status connection accepted")
 }
 
 // connectExec creates a new vsock connection to the guest's exec server.
@@ -310,6 +328,7 @@ func (s *apiServer) connectExec() (*gob.Encoder, *gob.Decoder, net.Conn, error) 
 // handling guest-initiated requests (checkpoint, etc).
 func (s *apiServer) setGuestCtrlConn(conn net.Conn) {
 	s.guestCtrlConn = conn
+	slog.Info("guest control connection accepted")
 	go s.handleGuestCtrl(conn)
 }
 
@@ -341,16 +360,64 @@ func (s *apiServer) handleGuestCtrl(conn net.Conn) {
 		if msg.OpenURLReq != nil {
 			resp := &protocol.OpenURLResp{}
 			u := msg.OpenURLReq.URL
-			if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
-				resp.Error = "only http:// and https:// URLs are allowed"
-			} else if err := exec.Command("open", u).Run(); err != nil {
+			slog.Info("guest requested host URL open", "url", u)
+			if err := openURLOnHost(u); err != nil {
 				resp.Error = err.Error()
+				slog.Warn("host URL open failed", "url", u, "error", err)
+			} else {
+				slog.Info("host URL open launched", "url", u)
 			}
 			if err := enc.Encode(protocol.Msg{OpenURLResp: resp}); err != nil {
 				return
 			}
 		}
+
+		if msg.LogReq != nil {
+			resp := &protocol.LogResp{}
+			logGuestMessage(msg.LogReq)
+			if err := enc.Encode(protocol.Msg{LogResp: resp}); err != nil {
+				return
+			}
+		}
 	}
+}
+
+func logGuestMessage(req *protocol.LogReq) {
+	if req == nil {
+		return
+	}
+	attrs := []any{}
+	if req.Identifier != "" {
+		attrs = append(attrs, "identifier", req.Identifier)
+	}
+	switch strings.ToLower(req.Level) {
+	case "debug":
+		slog.Debug(req.Message, attrs...)
+	case "warn", "warning":
+		slog.Warn(req.Message, attrs...)
+	case "error":
+		slog.Error(req.Message, attrs...)
+	default:
+		slog.Info(req.Message, attrs...)
+	}
+}
+
+func openURLOnHost(u string) error {
+	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+		return errors.New("only http:// and https:// URLs are allowed")
+	}
+	return launchHostURLOpener(u)
+}
+
+func defaultLaunchHostURLOpener(u string) error {
+	cmd := exec.Command("open", u)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	if cmd.Process != nil {
+		_ = cmd.Process.Release()
+	}
+	return nil
 }
 
 // queryGuest sends a StatusReq and reads the StatusResp.
@@ -392,9 +459,11 @@ func (s *apiServer) listenUnix(sockPath string) error {
 	s.listener = ln
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /ready", s.handleReady)
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /ports", s.handlePorts)
 	mux.HandleFunc("POST /checkpoint", s.handleCheckpoint)
+	mux.HandleFunc("POST /memorysnapshot/create", s.handleMemorySnapshotCreate)
 	mux.HandleFunc("POST /expose/host", s.handleExposeHost)
 	mux.HandleFunc("POST /expose/host/remove", s.handleRemoveExposeHost)
 	mux.HandleFunc("POST /guest/expose", s.handleGuestExpose)
@@ -460,6 +529,15 @@ func (s *apiServer) handleGuestPprofProxy(w http.ResponseWriter, r *http.Request
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func (s *apiServer) handleReady(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.queryGuest(false); err != nil {
+		slog.Info("ready probe pending", "error", err)
+		http.Error(w, fmt.Sprintf("guest not ready: %v", err), http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *apiServer) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -643,6 +721,108 @@ func (s *apiServer) handleCheckpoint(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"path": cpPath})
+}
+
+func (s *apiServer) handleMemorySnapshotCreate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	if s.proxyMemorySnapshotToGuest && s.sock != nil {
+		var resp struct {
+			Path string `json:"path"`
+		}
+		if err := s.proxyGuestJSON(r.Context(), "/memorysnapshot/create", req, &resp); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	if s.snapshotter != nil {
+		bundleDir, err := s.createMemorySnapshotBundle(req.Name)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"path": bundleDir})
+		return
+	}
+
+	if s.sock != nil {
+		var resp struct {
+			Path string `json:"path"`
+		}
+		if err := s.proxyGuestJSON(r.Context(), "/memorysnapshot/create", req, &resp); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	http.Error(w, "memory snapshots unavailable", http.StatusNotImplemented)
+}
+
+func (s *apiServer) createMemorySnapshotBundle(name string) (string, error) {
+	if s.instanceDir == "" {
+		return "", fmt.Errorf("instance dir unavailable")
+	}
+	if s.snapshotter == nil {
+		return "", fmt.Errorf("memory snapshots unavailable")
+	}
+
+	if name == "" {
+		name = time.Now().Format("2006-01-02T15-04-05.000000000")
+	}
+	if filepath.Base(name) != name || name == "." || name == ".." {
+		return "", fmt.Errorf("invalid memory snapshot name %q", name)
+	}
+
+	baseDir := filepath.Join(s.instanceDir, "memorysnapshots", name)
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return "", fmt.Errorf("create snapshot dir: %w", err)
+	}
+
+	statePath := filepath.Join(baseDir, "vmstate.bin")
+	memPath := filepath.Join(baseDir, "memory.bin")
+	rootfsPath := filepath.Join(baseDir, "rootfs.ext4")
+	swapPath := filepath.Join(baseDir, "swap.img")
+
+	if err := s.snapshotter.Pause(); err != nil {
+		return "", fmt.Errorf("pause vm: %w", err)
+	}
+	defer func() {
+		if err := s.snapshotter.Resume(); err != nil {
+			slog.Warn("resume after memory snapshot failed", "error", err)
+		}
+	}()
+
+	if err := cloneFile(s.rootfsPath, rootfsPath); err != nil {
+		return "", fmt.Errorf("clone rootfs: %w", err)
+	}
+	if s.swapPath != "" {
+		if _, err := os.Stat(s.swapPath); err == nil {
+			if err := cloneFile(s.swapPath, swapPath); err != nil {
+				return "", fmt.Errorf("clone swap: %w", err)
+			}
+		} else if !os.IsNotExist(err) {
+			return "", fmt.Errorf("clone swap: %w", err)
+		}
+	}
+	if err := s.snapshotter.CreateMemorySnapshot(statePath, memPath); err != nil {
+		return "", fmt.Errorf("create memory snapshot: %w", err)
+	}
+	return baseDir, nil
 }
 
 func (s *apiServer) proxyGuestJSON(ctx context.Context, path string, body any, respBody any) error {

@@ -26,13 +26,23 @@ func configureNetwork() {
 
 	runCmd("/sbin/ip", "link", "set", iface, "up")
 
+	if configureStaticLinuxHostNetwork(iface) {
+		return
+	}
+
 	lease, err := requestDHCPLease(iface)
 	if err != nil {
 		slog.Warn("dhcp lease failed", "iface", iface, "error", err)
+		if configureStaticLinuxHostNetwork(iface) {
+			return
+		}
 		return
 	}
 	if err := applyDHCPLease(iface, lease.ACK); err != nil {
 		slog.Warn("apply dhcp lease failed", "iface", iface, "error", err)
+		if configureStaticLinuxHostNetwork(iface) {
+			return
+		}
 		return
 	}
 	if err := writeResolvConf(lease.ACK); err != nil {
@@ -40,6 +50,19 @@ func configureNetwork() {
 	}
 
 	slog.Info("network configured", "iface", iface, "ip", lease.ACK.YourIPAddr, "router", lease.ACK.Router(), "dns", lease.ACK.DNS())
+}
+
+func configureStaticLinuxHostNetwork(iface string) bool {
+	if !experimentEnabled(linuxHostExperiment) {
+		return false
+	}
+	slog.Info("configuring static linux_host network", "iface", iface, "cidr", linuxHostGuestCIDR, "gateway", linuxHostGatewayIP)
+	applyStaticNetwork(iface, linuxHostGuestCIDR, linuxHostGatewayIP)
+	if err := os.WriteFile("/etc/resolv.conf", []byte(linuxHostResolvConf), 0644); err != nil {
+		slog.Warn("failed to write static linux_host resolv.conf", "iface", iface, "error", err)
+	}
+	slog.Info("network configured via static linux_host", "iface", iface, "cidr", linuxHostGuestCIDR, "gateway", linuxHostGatewayIP)
+	return true
 }
 
 func requestDHCPLease(iface string) (*nclient4.Lease, error) {
@@ -81,19 +104,25 @@ func applyDHCPLease(iface string, ack *dhcpv4.DHCPv4) error {
 		return err
 	}
 
-	runCmd("/sbin/ip", "addr", "flush", "dev", iface)
-	runCmd("/sbin/ip", "addr", "add", cidr, "dev", iface)
-	runCmd("/sbin/ip", "route", "del", "default")
-
 	routers := ack.Router()
 	if len(routers) > 0 {
 		gateway := firstIPv4(routers)
 		if gateway != nil {
-			runCmd("/sbin/ip", "route", "replace", "default", "via", gateway.String(), "dev", iface)
+			applyStaticNetwork(iface, cidr, gateway.String())
+			return nil
 		}
 	}
-
+	applyStaticNetwork(iface, cidr, "")
 	return nil
+}
+
+func applyStaticNetwork(iface, cidr, gateway string) {
+	runCmd("/sbin/ip", "addr", "flush", "dev", iface)
+	runCmd("/sbin/ip", "addr", "add", cidr, "dev", iface)
+	runCmd("/sbin/ip", "route", "del", "default")
+	if gateway != "" {
+		runCmd("/sbin/ip", "route", "replace", "default", "via", gateway, "dev", iface)
+	}
 }
 
 func writeResolvConf(ack *dhcpv4.DHCPv4) error {

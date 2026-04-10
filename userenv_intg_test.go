@@ -81,3 +81,21 @@ func TestRun_NotRoot(t *testing.T) {
 	// Should NOT be root (uid 0)
 	assert.NotContains(t, string(data), "0\n")
 }
+
+func TestRun_BrowserEnvUsesHostHelper(t *testing.T) {
+	t.Parallel()
+	dir := setupTestDir(t)
+	cfg := testConfig(dir)
+
+	cwd := t.TempDir()
+	cfg.CWD = cwd
+	outFile := filepath.Join(cwd, "browser.txt")
+
+	exitCode, err := lnx.Run(cfg, "sh", "-c", "printf '%s' \"$BROWSER\" > "+outFile)
+	require.NoError(t, err)
+	assert.Equal(t, 0, exitCode)
+
+	data, err := os.ReadFile(outFile)
+	require.NoError(t, err)
+	assert.Equal(t, "/usr/local/bin/lnx-open-browser", string(data))
+}

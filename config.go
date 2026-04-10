@@ -29,6 +29,16 @@ type Config struct {
 	// in the guest at boot.
 	Env []string
 
+	// User is the guest username to provision. Defaults to the current OS user.
+	User string
+
+	// UID is the guest UID to provision. Defaults to the current OS user ID.
+	UID int
+
+	// HomeDir is the host home directory path to mount into the guest.
+	// Defaults to the current OS user's home directory.
+	HomeDir string
+
 	// Checkpoint clones the rootfs before starting the VM.
 	// The clone is stored under CheckpointDir with a timestamped name.
 	// Requires APFS (macOS).
@@ -60,9 +70,17 @@ type Config struct {
 	// the socket must be in the instance dir for clients to find it.
 	SocketDir string
 
+	// InstanceDir is the durable instance directory backing this VM.
+	// If empty, defaults to the directory containing RootfsPath.
+	InstanceDir string
+
 	// NestedRootfs is a list of rootfs file paths for nested VM instances.
 	// Each is attached as an additional virtio-blk device (vdc, vdd, ...).
 	NestedRootfs []NestedRootfs
+
+	// MemorySnapshot restores the VM from a previously created memory snapshot.
+	// Currently only supported by the Linux/Firecracker backend.
+	MemorySnapshot *MemorySnapshot
 }
 
 // NestedRootfs pairs a nested instance name with its rootfs file path.
@@ -74,6 +92,13 @@ type NestedRootfs struct {
 func (c *Config) socketDir() string {
 	if c.SocketDir != "" {
 		return c.SocketDir
+	}
+	return filepath.Dir(c.RootfsPath)
+}
+
+func (c *Config) instanceDir() string {
+	if c.InstanceDir != "" {
+		return c.InstanceDir
 	}
 	return filepath.Dir(c.RootfsPath)
 }

@@ -23,16 +23,30 @@ var daemonCmd = &cobra.Command{
 
 		// Scan for nested instances to attach as block devices.
 		nested := scanNestedInstances()
+		shares := loadShares(dir)
+		ephemeral := doEphemeral
+		env := []string{}
+		if memorySnapshotEnabled() {
+			ephemeral = true
+			shares = append(shares, lnxBase())
+			env = append(env,
+				"LNX_TOPLEVEL_MODE=memorysnapshot",
+				"LNX_TOPLEVEL_INSTANCE="+qualifiedInstanceName(),
+				"LNX_BASE="+lnxBase(),
+			)
+		}
 
 		err := lnx.RunDaemon(&lnx.Config{
 			KernelPath:   resolveKernel(),
 			RootfsPath:   rootfsPath,
 			Hostname:     qualifiedInstanceName() + ".lnx",
+			Env:          env,
 			Checkpoint:   doCheckpoint,
-			Ephemeral:    doEphemeral,
+			Ephemeral:    ephemeral,
 			SSHAgent:     doSSHAgent,
-			Shares:       loadShares(dir),
+			Shares:       dedupeShares(shares),
 			SocketDir:    socketDir,
+			InstanceDir:  dir,
 			NestedRootfs: nested,
 		})
 		if err != nil {
@@ -43,6 +57,19 @@ var daemonCmd = &cobra.Command{
 		os.Remove(filepath.Join(socketDir, "error.log"))
 		return nil
 	},
+}
+
+func dedupeShares(paths []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, path := range paths {
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		out = append(out, path)
+	}
+	return out
 }
 
 func init() {

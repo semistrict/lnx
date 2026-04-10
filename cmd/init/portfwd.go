@@ -19,29 +19,44 @@ import (
 // startPortForwarder scans for listening TCP ports and notifies the host.
 // It also listens on a vsock port for incoming forwarded connections from the host.
 func startPortForwarder() {
-	// Control connection: notify host of port changes.
-	ctrlConn, err := vsock.Dial(vsockHostCID, protocol.PortForwardPort, nil)
-	if err != nil {
-		slog.Warn("port forward vsock dial failed", "error", err)
-		return
-	}
-
-	// Data listener: host connects here to forward TCP connections.
-	dataLn, err := vsock.Listen(protocol.PortForwardDataPort, nil)
-	if err != nil {
-		slog.Warn("port forward data listen failed", "error", err)
-		ctrlConn.Close()
-		return
-	}
-
-	// Accept forwarded connections from host.
-	go acceptForwardedConns(dataLn)
-
-	// Scan for listening ports and notify host.
-	go scanPorts(ctrlConn)
+	go runPortForwarder()
 }
 
-func scanPorts(conn net.Conn) {
+func runPortForwarder() {
+	for {
+		// Control connection: notify host of port changes.
+		ctrlConn, err := vsock.Dial(vsockHostCID, protocol.PortForwardPort, nil)
+		if err != nil {
+			slog.Warn("port forward vsock dial failed", "error", err)
+			time.Sleep(time.Second)
+			continue
+		}
+
+		// Data listener: host connects here to forward TCP connections.
+		dataLn, err := vsock.Listen(protocol.PortForwardDataPort, nil)
+		if err != nil {
+			slog.Warn("port forward data listen failed", "error", err)
+			ctrlConn.Close()
+			time.Sleep(time.Second)
+			continue
+		}
+
+		// Accept forwarded connections from host.
+		done := make(chan struct{})
+		go acceptForwardedConns(dataLn, done)
+
+		err = scanPorts(ctrlConn)
+		ctrlConn.Close()
+		_ = dataLn.Close()
+		<-done
+		if err != nil {
+			slog.Warn("port forward control loop ended", "error", err)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func scanPorts(conn net.Conn) error {
 	enc := gob.NewEncoder(conn)
 	var prev []uint16
 
@@ -49,8 +64,7 @@ func scanPorts(conn net.Conn) {
 		ports := getListeningPorts()
 		if !portsEqual(prev, ports) {
 			if err := enc.Encode(protocol.PortForward{Ports: ports}); err != nil {
-				slog.Debug("port forward encode failed", "error", err)
-				return
+				return err
 			}
 			prev = ports
 		}
@@ -61,7 +75,8 @@ func scanPorts(conn net.Conn) {
 // acceptForwardedConns accepts vsock connections from the host.
 // Each connection starts with a 2-byte big-endian port number,
 // then raw TCP data is spliced to localhost:port.
-func acceptForwardedConns(ln *vsock.Listener) {
+func acceptForwardedConns(ln *vsock.Listener, done chan<- struct{}) {
+	defer close(done)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {

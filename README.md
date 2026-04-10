@@ -15,6 +15,8 @@ make kernel rootfs
 lnx init --kernel vmlinuz --rootfs rootfs.ext4
 ```
 
+`make kernel` and `make rootfs` run Podman inside an `lnx` build VM, so they do not depend on Docker or Podman on the host.
+
 ## Usage
 
 ```

@@ -263,9 +263,8 @@ func waitForVM(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		for _, sp := range sockPaths {
-			conn, err := net.DialTimeout("unix", sp, 500*time.Millisecond)
-			if err == nil {
-				conn.Close()
+			ready, err := vmReadyAtSocket(sp)
+			if err == nil && ready {
 				return nil
 			}
 		}
@@ -278,6 +277,30 @@ func waitForVM(timeout time.Duration) error {
 		return fmt.Errorf("VM failed to start: %s", msg)
 	}
 	return fmt.Errorf("timed out waiting for VM to start")
+}
+
+func vmReadyAtSocket(sockPath string) (bool, error) {
+	conn, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
+	if err != nil {
+		return false, err
+	}
+	_ = conn.Close()
+
+	client := &http.Client{
+		Timeout: 500 * time.Millisecond,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", sockPath)
+			},
+		},
+	}
+	resp, err := client.Get("http://localhost/ready")
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusNoContent, nil
 }
 
 func readFirstErrorLog(paths []string) string {

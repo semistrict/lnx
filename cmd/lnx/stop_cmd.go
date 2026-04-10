@@ -1,15 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
 )
 
 var stopCmd = &cobra.Command{
@@ -20,18 +22,14 @@ var stopCmd = &cobra.Command{
 			return err
 		}
 
-		killReqCh, restoreTTY, err := watchStopKillKey()
+		killReqCh, err := watchStopKillKey()
 		if err != nil {
 			return err
 		}
-		if restoreTTY != nil {
-			defer restoreTTY()
-		}
-
 		if killReqCh != nil {
-			fmt.Fprintln(os.Stderr, "VM stopping. Press k to kill.")
+			writeTerminalStatusLine(os.Stderr, "VM stopping. Press k then Enter to kill.", false)
 		} else {
-			fmt.Fprintln(os.Stderr, "VM stopping.")
+			writeTerminalStatusLine(os.Stderr, "VM stopping.", false)
 		}
 
 		forced, err := waitForVMStop(killReqCh)
@@ -46,6 +44,18 @@ var stopCmd = &cobra.Command{
 		fmt.Println("VM stopped")
 		return nil
 	},
+}
+
+func writeTerminalStatusLine(w io.Writer, line string, rawTTY bool) {
+	if rawTTY {
+		fmt.Fprint(w, line, "\r\n")
+		return
+	}
+	fmt.Fprintln(w, line)
+}
+
+func shouldForceKillInput(line string) bool {
+	return strings.EqualFold(strings.TrimSpace(line), "k")
 }
 
 func init() {
@@ -68,29 +78,16 @@ func requestVMStop() error {
 	return nil
 }
 
-func watchStopKillKey() (<-chan struct{}, func(), error) {
-	if !term.IsTerminal(int(os.Stdin.Fd())) {
-		return nil, nil, nil
-	}
-
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-	if err != nil {
-		return nil, nil, fmt.Errorf("set raw terminal: %w", err)
-	}
-
-	restore := func() {
-		_ = term.Restore(int(os.Stdin.Fd()), oldState)
-	}
-
+func watchStopKillKey() (<-chan struct{}, error) {
 	ch := make(chan struct{}, 1)
 	go func() {
-		var buf [1]byte
+		reader := bufio.NewReader(os.Stdin)
 		for {
-			n, err := os.Stdin.Read(buf[:])
-			if err != nil || n == 0 {
+			line, err := reader.ReadString('\n')
+			if err != nil {
 				return
 			}
-			if buf[0] == 'k' || buf[0] == 'K' {
+			if shouldForceKillInput(line) {
 				select {
 				case ch <- struct{}{}:
 				default:
@@ -100,7 +97,7 @@ func watchStopKillKey() (<-chan struct{}, func(), error) {
 		}
 	}()
 
-	return ch, restore, nil
+	return ch, nil
 }
 
 func waitForVMStop(killReqCh <-chan struct{}) (bool, error) {

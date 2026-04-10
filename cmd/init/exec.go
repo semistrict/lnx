@@ -37,6 +37,7 @@ func startExecServer() {
 		execLn.Close()
 		return
 	}
+	slog.Info("guest exec servers ready", "exec_port", protocol.ExecPort, "interactive_port", protocol.ExecInteractivePort)
 
 	go func() {
 		for {

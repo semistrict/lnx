@@ -20,6 +20,10 @@ var doCheckpoint bool
 var doEphemeral bool
 var doSSHAgent bool
 
+var spawnDaemonFn = spawnDaemon
+var waitForVMFn = waitForVM
+var vmIsRunningFn = vmIsRunning
+
 // instanceName is the resolved instance name. Set from --instance flag or LNX_INSTANCE env.
 var instanceName = "default"
 
@@ -177,12 +181,15 @@ func runVM(args []string) (int, error) {
 	}
 
 	// Check if a VM is already running for this instance.
-	if !vmIsRunning() {
+	if !vmIsRunningFn() {
 		// Spawn daemon in background.
-		if err := spawnDaemon(); err != nil {
+		if err := spawnDaemonFn(); err != nil {
 			return -1, err
 		}
-		if err := waitForVM(60 * time.Second); err != nil {
+		if err := waitForVMFn(60 * time.Second); err != nil {
+			if bootErr := memorySnapshotBootError(); bootErr != nil {
+				return -1, bootErr
+			}
 			return -1, err
 		}
 	}
@@ -199,7 +206,12 @@ func runVM(args []string) (int, error) {
 	exitCode, err := execOnce()
 	if shouldRetryExec(err) {
 		if restartErr := restartDaemon(); restartErr == nil {
-			return execOnce()
+			exitCode, err = execOnce()
+		}
+	}
+	if err != nil {
+		if bootErr := memorySnapshotBootError(); bootErr != nil {
+			return -1, bootErr
 		}
 	}
 	return exitCode, err
@@ -356,4 +368,19 @@ func qualifiedInstanceName() string {
 		return instanceName
 	}
 	return parent + "." + instanceName
+}
+
+func memorySnapshotBootError() error {
+	if !memorySnapshotEnabled() {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(instanceDir(), "memorysnapshot", "boot-error.log"))
+	if err != nil {
+		return nil
+	}
+	msg := strings.TrimSpace(string(data))
+	if msg == "" {
+		return nil
+	}
+	return errors.New(msg)
 }

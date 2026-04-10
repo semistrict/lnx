@@ -1,4 +1,7 @@
-.PHONY: all cmd/lnx/init lnx lnx-linux kernel rootfs test test-integration install deps-macos clean help
+.PHONY: all cmd/lnx/init lnx lnx-linux kernel rootfs test test-integration test-memorysnapshot install deps-macos clean help
+
+LNX ?= ./lnx
+BUILD_INSTANCE ?= build
 
 all: lnx
 
@@ -10,12 +13,13 @@ help:
 	@echo "  lnx              Build the lnx binary with codesign (macOS)"
 	@echo "  lnx-linux        Build the lnx binary for Linux/arm64"
 	@echo "  install          Install to \$$GOPATH/bin"
-	@echo "  kernel           Build the Linux kernel in Docker"
-	@echo "  rootfs           Build the ext4 rootfs image in Docker"
+	@echo "  kernel           Build the Linux kernel inside lnx via Podman"
+	@echo "  rootfs           Build the ext4 rootfs image inside lnx via Podman"
 	@echo ""
 	@echo "Test:"
 	@echo "  test             Run unit tests (any platform)"
 	@echo "  test-integration Run integration tests (macOS, optional TEST=regex filter)"
+	@echo "  test-memorysnapshot Run memory snapshot integration coverage"
 	@echo ""
 	@echo "Other:"
 	@echo "  deps-macos       Install local macOS dependencies (currently zstd)"
@@ -35,22 +39,14 @@ lnx: cmd/lnx/init
 lnx-linux: cmd/lnx/init
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o $@ ./cmd/lnx
 
-# Build kernel in Docker
-kernel:
-	docker build --platform linux/arm64 -f Dockerfile.kernel -t lnx-kernel .
-	docker rm -f lnx-kernel-extract 2>/dev/null; true
-	docker create --name lnx-kernel-extract lnx-kernel true
-	docker cp lnx-kernel-extract:/build/arch/arm64/boot/Image vmlinuz
-	docker rm lnx-kernel-extract
+# Build kernel inside lnx using Podman from the guest rootfs.
+kernel: lnx
+	LNX_BIN="$(LNX)" LNX_BUILD_INSTANCE="$(BUILD_INSTANCE)" ./scripts/build-in-lnx.sh kernel
 	@echo "Kernel built: vmlinuz"
 
-# Build rootfs ext4 image in Docker
-rootfs:
-	docker build --platform linux/arm64 -f Dockerfile.rootfs -t lnx-rootfs .
-	docker rm -f lnx-rootfs-extract 2>/dev/null; true
-	docker create --name lnx-rootfs-extract lnx-rootfs true
-	docker cp lnx-rootfs-extract:/rootfs.ext4 rootfs.ext4
-	docker rm lnx-rootfs-extract
+# Build rootfs ext4 image inside lnx using Podman from the guest rootfs.
+rootfs: lnx
+	LNX_BIN="$(LNX)" LNX_BUILD_INSTANCE="$(BUILD_INSTANCE)" ./scripts/build-in-lnx.sh rootfs
 	@echo "Rootfs built: rootfs.ext4"
 
 # Unit tests (run anywhere)
@@ -62,6 +58,10 @@ test:
 test-integration: lnx
 	go build -o /tmp/lnx-codesign ./cmd/codesign
 	PATH="$(PWD):$$PATH" go test -v -timeout 180s -tags integration -exec /tmp/lnx-codesign $(if $(TEST),-run '$(TEST)') ./...
+
+test-memorysnapshot: lnx
+	go build -o /tmp/lnx-codesign ./cmd/codesign
+	PATH="$(PWD):$$PATH" LNX_EXPERIMENTS=memorysnapshot go test -v -timeout 240s -tags integration -exec /tmp/lnx-codesign -run 'TestCLI_CloneWithMemoryPreservesProcessAndPorts$$' .
 
 # Install to $GOPATH/bin
 install: cmd/lnx/init

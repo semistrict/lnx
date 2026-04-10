@@ -83,6 +83,9 @@ func TestConfig_AllFieldsCopied(t *testing.T) {
 		MemoryBytes:   8 << 30,
 		CWD:           "/work",
 		Env:           []string{"A=B"},
+		User:          "ramon",
+		UID:           501,
+		HomeDir:       "/Users/ramon",
 		Checkpoint:    true,
 		CheckpointDir: "/cp",
 		Shares:        []string{"/extra"},
@@ -90,12 +93,17 @@ func TestConfig_AllFieldsCopied(t *testing.T) {
 		SSHAgent:      true,
 		Ephemeral:     true,
 		SocketDir:     "/sock",
+		InstanceDir:   "/instance",
 		NestedRootfs:  []NestedRootfs{{InstanceName: "test", RootfsPath: "/nr"}},
+		MemorySnapshot: &MemorySnapshot{
+			StatePath: "/snap/state",
+			MemPath:   "/snap/mem",
+		},
 	}
 
 	// Count fields set above — must match struct field count.
 	// If this fails, a new field was added to Config but not to this test.
-	assert.Equal(t, fieldCount, 15, "Config has %d fields but test only covers 15 — update this test and the ephemeral copy in vm.go", fieldCount)
+	assert.Equal(t, fieldCount, 20, "Config has %d fields but test only covers 20 — update this test and the ephemeral copy in vm.go", fieldCount)
 
 	// Verify all fields are non-zero (catches typos in field names above).
 	val := reflect.ValueOf(*cfg)

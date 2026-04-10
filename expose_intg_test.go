@@ -274,6 +274,14 @@ func startTimedInstance(t *testing.T, bin, instance string, duration time.Durati
 	return cmd, stderr, done
 }
 
+func startTimedInstanceEnv(t *testing.T, bin string, env []string, instance string, duration time.Duration) (*exec.Cmd, *bytes.Buffer, <-chan error) {
+	t.Helper()
+	script := fmt.Sprintf("echo READY; sleep %.0f", duration.Seconds())
+	cmd, lines, stderr, done := startStreamingCLIEnv(t, bin, env, "--instance", instance, "sh", "-c", script)
+	waitForCLIOutput(t, lines, "READY", 20*time.Second, stderr)
+	return cmd, stderr, done
+}
+
 func startTCPServerInstance(t *testing.T, bin, instance string, port int, payload string) (*exec.Cmd, <-chan string, *bytes.Buffer, <-chan error) {
 	t.Helper()
 	script := fmt.Sprintf(`python3 -c "
@@ -339,8 +347,15 @@ func readTCPEventually(t *testing.T, addr, want string, timeout time.Duration) s
 
 func startStreamingCLI(t *testing.T, bin string, args ...string) (*exec.Cmd, <-chan string, *bytes.Buffer, <-chan error) {
 	t.Helper()
+	return startStreamingCLIEnv(t, bin, nil, args...)
+}
 
+func startStreamingCLIEnv(t *testing.T, bin string, env []string, args ...string) (*exec.Cmd, <-chan string, *bytes.Buffer, <-chan error) {
+	t.Helper()
 	cmd := exec.Command(bin, args...)
+	if env != nil {
+		cmd.Env = env
+	}
 	stdout, err := cmd.StdoutPipe()
 	require.NoError(t, err)
 	var stderr bytes.Buffer

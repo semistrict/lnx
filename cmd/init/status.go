@@ -24,6 +24,7 @@ func startStatusServer() {
 		slog.Warn("status vsock dial failed", "error", err)
 		return
 	}
+	slog.Info("guest status server connected", "vsock_port", protocol.StatusPort)
 
 	go func() {
 		defer conn.Close()

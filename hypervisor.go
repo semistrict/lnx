@@ -32,3 +32,11 @@ type VirtualMachine interface {
 	StateChangedNotify() <-chan VMState
 	VsockDevice() VsockDevice
 }
+
+// MemorySnapshotter is implemented by VM backends that can pause, snapshot,
+// and resume a running machine state.
+type MemorySnapshotter interface {
+	Pause() error
+	Resume() error
+	CreateMemorySnapshot(statePath, memPath string) error
+}

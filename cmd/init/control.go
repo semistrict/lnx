@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -29,6 +30,7 @@ func startGuestControlServer() {
 		slog.Warn("guest control vsock dial failed", "error", err)
 		return
 	}
+	slog.Info("guest control connected", "vsock_port", protocol.GuestControlPort)
 
 	os.MkdirAll("/var/run/lnx", 0755)
 	os.Remove(guestControlSock)
@@ -50,12 +52,14 @@ func startGuestControlServer() {
 	mux := newGuestControlMux(gc)
 
 	go http.Serve(ln, mux)
+	slog.Info("guest control unix socket ready", "path", guestControlSock)
 
 	vsockLn, err := vsock.Listen(protocol.GuestHTTPPort, nil)
 	if err != nil {
 		slog.Warn("guest control vsock listen failed", "error", err, "port", protocol.GuestHTTPPort)
 		return
 	}
+	slog.Info("guest control vsock http ready", "port", protocol.GuestHTTPPort)
 	go http.Serve(vsockLn, mux)
 }
 
@@ -63,6 +67,7 @@ func newGuestControlMux(gc *guestControl) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /checkpoint", gc.handleCheckpoint)
 	mux.HandleFunc("POST /open", gc.handleOpen)
+	mux.HandleFunc("POST /log", gc.handleLog)
 	mux.HandleFunc("POST /tcp/expose", gc.handleTCPExpose)
 	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
 	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
@@ -188,6 +193,53 @@ func (gc *guestControl) handleOpen(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (gc *guestControl) handleLog(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read log body failed", http.StatusBadRequest)
+		return
+	}
+	message := strings.TrimSpace(string(body))
+	if message == "" {
+		http.Error(w, "log message required", http.StatusBadRequest)
+		return
+	}
+
+	level := r.URL.Query().Get("level")
+	identifier := r.URL.Query().Get("identifier")
+	if level == "" {
+		level = "info"
+	}
+
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
+
+	if err := gc.enc.Encode(protocol.Msg{LogReq: &protocol.LogReq{
+		Level:      level,
+		Identifier: identifier,
+		Message:    message,
+	}}); err != nil {
+		http.Error(w, fmt.Sprintf("send log request: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	var msg protocol.Msg
+	if err := gc.dec.Decode(&msg); err != nil {
+		http.Error(w, fmt.Sprintf("read log response: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if msg.LogResp == nil {
+		http.Error(w, "unexpected response", http.StatusInternalServerError)
+		return
+	}
+	if msg.LogResp.Error != "" {
+		http.Error(w, msg.LogResp.Error, http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (gc *guestControl) handleTCPExpose(w http.ResponseWriter, r *http.Request) {

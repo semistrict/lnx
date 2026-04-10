@@ -22,10 +22,11 @@ import (
 // firecrackerVM implements VirtualMachine by managing a Firecracker process
 // configured via its REST API.
 type firecrackerVM struct {
-	cmd     *exec.Cmd
-	apiSock string
-	vsock   *firecrackerVsock
-	sockDir string
+	cmd            *exec.Cmd
+	apiSock        string
+	vsock          *firecrackerVsock
+	sockDir        string
+	loadedSnapshot bool
 
 	stateCh chan VMState
 	once    sync.Once
@@ -38,6 +39,8 @@ func buildVM(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (VirtualMac
 	if !linuxHostEnabled() {
 		return nil, fmt.Errorf("Linux host support is experimental; set LNX_EXPERIMENTS=linux_host to enable")
 	}
+	origSocketDir := cfg.socketDir()
+	slog.Info("firecracker buildVM starting", "kernel", cfg.KernelPath, "rootfs", cfg.RootfsPath, "socket_dir", origSocketDir, "restore", cfg.MemorySnapshot != nil)
 
 	// Firecracker sockets must be on a local filesystem (9P doesn't support
 	// Unix domain sockets). Override socketDir to /var/run/lnx/<instance>.
@@ -53,12 +56,13 @@ func buildVM(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (VirtualMac
 	os.Remove(vsockPath)
 
 	// Set up TAP networking (requires root/CAP_NET_ADMIN).
+	slog.Info("firecracker configuring TAP networking")
 	if err := setupTAP(); err != nil {
 		return nil, fmt.Errorf("setup TAP: %w", err)
 	}
 
 	// Set up serial console log file.
-	serialPath := filepath.Join(sockDir, "serial.log")
+	serialPath := firecrackerSerialLogPath(cfg, origSocketDir, sockDir)
 	serialFile, err := os.Create(serialPath)
 	if err != nil {
 		return nil, fmt.Errorf("create serial log: %w", err)
@@ -74,6 +78,7 @@ func buildVM(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (VirtualMac
 		return nil, fmt.Errorf("start firecracker: %w", err)
 	}
 	serialFile.Close()
+	slog.Info("firecracker process started", "api_sock", apiSock, "pid", cmd.Process.Pid)
 
 	vm := &firecrackerVM{
 		cmd:     cmd,
@@ -96,14 +101,36 @@ func buildVM(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (VirtualMac
 		cmd.Process.Kill()
 		return nil, fmt.Errorf("firecracker API socket: %w", err)
 	}
+	slog.Info("firecracker API socket ready", "api_sock", apiSock)
 
 	// Configure the VM via the Firecracker REST API.
-	if err := vm.configure(cfg, initrdPath, cwd, swapPath, homeDir, vsockPath); err != nil {
-		cmd.Process.Kill()
-		return nil, fmt.Errorf("configure firecracker: %w", err)
+	if cfg.MemorySnapshot != nil {
+		vm.loadedSnapshot = true
+		slog.Info("firecracker loading snapshot", "state_path", cfg.MemorySnapshot.StatePath, "mem_path", cfg.MemorySnapshot.MemPath)
+		if err := vm.loadSnapshot(cfg.MemorySnapshot); err != nil {
+			cmd.Process.Kill()
+			return nil, fmt.Errorf("load firecracker snapshot: %w", err)
+		}
+	} else {
+		slog.Info("firecracker configuring fresh VM")
+		if err := vm.configure(cfg, initrdPath, cwd, swapPath, homeDir, vsockPath); err != nil {
+			cmd.Process.Kill()
+			return nil, fmt.Errorf("configure firecracker: %w", err)
+		}
 	}
+	slog.Info("firecracker buildVM complete", "api_sock", apiSock)
 
 	return vm, nil
+}
+
+func firecrackerSerialLogPath(cfg *Config, origSocketDir, sockDir string) string {
+	if cfg.InstanceDir != "" && strings.Contains(origSocketDir, "/memorysnapshot/inner") {
+		dir := filepath.Join(cfg.InstanceDir, "memorysnapshot")
+		if err := os.MkdirAll(dir, 0755); err == nil {
+			return filepath.Join(dir, "inner-serial.log")
+		}
+	}
+	return filepath.Join(sockDir, "serial.log")
 }
 
 func (vm *firecrackerVM) configure(cfg *Config, initrdPath, cwd, swapPath, homeDir, vsockPath string) error {
@@ -180,6 +207,13 @@ func (vm *firecrackerVM) configure(cfg *Config, initrdPath, cwd, swapPath, homeD
 }
 
 func (vm *firecrackerVM) Start() error {
+	if vm.loadedSnapshot {
+		if err := vm.Resume(); err != nil {
+			return fmt.Errorf("resume instance: %w", err)
+		}
+		vm.stateCh <- VMStateRunning
+		return nil
+	}
 	if err := vm.apiPut("/actions", map[string]any{
 		"action_type": "InstanceStart",
 	}); err != nil {
@@ -221,6 +255,33 @@ func (vm *firecrackerVM) RequestStop() error {
 	})
 }
 
+func (vm *firecrackerVM) Pause() error {
+	return vm.apiPatch("/vm", map[string]any{"state": "Paused"})
+}
+
+func (vm *firecrackerVM) Resume() error {
+	return vm.apiPatch("/vm", map[string]any{"state": "Resumed"})
+}
+
+func (vm *firecrackerVM) CreateMemorySnapshot(statePath, memPath string) error {
+	return vm.apiPut("/snapshot/create", map[string]any{
+		"snapshot_type": "Full",
+		"snapshot_path": statePath,
+		"mem_file_path": memPath,
+	})
+}
+
+func (vm *firecrackerVM) loadSnapshot(snapshot *MemorySnapshot) error {
+	return vm.apiPut("/snapshot/load", map[string]any{
+		"snapshot_path": snapshot.StatePath,
+		"mem_backend": map[string]any{
+			"backend_type": "File",
+			"backend_path": snapshot.MemPath,
+		},
+		"resume_vm": false,
+	})
+}
+
 func (vm *firecrackerVM) StateChangedNotify() <-chan VMState {
 	return vm.stateCh
 }
@@ -247,8 +308,15 @@ func shutdownVM(vm VirtualMachine, exitCode int) {
 	}
 }
 
-// apiPut sends a PUT request to the Firecracker API.
 func (vm *firecrackerVM) apiPut(path string, body any) error {
+	return vm.apiRequest(http.MethodPut, path, body)
+}
+
+func (vm *firecrackerVM) apiPatch(path string, body any) error {
+	return vm.apiRequest(http.MethodPatch, path, body)
+}
+
+func (vm *firecrackerVM) apiRequest(method, path string, body any) error {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -262,7 +330,7 @@ func (vm *firecrackerVM) apiPut(path string, body any) error {
 		},
 	}
 
-	req, err := http.NewRequest(http.MethodPut, "http://localhost"+path, bytes.NewReader(data))
+	req, err := http.NewRequest(method, "http://localhost"+path, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
@@ -284,14 +352,7 @@ func (vm *firecrackerVM) apiPut(path string, body any) error {
 	return nil
 }
 
-func linuxHostEnabled() bool {
-	for _, exp := range strings.Split(os.Getenv("LNX_EXPERIMENTS"), ",") {
-		if strings.TrimSpace(exp) == "linux_host" {
-			return true
-		}
-	}
-	return false
-}
+func linuxHostEnabled() bool { return ExperimentEnabled("linux_host") }
 
 // findFirecracker returns the path to the firecracker binary.
 // Checks PATH first, then ~/.lnx/bin/. If found on a 9P mount (which

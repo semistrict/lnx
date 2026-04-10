@@ -70,20 +70,25 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 			return nil, fmt.Errorf("clone ephemeral rootfs: %w", err)
 		}
 		cfg = &Config{
-			KernelPath:    cfg.KernelPath,
-			RootfsPath:    ephRootfs,
-			InitramfsPath: cfg.InitramfsPath,
-			CPUs:          cfg.CPUs,
-			MemoryBytes:   cfg.MemoryBytes,
-			CWD:           cfg.CWD,
-			Env:           cfg.Env,
-			Checkpoint:    cfg.Checkpoint,
-			CheckpointDir: cfg.CheckpointDir,
-			Shares:        cfg.Shares,
-			Hostname:      cfg.Hostname,
-			SSHAgent:      cfg.SSHAgent,
-			SocketDir:     cfg.SocketDir,
-			NestedRootfs:  cfg.NestedRootfs,
+			KernelPath:     cfg.KernelPath,
+			RootfsPath:     ephRootfs,
+			InitramfsPath:  cfg.InitramfsPath,
+			CPUs:           cfg.CPUs,
+			MemoryBytes:    cfg.MemoryBytes,
+			CWD:            cfg.CWD,
+			Env:            cfg.Env,
+			User:           cfg.User,
+			UID:            cfg.UID,
+			HomeDir:        cfg.HomeDir,
+			Checkpoint:     cfg.Checkpoint,
+			CheckpointDir:  cfg.CheckpointDir,
+			Shares:         cfg.Shares,
+			Hostname:       cfg.Hostname,
+			SSHAgent:       cfg.SSHAgent,
+			SocketDir:      cfg.SocketDir,
+			InstanceDir:    cfg.InstanceDir,
+			NestedRootfs:   cfg.NestedRootfs,
+			MemorySnapshot: cfg.MemorySnapshot,
 		}
 	}
 
@@ -141,15 +146,28 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		}
 	}
 
-	u, err := user.Current()
-	if err != nil {
-		lock.unlock()
-		if ephCleanup != nil {
-			ephCleanup()
+	username := cfg.User
+	uid := cfg.UID
+	homeDir := cfg.HomeDir
+	if username == "" || uid == 0 || homeDir == "" {
+		u, err := user.Current()
+		if err != nil {
+			lock.unlock()
+			if ephCleanup != nil {
+				ephCleanup()
+			}
+			return nil, fmt.Errorf("get current user: %w", err)
 		}
-		return nil, fmt.Errorf("get current user: %w", err)
+		if username == "" {
+			username = u.Username
+		}
+		if uid == 0 {
+			uid, _ = strconv.Atoi(u.Uid)
+		}
+		if homeDir == "" {
+			homeDir = u.HomeDir
+		}
 	}
-	uid, _ := strconv.Atoi(u.Uid)
 
 	swapPath := filepath.Join(workDir, "swap.img")
 	if err := ensureSwapFile(swapPath, cfg.memoryBytes()); err != nil {
@@ -199,9 +217,9 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 	setupMsg := &protocol.Setup{
 		CWD:          cwd,
 		Env:          append([]string(nil), cfg.Env...),
-		User:         u.Username,
+		User:         username,
 		UID:          uid,
-		HomeDir:      u.HomeDir,
+		HomeDir:      homeDir,
 		Hostname:     hostname,
 		SSHAgent:     sshAgent,
 		Shares:       cfg.Shares,
@@ -210,7 +228,7 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 	}
 	setupMsg.Env = append(setupMsg.Env, "LNX_PARENT="+parentInstance)
 
-	vm, err := buildVM(cfg, initrdPath, cwd, swapPath, u.HomeDir)
+	vm, err := buildVM(cfg, initrdPath, cwd, swapPath, homeDir)
 	if err != nil {
 		lock.unlock()
 		if ephCleanup != nil {
@@ -220,7 +238,7 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 	}
 
 	sockDir := cfg.socketDir()
-	vs, err := setupVsock(vm.VsockDevice(), sockDir, cfg.RootfsPath, setupMsg)
+	vs, err := setupVsock(vm.VsockDevice(), sockDir, cfg.RootfsPath, swapPath, setupMsg, cfg.instanceDir(), vm)
 	if err != nil {
 		lock.unlock()
 		if ephCleanup != nil {
@@ -278,15 +296,19 @@ waitBoot:
 		}
 		return nil, fmt.Errorf("control connection failed\n%s", serialLogTail(sockDir))
 	}
+	slog.Info("guest control connection accepted")
 	enc := gob.NewEncoder(ctrlConn)
-	if err := enc.Encode(protocol.Msg{Setup: setupMsg}); err != nil {
-		ctrlConn.Close()
-		vs.cleanup()
-		lock.unlock()
-		if ephCleanup != nil {
-			ephCleanup()
+	if cfg.MemorySnapshot == nil {
+		if err := enc.Encode(protocol.Msg{Setup: setupMsg}); err != nil {
+			ctrlConn.Close()
+			vs.cleanup()
+			lock.unlock()
+			if ephCleanup != nil {
+				ephCleanup()
+			}
+			return nil, fmt.Errorf("send setup: %w", err)
 		}
-		return nil, fmt.Errorf("send setup: %w", err)
+		slog.Info("guest setup sent")
 	}
 
 	return &bootedVM{
@@ -395,7 +417,7 @@ type vsockState struct {
 	cleanup    func()
 }
 
-func setupVsock(sock VsockDevice, logDir, rootfsPath string, setupMsg *protocol.Setup) (*vsockState, error) {
+func setupVsock(sock VsockDevice, logDir, rootfsPath, swapPath string, setupMsg *protocol.Setup, instanceDir string, bootedVM VirtualMachine) (*vsockState, error) {
 	logListener, err := sock.Listen(vsockLogPort)
 	if err != nil {
 		return nil, fmt.Errorf("vsock log listen: %w", err)
@@ -488,9 +510,18 @@ func setupVsock(sock VsockDevice, logDir, rootfsPath string, setupMsg *protocol.
 		pf.run(conn)
 	}()
 
-	api := newAPIServer(nil, setupMsg.User, rootfsPath)
+	api := newAPIServer(nil, setupMsg.User, rootfsPath, instanceDir, swapPath)
 	api.sock = sock
 	api.pf = pf
+	for _, kv := range setupMsg.Env {
+		if kv == "LNX_TOPLEVEL_MODE=memorysnapshot" {
+			api.proxyMemorySnapshotToGuest = true
+			break
+		}
+	}
+	if snapshotter, ok := bootedVM.(MemorySnapshotter); ok {
+		api.snapshotter = snapshotter
+	}
 	go func() {
 		conn, err := statusListener.Accept()
 		if err != nil {

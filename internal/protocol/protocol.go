@@ -55,6 +55,8 @@ type Msg struct {
 	CheckpointResp *CheckpointResp
 	OpenURLReq     *OpenURLReq
 	OpenURLResp    *OpenURLResp
+	LogReq         *LogReq
+	LogResp        *LogResp
 }
 
 // Setup tells the guest the environment to configure (user, cwd, env vars).
@@ -162,6 +164,18 @@ type OpenURLReq struct {
 // OpenURLResp reports the result of opening a URL.
 type OpenURLResp struct {
 	Error string // non-empty on failure
+}
+
+// LogReq asks the host daemon to write a log entry on behalf of the guest.
+type LogReq struct {
+	Level      string
+	Identifier string
+	Message    string
+}
+
+// LogResp reports the result of writing a host log entry.
+type LogResp struct {
+	Error string
 }
 
 // ExecSignal tells the guest to forward a signal to a specific exec session's process.

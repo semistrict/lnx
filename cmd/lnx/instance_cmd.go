@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -162,6 +163,15 @@ func runInstanceClone(cmd *cobra.Command, args []string) error {
 
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("create instance dir: %w", err)
+	}
+
+	if memorySnapshotEnabled() && checkpointName == "" && isInstanceRunning(sourceResolvedName) {
+		if err := cloneRunningInstanceWithMemory(sourceResolvedName, sourceDir, dir); err != nil {
+			_ = os.RemoveAll(dir)
+			return err
+		}
+		fmt.Printf("created instance %q from %q with memory snapshot\n", name, sourceResolvedName)
+		return nil
 	}
 
 	checkpointPath, err := checkpointPathForClone(sourceDir, sourceResolvedName, checkpointName)
@@ -368,6 +378,72 @@ func createCheckpointViaAPI(instanceName, checkpointName string) (string, error)
 	return payload.Path, nil
 }
 
+func createMemorySnapshotViaAPI(instanceName string) (string, error) {
+	resp, err := apiClientFor(instanceName).Post("http://localhost/memorysnapshot/create", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		if isNoVM(err) {
+			return "", noVMError()
+		}
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		data, _ := io.ReadAll(resp.Body)
+		msg := strings.TrimSpace(string(data))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return "", errors.New(msg)
+	}
+	var payload struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", fmt.Errorf("decode memory snapshot response: %w", err)
+	}
+	if payload.Path == "" {
+		return "", fmt.Errorf("memory snapshot response missing path")
+	}
+	return payload.Path, nil
+}
+
+func cloneRunningInstanceWithMemory(sourceName, sourceDir, dstDir string) error {
+	bundleDir, err := createMemorySnapshotViaAPI(sourceName)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := os.RemoveAll(bundleDir); err != nil {
+			slog.Warn("remove transient memory snapshot bundle", "path", bundleDir, "error", err)
+		}
+	}()
+
+	if err := cloneInstanceMetadata(sourceDir, dstDir); err != nil {
+		return fmt.Errorf("clone metadata: %w", err)
+	}
+	if err := cloneRootfs(filepath.Join(bundleDir, "rootfs.ext4"), filepath.Join(dstDir, "rootfs.ext4")); err != nil {
+		return fmt.Errorf("clone snapshotted rootfs: %w", err)
+	}
+
+	dstSnapshotDir := filepath.Join(dstDir, "memorysnapshot", "current")
+	if err := os.MkdirAll(dstSnapshotDir, 0755); err != nil {
+		return fmt.Errorf("create destination memorysnapshot dir: %w", err)
+	}
+	for _, name := range []string{"vmstate.bin", "memory.bin", "swap.img"} {
+		srcPath := filepath.Join(bundleDir, name)
+		if _, err := os.Stat(srcPath); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		if err := copyFile(filepath.Join(dstSnapshotDir, name), srcPath); err != nil {
+			return fmt.Errorf("copy %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
 func isInstanceRunning(name string) bool {
 	conn, err := net.DialTimeout("unix", filepath.Join(lnxBase(), "instances", name, "status.sock"), 500*time.Millisecond)
 	if err != nil {
@@ -418,6 +494,9 @@ func cloneInstanceMetadata(srcDir, dstDir string) error {
 func shouldSkipClonedMetadata(rel string, d fs.DirEntry) bool {
 	base := filepath.Base(rel)
 	if rel == "rootfs.ext4" || base == "checkpoints" {
+		return true
+	}
+	if base == "memorysnapshot" || base == "memorysnapshots" {
 		return true
 	}
 	switch base {

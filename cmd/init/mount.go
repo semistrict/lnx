@@ -113,8 +113,8 @@ func mount9P(target string, port uint32, readOnly bool) error {
 
 func mountCgroups() error {
 	os.MkdirAll("/sys/fs/cgroup", 0755)
-	// Use cgroup v1 hybrid: tmpfs base with individual controllers.
-	// Docker requires the devices cgroup which doesn't exist in pure cgroup v2.
+	// Use cgroup v1 only. Hybrid v1+v2 breaks rootful Podman builds inside lnx,
+	// and Docker still needs the devices controller that pure cgroup v2 lacks.
 	if err := syscall.Mount("tmpfs", "/sys/fs/cgroup", "tmpfs", 0, ""); err != nil {
 		return fmt.Errorf("mount cgroup tmpfs: %w", err)
 	}
@@ -125,9 +125,6 @@ func mountCgroups() error {
 		os.MkdirAll(dir, 0755)
 		syscall.Mount("cgroup", dir, "cgroup", 0, c)
 	}
-	// Mount cgroup2 for unified hierarchy support.
-	os.MkdirAll("/sys/fs/cgroup/unified", 0755)
-	syscall.Mount("cgroup2", "/sys/fs/cgroup/unified", "cgroup2", 0, "")
 	return nil
 }
 

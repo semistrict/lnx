@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/mdlayher/vsock"
 	"github.com/semistrict/lnx/internal/protocol"
@@ -59,18 +60,42 @@ var (
 )
 
 func run() error {
+	bootStartMono := time.Now()
+	earlyLog := func(step string) {
+		fmt.Fprintf(os.Stderr, "[lnx-init %s] step=%s elapsed=%s\n", time.Now().UTC().Format(time.RFC3339Nano), step, time.Since(bootStartMono))
+	}
+
+	earlyLog("run.start")
+	bootStart := time.Now()
+	lastStep := bootStart
+	logStep := func(step string, attrs ...any) {
+		now := time.Now()
+		base := []any{
+			"step", step,
+			"step_elapsed", now.Sub(lastStep),
+			"total_elapsed", now.Sub(bootStart),
+		}
+		slog.Info("guest init step", append(base, attrs...)...)
+		lastStep = now
+	}
+
 	if err := mountInitialFS(); err != nil {
 		return err
 	}
+	earlyLog("mountInitialFS.done")
+	logStep("mountInitialFS")
 
 	initLogging()
 	parseEpoch()
+	earlyLog("initLogging+parseEpoch.done")
+	logStep("initLogging+parseEpoch")
 
 	// Connect to the host control channel.
 	conn, err := vsock.Dial(vsockHostCID, protocol.Port, nil)
 	if err != nil {
 		return fmt.Errorf("vsock dial control: %w", err)
 	}
+	earlyLog("controlDial.connected")
 	ctrlConn = conn
 	ctrlDec = gob.NewDecoder(conn)
 	ctrlDone = make(chan struct{})
@@ -84,43 +109,56 @@ func run() error {
 		return fmt.Errorf("expected Setup message, got %+v", msg)
 	}
 	setup := msg.Setup
+	earlyLog("setup.received")
+	logStep("connectControl+readSetup")
 
 	// Start reading signals/resize from control connection.
 	go controlReader()
+	logStep("startControlReader")
 
 	if err := mountRootfs(); err != nil {
 		return err
 	}
+	logStep("mountRootfs")
 	if setup.HomeDir != "" {
 		if err := mountHome(setup.HomeDir); err != nil {
 			slog.Warn("home 9p mount failed, continuing without it", "error", err)
 		}
+		logStep("mountHome", "home", setup.HomeDir)
 	}
 	if setup.CWD != "" {
 		if err := mountCWD(setup.CWD, setup.ShareMethod); err != nil {
 			return err
 		}
+		logStep("mountCWD", "cwd", setup.CWD)
 	}
 	for i, path := range setup.Shares {
 		if err := mountShare(path, fmt.Sprintf("share%d", i), setup.ShareMethod, i); err != nil {
 			slog.Warn("share mount failed", "path", path, "error", err)
 		}
 	}
+	if len(setup.Shares) > 0 {
+		logStep("mountShares", "count", len(setup.Shares))
+	}
 	if err := mountInNewRoot(); err != nil {
 		return err
 	}
+	logStep("mountInNewRoot")
 	if err := pivotRoot(); err != nil {
 		return err
 	}
+	logStep("pivotRoot")
 
 	mountCgroups()
 	writeNestedDrivesMapping(setup)
+	logStep("mountCgroups+writeNestedDrives")
 
 	if out, err := exec.Command("/sbin/resize2fs", "/dev/vda").CombinedOutput(); err != nil {
 		slog.Warn("resize2fs failed", "error", err, "output", string(out))
 	} else {
 		slog.Info("resize2fs", "output", strings.TrimSpace(string(out)))
 	}
+	logStep("resize2fs")
 
 	if _, err := os.Stat("/dev/vdb"); err == nil {
 		if out, err := exec.Command("/sbin/mkswap", "/dev/vdb").CombinedOutput(); err != nil {
@@ -131,17 +169,20 @@ func run() error {
 			slog.Info("swap enabled", "device", "/dev/vdb")
 		}
 	}
+	logStep("enableSwap")
 
 	hostname := setup.Hostname
 	if hostname == "" {
 		hostname = "lnx"
 	}
 	syscall.Sethostname([]byte(hostname))
+	logStep("setHostname", "hostname", hostname)
 
 	os.Setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	os.Setenv("TERM", "xterm-256color")
 	os.Setenv("LANG", "C.UTF-8")
-	os.Setenv("BROWSER", "xdg-open")
+	os.Setenv("BROWSER", hostBrowserOpenHelperPath)
+	logStep("setBaseEnv")
 
 	setupUID = setup.UID
 	setupCWD = setup.CWD
@@ -153,33 +194,63 @@ func run() error {
 	} else {
 		os.Setenv("HOME", "/root")
 	}
+	logStep("setupUser")
 
 	for _, kv := range setup.Env {
 		if k, v, ok := strings.Cut(kv, "="); ok {
 			os.Setenv(k, v)
 		}
 	}
+	logStep("applyGuestEnv", "count", len(setup.Env))
 
 	if setup.SSHAgent {
 		startSSHAgentForward()
+		logStep("startSSHAgentForward")
 	}
 
 	installSystemctlShim()
 	installSystemdCatShim()
+	logStep("installSystemShims")
 	configureNetwork()
+	logStep("configureNetwork")
 	installBashDefaults()
 	installXdgOpen()
-	startEnabledServices()
+	logStep("installShellShims")
+	if memorySnapshotModeEnabled() {
+		logStep("enterMemorySnapshotMode")
+		if err := runMemorySnapshotMode(setup); err != nil {
+			return err
+		}
+		return nil
+	}
+	if shouldStartEnabledServices() {
+		startEnabledServices()
+		logStep("startEnabledServices")
+	}
 	startStatusServer()
+	logStep("startStatusServer")
 	startExecServer()
+	logStep("startExecServer")
 	startGuestControlServer()
+	logStep("startGuestControlServer")
 	startPortForwarder()
+	logStep("startPortForwarder")
 
 	slog.Info("guest ready", "user", setup.User, "uid", setup.UID)
+
+	if os.Getenv("LNX_PERSIST_ON_CONTROL_DROP") != "" {
+		<-ctrlDone
+		slog.Warn("control connection dropped; keeping guest alive for memory snapshot mode")
+		select {}
+	}
 
 	// Block until the host closes the control connection.
 	<-ctrlDone
 	return nil
+}
+
+func shouldStartEnabledServices() bool {
+	return !memorySnapshotModeEnabled()
 }
 
 func runSystemdCat(args []string) int {
@@ -448,15 +519,44 @@ fi
 // installXdgOpen writes a shim that forwards xdg-open calls to the host
 // macOS browser via the guest control socket.
 func installXdgOpen() {
-	script := `#!/bin/sh
-curl -sf --unix-socket /var/run/lnx/control.sock \
-  -X POST -H "Content-Type: application/json" \
-  -d "{\"url\":\"$1\"}" \
-  http://localhost/open >/dev/null 2>&1
-`
-	if err := os.WriteFile("/usr/local/bin/xdg-open", []byte(script), 0755); err != nil {
+	if err := os.WriteFile("/usr/local/bin/xdg-open", []byte(xdgOpenShimScript()), 0755); err != nil {
 		slog.Warn("failed to install xdg-open shim", "error", err)
 	}
+	if err := os.WriteFile(hostBrowserOpenHelperPath, []byte(xdgOpenShimScript()), 0755); err != nil {
+		slog.Warn("failed to install browser helper", "path", hostBrowserOpenHelperPath, "error", err)
+	}
+}
+
+const hostBrowserOpenHelperPath = "/usr/local/bin/lnx-open-browser"
+
+func xdgOpenShimScript() string {
+	return `#!/bin/sh
+log_to_host() {
+  level="$1"
+  shift
+  printf '%s\n' "$*" | curl -sf --unix-socket /var/run/lnx/control.sock \
+    -X POST --data-binary @- \
+    "http://localhost/log?level=$level&identifier=lnx-xdg-open" >/dev/null 2>&1 || true
+}
+
+url="$1"
+if [ -z "$url" ]; then
+  log_to_host warn "xdg-open called without a URL"
+  exit 1
+fi
+
+if curl -sf --unix-socket /var/run/lnx/control.sock \
+  -X POST -H "Content-Type: application/json" \
+  -d "{\"url\":\"$url\"}" \
+  http://localhost/open >/dev/null 2>&1; then
+  log_to_host info "forwarded browser open url=$url"
+  exit 0
+fi
+
+rc=$?
+log_to_host warn "failed to forward browser open url=$url exit=$rc"
+exit "$rc"
+`
 }
 
 func poweroff() {
