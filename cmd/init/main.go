@@ -164,11 +164,20 @@ func run() error {
 		startSSHAgentForward()
 	}
 
+	mountCRIUDevice()
+
 	installSystemctlShim()
 	installSystemdCatShim()
 	configureNetwork()
+
+	// Auto-restore CRIU images after network is up (CRIU needs TCP
+	// repair support detection) but before services that spawn threads
+	// (which would claim the PIDs CRIU needs to restore into).
+	criuAutoRestore()
+
 	installBashDefaults()
 	installXdgOpen()
+	installForkRoleHelper()
 	startEnabledServices()
 	startStatusServer()
 	startExecServer()

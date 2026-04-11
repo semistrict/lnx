@@ -9,9 +9,12 @@ import (
 	vz "github.com/Code-Hex/vz/v3"
 )
 
-// attachDisks attaches the rootfs as /dev/vda, swap as /dev/vdb, and any
-// nested instance rootfs files as /dev/vdc, /dev/vdd, etc.
-func attachDisks(vmConfig *vz.VirtualMachineConfiguration, rootfsPath, swapPath string, nested []NestedRootfs) error {
+// attachDisks attaches block devices in order:
+//   /dev/vda — rootfs
+//   /dev/vdb — swap (hibernate resume device)
+//   /dev/vdc — CRIU images volume
+//   /dev/vdd, /dev/vde, ... — nested instance rootfs drives
+func attachDisks(vmConfig *vz.VirtualMachineConfiguration, rootfsPath, swapPath, criuPath string, nested []NestedRootfs) error {
 	var devices []vz.StorageDeviceConfiguration
 
 	rootAttach, err := vz.NewDiskImageStorageDeviceAttachment(rootfsPath, false)
@@ -33,6 +36,16 @@ func attachDisks(vmConfig *vz.VirtualMachineConfiguration, rootfsPath, swapPath 
 		return fmt.Errorf("swap block device: %w", err)
 	}
 	devices = append(devices, swapBlock)
+
+	criuAttach, err := vz.NewDiskImageStorageDeviceAttachment(criuPath, false)
+	if err != nil {
+		return fmt.Errorf("criu disk attachment: %w", err)
+	}
+	criuBlock, err := vz.NewVirtioBlockDeviceConfiguration(criuAttach)
+	if err != nil {
+		return fmt.Errorf("criu block device: %w", err)
+	}
+	devices = append(devices, criuBlock)
 
 	// Nested instance rootfs drives.
 	for _, nr := range nested {

@@ -55,6 +55,8 @@ type Msg struct {
 	CheckpointResp *CheckpointResp
 	OpenURLReq     *OpenURLReq
 	OpenURLResp    *OpenURLResp
+	ForkReq        *ForkReq
+	ForkResp       *ForkResp
 }
 
 // Setup tells the guest the environment to configure (user, cwd, env vars).
@@ -177,6 +179,15 @@ type ExecResize struct {
 	Cols uint16
 }
 
+// ForkReq tells the host that the guest has completed a CRIU dump for fork
+// and is ready for the host to clone the rootfs and spawn a child instance.
+type ForkReq struct{}
+
+// ForkResp reports the result of a fork operation.
+type ForkResp struct {
+	Instance string // child instance name
+	Error    string // non-empty on failure
+}
 // PortForward notifies the host of the current set of listening TCP ports in the guest.
 type PortForward struct {
 	Ports []uint16

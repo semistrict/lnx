@@ -28,6 +28,25 @@ RUN chroot /rootfs apt-get install -y --no-install-recommends \
 RUN chroot /rootfs apt-get install -y --no-install-recommends \
     linux-tools-common
 
+# Layer 6b: CRIU build deps
+RUN chroot /rootfs apt-get install -y --no-install-recommends \
+    libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler \
+    pkg-config python3-protobuf libbsd-dev libcap-dev \
+    libnl-3-dev libnet1-dev libaio-dev libgnutls28-dev \
+    libnftables-dev nftables uuid-dev python3-yaml
+
+# Layer 6c: CRIU (checkpoint/restore in userspace) — built from source
+# for compatibility with newer kernels (distro CRIU lags behind).
+RUN chroot /rootfs git clone --depth 1 https://github.com/checkpoint-restore/criu.git /tmp/criu && \
+    chroot /rootfs sh -c '\
+        PROTO_INC=$(find /usr -path "*/google/protobuf/descriptor.proto" -printf "%h/../..\n" 2>/dev/null | head -1); \
+        [ -z "$PROTO_INC" ] && PROTO_INC=/usr/include; \
+        mkdir -p /tmp/criu/images/google/protobuf && \
+        cp "$PROTO_INC/google/protobuf/descriptor.proto" /tmp/criu/images/google/protobuf/' && \
+    chroot /rootfs make -C /tmp/criu -j$(nproc) && \
+    chroot /rootfs make -C /tmp/criu install-criu PREFIX=/usr && \
+    rm -rf /rootfs/tmp/criu
+
 # Layer 7: containers
 RUN chroot /rootfs apt-get install -y --no-install-recommends \
     podman buildah skopeo uidmap slirp4netns fuse-overlayfs

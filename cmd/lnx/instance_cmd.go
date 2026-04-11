@@ -417,12 +417,12 @@ func cloneInstanceMetadata(srcDir, dstDir string) error {
 
 func shouldSkipClonedMetadata(rel string, d fs.DirEntry) bool {
 	base := filepath.Base(rel)
-	if rel == "rootfs.ext4" || base == "checkpoints" {
+	if rel == "rootfs.ext4" || rel == "criu.ext4" || base == "checkpoints" {
 		return true
 	}
 	switch base {
 	case "status.sock", "error.log", "serial.log", "lnx.log", "initramfs.cpio", "swap.img",
-		"rootfs.ext4.lock", "rootfs.ext4.pid", "firecracker.sock", "vsock":
+		"rootfs.ext4.lock", "rootfs.ext4.pid", "firecracker.sock", "vsock", "hibernated":
 		return true
 	}
 	return strings.HasPrefix(base, "vsock_")

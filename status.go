@@ -48,10 +48,13 @@ type StatusResponse struct {
 // apiServer manages the guest vsock connections and the host unix
 // socket HTTP server for status queries and exec requests.
 type apiServer struct {
-	args       []string
-	user       string
-	startTime  time.Time
-	rootfsPath string
+	args         []string
+	user         string
+	startTime    time.Time
+	rootfsPath   string
+	criuPath     string
+	instanceName string
+	instanceDir  string
 
 	statusMu   sync.Mutex
 	statusEnc  *gob.Encoder
@@ -350,7 +353,75 @@ func (s *apiServer) handleGuestCtrl(conn net.Conn) {
 				return
 			}
 		}
+
+		if msg.ForkReq != nil {
+			resp := s.executeFork()
+			if err := enc.Encode(protocol.Msg{ForkResp: resp}); err != nil {
+				return
+			}
+		}
 	}
+}
+
+// executeFork handles the fork orchestration (shared between HTTP and gob paths).
+func (s *apiServer) executeFork() *protocol.ForkResp {
+	if s.instanceName == "" || s.instanceDir == "" {
+		return &protocol.ForkResp{Error: "fork requires daemon mode"}
+	}
+
+	// Generate child name and create child instance dir.
+	childName := s.instanceName + "-fork-" + time.Now().Format("150405")
+	instancesDir := filepath.Dir(s.instanceDir)
+	childDir := filepath.Join(instancesDir, childName)
+	if err := os.MkdirAll(childDir, 0755); err != nil {
+		return &protocol.ForkResp{Error: fmt.Sprintf("create child dir: %v", err)}
+	}
+
+	// APFS clone rootfs.
+	childRootfs := filepath.Join(childDir, "rootfs.ext4")
+	if err := cloneFile(s.rootfsPath, childRootfs); err != nil {
+		os.RemoveAll(childDir)
+		return &protocol.ForkResp{Error: fmt.Sprintf("clone rootfs: %v", err)}
+	}
+
+	// APFS clone CRIU volume (contains fork dump images).
+	if s.criuPath != "" {
+		childCRIU := filepath.Join(childDir, "criu.ext4")
+		if err := cloneFile(s.criuPath, childCRIU); err != nil {
+			os.RemoveAll(childDir)
+			return &protocol.ForkResp{Error: fmt.Sprintf("clone criu volume: %v", err)}
+		}
+	}
+
+	// Copy instance metadata.
+	copyForkMetadata(s.instanceDir, childDir)
+
+	// Spawn child daemon.
+	self, err := os.Executable()
+	if err != nil {
+		os.RemoveAll(childDir)
+		return &protocol.ForkResp{Error: fmt.Sprintf("get executable: %v", err)}
+	}
+
+	childCmd := exec.Command(self, "_daemon", "--instance", childName)
+	childCmd.Env = os.Environ()
+	if err := childCmd.Start(); err != nil {
+		os.RemoveAll(childDir)
+		return &protocol.ForkResp{Error: fmt.Sprintf("start child daemon: %v", err)}
+	}
+	childCmd.Process.Release()
+
+	// Wait for child to be ready.
+	childSock := filepath.Join(childDir, "status.sock")
+	for i := 0; i < 300; i++ {
+		if conn, err := net.DialTimeout("unix", childSock, 200*time.Millisecond); err == nil {
+			conn.Close()
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	return &protocol.ForkResp{Instance: childName}
 }
 
 // queryGuest sends a StatusReq and reads the StatusResp.
@@ -395,6 +466,8 @@ func (s *apiServer) listenUnix(sockPath string) error {
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /ports", s.handlePorts)
 	mux.HandleFunc("POST /checkpoint", s.handleCheckpoint)
+	mux.HandleFunc("POST /criu/checkpoint", s.handleCRIUCheckpoint)
+	mux.HandleFunc("POST /fork", s.handleFork)
 	mux.HandleFunc("POST /expose/host", s.handleExposeHost)
 	mux.HandleFunc("POST /expose/host/remove", s.handleRemoveExposeHost)
 	mux.HandleFunc("POST /guest/expose", s.handleGuestExpose)
@@ -613,6 +686,96 @@ func (s *apiServer) handleGuestExpose(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// handleCRIUCheckpoint orchestrates a CRIU checkpoint:
+//  1. Guest dumps processes to the CRIU block device (/mnt/criu/<name>/)
+//  2. Host APFS-clones both rootfs.ext4 and criu.ext4
+//  3. Guest cleans up dump images from the live CRIU volume
+//
+// The checkpoint directory contains rootfs.ext4 + criu.ext4, both instant
+// copy-on-write clones.
+func (s *apiServer) handleCRIUCheckpoint(w http.ResponseWriter, r *http.Request) {
+	if s.sock == nil {
+		http.Error(w, "guest vsock unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if s.criuPath == "" {
+		http.Error(w, "CRIU volume not configured", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" {
+		http.Error(w, "name required", http.StatusBadRequest)
+		return
+	}
+
+	// Step 1: Guest dumps processes to CRIU volume.
+	var dumpResp struct {
+		Status string `json:"status"`
+	}
+	if err := s.proxyGuestJSON(r.Context(), "/criu/dump", req, &dumpResp); err != nil {
+		http.Error(w, fmt.Sprintf("guest CRIU dump: %v", err), http.StatusBadGateway)
+		return
+	}
+
+	// Step 2: APFS-clone rootfs + CRIU volume into checkpoint dir.
+	cpDir := filepath.Join(filepath.Dir(s.rootfsPath), "checkpoints", req.Name)
+	cpPath, err := CreateCRIUCheckpoint(s.rootfsPath, s.criuPath, cpDir)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("clone: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"path": cpPath})
+}
+
+func (s *apiServer) handleFork(w http.ResponseWriter, r *http.Request) {
+	if s.sock == nil {
+		http.Error(w, "guest vsock unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if s.instanceName == "" || s.instanceDir == "" {
+		http.Error(w, "fork requires daemon mode", http.StatusBadRequest)
+		return
+	}
+
+	// Step 1: Tell guest to CRIU dump for fork.
+	var dumpResp struct {
+		Status string `json:"status"`
+	}
+	if err := s.proxyGuestJSON(r.Context(), "/criu/fork-dump", nil, &dumpResp); err != nil {
+		http.Error(w, fmt.Sprintf("guest fork dump: %v", err), http.StatusBadGateway)
+		return
+	}
+
+	// Step 2: Clone rootfs + CRIU volume + spawn child.
+	resp := s.executeFork()
+	if resp.Error != "" {
+		http.Error(w, resp.Error, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"child_instance": resp.Instance})
+}
+
+// copyForkMetadata copies instance metadata files relevant to a fork.
+// Skips mac.addr, swap.img, hibernated, and other transient state.
+func copyForkMetadata(srcDir, dstDir string) {
+	// Only copy shares.json if it exists.
+	sharesPath := filepath.Join(srcDir, "shares.json")
+	if data, err := os.ReadFile(sharesPath); err == nil {
+		os.WriteFile(filepath.Join(dstDir, "shares.json"), data, 0644)
+	}
+}
+
 func (s *apiServer) handleCheckpoint(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name string `json:"name"`
@@ -627,12 +790,13 @@ func (s *apiServer) handleCheckpoint(w http.ResponseWriter, r *http.Request) {
 			Path string `json:"path"`
 		}
 		if err := s.proxyGuestJSON(r.Context(), "/checkpoint", req, &resp); err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			// Guest sync failed — fall through to direct clone without sync.
+			slog.Warn("checkpoint: guest sync failed, cloning without sync", "error", err)
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
-		return
 	}
 
 	cpDir := filepath.Join(filepath.Dir(s.rootfsPath), "checkpoints")

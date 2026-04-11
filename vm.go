@@ -1,8 +1,10 @@
 package lnx
 
 import (
+	cryptoRand "crypto/rand"
 	"encoding/gob"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -31,6 +33,8 @@ type bootedVM struct {
 	ctrlConn net.Conn
 	ctrlEnc  *gob.Encoder
 	cwd      string
+	sockDir  string
+	criuPath string // host path to CRIU images block device file
 	// ephCleanup removes the ephemeral temp dir (nil if not ephemeral).
 	ephCleanup func()
 	lock       *lockFile
@@ -160,6 +164,15 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		return nil, fmt.Errorf("swap file: %w", err)
 	}
 
+	criuPath := filepath.Join(workDir, "criu.ext4")
+	if err := ensureSparseFile(criuPath, cfg.memoryBytes()); err != nil {
+		lock.unlock()
+		if ephCleanup != nil {
+			ephCleanup()
+		}
+		return nil, fmt.Errorf("criu image file: %w", err)
+	}
+
 	hostname := cfg.Hostname
 	if hostname == "" {
 		hostname = "lnx"
@@ -186,10 +199,11 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		parentInstance = existing + "." + parentInstance
 	}
 
-	// Build nested drive mapping: each nested rootfs gets a device starting at vdc.
+	// Build nested drive mapping: each nested rootfs gets a device starting at vdd
+	// (vda=rootfs, vdb=swap, vdc=criu).
 	var nestedDrives []protocol.NestedDrive
 	for i, nr := range cfg.NestedRootfs {
-		devLetter := 'c' + rune(i) // vdc, vdd, vde, ...
+		devLetter := 'd' + rune(i) // vdd, vde, vdf, ...
 		nestedDrives = append(nestedDrives, protocol.NestedDrive{
 			InstanceName: nr.InstanceName,
 			DevicePath:   fmt.Sprintf("/dev/vd%c", devLetter),
@@ -210,7 +224,14 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 	}
 	setupMsg.Env = append(setupMsg.Env, "LNX_PARENT="+parentInstance)
 
-	vm, err := buildVM(cfg, initrdPath, cwd, swapPath, u.HomeDir)
+	sockDir := cfg.socketDir()
+
+	// Load or generate a stable MAC address for this instance.
+	macAddr := loadOrGenerateMAC(sockDir)
+
+	epoch := time.Now().Unix()
+
+	vm, err := buildVM(cfg, initrdPath, cwd, swapPath, criuPath, u.HomeDir, macAddr, epoch)
 	if err != nil {
 		lock.unlock()
 		if ephCleanup != nil {
@@ -219,8 +240,10 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		return nil, err
 	}
 
-	sockDir := cfg.socketDir()
-	vs, err := setupVsock(vm.VsockDevice(), sockDir, cfg.RootfsPath, setupMsg)
+	// Derive instance name from hostname for fork support.
+	vmInstanceName := strings.TrimSuffix(hostname, ".lnx")
+
+	vs, err := setupVsock(vm.VsockDevice(), sockDir, cfg.RootfsPath, vmInstanceName, setupMsg)
 	if err != nil {
 		lock.unlock()
 		if ephCleanup != nil {
@@ -295,6 +318,8 @@ waitBoot:
 		ctrlConn:   ctrlConn,
 		ctrlEnc:    enc,
 		cwd:        cwd,
+		sockDir:    sockDir,
+		criuPath:   criuPath,
 		ephCleanup: ephCleanup,
 		lock:       lock,
 	}, nil
@@ -395,7 +420,7 @@ type vsockState struct {
 	cleanup    func()
 }
 
-func setupVsock(sock VsockDevice, logDir, rootfsPath string, setupMsg *protocol.Setup) (*vsockState, error) {
+func setupVsock(sock VsockDevice, logDir, rootfsPath, instanceName string, setupMsg *protocol.Setup) (*vsockState, error) {
 	logListener, err := sock.Listen(vsockLogPort)
 	if err != nil {
 		return nil, fmt.Errorf("vsock log listen: %w", err)
@@ -488,9 +513,13 @@ func setupVsock(sock VsockDevice, logDir, rootfsPath string, setupMsg *protocol.
 		pf.run(conn)
 	}()
 
+	criuImagePath := filepath.Join(filepath.Dir(rootfsPath), "criu.ext4")
 	api := newAPIServer(nil, setupMsg.User, rootfsPath)
 	api.sock = sock
 	api.pf = pf
+	api.instanceName = instanceName
+	api.instanceDir = logDir
+	api.criuPath = criuImagePath
 	go func() {
 		conn, err := statusListener.Accept()
 		if err != nil {
@@ -611,6 +640,21 @@ func initHostLoggingFromEnv() {
 	})
 }
 
+// ensureSparseFile creates a sparse file if it doesn't exist.
+// Unlike ensureSwapFile, it preserves existing files (they may contain
+// CRIU images from a checkpoint restore).
+func ensureSparseFile(path string, size uint64) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil // already exists, preserve contents
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Truncate(int64(size))
+}
+
 // ensureSwapFile creates a sparse swap file if it doesn't exist or is the wrong size.
 func ensureSwapFile(path string, size uint64) error {
 	if info, err := os.Stat(path); err == nil && uint64(info.Size()) == size {
@@ -622,6 +666,30 @@ func ensureSwapFile(path string, size uint64) error {
 	}
 	defer f.Close()
 	return f.Truncate(int64(size))
+}
+
+// loadOrGenerateMAC returns a stable MAC address for an instance.
+// On the first call for a given dir, it generates a random locally-administered
+// MAC and persists it to mac.addr. Subsequent calls read the saved value.
+func loadOrGenerateMAC(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	path := filepath.Join(dir, "mac.addr")
+	if data, err := os.ReadFile(path); err == nil {
+		mac := strings.TrimSpace(string(data))
+		if mac != "" {
+			return mac
+		}
+	}
+	b := make([]byte, 6)
+	if _, err := io.ReadFull(cryptoRand.Reader, b); err != nil {
+		return ""
+	}
+	b[0] = (b[0] & 0xfe) | 0x02 // locally administered, unicast
+	mac := fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
+	os.WriteFile(path, []byte(mac+"\n"), 0644)
+	return mac
 }
 
 // serialLogTail returns the last few lines of serial.log for error diagnostics.

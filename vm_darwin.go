@@ -58,8 +58,10 @@ func vzStateToVMState(s vz.VirtualMachineState) VMState {
 }
 
 // buildVM creates a Darwin VM configured and ready to start.
-func buildVM(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (VirtualMachine, error) {
-	vmConfig, err := buildVMConfig(cfg, initrdPath, cwd, swapPath, homeDir)
+// macAddr is a stable MAC address string; if empty, one is generated.
+// epoch overrides lnx.epoch in the kernel cmdline (0 = use current time).
+func buildVM(cfg *Config, initrdPath, cwd, swapPath, criuPath, homeDir, macAddr string, epoch int64) (VirtualMachine, error) {
+	vmConfig, err := buildVMConfig(cfg, initrdPath, cwd, swapPath, criuPath, homeDir, macAddr, epoch)
 	if err != nil {
 		return nil, err
 	}
@@ -80,8 +82,12 @@ func buildVM(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (VirtualMac
 	}, nil
 }
 
-func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.VirtualMachineConfiguration, error) {
-	cmdline := fmt.Sprintf("console=hvc0 lnx.epoch=%d", time.Now().Unix())
+// buildVMConfig creates the VZ VM configuration.
+func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, criuPath, homeDir, macAddr string, epoch int64) (*vz.VirtualMachineConfiguration, error) {
+	if epoch == 0 {
+		epoch = time.Now().Unix()
+	}
+	cmdline := fmt.Sprintf("console=hvc0 lnx.epoch=%d", epoch)
 
 	bootLoader, err := vz.NewLinuxBootLoader(
 		cfg.KernelPath,
@@ -110,7 +116,7 @@ func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.
 
 	for _, attach := range []func(*vz.VirtualMachineConfiguration) error{
 		func(c *vz.VirtualMachineConfiguration) error {
-			return attachDisks(c, cfg.RootfsPath, swapPath, cfg.NestedRootfs)
+			return attachDisks(c, cfg.RootfsPath, swapPath, criuPath, cfg.NestedRootfs)
 		},
 		func(c *vz.VirtualMachineConfiguration) error { return attachShares(c, cwd, cfg.Shares) },
 		func(c *vz.VirtualMachineConfiguration) error {

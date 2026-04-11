@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,72 @@ import (
 	"github.com/semistrict/lnx/internal/protocol"
 	"golang.org/x/sys/unix"
 )
+
+// listUserPIDs scans /proc for all session-leader processes owned by the
+// setup user. These are the top-level process trees that CRIU should dump.
+// Excludes PID 1 (init) and kernel threads.
+func listUserPIDs() []int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+
+	myPID := os.Getpid()
+	var pids []int
+
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 1 || pid == myPID {
+			continue
+		}
+
+		// Read process status to check UID and session ID.
+		statusPath := fmt.Sprintf("/proc/%d/status", pid)
+		data, err := os.ReadFile(statusPath)
+		if err != nil {
+			continue // process may have exited
+		}
+
+		// Parse UID line: "Uid:\treal\teffective\tsaved\tfs"
+		uid := -1
+		sid := -1
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "Uid:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					uid, _ = strconv.Atoi(fields[1])
+				}
+			}
+		}
+
+		// Read session ID from /proc/<pid>/stat (field 6).
+		statData, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if err != nil {
+			continue
+		}
+		// Skip past comm field (may contain spaces/parens).
+		if idx := strings.LastIndex(string(statData), ")"); idx >= 0 {
+			fields := strings.Fields(string(statData)[idx+2:])
+			if len(fields) >= 4 {
+				sid, _ = strconv.Atoi(fields[3]) // field 6 = session ID (0-indexed field 3 after ")")
+			}
+		}
+
+		// Only include user processes that are session leaders.
+		// Session leader: PID == SID.
+		if setupUID > 0 && uid != setupUID {
+			continue
+		}
+		if sid != pid {
+			continue // not a session leader
+		}
+
+		pids = append(pids, pid)
+	}
+
+	sort.Ints(pids)
+	return pids
+}
 
 // startExecServer listens on the exec vsock port and handles one
 // exec request per connection. Multiple connections are accepted
@@ -159,13 +226,14 @@ func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener, ses
 	default:
 		cmd.Dir = os.Getenv("HOME")
 	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true, // CRIU requires session leaders
+	}
 	if setupUID > 0 {
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Credential: &syscall.Credential{
-				Uid:    uint32(setupUID),
-				Gid:    uint32(setupUID),
-				Groups: lookupSupplementaryGroups(setupUID),
-			},
+		cmd.SysProcAttr.Credential = &syscall.Credential{
+			Uid:    uint32(setupUID),
+			Gid:    uint32(setupUID),
+			Groups: lookupSupplementaryGroups(setupUID),
 		}
 	}
 
@@ -315,13 +383,14 @@ func runExecPipe(enc *gob.Encoder, req *protocol.ExecReq, sess *execSession) {
 	default:
 		cmd.Dir = os.Getenv("HOME")
 	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true, // CRIU requires session leaders
+	}
 	if setupUID > 0 {
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Credential: &syscall.Credential{
-				Uid:    uint32(setupUID),
-				Gid:    uint32(setupUID),
-				Groups: lookupSupplementaryGroups(setupUID),
-			},
+		cmd.SysProcAttr.Credential = &syscall.Credential{
+			Uid:    uint32(setupUID),
+			Gid:    uint32(setupUID),
+			Groups: lookupSupplementaryGroups(setupUID),
 		}
 	}
 

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 
@@ -64,6 +65,9 @@ func newGuestControlMux(gc *guestControl) *http.ServeMux {
 	mux.HandleFunc("POST /checkpoint", gc.handleCheckpoint)
 	mux.HandleFunc("POST /open", gc.handleOpen)
 	mux.HandleFunc("POST /tcp/expose", gc.handleTCPExpose)
+	mux.HandleFunc("POST /criu/dump", gc.handleCRIUDump)
+	mux.HandleFunc("POST /criu/fork-dump", gc.handleCRIUForkDump)
+	mux.HandleFunc("POST /fork", gc.handleFork)
 	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
 	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
 	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
@@ -188,6 +192,85 @@ func (gc *guestControl) handleOpen(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// handleCRIUDump dumps all user processes to the CRIU volume.
+// The images are written to /mnt/criu/<name>/ on the CRIU block device,
+// which the host can then APFS-clone.
+func (gc *guestControl) handleCRIUDump(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" {
+		http.Error(w, "name required", http.StatusBadRequest)
+		return
+	}
+
+	dir := filepath.Join(criuMountPoint, req.Name)
+	if err := criuDump(req.Name, dir, true); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	syscall.Sync()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (gc *guestControl) handleCRIUForkDump(w http.ResponseWriter, r *http.Request) {
+	if err := criuDump("fork", criuForkDir, true); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	syscall.Sync()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+}
+
+func (gc *guestControl) handleFork(w http.ResponseWriter, r *http.Request) {
+	// Dump all user processes with --leave-running.
+	if err := criuDump("fork", criuForkDir, true); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	syscall.Sync()
+
+	// Ask the host to clone rootfs + CRIU volume and spawn a child instance.
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
+
+	if err := gc.enc.Encode(protocol.Msg{ForkReq: &protocol.ForkReq{}}); err != nil {
+		http.Error(w, fmt.Sprintf("send fork request: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	var msg protocol.Msg
+	if err := gc.dec.Decode(&msg); err != nil {
+		http.Error(w, fmt.Sprintf("read fork response: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if msg.ForkResp == nil {
+		http.Error(w, "unexpected response from host", http.StatusInternalServerError)
+		return
+	}
+	if msg.ForkResp.Error != "" {
+		http.Error(w, msg.ForkResp.Error, http.StatusInternalServerError)
+		return
+	}
+
+	// Clean up fork dump from parent (child has it in its cloned CRIU volume).
+	os.RemoveAll(criuForkDir)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"role":           "parent",
+		"child_instance": msg.ForkResp.Instance,
+	})
 }
 
 func (gc *guestControl) handleTCPExpose(w http.ResponseWriter, r *http.Request) {
