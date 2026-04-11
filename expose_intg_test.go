@@ -250,7 +250,7 @@ func registerInstanceStopCleanup(t *testing.T, bin string, names ...string) {
 	t.Helper()
 	t.Cleanup(func() {
 		for _, name := range names {
-			cmd := exec.Command(bin, "--instance", name, "stop", "--shutdown")
+			cmd := exec.Command(bin, "--instance", name, "stop")
 			out, err := cmd.CombinedOutput()
 			if err != nil && !strings.Contains(string(out), "no VM running") {
 				t.Logf("stop %s failed: %v: %s", name, err, out)

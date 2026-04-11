@@ -19,7 +19,6 @@ import (
 var doCheckpoint bool
 var doEphemeral bool
 var doSSHAgent bool
-var memoryMB uint64
 
 // instanceName is the resolved instance name. Set from --instance flag or LNX_INSTANCE env.
 var instanceName = "default"
@@ -55,7 +54,6 @@ func init() {
 	rootCmd.Flags().BoolVarP(&doCheckpoint, "checkpoint", "c", false, "snapshot rootfs before starting the VM")
 	rootCmd.Flags().BoolVar(&doEphemeral, "ephemeral", false, "clone rootfs to a temp file; discard on exit")
 	rootCmd.Flags().BoolVar(&doSSHAgent, "ssh-agent", false, "forward host SSH agent into the guest")
-	rootCmd.Flags().Uint64Var(&memoryMB, "memory", 0, "VM memory in MB (default: 50% of host RAM)")
 	rootCmd.Flags().StringArrayVarP(&forwardEnv, "env", "e", nil, "forward a host env var, set KEY=VALUE, or load dotenv vars from @file")
 	rootCmd.Flags().BoolVar(&forwardAllEnv, "preserve-env", false, "forward most host environment variables except host-specific path and session vars")
 
@@ -129,9 +127,6 @@ func stripLnxFlags(args []string) []string {
 		case a == "--checkpoint" || a == "-c":
 			doCheckpoint = true
 			i++
-		case a == "--memory" && i+1 < len(args):
-			fmt.Sscanf(args[i+1], "%d", &memoryMB)
-			i += 2
 		case a == "--instance" && i+1 < len(args):
 			instanceName = args[i+1]
 			instanceFlag = true
@@ -258,9 +253,6 @@ func spawnDaemon() error {
 	}
 	if doSSHAgent {
 		daemonArgs = append(daemonArgs, "--ssh-agent")
-	}
-	if memoryMB > 0 {
-		daemonArgs = append(daemonArgs, "--memory", fmt.Sprintf("%d", memoryMB))
 	}
 
 	cmd := buildDaemonCmd(self, daemonArgs)

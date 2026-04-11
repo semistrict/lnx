@@ -41,7 +41,6 @@ const (
 // Exactly one field is non-nil per message.
 type Msg struct {
 	Setup          *Setup
-	Reconnect      *Reconnect
 	Signal         *Signal
 	Resize         *Resize
 	StatusReq      *StatusReq
@@ -56,14 +55,7 @@ type Msg struct {
 	CheckpointResp *CheckpointResp
 	OpenURLReq     *OpenURLReq
 	OpenURLResp    *OpenURLResp
-	Hibernate      *Hibernate
-	HibernateResp  *HibernateResp
 }
-
-// Reconnect tells the guest that it has been restored from a hibernate
-// state and should re-establish its host connections. Sent on the control
-// connection after a successful VM restore (instead of Setup).
-type Reconnect struct{}
 
 // Setup tells the guest the environment to configure (user, cwd, env vars).
 // Sent once on the control connection at boot. No command args — commands
@@ -183,19 +175,6 @@ type ExecSignal struct {
 type ExecResize struct {
 	Rows uint16
 	Cols uint16
-}
-
-// Hibernate tells the guest to suspend-to-disk (Linux hibernate).
-// The guest writes "disk" to /sys/power/state, which causes the kernel
-// to save its state to swap and power off. On next boot, the kernel
-// auto-resumes from swap (via the resume= cmdline param).
-type Hibernate struct{}
-
-// HibernateResp reports whether the guest successfully initiated hibernate.
-// An empty Error means hibernate is in progress (the VM will power off shortly).
-// A non-empty Error means hibernate failed and the host should fall back to shutdown.
-type HibernateResp struct {
-	Error string
 }
 
 // PortForward notifies the host of the current set of listening TCP ports in the guest.

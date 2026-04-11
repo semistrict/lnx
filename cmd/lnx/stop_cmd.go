@@ -12,12 +12,9 @@ import (
 	"golang.org/x/term"
 )
 
-var doShutdown bool
-
 var stopCmd = &cobra.Command{
 	Use:   "stop",
 	Short: "Stop the running VM",
-	Long:  "Stop the running VM. By default, the VM is hibernated so the next boot restores instantly. Use --shutdown for a full shutdown.",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := requestVMStop(); err != nil {
 			return err
@@ -31,15 +28,10 @@ var stopCmd = &cobra.Command{
 			defer restoreTTY()
 		}
 
-		action := "hibernating"
-		if doShutdown {
-			action = "stopping"
-		}
-
 		if killReqCh != nil {
-			fmt.Fprintf(os.Stderr, "VM %s. Press k to kill.\n", action)
+			fmt.Fprintln(os.Stderr, "VM stopping. Press k to kill.")
 		} else {
-			fmt.Fprintf(os.Stderr, "VM %s.\n", action)
+			fmt.Fprintln(os.Stderr, "VM stopping.")
 		}
 
 		forced, err := waitForVMStop(killReqCh)
@@ -51,26 +43,17 @@ var stopCmd = &cobra.Command{
 			fmt.Println("VM killed")
 			return nil
 		}
-		if doShutdown {
-			fmt.Println("VM stopped")
-		} else {
-			fmt.Println("VM hibernated")
-		}
+		fmt.Println("VM stopped")
 		return nil
 	},
 }
 
 func init() {
-	stopCmd.Flags().BoolVar(&doShutdown, "shutdown", false, "full shutdown (discard VM state, no hibernate)")
 	rootCmd.AddCommand(stopCmd)
 }
 
 func requestVMStop() error {
-	url := "http://localhost/stop"
-	if doShutdown {
-		url += "?mode=shutdown"
-	}
-	resp, err := apiClient().Post(url, "", nil)
+	resp, err := apiClient().Post("http://localhost/stop", "", nil)
 	if err != nil {
 		if isNoVM(err) {
 			fmt.Fprintln(os.Stderr, "no VM running")

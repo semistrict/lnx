@@ -28,22 +28,6 @@ func (d *darwinVM) RequestStop() error {
 	return err
 }
 
-func (d *darwinVM) Pause() error {
-	return d.vm.Pause()
-}
-
-func (d *darwinVM) Resume() error {
-	return d.vm.Resume()
-}
-
-func (d *darwinVM) SaveState(path string) error {
-	return d.vm.SaveMachineStateToPath(path)
-}
-
-func (d *darwinVM) RestoreState(path string) error {
-	return d.vm.RestoreMachineStateFromURL(path)
-}
-
 func (d *darwinVM) StateChangedNotify() <-chan VMState {
 	vzCh := d.vm.StateChangedNotify()
 	ch := make(chan VMState, 1)
@@ -64,23 +48,18 @@ func vzStateToVMState(s vz.VirtualMachineState) VMState {
 	switch s {
 	case vz.VirtualMachineStateStarting:
 		return VMStateStarting
-	case vz.VirtualMachineStateRunning, vz.VirtualMachineStateResuming:
+	case vz.VirtualMachineStateRunning:
 		return VMStateRunning
-	case vz.VirtualMachineStateStopped, vz.VirtualMachineStateStopping:
+	case vz.VirtualMachineStateStopped:
 		return VMStateStopped
-	case vz.VirtualMachineStatePaused, vz.VirtualMachineStatePausing,
-		vz.VirtualMachineStateSaving, vz.VirtualMachineStateRestoring:
-		return VMStatePaused
 	default:
 		return VMStateError
 	}
 }
 
 // buildVM creates a Darwin VM configured and ready to start.
-// macAddr is a stable MAC address string; if empty, one is generated.
-// epoch overrides lnx.epoch in the kernel cmdline (0 = use current time).
-func buildVM(cfg *Config, initrdPath, cwd, swapPath, homeDir, macAddr string, epoch int64) (VirtualMachine, error) {
-	vmConfig, err := buildVMConfig(cfg, initrdPath, cwd, swapPath, homeDir, macAddr, epoch)
+func buildVM(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (VirtualMachine, error) {
+	vmConfig, err := buildVMConfig(cfg, initrdPath, cwd, swapPath, homeDir)
 	if err != nil {
 		return nil, err
 	}
@@ -101,12 +80,8 @@ func buildVM(cfg *Config, initrdPath, cwd, swapPath, homeDir, macAddr string, ep
 	}, nil
 }
 
-// buildVMConfig creates the VZ VM configuration.
-func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir, macAddr string, epoch int64) (*vz.VirtualMachineConfiguration, error) {
-	if epoch == 0 {
-		epoch = time.Now().Unix()
-	}
-	cmdline := fmt.Sprintf("console=hvc0 lnx.epoch=%d resume=/dev/vdb", epoch)
+func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (*vz.VirtualMachineConfiguration, error) {
+	cmdline := fmt.Sprintf("console=hvc0 lnx.epoch=%d", time.Now().Unix())
 
 	bootLoader, err := vz.NewLinuxBootLoader(
 		cfg.KernelPath,
@@ -133,18 +108,15 @@ func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, homeDir, macAddr stri
 		vmConfig.SetPlatformVirtualMachineConfiguration(platform)
 	}
 
-	// Note: CWD and extra shares are served via 9P over vsock (not VirtioFS)
-	// so that the VM can hibernate — VirtioFS blocks kernel suspend.
 	for _, attach := range []func(*vz.VirtualMachineConfiguration) error{
 		func(c *vz.VirtualMachineConfiguration) error {
 			return attachDisks(c, cfg.RootfsPath, swapPath, cfg.NestedRootfs)
 		},
+		func(c *vz.VirtualMachineConfiguration) error { return attachShares(c, cwd, cfg.Shares) },
 		func(c *vz.VirtualMachineConfiguration) error {
 			return attachSerialConsole(c, cfg.socketDir())
 		},
-		func(c *vz.VirtualMachineConfiguration) error {
-			return attachNetwork(c, macAddr)
-		},
+		attachNetwork,
 		attachMisc,
 	} {
 		if err := attach(vmConfig); err != nil {

@@ -66,11 +66,6 @@ type apiServer struct {
 	sockPath string
 	listener net.Listener
 
-	// stopMode is set by handleStop to control shutdown behavior.
-	// "shutdown" forces a full shutdown; anything else (including "")
-	// means hibernate (the default).
-	stopMode string
-
 	// Session tracking for daemon mode.
 	activeExecs atomic.Int64
 	pinRefs     atomic.Int64
@@ -1047,11 +1042,7 @@ func (s *apiServer) handleSessionKill(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleStop shuts down the VM daemon.
-// Pass ?mode=shutdown to force a full shutdown (no hibernate).
 func (s *apiServer) handleStop(w http.ResponseWriter, r *http.Request) {
-	if mode := r.URL.Query().Get("mode"); mode != "" {
-		s.stopMode = mode
-	}
 	s.requestStop("stop requested by client")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, "stopping")

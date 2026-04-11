@@ -15,7 +15,6 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/mdlayher/vsock"
 	"github.com/semistrict/lnx/internal/protocol"
@@ -49,7 +48,6 @@ func main() {
 var (
 	ctrlConn  *vsock.Conn
 	ctrlDec   *gob.Decoder
-	ctrlEnc   *gob.Encoder
 	ctrlDone  chan struct{} // closed when control connection drops
 	ctrlProc  *os.Process
 	ctrlMu    sync.RWMutex
@@ -75,7 +73,6 @@ func run() error {
 	}
 	ctrlConn = conn
 	ctrlDec = gob.NewDecoder(conn)
-	ctrlEnc = gob.NewEncoder(conn)
 	ctrlDone = make(chan struct{})
 
 	// Read the Setup message from the host.
@@ -180,86 +177,9 @@ func run() error {
 
 	slog.Info("guest ready", "user", setup.User, "uid", setup.UID)
 
-	// Block until the host closes the control connection, then try to
-	// reconnect (the host may have hibernated and a new daemon restored us).
-	for {
-		<-ctrlDone
-		if !reconnectToHost() {
-			break
-		}
-		slog.Info("reconnected to host after restore")
-	}
+	// Block until the host closes the control connection.
+	<-ctrlDone
 	return nil
-}
-
-// reconnectToHost attempts to re-establish the control connection to a new
-// host daemon after a hibernate/restore cycle. Returns true on success.
-//
-// On restore the kernel resumes exactly where it was paused. Outbound vsock
-// connections to the old host are dead, but in-kernel vsock listeners (exec,
-// interactive, port-fwd-data) survive. We re-dial the control port and all
-// outbound service connections.
-func reconnectToHost() bool {
-	var conn *vsock.Conn
-	var err error
-
-	// The new host daemon sets up vsock listeners before resuming the VM,
-	// so the port should be available quickly. Retry for up to 10 seconds
-	// to handle any scheduling delay.
-	for i := 0; i < 100; i++ {
-		conn, err = vsock.Dial(vsockHostCID, protocol.Port, nil)
-		if err == nil {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if conn == nil {
-		slog.Info("reconnect failed, shutting down", "error", err)
-		return false
-	}
-
-	dec := gob.NewDecoder(conn)
-	var msg protocol.Msg
-	if err := dec.Decode(&msg); err != nil {
-		slog.Warn("reconnect decode failed", "error", err)
-		conn.Close()
-		return false
-	}
-	if msg.Reconnect == nil {
-		slog.Warn("expected Reconnect message after restore", "msg", fmt.Sprintf("%+v", msg))
-		conn.Close()
-		return false
-	}
-
-	// Reset global control state.
-	ctrlConn = conn
-	ctrlDec = dec
-	ctrlEnc = gob.NewEncoder(conn)
-	ctrlDone = make(chan struct{})
-	go controlReader()
-
-	// Re-establish outbound service connections. These services run in
-	// goroutines that exited when their old connections broke, so we
-	// restart them.
-	reconnectServices()
-	return true
-}
-
-// reconnectServices re-dials all outbound vsock service connections
-// that broke during hibernate. Called after the control connection is
-// re-established.
-func reconnectServices() {
-	// Re-init logging over vsock (the old connection is dead).
-	reconnectLogging()
-
-	// Status server: the old goroutine exited when its connection broke.
-	startStatusServer()
-
-	// Guest control: same pattern.
-	startGuestControlServer()
-
-	// Port forwarder: the scan goroutine exited when its connection broke.
-	startPortForwarder()
 }
 
 func runSystemdCat(args []string) int {
@@ -340,7 +260,7 @@ func logSystemdCatOutput(identifier, priority string, data []byte) {
 	}
 }
 
-// controlReader reads Signal, Resize, and Hibernate messages from the host.
+// controlReader reads Signal and Resize messages from the host.
 // When the connection closes, it signals ctrlDone.
 func controlReader() {
 	defer close(ctrlDone)
@@ -368,114 +288,6 @@ func controlReader() {
 				})
 			}
 		}
-		if msg.Hibernate != nil {
-			go handleHibernate()
-		}
-	}
-}
-
-// handleHibernate initiates Linux suspend-to-disk. On success the kernel
-// writes its state to swap and powers off the VM. On failure (kernel
-// doesn't support hibernate, etc.) it sends an error back to the host.
-func handleHibernate() {
-	slog.Info("hibernate requested")
-
-	// Check if the kernel supports hibernate.
-	states, err := os.ReadFile("/sys/power/state")
-	if err != nil {
-		sendHibernateError("read /sys/power/state: %v", err)
-		return
-	}
-	supported := false
-	for _, s := range strings.Fields(string(states)) {
-		if s == "disk" {
-			supported = true
-			break
-		}
-	}
-	if !supported {
-		sendHibernateError("kernel does not support disk hibernate (available: %s)", strings.TrimSpace(string(states)))
-		return
-	}
-
-	// Unmount shared filesystems (9P/virtiofs) before hibernate so the
-	// kernel doesn't try to freeze their devices. They're remounted on resume.
-	unmounted := unmountSharedFS()
-
-	syscall.Sync()
-
-	// Tell the host we're about to hibernate.
-	ctrlEnc.Encode(protocol.Msg{HibernateResp: &protocol.HibernateResp{}})
-
-	slog.Info("initiating suspend-to-disk", "unmounted", len(unmounted))
-	if err := os.WriteFile("/sys/power/state", []byte("disk"), 0644); err != nil {
-		slog.Error("hibernate failed", "error", err)
-		remountSharedFS(unmounted)
-		return
-	}
-
-	// If we reach here, the kernel resumed from hibernate.
-	slog.Info("resumed from hibernate, remounting shared filesystems")
-	remountSharedFS(unmounted)
-}
-
-func sendHibernateError(format string, args ...any) {
-	errMsg := fmt.Sprintf(format, args...)
-	slog.Warn("hibernate not supported", "error", errMsg)
-	ctrlEnc.Encode(protocol.Msg{HibernateResp: &protocol.HibernateResp{Error: errMsg}})
-}
-
-// sharedFSMount holds info needed to remount a shared filesystem after hibernate.
-type sharedFSMount struct {
-	device string // e.g. "cwd", "share0", "home"
-	target string // e.g. "/Users/ramon/src/lnx"
-	fstype string // e.g. "virtiofs", "9p"
-}
-
-// unmountSharedFS finds and lazy-unmounts all virtiofs and 9p mounts.
-// Returns the info needed to remount them after hibernate resume.
-// Uses MNT_DETACH because mounts may be busy (processes using them as CWD).
-func unmountSharedFS() []sharedFSMount {
-	data, err := os.ReadFile("/proc/mounts")
-	if err != nil {
-		return nil
-	}
-	var mounts []sharedFSMount
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 3 {
-			continue
-		}
-		if fields[2] != "virtiofs" && fields[2] != "9p" {
-			continue
-		}
-		mounts = append(mounts, sharedFSMount{
-			device: fields[0],
-			target: fields[1],
-			fstype: fields[2],
-		})
-	}
-	// Unmount in reverse order (nested mounts first).
-	for i := len(mounts) - 1; i >= 0; i-- {
-		m := mounts[i]
-		if err := syscall.Unmount(m.target, syscall.MNT_DETACH); err != nil {
-			slog.Warn("unmount shared fs failed", "target", m.target, "error", err)
-		} else {
-			slog.Debug("unmounted shared fs", "device", m.device, "target", m.target, "fstype", m.fstype)
-		}
-	}
-	return mounts
-}
-
-// remountSharedFS remounts shared filesystems that were unmounted for hibernate.
-func remountSharedFS(mounts []sharedFSMount) {
-	for _, m := range mounts {
-		os.MkdirAll(m.target, 0755)
-		if err := syscall.Mount(m.device, m.target, m.fstype, 0, ""); err != nil {
-			slog.Warn("remount shared fs failed", "device", m.device, "target", m.target, "error", err)
-		} else {
-			slog.Debug("remounted shared fs", "device", m.device, "target", m.target)
-		}
 	}
 }
 
@@ -491,36 +303,23 @@ func setControlPTY(f *os.File) {
 	ctrlPTY = f
 }
 
-var logLevel slog.Level
-
 func initLogging() {
-	logLevel = slog.LevelInfo
+	level := slog.LevelInfo
 	switch strings.ToLower(os.Getenv("LNX_LOG")) {
 	case "debug":
-		logLevel = slog.LevelDebug
+		level = slog.LevelDebug
 	case "warn":
-		logLevel = slog.LevelWarn
+		level = slog.LevelWarn
 	case "error":
-		logLevel = slog.LevelError
+		level = slog.LevelError
 	}
 
 	conn, err := vsock.Dial(vsockHostCID, vsockLogPort, nil)
 	if err != nil {
-		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
+		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 		return
 	}
-	slog.SetDefault(slog.New(slog.NewJSONHandler(conn, &slog.HandlerOptions{Level: logLevel})))
-}
-
-// reconnectLogging re-dials the host log port and resets the default logger.
-// Called after a hibernate/restore cycle when the old log connection is dead.
-func reconnectLogging() {
-	conn, err := vsock.Dial(vsockHostCID, vsockLogPort, nil)
-	if err != nil {
-		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
-		return
-	}
-	slog.SetDefault(slog.New(slog.NewJSONHandler(conn, &slog.HandlerOptions{Level: logLevel})))
+	slog.SetDefault(slog.New(slog.NewJSONHandler(conn, &slog.HandlerOptions{Level: level})))
 }
 
 func parseEpoch() {

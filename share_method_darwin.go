@@ -2,4 +2,4 @@
 
 package lnx
 
-func shareMethod() string { return "9p" }
+func shareMethod() string { return "virtiofs" }
