@@ -5,6 +5,7 @@
 /cmd/lnx/init
 /kernel.Image
 /rootfs.ext4
+/vmlinuz
 /vmlinuz-for-firecracker
 
 # Go workspace (local override)
