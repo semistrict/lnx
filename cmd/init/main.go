@@ -166,14 +166,20 @@ func run() error {
 
 	mountCRIUDevice()
 
+	// Bring up loopback before CRIU restore — needed for TCP repair
+	// of loopback connections in the restored process tree.
+	if out, err := exec.Command("/sbin/ip", "link", "set", "lo", "up").CombinedOutput(); err != nil {
+		slog.Warn("loopback up failed", "error", err, "output", string(out))
+	}
+
+	// Auto-restore CRIU images immediately after mounting the CRIU device,
+	// before ANY commands that fork processes (like ip, resize2fs). CRIU
+	// restores processes to their original PIDs, which must not be taken.
+	criuAutoRestore()
+
 	installSystemctlShim()
 	installSystemdCatShim()
 	configureNetwork()
-
-	// Auto-restore CRIU images after network is up (CRIU needs TCP
-	// repair support detection) but before services that spawn threads
-	// (which would claim the PIDs CRIU needs to restore into).
-	criuAutoRestore()
 
 	installBashDefaults()
 	installXdgOpen()

@@ -1,30 +1,42 @@
 #!/usr/bin/env -S python3 -u
 """
-Fork the VM — like fork(), both sides continue from the same point.
+VM fork with classic fork() semantics.
 
-Host-side (recommended):
-    lnx fork -- python3 examples/fork.py
-    # Parent keeps running. Child gets this script with fork-role=child.
+    lnx python3 examples/fork.py
 
-Guest-side (for processes without open sockets):
-    curl -X POST --unix-socket /var/run/lnx/control.sock http://localhost/fork
+Like os.fork(), returns in both parent and child:
+  - Parent: returns child instance name (truthy)
+  - Child:  returns None (CRIU-restored at same program counter)
 """
 
 import os
-import sys
 
 
-def fork_role():
-    """Returns 'child' if this process was restored by a VM fork, else None."""
+def fork():
+    """Fork the VM. Returns child instance name in parent, None in child.
+
+    Writes "fork" to fd 3 (pipe to init), reads result from fd 4.
+    In the CRIU-restored child, fd 4 is dead → returns None.
+    """
     try:
-        return open("/var/run/lnx/fork-role").read().strip() or None
-    except FileNotFoundError:
+        os.write(3, b"fork\n")
+        result = os.read(4, 4096)
+        if not result:
+            return None  # EOF = restored child
+        text = result.decode().strip()
+        if text.startswith("error:"):
+            raise RuntimeError(text)
+        return text
+    except OSError:
+        # Restored child — pipe fds are dead.
         return None
 
 
 if __name__ == "__main__":
-    role = fork_role()
-    if role == "child":
-        print(f"child  pid={os.getpid()}")
+    child = fork()
+    pid = os.getpid()
+
+    if child is None:
+        print(f"[child]  pid={pid}")
     else:
-        print(f"parent pid={os.getpid()}")
+        print(f"[parent] pid={pid}  child={child}")

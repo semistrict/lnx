@@ -114,10 +114,11 @@ func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, criuPath, homeDir, ma
 		vmConfig.SetPlatformVirtualMachineConfiguration(platform)
 	}
 
+	if err := attachDisks(vmConfig, cfg.RootfsPath, swapPath, criuPath, cfg.NestedRootfs); err != nil {
+		return nil, err
+	}
+
 	for _, attach := range []func(*vz.VirtualMachineConfiguration) error{
-		func(c *vz.VirtualMachineConfiguration) error {
-			return attachDisks(c, cfg.RootfsPath, swapPath, criuPath, cfg.NestedRootfs)
-		},
 		func(c *vz.VirtualMachineConfiguration) error { return attachShares(c, cwd, cfg.Shares) },
 		func(c *vz.VirtualMachineConfiguration) error {
 			return attachSerialConsole(c, cfg.socketDir())

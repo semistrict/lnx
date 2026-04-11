@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -29,9 +30,10 @@ const (
 // criuCheckpointMetadata is written alongside CRIU image dirs so we
 // know what was dumped.
 type criuCheckpointMetadata struct {
-	Name      string    `json:"name"`
-	PIDs      []int     `json:"pids"`
-	Timestamp time.Time `json:"timestamp"`
+	Name       string           `json:"name"`
+	PIDs       []int            `json:"pids"`
+	Timestamp  time.Time        `json:"timestamp"`
+	PipeInodes map[int][]string `json:"pipe_inodes,omitempty"` // PID → external pipe inodes
 }
 
 // mountCRIUDevice mounts the CRIU block device. If the device has no
@@ -48,6 +50,8 @@ func mountCRIUDevice() {
 	if err := syscall.Mount(criuDevice, criuMountPoint, "ext4", syscall.MS_NOATIME, "errors=continue"); err == nil {
 		slog.Info("mounted CRIU device", "device", criuDevice, "target", criuMountPoint)
 		return
+	} else {
+		slog.Warn("CRIU device mount failed, will format", "error", err)
 	}
 
 	// Not formatted yet — format and mount.
@@ -64,6 +68,11 @@ func mountCRIUDevice() {
 	slog.Info("formatted and mounted CRIU device", "device", criuDevice, "target", criuMountPoint)
 }
 
+// syncCRIUVolume forces all dirty data on the CRIU filesystem to disk.
+func syncCRIUVolume() {
+	syscall.Sync()
+}
+
 // criuDump dumps each tracked user process tree with CRIU.
 // Each PID gets its own sub-directory under dir.
 // If leaveRunning is true, processes continue after the dump.
@@ -78,6 +87,9 @@ func criuDump(name, dir string, leaveRunning bool) error {
 	}
 
 	var dumpedPIDs []int
+	pipeInodesMap := make(map[int][]string)
+	var lastDumpErr string
+
 	for _, pid := range pids {
 		pidDir := filepath.Join(dir, strconv.Itoa(pid))
 		if err := os.MkdirAll(pidDir, 0755); err != nil {
@@ -99,12 +111,20 @@ func criuDump(name, dir string, leaveRunning bool) error {
 		for _, inode := range externals {
 			args = append(args, "--external", "socket["+inode+"]")
 		}
+
+		// Find pipes shared with init (fork pipes etc.) and externalize
+		// them so CRIU doesn't try to checkpoint cross-boundary pipes.
+		pipeInodes := findExternalPipeInodes(pid)
+		for _, inode := range pipeInodes {
+			args = append(args, "--external", "pipe["+inode+"]")
+		}
+
 		if leaveRunning {
 			args = append(args, "--leave-running")
 		}
 
 		slog.Info("criu dump", "pid", pid, "dir", pidDir, "leaveRunning", leaveRunning,
-			"externals", len(externals))
+			"externals", len(externals), "pipes", len(pipeInodes))
 		cmd := exec.Command("criu", args...)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
@@ -112,23 +132,31 @@ func criuDump(name, dir string, leaveRunning bool) error {
 			// types that --external can't handle), skip it and try the
 			// rest. This happens for exec session shells that inherit
 			// vsock FDs from init.
+			lastDumpErr = fmt.Sprintf("pid %d: %v: %s", pid, err, string(output))
 			slog.Warn("criu dump failed, skipping", "pid", pid, "error", err,
 				"output", string(output))
 			os.RemoveAll(pidDir)
 			continue
 		}
 		dumpedPIDs = append(dumpedPIDs, pid)
+		if len(pipeInodes) > 0 {
+			pipeInodesMap[pid] = pipeInodes
+		}
 	}
 
 	if len(dumpedPIDs) == 0 {
+		if lastDumpErr != "" {
+			return fmt.Errorf("no user processes were dumped (last: %s)", lastDumpErr)
+		}
 		return fmt.Errorf("no user processes were dumped")
 	}
 
 	// Write metadata.
 	meta := criuCheckpointMetadata{
-		Name:      name,
-		PIDs:      dumpedPIDs,
-		Timestamp: time.Now(),
+		Name:       name,
+		PIDs:       dumpedPIDs,
+		Timestamp:  time.Now(),
+		PipeInodes: pipeInodesMap,
 	}
 	metaData, err := json.Marshal(meta)
 	if err != nil {
@@ -148,15 +176,7 @@ func findUnsupportedSocketInodes(pid int) []string {
 	// Walk the process tree rooted at pid.
 	var allPids []int
 	allPids = append(allPids, pid)
-	// Also check children (CRIU dumps the whole tree).
-	if entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/task/%d/children", pid, pid)); err == nil {
-		for _, e := range entries {
-			if childPid, err := strconv.Atoi(e.Name()); err == nil {
-				allPids = append(allPids, childPid)
-			}
-		}
-	}
-	// Simpler: read /proc/<pid>/task/<tid>/children file.
+	// Read children from /proc/<pid>/task/<pid>/children file.
 	if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/children", pid, pid)); err == nil {
 		for _, f := range strings.Fields(string(data)) {
 			if childPid, err := strconv.Atoi(f); err == nil {
@@ -231,6 +251,80 @@ func collectKnownSocketInodes(pid int) map[string]bool {
 	return known
 }
 
+// findExternalPipeInodes returns pipe inodes in the target process that
+// are also held by init (us, PID 1). These are pipes that cross the dump
+// boundary — one end in init, one end in the target — and must be
+// externalized so CRIU doesn't try to checkpoint half a pipe.
+func findExternalPipeInodes(pid int) []string {
+	// Collect pipe inodes from the target process.
+	targetPipes := make(map[string]bool)
+	fdDir := fmt.Sprintf("/proc/%d/fd", pid)
+	entries, err := os.ReadDir(fdDir)
+	if err != nil {
+		return nil
+	}
+	for _, e := range entries {
+		link, err := os.Readlink(filepath.Join(fdDir, e.Name()))
+		if err != nil || !strings.HasPrefix(link, "pipe:[") {
+			continue
+		}
+		inode := strings.TrimSuffix(strings.TrimPrefix(link, "pipe:["), "]")
+		targetPipes[inode] = true
+	}
+
+	// Also check direct children (CRIU dumps the whole tree).
+	if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/children", pid, pid)); err == nil {
+		for _, f := range strings.Fields(string(data)) {
+			childPid, err := strconv.Atoi(f)
+			if err != nil {
+				continue
+			}
+			childFdDir := fmt.Sprintf("/proc/%d/fd", childPid)
+			childEntries, err := os.ReadDir(childFdDir)
+			if err != nil {
+				continue
+			}
+			for _, ce := range childEntries {
+				link, err := os.Readlink(filepath.Join(childFdDir, ce.Name()))
+				if err != nil || !strings.HasPrefix(link, "pipe:[") {
+					continue
+				}
+				inode := strings.TrimSuffix(strings.TrimPrefix(link, "pipe:["), "]")
+				targetPipes[inode] = true
+			}
+		}
+	}
+
+	if len(targetPipes) == 0 {
+		return nil
+	}
+
+	// Collect pipe inodes from init (us).
+	initPipes := make(map[string]bool)
+	selfEntries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return nil
+	}
+	for _, e := range selfEntries {
+		link, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name()))
+		if err != nil || !strings.HasPrefix(link, "pipe:[") {
+			continue
+		}
+		inode := strings.TrimSuffix(strings.TrimPrefix(link, "pipe:["), "]")
+		initPipes[inode] = true
+	}
+
+	// External = pipe inodes present in both init and the target tree.
+	var external []string
+	for inode := range targetPipes {
+		if initPipes[inode] {
+			external = append(external, inode)
+		}
+	}
+	sort.Strings(external)
+	return external
+}
+
 // criuRestore restores processes from CRIU images in dir.
 // Each sub-directory should contain a CRIU image set for one process tree.
 func criuRestore(dir string) error {
@@ -261,9 +355,29 @@ func criuRestore(dir string) error {
 			"--ext-unix-sk",
 		}
 
-		slog.Info("criu restore", "pid", pid, "dir", pidDir)
+		// For each external pipe inode, open /dev/null as a replacement fd.
+		// CRIU will wire the restored process's pipe endpoints to /dev/null,
+		// so reads return EOF (how fork children detect they're restored).
+		var extraFiles []*os.File
+		if inodes := meta.PipeInodes[pid]; len(inodes) > 0 {
+			for i, inode := range inodes {
+				f, err := os.Open("/dev/null")
+				if err != nil {
+					return fmt.Errorf("open /dev/null for pipe inherit: %w", err)
+				}
+				extraFiles = append(extraFiles, f)
+				fdNum := 3 + i // ExtraFiles[i] → fd 3+i in CRIU's process
+				args = append(args, "--inherit-fd", fmt.Sprintf("fd[%d]:pipe:[%s]", fdNum, inode))
+			}
+		}
+
+		slog.Info("criu restore", "pid", pid, "dir", pidDir, "inherit_pipes", len(extraFiles))
 		cmd := exec.Command("criu", args...)
+		cmd.ExtraFiles = extraFiles
 		output, err := cmd.CombinedOutput()
+		for _, f := range extraFiles {
+			f.Close()
+		}
 		if err != nil {
 			return fmt.Errorf("criu restore pid %d: %w\n%s", pid, err, string(output))
 		}
@@ -297,6 +411,7 @@ func criuAutoRestore() {
 	if err != nil {
 		return
 	}
+
 	for _, e := range entries {
 		if !e.IsDir() || e.Name() == "lost+found" {
 			continue

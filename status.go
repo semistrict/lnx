@@ -55,7 +55,6 @@ type apiServer struct {
 	criuPath     string
 	instanceName string
 	instanceDir  string
-
 	statusMu   sync.Mutex
 	statusEnc  *gob.Encoder
 	statusDec  *gob.Decoder

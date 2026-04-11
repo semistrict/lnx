@@ -47,6 +47,7 @@ func startGuestControlServer() {
 		enc: gob.NewEncoder(hostConn),
 		dec: gob.NewDecoder(hostConn),
 	}
+	setGuestControl(gc)
 
 	mux := newGuestControlMux(gc)
 
@@ -91,6 +92,23 @@ type guestControl struct {
 	mu  sync.Mutex
 	enc *gob.Encoder
 	dec *gob.Decoder
+}
+
+var globalGuestControl struct {
+	mu sync.Mutex
+	gc *guestControl
+}
+
+func setGuestControl(gc *guestControl) {
+	globalGuestControl.mu.Lock()
+	globalGuestControl.gc = gc
+	globalGuestControl.mu.Unlock()
+}
+
+func getGuestControl() *guestControl {
+	globalGuestControl.mu.Lock()
+	defer globalGuestControl.mu.Unlock()
+	return globalGuestControl.gc
 }
 
 type guestTCPExpose struct {
@@ -215,7 +233,7 @@ func (gc *guestControl) handleCRIUDump(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	syscall.Sync()
+	syncCRIUVolume()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})

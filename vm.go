@@ -251,6 +251,7 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		}
 		return nil, err
 	}
+
 	if err := vm.Start(); err != nil {
 		vs.cleanup()
 		lock.unlock()

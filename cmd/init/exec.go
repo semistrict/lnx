@@ -88,6 +88,113 @@ func listUserPIDs() []int {
 	return pids
 }
 
+const (
+	// forkRequestFD is the fd number the child writes to to request a fork.
+	// Passed as ExtraFiles[0] → child sees it as fd 3.
+	forkRequestFD = 3
+	// forkResultFD is the fd number the child reads from to get the fork result.
+	// Passed as ExtraFiles[1] → child sees it as fd 4.
+	forkResultFD = 4
+)
+
+// ensureCloseOnExec sets close-on-exec on all file descriptors from minFD
+// upward. This is a safety net against fd leaks (e.g. vsock fds without
+// CLOEXEC) that would otherwise be inherited by child processes and cause
+// CRIU to fail with "Unknown socket collected (family 40)".
+// Go's exec.Cmd already closes extra fds in the child, but this catches
+// any fds that slip through (race between goroutines creating fds and fork).
+func ensureCloseOnExec(minFD int) {
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		fd, err := strconv.Atoi(e.Name())
+		if err != nil || fd < minFD {
+			continue
+		}
+		unix.CloseOnExec(fd)
+	}
+}
+
+// createForkPipes creates the pipe pairs for fork communication.
+// Returns (requestRead, requestWrite, resultRead, resultWrite).
+// requestWrite (fd 3) and resultRead (fd 4) go to the child via ExtraFiles.
+// requestRead and resultWrite are kept by init.
+func createForkPipes() (reqR, reqW, resR, resW *os.File, err error) {
+	rr, rw, err := os.Pipe()
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("fork request pipe: %w", err)
+	}
+	sr, sw, err := os.Pipe()
+	if err != nil {
+		rr.Close()
+		rw.Close()
+		return nil, nil, nil, nil, fmt.Errorf("fork result pipe: %w", err)
+	}
+	return rr, rw, sr, sw, nil
+}
+
+// handleForkPipe reads fork requests from the pipe and triggers forks.
+// Runs until the pipe is closed (child exited).
+func handleForkPipe(reqR, resW *os.File) {
+	defer reqR.Close()
+	defer resW.Close()
+
+	buf := make([]byte, 64)
+	for {
+		n, err := reqR.Read(buf)
+		if err != nil {
+			return // pipe closed, child exited
+		}
+		cmd := strings.TrimSpace(string(buf[:n]))
+		if cmd != "fork" {
+			continue
+		}
+
+		// Trigger fork via the guest control handler.
+		result := doGuestFork()
+		resW.Write([]byte(result + "\n"))
+	}
+}
+
+// doGuestFork triggers a CRIU fork dump and asks the host to clone.
+// Returns the child instance name or "error: ...".
+func doGuestFork() string {
+	if err := criuDump("fork", criuForkDir, true); err != nil {
+		return "error: " + err.Error()
+	}
+	syscall.Sync()
+
+	// Ask the host to clone rootfs + CRIU volume and spawn child.
+	gc := getGuestControl()
+	if gc == nil {
+		return "error: guest control not available"
+	}
+
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
+
+	if err := gc.enc.Encode(protocol.Msg{ForkReq: &protocol.ForkReq{}}); err != nil {
+		return "error: " + err.Error()
+	}
+
+	var msg protocol.Msg
+	if err := gc.dec.Decode(&msg); err != nil {
+		return "error: " + err.Error()
+	}
+	if msg.ForkResp == nil {
+		return "error: unexpected response"
+	}
+	if msg.ForkResp.Error != "" {
+		return "error: " + msg.ForkResp.Error
+	}
+
+	// Clean up fork dump from parent.
+	os.RemoveAll(criuForkDir)
+	return msg.ForkResp.Instance
+}
+
 // startExecServer listens on the exec vsock port and handles one
 // exec request per connection. Multiple connections are accepted
 // concurrently so `lnx exec` works while the main command runs.
@@ -237,8 +344,23 @@ func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener, ses
 		}
 	}
 
+	// Fork pipes: child gets fd 3 (write fork request) and fd 4 (read result).
+	reqR, reqW, resR, resW, err := createForkPipes()
+	if err != nil {
+		slog.Warn("create fork pipes failed", "error", err)
+		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
+		return
+	}
+	cmd.ExtraFiles = []*os.File{reqW, resR} // fd 3, fd 4 in child
+	defer reqR.Close()
+	defer resW.Close()
+
+	ensureCloseOnExec(3) // prevent vsock/other fd leaks to child
+
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
+		reqW.Close()
+		resR.Close()
 		slog.Warn("exec pty start failed", "args", req.Args, "error", err)
 		if len(req.Args) > 0 {
 			commandNotFound(enc, req.Args, err)
@@ -247,6 +369,13 @@ func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener, ses
 		return
 	}
 	defer ptmx.Close()
+
+	// Close child's end of fork pipes (they're dup'd into the child).
+	reqW.Close()
+	resR.Close()
+
+	// Handle fork requests from the child in the background.
+	go handleForkPipe(reqR, resW)
 
 	// Report guest PID to host.
 	enc.Encode(protocol.Msg{ExecStarted: &protocol.ExecStarted{PID: cmd.Process.Pid}})
@@ -405,11 +534,33 @@ func runExecPipe(enc *gob.Encoder, req *protocol.ExecReq, sess *execSession) {
 		return
 	}
 
+	// Fork pipes: child gets fd 3 (write fork request) and fd 4 (read result).
+	reqR, reqW, resR, resW, err := createForkPipes()
+	if err != nil {
+		slog.Warn("create fork pipes failed", "error", err)
+		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
+		return
+	}
+	cmd.ExtraFiles = []*os.File{reqW, resR} // fd 3, fd 4 in child
+
+	ensureCloseOnExec(3) // prevent vsock/other fd leaks to child
+
 	if err := cmd.Start(); err != nil {
+		reqR.Close()
+		reqW.Close()
+		resR.Close()
+		resW.Close()
 		commandNotFound(enc, req.Args, err)
 		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
 		return
 	}
+
+	// Close child's end of fork pipes.
+	reqW.Close()
+	resR.Close()
+
+	// Handle fork requests from the child in the background.
+	go handleForkPipe(reqR, resW)
 
 	// Report guest PID to host.
 	enc.Encode(protocol.Msg{ExecStarted: &protocol.ExecStarted{PID: cmd.Process.Pid}})

@@ -35,10 +35,10 @@ RUN chroot /rootfs apt-get install -y --no-install-recommends \
     libnl-3-dev libnet1-dev libaio-dev libgnutls28-dev \
     libnftables-dev nftables uuid-dev python3-yaml
 
-# Layer 6c: CRIU (checkpoint/restore in userspace) — built from source
-# for compatibility with newer kernels (distro CRIU lags behind).
-RUN chroot /rootfs git clone --depth 1 https://github.com/checkpoint-restore/criu.git /tmp/criu && \
-    chroot /rootfs sh -c '\
+# Layer 6c: CRIU (checkpoint/restore in userspace) — built from our fork
+# (third_party/criu) which patches SO_PASSSEC handling for kernel 7.0-rc4.
+COPY third_party/criu /rootfs/tmp/criu
+RUN chroot /rootfs sh -c '\
         PROTO_INC=$(find /usr -path "*/google/protobuf/descriptor.proto" -printf "%h/../..\n" 2>/dev/null | head -1); \
         [ -z "$PROTO_INC" ] && PROTO_INC=/usr/include; \
         mkdir -p /tmp/criu/images/google/protobuf && \

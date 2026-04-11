@@ -10,10 +10,11 @@ import (
 )
 
 // attachDisks attaches block devices in order:
-//   /dev/vda — rootfs
-//   /dev/vdb — swap (hibernate resume device)
-//   /dev/vdc — CRIU images volume
-//   /dev/vdd, /dev/vde, ... — nested instance rootfs drives
+//
+//	/dev/vda — rootfs
+//	/dev/vdb — swap (hibernate resume device)
+//	/dev/vdc — CRIU images volume
+//	/dev/vdd, /dev/vde, ... — nested instance rootfs drives
 func attachDisks(vmConfig *vz.VirtualMachineConfiguration, rootfsPath, swapPath, criuPath string, nested []NestedRootfs) error {
 	var devices []vz.StorageDeviceConfiguration
 
