@@ -29,3 +29,8 @@ func cloneFile(src, dst string) error {
 	}
 	return df.Close()
 }
+
+// CloneFile is the exported version of cloneFile for use by the CLI.
+func CloneFile(src, dst string) error {
+	return cloneFile(src, dst)
+}

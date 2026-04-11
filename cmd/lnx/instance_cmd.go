@@ -246,12 +246,26 @@ func runInstanceDelete(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("instance %q does not exist", name)
 	}
 
-	// Refuse if the VM is running.
+	// Stop the VM if it's running.
 	sockPath := filepath.Join(dir, "status.sock")
 	conn, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
 	if err == nil {
 		conn.Close()
-		return fmt.Errorf("instance %q is running — stop it first", name)
+		fmt.Printf("stopping instance %q...\n", name)
+		resp, err := apiClientFor(name).Post("http://localhost/stop?mode=shutdown", "", nil)
+		if err != nil {
+			return fmt.Errorf("stop instance %q: %w", name, err)
+		}
+		resp.Body.Close()
+		// Wait for the daemon to actually exit.
+		for i := 0; i < 60; i++ {
+			c, err := net.DialTimeout("unix", sockPath, 200*time.Millisecond)
+			if err != nil {
+				break
+			}
+			c.Close()
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 
 	// Check for rootfs lock.
@@ -422,7 +436,7 @@ func shouldSkipClonedMetadata(rel string, d fs.DirEntry) bool {
 	}
 	switch base {
 	case "status.sock", "error.log", "serial.log", "lnx.log", "initramfs.cpio", "swap.img",
-		"rootfs.ext4.lock", "rootfs.ext4.pid", "firecracker.sock", "vsock":
+		"rootfs.ext4.lock", "rootfs.ext4.pid", "firecracker.sock", "vsock", "hibernated":
 		return true
 	}
 	return strings.HasPrefix(base, "vsock_")

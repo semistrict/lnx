@@ -52,12 +52,16 @@ type Msg struct {
 	ExecDone       *ExecDone
 	ExecSignal     *ExecSignal
 	ExecResize     *ExecResize
-	CheckpointReq  *CheckpointReq
-	CheckpointResp *CheckpointResp
-	OpenURLReq     *OpenURLReq
-	OpenURLResp    *OpenURLResp
-	Hibernate      *Hibernate
-	HibernateResp  *HibernateResp
+	CheckpointReq        *CheckpointReq
+	CheckpointResp       *CheckpointResp
+	MemoryCheckpointReq  *MemoryCheckpointReq
+	MemoryCheckpointResp *MemoryCheckpointResp
+	RestoreCheckpointReq *RestoreCheckpointReq
+	RestoreCheckpointResp *RestoreCheckpointResp
+	OpenURLReq           *OpenURLReq
+	OpenURLResp          *OpenURLResp
+	Hibernate            *Hibernate
+	HibernateResp        *HibernateResp
 }
 
 // Reconnect tells the guest that it has been restored from a hibernate
@@ -196,6 +200,33 @@ type Hibernate struct{}
 // A non-empty Error means hibernate failed and the host should fall back to shutdown.
 type HibernateResp struct {
 	Error string
+}
+
+// MemoryCheckpointReq asks the host to create a memory checkpoint
+// (hibernate + clone rootfs + swap). Sent from guest to host on the
+// guest control connection.
+type MemoryCheckpointReq struct {
+	Name        string
+	Description string
+	Tags        []string
+}
+
+// MemoryCheckpointResp reports the result of a memory checkpoint request.
+type MemoryCheckpointResp struct {
+	Name  string // checkpoint name on success
+	Error string // non-empty on failure
+}
+
+// RestoreCheckpointReq asks the host to restore from a named checkpoint.
+// For memory checkpoints, the host shuts down the VM, replaces rootfs+swap,
+// writes a hibernated marker, and exits.
+type RestoreCheckpointReq struct {
+	Name string
+}
+
+// RestoreCheckpointResp reports the result of a restore checkpoint request.
+type RestoreCheckpointResp struct {
+	Error string // non-empty on failure
 }
 
 // PortForward notifies the host of the current set of listening TCP ports in the guest.

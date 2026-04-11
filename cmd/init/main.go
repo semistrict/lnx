@@ -252,6 +252,9 @@ func reconnectServices() {
 	// Re-init logging over vsock (the old connection is dead).
 	reconnectLogging()
 
+	// Exec server: the old vsock listeners are dead after hibernate.
+	startExecServer()
+
 	// Status server: the old goroutine exited when its connection broke.
 	startStatusServer()
 

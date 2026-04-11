@@ -21,8 +21,14 @@ import (
 
 const guestControlSock = "/var/run/lnx/control.sock"
 
+var (
+	guestCtrlVsockMu   sync.Mutex
+	guestCtrlVsockPrev *vsock.Listener
+)
+
 // startGuestControlServer dials the host on the guest control vsock port
 // and starts an HTTP server on a unix socket inside the guest.
+// Safe to call multiple times (after hibernate/restore).
 func startGuestControlServer() {
 	hostConn, err := vsock.Dial(vsockHostCID, protocol.GuestControlPort, nil)
 	if err != nil {
@@ -51,17 +57,31 @@ func startGuestControlServer() {
 
 	go http.Serve(ln, mux)
 
+	// Close previous vsock listener before re-binding.
+	guestCtrlVsockMu.Lock()
+	if guestCtrlVsockPrev != nil {
+		guestCtrlVsockPrev.Close()
+	}
+	guestCtrlVsockMu.Unlock()
+
 	vsockLn, err := vsock.Listen(protocol.GuestHTTPPort, nil)
 	if err != nil {
 		slog.Warn("guest control vsock listen failed", "error", err, "port", protocol.GuestHTTPPort)
 		return
 	}
+
+	guestCtrlVsockMu.Lock()
+	guestCtrlVsockPrev = vsockLn
+	guestCtrlVsockMu.Unlock()
+
 	go http.Serve(vsockLn, mux)
 }
 
 func newGuestControlMux(gc *guestControl) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /checkpoint", gc.handleCheckpoint)
+	mux.HandleFunc("POST /checkpoint/memory", gc.handleMemoryCheckpoint)
+	mux.HandleFunc("POST /checkpoint/restore", gc.handleRestoreCheckpoint)
 	mux.HandleFunc("POST /open", gc.handleOpen)
 	mux.HandleFunc("POST /tcp/expose", gc.handleTCPExpose)
 	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
@@ -146,6 +166,101 @@ func (gc *guestControl) handleCheckpoint(w http.ResponseWriter, r *http.Request)
 	}
 
 	json.NewEncoder(w).Encode(map[string]string{"path": msg.CheckpointResp.Path})
+}
+
+func (gc *guestControl) handleMemoryCheckpoint(w http.ResponseWriter, r *http.Request) {
+	syscall.Sync()
+
+	var req struct {
+		Name        string   `json:"name"`
+		Description string   `json:"description"`
+		Tags        []string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
+
+	if err := gc.enc.Encode(protocol.Msg{MemoryCheckpointReq: &protocol.MemoryCheckpointReq{
+		Name:        req.Name,
+		Description: req.Description,
+		Tags:        req.Tags,
+	}}); err != nil {
+		http.Error(w, fmt.Sprintf("send memory checkpoint request: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	var msg protocol.Msg
+	if err := gc.dec.Decode(&msg); err != nil {
+		http.Error(w, fmt.Sprintf("read memory checkpoint response: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if msg.MemoryCheckpointResp == nil {
+		http.Error(w, "unexpected response", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if msg.MemoryCheckpointResp.Error != "" {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": msg.MemoryCheckpointResp.Error})
+		return
+	}
+
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "initiated",
+		"name":   msg.MemoryCheckpointResp.Name,
+	})
+}
+
+func (gc *guestControl) handleRestoreCheckpoint(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" {
+		http.Error(w, "name required", http.StatusBadRequest)
+		return
+	}
+
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
+
+	if err := gc.enc.Encode(protocol.Msg{RestoreCheckpointReq: &protocol.RestoreCheckpointReq{
+		Name: req.Name,
+	}}); err != nil {
+		http.Error(w, fmt.Sprintf("send restore request: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	var msg protocol.Msg
+	if err := gc.dec.Decode(&msg); err != nil {
+		http.Error(w, fmt.Sprintf("read restore response: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if msg.RestoreCheckpointResp == nil {
+		http.Error(w, "unexpected response", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if msg.RestoreCheckpointResp.Error != "" {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": msg.RestoreCheckpointResp.Error})
+		return
+	}
+
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]string{"status": "restoring"})
 }
 
 func (gc *guestControl) handleOpen(w http.ResponseWriter, r *http.Request) {

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/semistrict/lnx"
 	"github.com/spf13/cobra"
@@ -14,7 +16,10 @@ import (
 
 const guestHostGateway = "192.168.64.1"
 
-var exposeAs string
+var (
+	exposeAs   string
+	exposeWait bool
+)
 
 var exposeCmd = &cobra.Command{
 	Use:   "expose SOURCE",
@@ -31,6 +36,7 @@ type exposeEndpoint struct {
 
 func init() {
 	exposeCmd.Flags().StringVar(&exposeAs, "as", "", "host or VM destination ([vm][:port])")
+	exposeCmd.Flags().BoolVar(&exposeWait, "wait", false, "wait until something is listening on the guest port")
 	rootCmd.AddCommand(exposeCmd)
 }
 
@@ -58,6 +64,11 @@ func runExpose(cmd *cobra.Command, args []string) error {
 		resp, err := exposeHostPort(src.Instance, srcPort, dstPort, true)
 		if err != nil {
 			return err
+		}
+		if exposeWait {
+			if err := waitForPort(resp.HostPort, 30*time.Second); err != nil {
+				return fmt.Errorf("waiting for %s:%d: %w", src.Instance, srcPort, err)
+			}
 		}
 		fmt.Printf("localhost:%d -> %s:%d\n", resp.HostPort, src.Instance, srcPort)
 		return nil
@@ -175,6 +186,44 @@ func removeHostExpose(instance string, hostPort uint16) error {
 		return fmt.Errorf("remove host expose %s:%d: %w", instance, hostPort, err)
 	}
 	return nil
+}
+
+// waitForPort probes localhost:port until the guest is actually serving.
+// A bare TCP connect isn't enough — the host port forward listener accepts
+// immediately, but the forwarded connection resets if nothing is listening
+// in the guest. We connect, then read without sending: if the read blocks
+// (times out), the guest accepted the connection and is waiting for data,
+// meaning the service is up. If the read returns immediately with an error
+// (reset/EOF), the guest isn't ready yet and we retry.
+func waitForPort(port uint16, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, time.Second)
+		if err != nil {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		buf := make([]byte, 1)
+		_, err = conn.Read(buf)
+		conn.Close()
+		if err != nil && isTimeout(err) {
+			// Read timed out — the guest accepted and is waiting for
+			// data, so the service is up.
+			return nil
+		}
+		// Connection closed or reset immediately — guest not ready.
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("timed out after %s", timeout)
+}
+
+func isTimeout(err error) bool {
+	if ne, ok := err.(net.Error); ok {
+		return ne.Timeout()
+	}
+	return false
 }
 
 func postInstanceJSON(instance, path string, reqBody any, respBody any) error {

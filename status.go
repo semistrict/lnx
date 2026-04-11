@@ -83,6 +83,27 @@ type apiServer struct {
 	sessionsMu sync.RWMutex
 	sessions   map[string]*SessionInfo
 	sessionSeq atomic.Int64
+
+	// pendingCheckpoint is set when a memory checkpoint is requested.
+	// The close() path checks it after hibernate succeeds.
+	pendingCheckpointMu sync.Mutex
+	pendingCheckpoint   *pendingCheckpointReq
+
+	// pendingRestore is set when a checkpoint restore is requested.
+	// The close() path checks it after shutdown.
+	pendingRestore *pendingRestoreReq
+}
+
+type pendingCheckpointReq struct {
+	Name        string
+	Description string
+	Tags        []string
+	Done        chan error
+}
+
+type pendingRestoreReq struct {
+	Name string
+	Done chan error
 }
 
 // SessionInfo describes an active exec session.
@@ -343,6 +364,67 @@ func (s *apiServer) handleGuestCtrl(conn net.Conn) {
 			}
 		}
 
+		if msg.MemoryCheckpointReq != nil {
+			req := msg.MemoryCheckpointReq
+			resp := &protocol.MemoryCheckpointResp{}
+
+			s.pendingCheckpointMu.Lock()
+			if s.pendingCheckpoint != nil {
+				s.pendingCheckpointMu.Unlock()
+				resp.Error = "checkpoint already in progress"
+			} else {
+				pending := &pendingCheckpointReq{
+					Name:        req.Name,
+					Description: req.Description,
+					Tags:        req.Tags,
+					Done:        make(chan error, 1),
+				}
+				s.pendingCheckpoint = pending
+				s.pendingCheckpointMu.Unlock()
+
+				// Acknowledge immediately, then schedule a stop which triggers
+				// hibernate. The close() path will do the actual clone.
+				resp.Name = req.Name
+
+				// Schedule stop after sending the response so the guest
+				// gets the ack before the VM hibernates.
+				go func() {
+					time.Sleep(500 * time.Millisecond)
+					s.requestStop("memory checkpoint requested")
+				}()
+			}
+			if err := enc.Encode(protocol.Msg{MemoryCheckpointResp: resp}); err != nil {
+				return
+			}
+		}
+
+		if msg.RestoreCheckpointReq != nil {
+			req := msg.RestoreCheckpointReq
+			resp := &protocol.RestoreCheckpointResp{}
+
+			s.pendingCheckpointMu.Lock()
+			if s.pendingRestore != nil {
+				s.pendingCheckpointMu.Unlock()
+				resp.Error = "restore already in progress"
+			} else {
+				pending := &pendingRestoreReq{
+					Name: req.Name,
+					Done: make(chan error, 1),
+				}
+				s.pendingRestore = pending
+				s.stopMode = "shutdown"
+				s.pendingCheckpointMu.Unlock()
+
+				go func() {
+					time.Sleep(500 * time.Millisecond)
+					s.requestStop("checkpoint restore requested")
+				}()
+			}
+			if err := enc.Encode(protocol.Msg{RestoreCheckpointResp: resp}); err != nil {
+				return
+			}
+		}
+
 		if msg.OpenURLReq != nil {
 			resp := &protocol.OpenURLResp{}
 			u := msg.OpenURLReq.URL
@@ -400,6 +482,9 @@ func (s *apiServer) listenUnix(sockPath string) error {
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /ports", s.handlePorts)
 	mux.HandleFunc("POST /checkpoint", s.handleCheckpoint)
+	mux.HandleFunc("POST /checkpoint/memory", s.handleMemoryCheckpoint)
+	mux.HandleFunc("POST /checkpoint/restore", s.handleRestoreCheckpoint)
+	mux.HandleFunc("GET /checkpoints", s.handleListCheckpoints)
 	mux.HandleFunc("POST /expose/host", s.handleExposeHost)
 	mux.HandleFunc("POST /expose/host/remove", s.handleRemoveExposeHost)
 	mux.HandleFunc("POST /guest/expose", s.handleGuestExpose)
@@ -648,6 +733,111 @@ func (s *apiServer) handleCheckpoint(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"path": cpPath})
+}
+
+func (s *apiServer) handleMemoryCheckpoint(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name        string   `json:"name"`
+		Description string   `json:"description"`
+		Tags        []string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	// If the guest HTTP endpoint is available, proxy to it so the guest can
+	// sync filesystems and relay to the host via gob.
+	if s.sock != nil {
+		var resp struct {
+			Name   string `json:"name,omitempty"`
+			Status string `json:"status,omitempty"`
+			Error  string `json:"error,omitempty"`
+		}
+		if err := s.proxyGuestJSON(r.Context(), "/checkpoint/memory", req, &resp); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+
+		// The guest acked. Now wait for the pending checkpoint to complete
+		// (the VM will hibernate, clone, and resume).
+		s.pendingCheckpointMu.Lock()
+		pending := s.pendingCheckpoint
+		s.pendingCheckpointMu.Unlock()
+
+		if pending != nil {
+			if err := <-pending.Done; err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "created", "name": req.Name})
+		return
+	}
+
+	http.Error(w, "VM not running", http.StatusServiceUnavailable)
+}
+
+func (s *apiServer) handleRestoreCheckpoint(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.Name == "" {
+		http.Error(w, "name required", http.StatusBadRequest)
+		return
+	}
+
+	// Validate the checkpoint exists before scheduling.
+	cpDir := filepath.Join(filepath.Dir(s.rootfsPath), "checkpoints")
+	cpPath := filepath.Join(cpDir, req.Name)
+	if _, err := os.Stat(filepath.Join(cpPath, "metadata.json")); err != nil {
+		http.Error(w, fmt.Sprintf("checkpoint %q not found", req.Name), http.StatusNotFound)
+		return
+	}
+
+	s.pendingCheckpointMu.Lock()
+	if s.pendingRestore != nil {
+		s.pendingCheckpointMu.Unlock()
+		http.Error(w, "restore already in progress", http.StatusConflict)
+		return
+	}
+	pending := &pendingRestoreReq{
+		Name: req.Name,
+		Done: make(chan error, 1),
+	}
+	s.pendingRestore = pending
+	s.stopMode = "shutdown"
+	s.pendingCheckpointMu.Unlock()
+
+	s.requestStop("checkpoint restore requested via API")
+
+	if err := <-pending.Done; err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "restored", "name": req.Name})
+}
+
+func (s *apiServer) handleListCheckpoints(w http.ResponseWriter, r *http.Request) {
+	cpDir := filepath.Join(filepath.Dir(s.rootfsPath), "checkpoints")
+	checkpoints, err := ListCheckpoints(cpDir)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if checkpoints == nil {
+		checkpoints = []CheckpointMetadata{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(checkpoints)
 }
 
 func (s *apiServer) proxyGuestJSON(ctx context.Context, path string, body any, respBody any) error {

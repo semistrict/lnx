@@ -10,14 +10,21 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mdlayher/vsock"
 	"github.com/semistrict/lnx/internal/protocol"
 )
 
+var (
+	portfwdDataLnMu sync.Mutex
+	portfwdDataPrev *vsock.Listener
+)
+
 // startPortForwarder scans for listening TCP ports and notifies the host.
 // It also listens on a vsock port for incoming forwarded connections from the host.
+// Safe to call multiple times (after hibernate/restore).
 func startPortForwarder() {
 	// Control connection: notify host of port changes.
 	ctrlConn, err := vsock.Dial(vsockHostCID, protocol.PortForwardPort, nil)
@@ -26,6 +33,13 @@ func startPortForwarder() {
 		return
 	}
 
+	// Close previous data listener before re-binding.
+	portfwdDataLnMu.Lock()
+	if portfwdDataPrev != nil {
+		portfwdDataPrev.Close()
+	}
+	portfwdDataLnMu.Unlock()
+
 	// Data listener: host connects here to forward TCP connections.
 	dataLn, err := vsock.Listen(protocol.PortForwardDataPort, nil)
 	if err != nil {
@@ -33,6 +47,10 @@ func startPortForwarder() {
 		ctrlConn.Close()
 		return
 	}
+
+	portfwdDataLnMu.Lock()
+	portfwdDataPrev = dataLn
+	portfwdDataLnMu.Unlock()
 
 	// Accept forwarded connections from host.
 	go acceptForwardedConns(dataLn)

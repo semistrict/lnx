@@ -198,6 +198,12 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		workDir = cfg.socketDir()
 	}
 
+	// Check for a hibernate marker early so ensureSwapFile can be skipped
+	// when resuming (the swap file contains the kernel's hibernate image).
+	sockDir := cfg.socketDir()
+	hibernateMarker := filepath.Join(sockDir, "hibernated")
+	resuming := ephCleanup == nil && fileExists(hibernateMarker)
+
 	initrdDir := workDir
 	if cfg.InitramfsPath != "" {
 		initrdDir = filepath.Dir(cfg.InitramfsPath)
@@ -234,12 +240,19 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 	uid, _ := strconv.Atoi(u.Uid)
 
 	swapPath := filepath.Join(workDir, "swap.img")
-	if err := ensureSwapFile(swapPath, cfg.memoryBytes()); err != nil {
-		lock.unlock()
-		if ephCleanup != nil {
-			ephCleanup()
+	// Skip ensureSwapFile when resuming from hibernate — the swap file
+	// contains the kernel's hibernate image and must not be overwritten,
+	// even if the configured memory size differs from the checkpoint's.
+	// Only skip if the swap file actually exists (a cloned instance may
+	// have a stale hibernated marker without a swap file).
+	if !resuming || !fileExists(swapPath) {
+		if err := ensureSwapFile(swapPath, cfg.memoryBytes()); err != nil {
+			lock.unlock()
+			if ephCleanup != nil {
+				ephCleanup()
+			}
+			return nil, fmt.Errorf("swap file: %w", err)
 		}
-		return nil, fmt.Errorf("swap file: %w", err)
 	}
 
 	hostname := cfg.Hostname
@@ -292,13 +305,6 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 	}
 	setupMsg.Env = append(setupMsg.Env, "LNX_PARENT="+parentInstance)
 
-	sockDir := cfg.socketDir()
-
-	// Check for a hibernate marker (left by a previous guest-side hibernate).
-	// If present, the kernel will auto-resume from the hibernate image in swap
-	// via the resume=/dev/vdb cmdline parameter.
-	hibernateMarker := filepath.Join(sockDir, "hibernated")
-	resuming := ephCleanup == nil && fileExists(hibernateMarker)
 	// Consume the marker — if the kernel can't resume it will cold boot.
 	os.Remove(hibernateMarker)
 
@@ -451,42 +457,129 @@ func Run(cfg *Config, args ...string) (int, error) {
 // RunDaemon boots a VM and runs it as a background daemon with no initial command.
 // It blocks until all exec sessions have finished (idle) or Stop is requested
 // via the API. Returns nil on clean shutdown.
+//
+// When a memory checkpoint or restore is requested, the daemon reboots the VM
+// internally (hibernate → clone → resume) so the caller sees a brief pause
+// rather than needing to restart the daemon.
 func RunDaemon(cfg *Config) error {
-	b, err := bootVM(cfg)
-	if err != nil {
-		return err
-	}
+	// Pending requests survive across reboot iterations. The HTTP handler
+	// holds a reference to the Done channel; we signal it after the new VM
+	// is up so the client gets a response only when the VM is ready again.
+	var rebootCP *pendingCheckpointReq
+	var rebootRestore *pendingRestoreReq
 
-	slog.Info("daemon ready, waiting for exec sessions")
-
-	go func() {
-		for state := range b.vm.StateChangedNotify() {
-			switch state {
-			case VMStateStarting, VMStateRunning:
-				slog.Debug("vm state changed", "state", state)
-			case VMStatePaused:
-				// Expected during hibernate (Pause → SaveState → Stop).
-				slog.Debug("vm paused (hibernate in progress)", "state", state)
-			case VMStateStopped:
-				slog.Warn("vm stopped while daemon was still running")
-				b.vs.api.requestStop("vm stopped while daemon was still running", "state", state)
-				return
-			default:
-				slog.Warn("vm entered unexpected state while daemon was still running", "state", state)
-				b.vs.api.requestStop("vm entered unexpected state while daemon was still running", "state", state)
-				return
+	for {
+		b, err := bootVM(cfg)
+		if err != nil {
+			if rebootCP != nil {
+				rebootCP.Done <- err
+				close(rebootCP.Done)
 			}
+			if rebootRestore != nil {
+				rebootRestore.Done <- err
+				close(rebootRestore.Done)
+			}
+			return err
 		}
-		slog.Warn("vm state channel closed while daemon was still running")
-		b.vs.api.requestStop("vm state channel closed while daemon was still running")
-	}()
 
-	// Block until idle (all execs finished) or stop requested.
-	b.vs.api.WaitIdle()
+		// If we rebooted after a checkpoint/restore, the VM is back.
+		// Signal the waiting HTTP handler so it can respond to the client.
+		if rebootCP != nil {
+			slog.Info("VM resumed after memory checkpoint", "name", rebootCP.Name)
+			rebootCP.Done <- nil
+			close(rebootCP.Done)
+			rebootCP = nil
+		}
+		if rebootRestore != nil {
+			slog.Info("VM resumed after checkpoint restore", "name", rebootRestore.Name)
+			rebootRestore.Done <- nil
+			close(rebootRestore.Done)
+			rebootRestore = nil
+		}
 
-	slog.Info("daemon shutting down", "stopMode", b.vs.api.stopMode)
-	b.close(0, b.vs.api.stopMode)
-	return nil
+		slog.Info("daemon ready, waiting for exec sessions")
+
+		go func() {
+			for state := range b.vm.StateChangedNotify() {
+				switch state {
+				case VMStateStarting, VMStateRunning:
+					slog.Debug("vm state changed", "state", state)
+				case VMStatePaused:
+					// Expected during hibernate (Pause → SaveState → Stop).
+					slog.Debug("vm paused (hibernate in progress)", "state", state)
+				case VMStateStopped:
+					slog.Warn("vm stopped while daemon was still running")
+					b.vs.api.requestStop("vm stopped while daemon was still running", "state", state)
+					return
+				default:
+					slog.Warn("vm entered unexpected state while daemon was still running", "state", state)
+					b.vs.api.requestStop("vm entered unexpected state while daemon was still running", "state", state)
+					return
+				}
+			}
+			slog.Warn("vm state channel closed while daemon was still running")
+			b.vs.api.requestStop("vm state channel closed while daemon was still running")
+		}()
+
+		// Block until idle (all execs finished) or stop requested.
+		b.vs.api.WaitIdle()
+
+		// Grab pending checkpoint/restore before close() tears down the API.
+		b.vs.api.pendingCheckpointMu.Lock()
+		pendingCP := b.vs.api.pendingCheckpoint
+		b.vs.api.pendingCheckpoint = nil
+		pendingRestore := b.vs.api.pendingRestore
+		b.vs.api.pendingRestore = nil
+		b.vs.api.pendingCheckpointMu.Unlock()
+
+		slog.Info("daemon shutting down", "stopMode", b.vs.api.stopMode)
+
+		// Save paths we need after close() releases the VM.
+		rootfsPath := b.vs.api.rootfsPath
+		sockDir := b.sockDir
+		workDir := filepath.Dir(rootfsPath)
+		if strings.HasPrefix(rootfsPath, "/dev/") {
+			workDir = sockDir
+		}
+
+		b.close(0, b.vs.api.stopMode)
+
+		// --- Memory checkpoint: clone rootfs+swap, then reboot ---
+		if pendingCP != nil {
+			cpDir := filepath.Join(workDir, "checkpoints")
+			swapPath := filepath.Join(workDir, "swap.img")
+			_, err := CreateMemoryCheckpoint(rootfsPath, swapPath, cpDir,
+				pendingCP.Name, pendingCP.Description, pendingCP.Tags)
+			if err != nil {
+				slog.Error("memory checkpoint failed", "name", pendingCP.Name, "error", err)
+				pendingCP.Done <- err
+				close(pendingCP.Done)
+				return err
+			}
+			slog.Info("memory checkpoint created, rebooting VM", "name", pendingCP.Name)
+			rebootCP = pendingCP
+			continue
+		}
+
+		// --- Checkpoint restore: replace files, then reboot ---
+		if pendingRestore != nil {
+			cpDir := filepath.Join(workDir, "checkpoints")
+			swapPath := filepath.Join(workDir, "swap.img")
+			err := RestoreMemoryCheckpoint(cpDir, pendingRestore.Name, rootfsPath, swapPath)
+			if err != nil {
+				slog.Error("checkpoint restore failed", "name", pendingRestore.Name, "error", err)
+				pendingRestore.Done <- err
+				close(pendingRestore.Done)
+				return err
+			}
+			os.WriteFile(filepath.Join(sockDir, "hibernated"), []byte("1"), 0644)
+			slog.Info("checkpoint restored, rebooting VM", "name", pendingRestore.Name)
+			rebootRestore = pendingRestore
+			continue
+		}
+
+		return nil
+	}
 }
 
 // vsockState holds the vsock infrastructure created during VM setup.

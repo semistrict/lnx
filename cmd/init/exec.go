@@ -21,10 +21,27 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+var (
+	execLnMu        sync.Mutex
+	execLnPrev      *vsock.Listener
+	interactivePrev *vsock.Listener
+)
+
 // startExecServer listens on the exec vsock port and handles one
 // exec request per connection. Multiple connections are accepted
 // concurrently so `lnx exec` works while the main command runs.
+// Safe to call multiple times (after hibernate/restore) — closes
+// previous listeners before re-binding.
 func startExecServer() {
+	execLnMu.Lock()
+	if execLnPrev != nil {
+		execLnPrev.Close()
+	}
+	if interactivePrev != nil {
+		interactivePrev.Close()
+	}
+	execLnMu.Unlock()
+
 	execLn, err := vsock.Listen(protocol.ExecPort, nil)
 	if err != nil {
 		slog.Warn("exec listen failed", "error", err)
@@ -37,6 +54,11 @@ func startExecServer() {
 		execLn.Close()
 		return
 	}
+
+	execLnMu.Lock()
+	execLnPrev = execLn
+	interactivePrev = interactiveLn
+	execLnMu.Unlock()
 
 	go func() {
 		for {
