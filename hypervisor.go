@@ -10,6 +10,7 @@ const (
 	VMStateRunning
 	VMStateStopped
 	VMStateError
+	VMStatePaused
 )
 
 // VsockDevice abstracts vsock communication between host and guest.
@@ -28,6 +29,10 @@ type VirtualMachine interface {
 	Start() error
 	Stop() error
 	RequestStop() error
+	Pause() error
+	Resume() error
+	SaveState(path string) error
+	RestoreState(path string) error
 	// StateChangedNotify returns a channel that receives state transitions.
 	StateChangedNotify() <-chan VMState
 	VsockDevice() VsockDevice

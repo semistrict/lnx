@@ -34,7 +34,7 @@ type firecrackerVM struct {
 
 // buildVM creates and configures a Firecracker VM ready to start.
 // Requires LNX_EXPERIMENTS=linux_host (experimental feature).
-func buildVM(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (VirtualMachine, error) {
+func buildVM(cfg *Config, initrdPath, cwd, swapPath, homeDir, macAddr string, epoch int64) (VirtualMachine, error) {
 	if !linuxHostEnabled() {
 		return nil, fmt.Errorf("Linux host support is experimental; set LNX_EXPERIMENTS=linux_host to enable")
 	}
@@ -107,7 +107,7 @@ func buildVM(cfg *Config, initrdPath, cwd, swapPath, homeDir string) (VirtualMac
 }
 
 func (vm *firecrackerVM) configure(cfg *Config, initrdPath, cwd, swapPath, homeDir, vsockPath string) error {
-	cmdline := fmt.Sprintf("console=ttyS0 lnx.epoch=%d reboot=k panic=1", time.Now().Unix())
+	cmdline := fmt.Sprintf("console=ttyS0 lnx.epoch=%d reboot=k panic=1 resume=/dev/vdb", time.Now().Unix())
 
 	// 1. Boot source.
 	if err := vm.apiPut("/boot-source", map[string]any{
@@ -219,6 +219,22 @@ func (vm *firecrackerVM) RequestStop() error {
 	return vm.apiPut("/actions", map[string]any{
 		"action_type": "SendCtrlAltDel",
 	})
+}
+
+func (vm *firecrackerVM) Pause() error {
+	return fmt.Errorf("hibernate not supported on Linux host")
+}
+
+func (vm *firecrackerVM) Resume() error {
+	return fmt.Errorf("hibernate not supported on Linux host")
+}
+
+func (vm *firecrackerVM) SaveState(path string) error {
+	return fmt.Errorf("hibernate not supported on Linux host")
+}
+
+func (vm *firecrackerVM) RestoreState(path string) error {
+	return fmt.Errorf("hibernate not supported on Linux host")
 }
 
 func (vm *firecrackerVM) StateChangedNotify() <-chan VMState {

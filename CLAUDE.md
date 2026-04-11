@@ -121,6 +121,15 @@ When a test or feature doesn't work, check the **data flow** first, not the buil
 - Check if there's a manual struct copy that drops fields (ephemeral path, gob re-encoding)
 - Do NOT spend time on build cache issues (`go clean -cache`, MD5 comparisons, binary extraction) until you've ruled out logic bugs
 
+## Bash command timeouts — CRITICAL
+
+ALWAYS set the `timeout` parameter on EVERY Bash tool call. Never rely on defaults.
+- Quick commands (ls, git status, go build): 30000 (30s)
+- Medium commands (make, unit tests): 60000 (60s)
+- Integration tests: 120000 (120s) MAX
+- NEVER use 600000 (10 min) — if a command needs that long, use `run_in_background: true`
+- If a command might hang (VM operations, network), use a SHORT timeout
+
 ## Key conventions
 
 - All interactive I/O goes through WebSocket (`handleExecWS` in status.go). Binary frames carry PTY data, text frames carry JSON control messages (signals, resize, exit_code).

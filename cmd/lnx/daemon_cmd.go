@@ -34,6 +34,7 @@ var daemonCmd = &cobra.Command{
 			Shares:       loadShares(dir),
 			SocketDir:    socketDir,
 			NestedRootfs: nested,
+			MemoryBytes:  memoryMB * 1024 * 1024,
 		})
 		if err != nil {
 			errPath := filepath.Join(socketDir, "error.log")
@@ -49,6 +50,7 @@ func init() {
 	daemonCmd.Flags().BoolVarP(&doCheckpoint, "checkpoint", "c", false, "snapshot rootfs before starting")
 	daemonCmd.Flags().BoolVar(&doEphemeral, "ephemeral", false, "clone rootfs to a temp file; discard on exit")
 	daemonCmd.Flags().BoolVar(&doSSHAgent, "ssh-agent", false, "forward host SSH agent into the guest")
+	daemonCmd.Flags().Uint64Var(&memoryMB, "memory", 0, "VM memory in MB")
 	rootCmd.AddCommand(daemonCmd)
 }
 

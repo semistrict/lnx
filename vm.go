@@ -1,8 +1,10 @@
 package lnx
 
 import (
+	cryptoRand "crypto/rand"
 	"encoding/gob"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -31,19 +33,99 @@ type bootedVM struct {
 	ctrlConn net.Conn
 	ctrlEnc  *gob.Encoder
 	cwd      string
+	sockDir  string
 	// ephCleanup removes the ephemeral temp dir (nil if not ephemeral).
 	ephCleanup func()
 	lock       *lockFile
 }
 
 // close shuts down the VM and releases all resources.
-func (b *bootedVM) close(exitCode int) {
-	b.ctrlConn.Close()
-	shutdownVM(b.vm, exitCode)
+// If stopMode is "" (default) and the VM is not ephemeral, it attempts
+// guest-side hibernate (Linux suspend-to-disk). The guest writes its state
+// to swap and the kernel powers off. On next boot, the kernel auto-resumes.
+// "shutdown" always does a full shutdown.
+func (b *bootedVM) close(exitCode int, stopMode string) {
+	hibernated := false
+	if stopMode != "shutdown" && b.ephCleanup == nil && exitCode == 0 {
+		hibernated = b.requestGuestHibernate()
+	}
+
+	if !hibernated {
+		b.ctrlConn.Close()
+		shutdownVM(b.vm, exitCode)
+	}
+
 	b.lock.unlock()
 	b.vs.cleanup()
 	if b.ephCleanup != nil {
 		b.ephCleanup()
+	}
+}
+
+// requestGuestHibernate sends a Hibernate message to the guest and waits
+// for the VM to stop (kernel powers off after writing to swap). Returns
+// true if hibernate succeeded, false if the host should fall back to shutdown.
+func (b *bootedVM) requestGuestHibernate() bool {
+	slog.Info("requesting guest hibernate")
+
+	if err := b.ctrlEnc.Encode(protocol.Msg{Hibernate: &protocol.Hibernate{}}); err != nil {
+		slog.Warn("failed to send hibernate request", "error", err)
+		return false
+	}
+
+	// Read the guest's response. The gob decoder will also return an error
+	// when the VM stops (connection closes), so this doubles as a VM-stop detector.
+	type result struct {
+		resp *protocol.HibernateResp
+		err  error
+	}
+	respCh := make(chan result, 1)
+	go func() {
+		dec := gob.NewDecoder(b.ctrlConn)
+		var msg protocol.Msg
+		if err := dec.Decode(&msg); err != nil {
+			respCh <- result{err: err}
+			return
+		}
+		respCh <- result{resp: msg.HibernateResp}
+		// After sending the response, the guest writes to /sys/power/state.
+		// The kernel saves to swap then powers off, closing this connection.
+		// Block until that happens (Decode returns error on close).
+		dec.Decode(&msg)
+		respCh <- result{err: fmt.Errorf("vm stopped")}
+	}()
+
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
+
+	// First wait for the guest's response.
+	select {
+	case r := <-respCh:
+		if r.err != nil {
+			slog.Warn("hibernate response failed", "error", r.err)
+			return false
+		}
+		if r.resp != nil && r.resp.Error != "" {
+			slog.Warn("guest reports hibernate not supported", "error", r.resp.Error)
+			return false
+		}
+		slog.Info("guest acknowledged hibernate, waiting for VM to stop")
+	case <-timer.C:
+		slog.Warn("hibernate response timed out")
+		return false
+	}
+
+	// Guest acknowledged — wait for the VM to power off. The second
+	// Decode() in the goroutine above will return when the connection
+	// closes (VM stopped after kernel hibernate).
+	select {
+	case <-respCh:
+		slog.Info("VM stopped after hibernate")
+		os.WriteFile(filepath.Join(b.sockDir, "hibernated"), []byte("1"), 0644)
+		return true
+	case <-time.After(120 * time.Second):
+		slog.Warn("VM did not stop after hibernate within timeout")
+		return false
 	}
 }
 
@@ -210,7 +292,26 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 	}
 	setupMsg.Env = append(setupMsg.Env, "LNX_PARENT="+parentInstance)
 
-	vm, err := buildVM(cfg, initrdPath, cwd, swapPath, u.HomeDir)
+	sockDir := cfg.socketDir()
+
+	// Check for a hibernate marker (left by a previous guest-side hibernate).
+	// If present, the kernel will auto-resume from the hibernate image in swap
+	// via the resume=/dev/vdb cmdline parameter.
+	hibernateMarker := filepath.Join(sockDir, "hibernated")
+	resuming := ephCleanup == nil && fileExists(hibernateMarker)
+	// Consume the marker — if the kernel can't resume it will cold boot.
+	os.Remove(hibernateMarker)
+
+	if resuming {
+		slog.Info("booting VM (kernel will resume from hibernate)")
+	}
+
+	// Load or generate a stable MAC address for this instance.
+	macAddr := loadOrGenerateMAC(sockDir)
+
+	epoch := time.Now().Unix()
+
+	vm, err := buildVM(cfg, initrdPath, cwd, swapPath, u.HomeDir, macAddr, epoch)
 	if err != nil {
 		lock.unlock()
 		if ephCleanup != nil {
@@ -219,7 +320,6 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		return nil, err
 	}
 
-	sockDir := cfg.socketDir()
 	vs, err := setupVsock(vm.VsockDevice(), sockDir, cfg.RootfsPath, setupMsg)
 	if err != nil {
 		lock.unlock()
@@ -228,17 +328,25 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		}
 		return nil, err
 	}
-	if err := vm.Start(); err != nil {
+
+	bail := func(format string, args ...any) (*bootedVM, error) {
 		vs.cleanup()
+		vm.Stop()
 		lock.unlock()
 		if ephCleanup != nil {
 			ephCleanup()
 		}
-		return nil, fmt.Errorf("start vm: %w", err)
+		return nil, fmt.Errorf(format, args...)
+	}
+
+	if err := vm.Start(); err != nil {
+		return bail("start vm: %w", err)
 	}
 
 	// Wait for the guest to connect on the control port, with a timeout.
-	// Also watch for VM state changes (crash/stop) so we don't wait forever.
+	// On resume from hibernate, the restored guest init enters a reconnect
+	// loop and dials this port. On cold boot, the fresh init connects after
+	// setup. Either way, we wait for a connection here.
 	var ctrlConn net.Conn
 	stateCh := vm.StateChangedNotify()
 	bootTimer := time.NewTimer(30 * time.Second)
@@ -250,43 +358,32 @@ waitBoot:
 			break waitBoot
 		case state := <-stateCh:
 			switch state {
-			case VMStateRunning, VMStateStarting:
+			case VMStateRunning, VMStateStarting, VMStatePaused:
 				continue // expected transient states
 			default:
-				vs.cleanup()
-				lock.unlock()
-				if ephCleanup != nil {
-					ephCleanup()
-				}
-				return nil, fmt.Errorf("VM entered state %v during boot\n%s", state, serialLogTail(sockDir))
+				return bail("VM entered state %v during boot\n%s", state, serialLogTail(sockDir))
 			}
 		case <-bootTimer.C:
-			vs.cleanup()
-			vm.Stop()
-			lock.unlock()
-			if ephCleanup != nil {
-				ephCleanup()
-			}
-			return nil, fmt.Errorf("guest did not connect within 30s\n%s", serialLogTail(sockDir))
+			return bail("guest did not connect within 30s\n%s", serialLogTail(sockDir))
 		}
 	}
 	if ctrlConn == nil {
-		vs.cleanup()
-		lock.unlock()
-		if ephCleanup != nil {
-			ephCleanup()
-		}
-		return nil, fmt.Errorf("control connection failed\n%s", serialLogTail(sockDir))
+		return bail("control connection failed\n%s", serialLogTail(sockDir))
 	}
+
+	// Send the appropriate first message on the control connection.
+	// On resume: Reconnect (guest already has setup state from the original boot).
+	// On cold boot: Setup (guest needs environment config).
 	enc := gob.NewEncoder(ctrlConn)
-	if err := enc.Encode(protocol.Msg{Setup: setupMsg}); err != nil {
+	var ctrlMsg protocol.Msg
+	if resuming {
+		ctrlMsg = protocol.Msg{Reconnect: &protocol.Reconnect{}}
+	} else {
+		ctrlMsg = protocol.Msg{Setup: setupMsg}
+	}
+	if err := enc.Encode(ctrlMsg); err != nil {
 		ctrlConn.Close()
-		vs.cleanup()
-		lock.unlock()
-		if ephCleanup != nil {
-			ephCleanup()
-		}
-		return nil, fmt.Errorf("send setup: %w", err)
+		return bail("send control message: %w", err)
 	}
 
 	return &bootedVM{
@@ -295,6 +392,7 @@ waitBoot:
 		ctrlConn:   ctrlConn,
 		ctrlEnc:    enc,
 		cwd:        cwd,
+		sockDir:    sockDir,
 		ephCleanup: ephCleanup,
 		lock:       lock,
 	}, nil
@@ -346,7 +444,7 @@ func Run(cfg *Config, args ...string) (int, error) {
 	default:
 	}
 
-	b.close(exitCode)
+	b.close(exitCode, "shutdown")
 	return exitCode, nil
 }
 
@@ -366,6 +464,9 @@ func RunDaemon(cfg *Config) error {
 			switch state {
 			case VMStateStarting, VMStateRunning:
 				slog.Debug("vm state changed", "state", state)
+			case VMStatePaused:
+				// Expected during hibernate (Pause → SaveState → Stop).
+				slog.Debug("vm paused (hibernate in progress)", "state", state)
 			case VMStateStopped:
 				slog.Warn("vm stopped while daemon was still running")
 				b.vs.api.requestStop("vm stopped while daemon was still running", "state", state)
@@ -383,8 +484,8 @@ func RunDaemon(cfg *Config) error {
 	// Block until idle (all execs finished) or stop requested.
 	b.vs.api.WaitIdle()
 
-	slog.Info("daemon shutting down")
-	b.close(0)
+	slog.Info("daemon shutting down", "stopMode", b.vs.api.stopMode)
+	b.close(0, b.vs.api.stopMode)
 	return nil
 }
 
@@ -622,6 +723,39 @@ func ensureSwapFile(path string, size uint64) error {
 	}
 	defer f.Close()
 	return f.Truncate(int64(size))
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// loadOrGenerateMAC returns a stable MAC address for an instance.
+// On the first call for a given dir, it generates a random locally-administered
+// MAC and persists it to mac.addr. Subsequent calls read the saved value.
+// Returns "" if the dir is empty (ephemeral VMs get a random MAC each time).
+func loadOrGenerateMAC(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	path := filepath.Join(dir, "mac.addr")
+	if data, err := os.ReadFile(path); err == nil {
+		mac := strings.TrimSpace(string(data))
+		if mac != "" {
+			return mac
+		}
+	}
+	// Generate a random locally-administered unicast MAC.
+	// Format: x2:xx:xx:xx:xx:xx (bit 1 of first octet = locally administered,
+	// bit 0 = unicast).
+	b := make([]byte, 6)
+	if _, err := io.ReadFull(cryptoRand.Reader, b); err != nil {
+		return "" // fall back to VZ-generated random MAC
+	}
+	b[0] = (b[0] & 0xfe) | 0x02 // locally administered, unicast
+	mac := fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
+	os.WriteFile(path, []byte(mac+"\n"), 0644)
+	return mac
 }
 
 // serialLogTail returns the last few lines of serial.log for error diagnostics.

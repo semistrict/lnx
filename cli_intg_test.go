@@ -80,7 +80,7 @@ func TestCLI_StopWaitsUntilVMStops(t *testing.T) {
 
 	runCLISuccess(t, bin, "--instance", inst, "true")
 
-	stopOut := runCLISuccess(t, bin, "--instance", inst, "stop")
+	stopOut := runCLISuccess(t, bin, "--instance", inst, "stop", "--shutdown")
 	assert.Contains(t, stopOut, "VM stopped")
 
 	statusOut, err := runCLI(bin, "--instance", inst, "status")
