@@ -42,10 +42,25 @@ func startSSHServer() {
 		return
 	}
 
+	forwardHandler := &ssh.ForwardedTCPHandler{}
 	server := &ssh.Server{
 		Handler: handleSSHSession,
 		PublicKeyHandler: func(ctx ssh.Context, key ssh.PublicKey) bool {
 			return true // vsock is host-only, no network exposure
+		},
+		LocalPortForwardingCallback: func(ctx ssh.Context, dhost string, dport uint32) bool {
+			return true // allow all port forwarding (needed for VS Code Remote)
+		},
+		ReversePortForwardingCallback: func(ctx ssh.Context, bhost string, bport uint32) bool {
+			return true
+		},
+		ChannelHandlers: map[string]ssh.ChannelHandler{
+			"session":      ssh.DefaultSessionHandler,
+			"direct-tcpip": ssh.DirectTCPIPHandler,
+		},
+		RequestHandlers: map[string]ssh.RequestHandler{
+			"tcpip-forward":        forwardHandler.HandleSSHRequest,
+			"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
 		},
 	}
 	server.AddHostKey(signer)
