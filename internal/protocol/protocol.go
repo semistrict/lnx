@@ -35,6 +35,14 @@ const (
 	// P9ShareBasePort is the first vsock port for extra 9P shares.
 	// Share i uses port P9ShareBasePort + i.
 	P9ShareBasePort = 1037
+
+	// ForkAttachPort is the vsock port for attaching to a CRIU-restored
+	// fork session's gob control (ExecStarted, ExecDone, ExecSignal, ExecResize).
+	// The guest listens; the host connects once after a fork restore.
+	ForkAttachPort = 1038
+	// ForkAttachDataPort is the vsock port for the fork session's raw PTY data.
+	// The guest listens; the host connects once after a fork restore.
+	ForkAttachDataPort = 1039
 )
 
 // Msg is the envelope for all control messages.
@@ -57,6 +65,7 @@ type Msg struct {
 	OpenURLResp    *OpenURLResp
 	ForkReq        *ForkReq
 	ForkResp       *ForkResp
+	ForkNotify     *ForkNotify
 }
 
 // Setup tells the guest the environment to configure (user, cwd, env vars).
@@ -188,6 +197,13 @@ type ForkResp struct {
 	Instance string // child instance name
 	Error    string // non-empty on failure
 }
+// ForkNotify tells the host that a fork happened in this exec session.
+// Sent on the per-session exec gob connection (port 1027) so the host
+// can forward the notification to the specific CLI WebSocket.
+type ForkNotify struct {
+	Instance string // child instance name
+}
+
 // PortForward notifies the host of the current set of listening TCP ports in the guest.
 type PortForward struct {
 	Ports []uint16

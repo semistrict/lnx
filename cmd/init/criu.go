@@ -3,8 +3,10 @@
 package main
 
 import (
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -12,8 +14,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/creack/pty"
+	"github.com/mdlayher/vsock"
+	"github.com/semistrict/lnx/internal/protocol"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -27,6 +35,36 @@ const (
 	forkRolePath = "/var/run/lnx/fork-role"
 )
 
+// forkSession holds the PTY master and criu command of a CRIU-restored fork
+// child, so the fork attach server can serve it to the host.
+type forkSession struct {
+	ptmx       *os.File   // PTY master — restored process has the slave
+	pts        *os.File   // PTY slave — kept open to prevent EIO until host connects
+	pid        int        // restored process PID (session leader)
+	cmd        *exec.Cmd  // criu restore command (nil if --restore-detached was used)
+	cleanupDir string     // directory to remove after criu exits
+	extraPTMX  *os.File   // criu's session PTY master (tty path); kept alive to prevent SIGHUP
+}
+
+var pendingFork struct {
+	mu   sync.Mutex
+	sess *forkSession
+}
+
+func setPendingForkSession(fs *forkSession) {
+	pendingFork.mu.Lock()
+	pendingFork.sess = fs
+	pendingFork.mu.Unlock()
+}
+
+func consumePendingForkSession() *forkSession {
+	pendingFork.mu.Lock()
+	defer pendingFork.mu.Unlock()
+	fs := pendingFork.sess
+	pendingFork.sess = nil
+	return fs
+}
+
 // criuCheckpointMetadata is written alongside CRIU image dirs so we
 // know what was dumped.
 type criuCheckpointMetadata struct {
@@ -34,6 +72,8 @@ type criuCheckpointMetadata struct {
 	PIDs       []int            `json:"pids"`
 	Timestamp  time.Time        `json:"timestamp"`
 	PipeInodes map[int][]string `json:"pipe_inodes,omitempty"` // PID → external pipe inodes
+	StdioPipes map[int][]string `json:"stdio_pipes,omitempty"` // PID → [stdout_inode, stderr_inode]
+	StdioTTY   map[int]uint64   `json:"stdio_tty,omitempty"`   // PID → tty rdev (if stdout is a PTY)
 }
 
 // mountCRIUDevice mounts the CRIU block device. If the device has no
@@ -88,6 +128,8 @@ func criuDump(name, dir string, leaveRunning bool) error {
 
 	var dumpedPIDs []int
 	pipeInodesMap := make(map[int][]string)
+	stdioPipesMap := make(map[int][]string)
+	stdioTTYMap := make(map[int]uint64)
 	var lastDumpErr string
 
 	for _, pid := range pids {
@@ -139,6 +181,15 @@ func criuDump(name, dir string, leaveRunning bool) error {
 			continue
 		}
 		dumpedPIDs = append(dumpedPIDs, pid)
+		// Record stdout/stderr info so the restore path can wire them
+		// to a PTY instead of /dev/null or a disconnected tty.
+		stdioPipes := findStdioPipeInodes(pid)
+		if len(stdioPipes) > 0 {
+			stdioPipesMap[pid] = stdioPipes
+		}
+		if rdev := findStdioTTYRdev(pid); rdev != 0 {
+			stdioTTYMap[pid] = rdev
+		}
 		if len(pipeInodes) > 0 {
 			pipeInodesMap[pid] = pipeInodes
 		}
@@ -157,6 +208,8 @@ func criuDump(name, dir string, leaveRunning bool) error {
 		PIDs:       dumpedPIDs,
 		Timestamp:  time.Now(),
 		PipeInodes: pipeInodesMap,
+		StdioPipes: stdioPipesMap,
+		StdioTTY:   stdioTTYMap,
 	}
 	metaData, err := json.Marshal(meta)
 	if err != nil {
@@ -249,6 +302,36 @@ func collectKnownSocketInodes(pid int) map[string]bool {
 		}
 	}
 	return known
+}
+
+// findStdioPipeInodes returns the pipe inodes for the process's stdout and
+// stderr (fd 1 and fd 2), if they are pipes. Returns up to 2 inodes.
+func findStdioPipeInodes(pid int) []string {
+	var inodes []string
+	for _, fd := range []string{"1", "2"} {
+		link, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%s", pid, fd))
+		if err != nil || !strings.HasPrefix(link, "pipe:[") {
+			continue
+		}
+		inode := strings.TrimSuffix(strings.TrimPrefix(link, "pipe:["), "]")
+		inodes = append(inodes, inode)
+	}
+	return inodes
+}
+
+// findStdioTTYRdev returns the rdev of stdout (fd 1) if it's a tty device.
+// Returns 0 if stdout is not a tty.
+func findStdioTTYRdev(pid int) uint64 {
+	var st syscall.Stat_t
+	path := fmt.Sprintf("/proc/%d/fd/1", pid)
+	if err := syscall.Stat(path, &st); err != nil {
+		return 0
+	}
+	// Check if it's a character device (tty).
+	if st.Mode&syscall.S_IFMT != syscall.S_IFCHR {
+		return 0
+	}
+	return st.Rdev
 }
 
 // findExternalPipeInodes returns pipe inodes in the target process that
@@ -386,6 +469,271 @@ func criuRestore(dir string) error {
 	return nil
 }
 
+// criuRestoreForFork restores processes from CRIU images into a PTY so
+// the host can attach and read the restored process's terminal output.
+// The PTY master and first restored PID are stored as a pending fork session.
+func criuRestoreForFork(dir string) error {
+	metaPath := filepath.Join(dir, "metadata.json")
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return fmt.Errorf("read metadata: %w", err)
+	}
+
+	var meta criuCheckpointMetadata
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return fmt.Errorf("parse metadata: %w", err)
+	}
+	if len(meta.PIDs) == 0 {
+		return fmt.Errorf("no PIDs in metadata")
+	}
+
+	// Create a PTY pair. Stdio pipes (stdout/stderr) from the dump are
+	// wired to the PTY slave so output appears on our PTY master.
+	// Other external pipes (fork pipes) are wired to /dev/null as before.
+	ptmx, pts, err := pty.Open()
+	if err != nil {
+		return fmt.Errorf("open pty: %w", err)
+	}
+
+	var firstPID int
+	var firstCriuPtmx *os.File
+	for _, pid := range meta.PIDs {
+		pidDir := filepath.Join(dir, strconv.Itoa(pid))
+		if _, err := os.Stat(pidDir); err != nil {
+			slog.Warn("criu fork restore: PID dir missing, skipping", "pid", pid, "dir", pidDir)
+			continue
+		}
+
+		args := []string{
+			"restore",
+			"--images-dir", pidDir,
+			"--shell-job",
+			"--restore-detached",
+			"--tcp-established",
+			"--ext-unix-sk",
+		}
+
+		// Build a set of stdio pipe inodes so we can wire them to the PTY.
+		stdioSet := make(map[string]bool)
+		for _, inode := range meta.StdioPipes[pid] {
+			stdioSet[inode] = true
+		}
+
+		// Wire external pipe inodes: stdio pipes → PTY slave, others → /dev/null.
+		var extraFiles []*os.File
+		if inodes := meta.PipeInodes[pid]; len(inodes) > 0 {
+			for _, inode := range inodes {
+				var f *os.File
+				if stdioSet[inode] {
+					// Dup the PTY slave for each stdio pipe.
+					dupFd, err := syscall.Dup(int(pts.Fd()))
+					if err != nil {
+						pts.Close()
+						ptmx.Close()
+						return fmt.Errorf("dup pty slave: %w", err)
+					}
+					f = os.NewFile(uintptr(dupFd), "pts-dup")
+				} else {
+					var err error
+					f, err = os.Open("/dev/null")
+					if err != nil {
+						pts.Close()
+						ptmx.Close()
+						return fmt.Errorf("open /dev/null for pipe inherit: %w", err)
+					}
+				}
+				fdNum := 3 + len(extraFiles)
+				extraFiles = append(extraFiles, f)
+				args = append(args, "--inherit-fd", fmt.Sprintf("fd[%d]:pipe:[%s]", fdNum, inode))
+			}
+		}
+
+		// If stdout was a tty, map the tty device to our PTY slave.
+		if rdev := meta.StdioTTY[pid]; rdev != 0 {
+			dupFd, err := syscall.Dup(int(pts.Fd()))
+			if err != nil {
+				pts.Close()
+				ptmx.Close()
+				return fmt.Errorf("dup pty slave for tty: %w", err)
+			}
+			fdNum := 3 + len(extraFiles)
+			extraFiles = append(extraFiles, os.NewFile(uintptr(dupFd), "pts-tty"))
+			args = append(args, "--inherit-fd", fmt.Sprintf("fd[%d]:tty[%x]", fdNum, rdev))
+		}
+
+		slog.Info("criu fork restore", "pid", pid, "dir", pidDir,
+			"pipes", len(extraFiles), "stdioPipes", len(stdioSet),
+			"ttyRdev", fmt.Sprintf("0x%x", meta.StdioTTY[pid]))
+
+		cmd := exec.Command("criu", args...)
+		cmd.ExtraFiles = extraFiles
+		if meta.StdioTTY[pid] != 0 {
+			// For tty-based processes, criu needs a controlling terminal
+			// session for --shell-job. Set stdin to our PTY slave.
+			cmd.Stdin = pts
+		}
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			pts.Close()
+			ptmx.Close()
+			return fmt.Errorf("criu fork restore pid %d: %w\n%s", pid, err, string(output))
+		}
+		if firstPID == 0 {
+			firstPID = pid
+		}
+	}
+
+	if firstPID == 0 {
+		pts.Close()
+		ptmx.Close()
+		return fmt.Errorf("no PIDs were restored")
+	}
+
+	// Keep pts open — if the restored process exits before the host
+	// connects, the PTY slave reference keeps the master readable
+	// (buffered data won't be lost to EIO).
+	setPendingForkSession(&forkSession{ptmx: ptmx, pts: pts, pid: firstPID, cleanupDir: dir, extraPTMX: firstCriuPtmx})
+	slog.Info("fork session ready", "pid", firstPID)
+	return nil
+}
+
+// startForkAttachServer listens on the fork attach vsock ports and serves
+// the pending fork session's PTY to a single host connection. After the
+// restored process exits, the server shuts down.
+func startForkAttachServer(fs *forkSession) {
+	gobLn, err := vsock.Listen(protocol.ForkAttachPort, nil)
+	if err != nil {
+		slog.Error("fork attach listen failed", "port", protocol.ForkAttachPort, "error", err)
+		fs.ptmx.Close()
+		return
+	}
+
+	dataLn, err := vsock.Listen(protocol.ForkAttachDataPort, nil)
+	if err != nil {
+		slog.Error("fork attach data listen failed", "port", protocol.ForkAttachDataPort, "error", err)
+		gobLn.Close()
+		fs.ptmx.Close()
+		return
+	}
+
+	go func() {
+		defer gobLn.Close()
+		defer dataLn.Close()
+		defer fs.ptmx.Close()
+
+		// Accept one gob connection from the host.
+		gobConn, err := gobLn.Accept()
+		if err != nil {
+			slog.Error("fork attach accept failed", "error", err)
+			return
+		}
+		defer gobConn.Close()
+		enc := gob.NewEncoder(gobConn)
+		dec := gob.NewDecoder(gobConn)
+
+		// Read ExecReq for PTY dimensions.
+		var msg protocol.Msg
+		if err := dec.Decode(&msg); err != nil {
+			slog.Error("fork attach read request failed", "error", err)
+			return
+		}
+		if msg.ExecReq != nil && msg.ExecReq.Rows > 0 && msg.ExecReq.Cols > 0 {
+			unix.IoctlSetWinsize(int(fs.ptmx.Fd()), unix.TIOCSWINSZ, &unix.Winsize{
+				Row: msg.ExecReq.Rows,
+				Col: msg.ExecReq.Cols,
+			})
+		}
+
+		// Send ExecStarted.
+		if err := enc.Encode(protocol.Msg{ExecStarted: &protocol.ExecStarted{PID: fs.pid}}); err != nil {
+			slog.Error("fork attach send started failed", "error", err)
+			return
+		}
+
+		// Accept PTY data connection from host.
+		dataConn, err := dataLn.Accept()
+		if err != nil {
+			slog.Error("fork attach data accept failed", "error", err)
+			return
+		}
+		defer dataConn.Close()
+
+		// Now that the host is connected, close our extra PTY slave ref.
+		// The restored process (if still alive) holds its own ref. When it
+		// exits, the slave closes fully → master drains buffer then returns EIO.
+		if fs.pts != nil {
+			fs.pts.Close()
+			fs.pts = nil
+		}
+
+		// Handle signals and resize from host.
+		go func() {
+			for {
+				var msg protocol.Msg
+				if err := dec.Decode(&msg); err != nil {
+					return
+				}
+				if msg.ExecSignal != nil {
+					syscall.Kill(-fs.pid, syscall.Signal(msg.ExecSignal.Sig))
+				}
+				if msg.ExecResize != nil {
+					unix.IoctlSetWinsize(int(fs.ptmx.Fd()), unix.TIOCSWINSZ, &unix.Winsize{
+						Row: msg.ExecResize.Rows,
+						Col: msg.ExecResize.Cols,
+					})
+				}
+			}
+		}()
+
+		// Splice PTY ↔ data connection.
+		done := make(chan struct{})
+		go func() {
+			io.Copy(fs.ptmx, dataConn)
+			close(done)
+		}()
+		io.Copy(dataConn, fs.ptmx)
+		dataConn.Close()
+		<-done
+
+		// PTY read returned (slave closed — process exited). Collect exit code.
+		exitCode := 0
+		if fs.cmd != nil {
+			if err := fs.cmd.Wait(); err != nil {
+				if exitErr, ok := err.(*exec.ExitError); ok {
+					exitCode = exitErr.ExitCode()
+				} else {
+					slog.Warn("fork attach cmd.Wait failed", "error", err)
+					exitCode = 1
+				}
+			}
+		} else {
+			var ws syscall.WaitStatus
+			_, err = syscall.Wait4(fs.pid, &ws, 0, nil)
+			if err != nil {
+				slog.Warn("fork attach wait4 failed", "pid", fs.pid, "error", err)
+				exitCode = 1
+			} else if ws.Exited() {
+				exitCode = ws.ExitStatus()
+			} else if ws.Signaled() {
+				exitCode = 128 + int(ws.Signal())
+			}
+		}
+
+		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: exitCode}})
+
+		// Clean up resources now that the process has exited.
+		if fs.pts != nil {
+			fs.pts.Close()
+		}
+		if fs.extraPTMX != nil {
+			fs.extraPTMX.Close()
+		}
+		if fs.cleanupDir != "" {
+			os.RemoveAll(fs.cleanupDir)
+		}
+	}()
+}
+
 // criuAutoRestore detects CRIU images on the CRIU volume from a fork or
 // checkpoint restore and restores the processes automatically.
 // Fork detection takes priority over checkpoint restore.
@@ -397,12 +745,16 @@ func criuAutoRestore() {
 		os.MkdirAll(filepath.Dir(forkRolePath), 0755)
 		os.WriteFile(forkRolePath, []byte("child\n"), 0644)
 
-		if err := criuRestore(criuForkDir); err != nil {
+		if err := criuRestoreForFork(criuForkDir); err != nil {
 			slog.Error("CRIU fork restore failed", "error", err)
 		} else {
 			slog.Info("CRIU fork restore complete")
+			// Start the fork attach server immediately so the PTY
+			// buffer is read before the restored process exits.
+			if fs := consumePendingForkSession(); fs != nil {
+				startForkAttachServer(fs)
+			}
 		}
-		os.RemoveAll(criuForkDir)
 		return
 	}
 

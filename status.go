@@ -368,8 +368,9 @@ func (s *apiServer) executeFork() *protocol.ForkResp {
 		return &protocol.ForkResp{Error: "fork requires daemon mode"}
 	}
 
-	// Generate child name and create child instance dir.
-	childName := s.instanceName + "-fork-" + time.Now().Format("150405")
+	// Generate child name with millisecond precision to avoid collisions.
+	childName := s.instanceName + "-fork-" + time.Now().Format("150405.000")
+	childName = strings.ReplaceAll(childName, ".", "")
 	instancesDir := filepath.Dir(s.instanceDir)
 	childDir := filepath.Join(instancesDir, childName)
 	if err := os.MkdirAll(childDir, 0755); err != nil {
@@ -472,6 +473,7 @@ func (s *apiServer) listenUnix(sockPath string) error {
 	mux.HandleFunc("POST /guest/expose", s.handleGuestExpose)
 	mux.HandleFunc("POST /exec", s.handleExec)
 	mux.HandleFunc("GET /exec/ws", s.handleExecWS)
+	mux.HandleFunc("GET /fork/ws", s.handleForkAttachWS)
 	mux.HandleFunc("GET /sessions", s.handleSessions)
 	mux.HandleFunc("POST /sessions/kill", s.handleSessionKill)
 	mux.HandleFunc("POST /stop", s.handleStop)
@@ -952,6 +954,13 @@ func (s *apiServer) handleExecStream(w http.ResponseWriter, execDec *gob.Decoder
 			}
 		}
 
+		if msg.ForkNotify != nil {
+			enc.Encode(map[string]any{
+				"fork": map[string]string{"instance": msg.ForkNotify.Instance},
+			})
+			flusher.Flush()
+		}
+
 		if msg.ExecDone != nil {
 			enc.Encode(map[string]int{"exit_code": msg.ExecDone.ExitCode})
 			flusher.Flush()
@@ -1112,6 +1121,12 @@ func (s *apiServer) handleExecWS(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		if msg.ForkNotify != nil {
+			forkMsg, _ := json.Marshal(map[string]any{
+				"fork": map[string]string{"instance": msg.ForkNotify.Instance},
+			})
+			ws.Write(ctx, websocket.MessageText, forkMsg)
+		}
 		if msg.ExecDone != nil {
 			exitCode = msg.ExecDone.ExitCode
 			break
@@ -1119,6 +1134,167 @@ func (s *apiServer) handleExecWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Send exit code to client as text frame.
+	exitMsg, _ := json.Marshal(map[string]int{"exit_code": exitCode})
+	ws.Write(ctx, websocket.MessageText, exitMsg)
+	ws.Close(websocket.StatusNormalClosure, "")
+}
+
+// handleForkAttachWS connects to a CRIU-restored fork session's PTY in the
+// guest and bridges it to the client WebSocket. The protocol is identical
+// to handleExecWS (binary = PTY data, text = signals/resize/exit_code)
+// except the guest side is a fork attach server rather than an exec server.
+func (s *apiServer) handleForkAttachWS(w http.ResponseWriter, r *http.Request) {
+	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		InsecureSkipVerify: true,
+	})
+	if err != nil {
+		slog.Debug("fork attach websocket accept failed", "error", err)
+		return
+	}
+	defer ws.CloseNow()
+	ws.SetReadLimit(-1)
+
+	ctx := r.Context()
+
+	// Read the first text message for PTY dimensions.
+	_, data, err := ws.Read(ctx)
+	if err != nil {
+		slog.Debug("fork attach websocket read request failed", "error", err)
+		return
+	}
+	var req ExecRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		ws.Close(websocket.StatusInvalidFramePayloadData, "bad request: "+err.Error())
+		return
+	}
+
+	s.execStarted()
+	defer s.execFinished()
+
+	// Connect to the guest's fork attach gob port.
+	var gobConn net.Conn
+	for i := 0; i < 300; i++ {
+		gobConn, err = s.sock.Connect(protocol.ForkAttachPort)
+		if err == nil {
+			break
+		}
+		if errSuggestsDeadVM(err) {
+			ws.Close(websocket.StatusInternalError, "vm not live")
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if gobConn == nil {
+		ws.Close(websocket.StatusInternalError, "fork attach connect failed")
+		return
+	}
+	defer gobConn.Close()
+
+	gobEnc := gob.NewEncoder(gobConn)
+	gobDec := gob.NewDecoder(gobConn)
+
+	sessID := s.registerSession([]string{"[fork]"}, true, req.ClientPID, gobEnc, gobConn)
+	defer s.unregisterSession(sessID)
+
+	// Send ExecReq with PTY dimensions so the guest can resize.
+	if err := gobEnc.Encode(protocol.Msg{ExecReq: &protocol.ExecReq{
+		PTY:  true,
+		Rows: req.Rows,
+		Cols: req.Cols,
+	}}); err != nil {
+		ws.Close(websocket.StatusInternalError, "send fork request: "+err.Error())
+		return
+	}
+
+	// Connect to the guest's fork attach data port.
+	var dataConn net.Conn
+	for i := 0; i < 300; i++ {
+		dataConn, err = s.sock.Connect(protocol.ForkAttachDataPort)
+		if err == nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if dataConn == nil {
+		ws.Close(websocket.StatusInternalError, "fork attach data connect failed")
+		return
+	}
+	defer dataConn.Close()
+	s.setSessionVsockConn(sessID, dataConn)
+
+	// Look up session for thread-safe encoder access.
+	s.sessionsMu.RLock()
+	sess := s.sessions[sessID]
+	s.sessionsMu.RUnlock()
+
+	// Client → guest: text = signals/resize, binary = stdin.
+	go func() {
+		for {
+			typ, data, err := ws.Read(ctx)
+			if err != nil {
+				dataConn.Close()
+				gobConn.Close()
+				return
+			}
+			switch typ {
+			case websocket.MessageBinary:
+				dataConn.Write(data)
+			case websocket.MessageText:
+				var ctrl wsControl
+				if err := json.Unmarshal(data, &ctrl); err != nil {
+					continue
+				}
+				if ctrl.Signal != nil {
+					sess.encodeExec(protocol.Msg{ExecSignal: &protocol.ExecSignal{Sig: *ctrl.Signal}})
+				}
+				if ctrl.Resize != nil {
+					sess.encodeExec(protocol.Msg{ExecResize: &protocol.ExecResize{
+						Rows: ctrl.Resize.Rows,
+						Cols: ctrl.Resize.Cols,
+					}})
+				}
+			}
+		}
+	}()
+
+	// Guest PTY → client.
+	go func() {
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := dataConn.Read(buf)
+			if n > 0 {
+				if werr := ws.Write(ctx, websocket.MessageBinary, buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Wait for ExecStarted/ExecDone from guest gob connection.
+	exitCode := -1
+	for {
+		var msg protocol.Msg
+		if err := gobDec.Decode(&msg); err != nil {
+			break
+		}
+		if msg.ExecStarted != nil {
+			s.setSessionGuestPID(sessID, msg.ExecStarted.PID)
+		}
+		if msg.ForkNotify != nil {
+			forkMsg, _ := json.Marshal(map[string]any{
+				"fork": map[string]string{"instance": msg.ForkNotify.Instance},
+			})
+			ws.Write(ctx, websocket.MessageText, forkMsg)
+		}
+		if msg.ExecDone != nil {
+			exitCode = msg.ExecDone.ExitCode
+			break
+		}
+	}
+
 	exitMsg, _ := json.Marshal(map[string]int{"exit_code": exitCode})
 	ws.Write(ctx, websocket.MessageText, exitMsg)
 	ws.Close(websocket.StatusNormalClosure, "")

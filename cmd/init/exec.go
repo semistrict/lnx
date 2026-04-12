@@ -136,8 +136,10 @@ func createForkPipes() (reqR, reqW, resR, resW *os.File, err error) {
 }
 
 // handleForkPipe reads fork requests from the pipe and triggers forks.
-// Runs until the pipe is closed (child exited).
-func handleForkPipe(reqR, resW *os.File) {
+// Runs until the pipe is closed (child exited). After a successful fork,
+// sends a ForkNotify on the exec session's gob connection so the host
+// can tell the CLI about the new child instance.
+func handleForkPipe(reqR, resW *os.File, sess *execSession) {
 	defer reqR.Close()
 	defer resW.Close()
 
@@ -154,6 +156,14 @@ func handleForkPipe(reqR, resW *os.File) {
 
 		// Trigger fork via the guest control handler.
 		result := doGuestFork()
+
+		// Notify the host BEFORE writing to the result pipe — the parent
+		// process may exit immediately after reading the result, and the
+		// CLI needs to know about the fork before ExecDone arrives.
+		if !strings.HasPrefix(result, "error:") {
+			sess.encode(protocol.Msg{ForkNotify: &protocol.ForkNotify{Instance: result}})
+		}
+
 		resW.Write([]byte(result + "\n"))
 	}
 }
@@ -229,6 +239,18 @@ type execSession struct {
 	pgid  int
 	ptyFd *os.File
 	mu    sync.Mutex
+
+	// encMu serializes writes to the gob encoder (used by main goroutine
+	// for ExecStarted/ExecDone and by handleForkPipe for ForkNotify).
+	encMu sync.Mutex
+	enc   *gob.Encoder
+}
+
+// encode sends a gob message on the session's exec connection, safely.
+func (s *execSession) encode(msg protocol.Msg) error {
+	s.encMu.Lock()
+	defer s.encMu.Unlock()
+	return s.enc.Encode(msg)
 }
 
 func (s *execSession) setProcess(p *os.Process) {
@@ -303,20 +325,20 @@ func handleExecConn(conn *vsock.Conn, interactiveLn *vsock.Listener) {
 		return
 	}
 
-	sess := &execSession{}
+	sess := &execSession{enc: enc}
 	go sess.readControlMessages(dec)
 
 	if msg.ExecReq.PTY {
-		runExecPTY(enc, msg.ExecReq, interactiveLn, sess)
+		runExecPTY(msg.ExecReq, interactiveLn, sess)
 	} else {
-		runExecPipe(enc, msg.ExecReq, sess)
+		runExecPipe(msg.ExecReq, sess)
 	}
 }
 
 // runExecPTY handles an interactive exec request with a PTY.
-func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener, sess *execSession) {
+func runExecPTY(req *protocol.ExecReq, ln *vsock.Listener, sess *execSession) {
 	if len(req.Args) == 0 {
-		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
+		sess.encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
 		return
 	}
 
@@ -348,7 +370,7 @@ func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener, ses
 	reqR, reqW, resR, resW, err := createForkPipes()
 	if err != nil {
 		slog.Warn("create fork pipes failed", "error", err)
-		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
+		sess.encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
 		return
 	}
 	cmd.ExtraFiles = []*os.File{reqW, resR} // fd 3, fd 4 in child
@@ -363,9 +385,9 @@ func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener, ses
 		resR.Close()
 		slog.Warn("exec pty start failed", "args", req.Args, "error", err)
 		if len(req.Args) > 0 {
-			commandNotFound(enc, req.Args, err)
+			commandNotFound(sess.enc, req.Args, err)
 		}
-		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
+		sess.encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
 		return
 	}
 	defer ptmx.Close()
@@ -375,10 +397,10 @@ func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener, ses
 	resR.Close()
 
 	// Handle fork requests from the child in the background.
-	go handleForkPipe(reqR, resW)
+	go handleForkPipe(reqR, resW, sess)
 
 	// Report guest PID to host.
-	enc.Encode(protocol.Msg{ExecStarted: &protocol.ExecStarted{PID: cmd.Process.Pid}})
+	sess.encode(protocol.Msg{ExecStarted: &protocol.ExecStarted{PID: cmd.Process.Pid}})
 
 	if req.Rows > 0 && req.Cols > 0 {
 		unix.IoctlSetWinsize(int(ptmx.Fd()), unix.TIOCSWINSZ, &unix.Winsize{
@@ -397,7 +419,7 @@ func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener, ses
 		slog.Warn("exec interactive accept failed", "args", req.Args, "error", err)
 		cmd.Process.Kill()
 		cmd.Wait()
-		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
+		sess.encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
 		return
 	}
 	defer vsockConn.Close()
@@ -438,7 +460,7 @@ func runExecPTY(enc *gob.Encoder, req *protocol.ExecReq, ln *vsock.Listener, ses
 		}
 	}
 
-	enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: exitCode}})
+	sess.encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: exitCode}})
 }
 
 // commandNotFound writes "name: command not found" to the gob encoder
@@ -493,9 +515,9 @@ func lookupSupplementaryGroups(uid int) []uint32 {
 }
 
 // runExecPipe handles a non-interactive exec request with piped stdout/stderr.
-func runExecPipe(enc *gob.Encoder, req *protocol.ExecReq, sess *execSession) {
+func runExecPipe(req *protocol.ExecReq, sess *execSession) {
 	if len(req.Args) == 0 {
-		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
+		sess.encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
 		return
 	}
 
@@ -525,12 +547,12 @@ func runExecPipe(enc *gob.Encoder, req *protocol.ExecReq, sess *execSession) {
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
+		sess.encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
 		return
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
+		sess.encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
 		return
 	}
 
@@ -538,7 +560,7 @@ func runExecPipe(enc *gob.Encoder, req *protocol.ExecReq, sess *execSession) {
 	reqR, reqW, resR, resW, err := createForkPipes()
 	if err != nil {
 		slog.Warn("create fork pipes failed", "error", err)
-		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
+		sess.encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
 		return
 	}
 	cmd.ExtraFiles = []*os.File{reqW, resR} // fd 3, fd 4 in child
@@ -550,8 +572,8 @@ func runExecPipe(enc *gob.Encoder, req *protocol.ExecReq, sess *execSession) {
 		reqW.Close()
 		resR.Close()
 		resW.Close()
-		commandNotFound(enc, req.Args, err)
-		enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
+		commandNotFound(sess.enc, req.Args, err)
+		sess.encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: 127}})
 		return
 	}
 
@@ -560,10 +582,10 @@ func runExecPipe(enc *gob.Encoder, req *protocol.ExecReq, sess *execSession) {
 	resR.Close()
 
 	// Handle fork requests from the child in the background.
-	go handleForkPipe(reqR, resW)
+	go handleForkPipe(reqR, resW, sess)
 
 	// Report guest PID to host.
-	enc.Encode(protocol.Msg{ExecStarted: &protocol.ExecStarted{PID: cmd.Process.Pid}})
+	sess.encode(protocol.Msg{ExecStarted: &protocol.ExecStarted{PID: cmd.Process.Pid}})
 
 	sess.setProcess(cmd.Process)
 
@@ -582,7 +604,7 @@ func runExecPipe(enc *gob.Encoder, req *protocol.ExecReq, sess *execSession) {
 				} else {
 					out.Stdout = data
 				}
-				if encErr := enc.Encode(protocol.Msg{ExecOutput: out}); encErr != nil {
+				if encErr := sess.encode(protocol.Msg{ExecOutput: out}); encErr != nil {
 					return
 				}
 			}
@@ -606,5 +628,5 @@ func runExecPipe(enc *gob.Encoder, req *protocol.ExecReq, sess *execSession) {
 		}
 	}
 
-	enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: exitCode}})
+	sess.encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: exitCode}})
 }

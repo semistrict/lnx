@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -60,6 +62,10 @@ func execNonInteractive(args []string) (int, error) {
 		resp.Body.Close()
 	}()
 
+	// Track fork children so we can wait for all of them.
+	ft := &forkTracker{}
+	ctx := context.Background()
+
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
@@ -81,11 +87,23 @@ func execNonInteractive(args []string) (int, error) {
 			json.Unmarshal(raw, &s)
 			os.Stderr.WriteString(s)
 		}
+		if raw, ok := msg["fork"]; ok {
+			var forkInfo struct {
+				Instance string `json:"instance"`
+			}
+			json.Unmarshal(raw, &forkInfo)
+			ft.wg.Add(1)
+			go attachToForkChild(ctx, forkInfo.Instance, ft)
+		}
 		if raw, ok := msg["exit_code"]; ok {
 			json.Unmarshal(raw, &exitCode)
 			sawExitCode = true
 		}
 	}
+
+	// Wait for all fork children to finish.
+	ft.wg.Wait()
+
 	if err := scanner.Err(); err != nil {
 		return -1, fmt.Errorf("read exec stream: %w", err)
 	}
@@ -93,6 +111,40 @@ func execNonInteractive(args []string) (int, error) {
 		return -1, errExecTerminatedUnexpectedly
 	}
 	return exitCode, nil
+}
+
+// forkTracker manages child fork connections so the outermost CLI can
+// wait for all descendants and broadcast SIGWINCH to them.
+type forkTracker struct {
+	mu    sync.Mutex
+	wg    sync.WaitGroup
+	conns []*websocket.Conn // active child WebSocket connections
+}
+
+func (ft *forkTracker) add(ws *websocket.Conn) {
+	ft.mu.Lock()
+	ft.conns = append(ft.conns, ws)
+	ft.mu.Unlock()
+}
+
+func (ft *forkTracker) remove(ws *websocket.Conn) {
+	ft.mu.Lock()
+	for i, c := range ft.conns {
+		if c == ws {
+			ft.conns = append(ft.conns[:i], ft.conns[i+1:]...)
+			break
+		}
+	}
+	ft.mu.Unlock()
+}
+
+func (ft *forkTracker) broadcastResize(ctx context.Context, data []byte) {
+	ft.mu.Lock()
+	conns := append([]*websocket.Conn{}, ft.conns...)
+	ft.mu.Unlock()
+	for _, c := range conns {
+		c.Write(ctx, websocket.MessageText, data)
+	}
 }
 
 // execInteractive runs an interactive command via WebSocket.
@@ -142,6 +194,9 @@ func execInteractive(args []string) (int, error) {
 		return -1, fmt.Errorf("send exec request: %w", err)
 	}
 
+	// Track fork children so we can wait for all of them and broadcast resize.
+	ft := &forkTracker{}
+
 	// Forward host signals (SIGWINCH, SIGINT, SIGTERM, SIGHUP) to the guest
 	// via WebSocket text frames.
 	sigCh := make(chan os.Signal, 4)
@@ -157,6 +212,7 @@ func execInteractive(args []string) (int, error) {
 						"resize": map[string]uint16{"rows": uint16(h), "cols": uint16(w)},
 					})
 					ws.Write(ctx, websocket.MessageText, data)
+					ft.broadcastResize(ctx, data)
 				}
 			} else {
 				data, _ := json.Marshal(map[string]any{
@@ -196,7 +252,7 @@ func execInteractive(args []string) (int, error) {
 		}
 	}()
 
-	// Read WebSocket messages: binary = PTY output, text = exit_code.
+	// Read WebSocket messages: binary = PTY output, text = exit_code/fork.
 	exitCode := -1
 	sawExitCode := false
 	var last byte
@@ -220,6 +276,14 @@ func execInteractive(args []string) (int, error) {
 		case websocket.MessageText:
 			var msg map[string]json.RawMessage
 			if err := json.Unmarshal(data, &msg); err == nil {
+				if raw, ok := msg["fork"]; ok {
+					var forkInfo struct {
+						Instance string `json:"instance"`
+					}
+					json.Unmarshal(raw, &forkInfo)
+					ft.wg.Add(1)
+					go attachToForkChild(ctx, forkInfo.Instance, ft)
+				}
 				if raw, ok := msg["exit_code"]; ok {
 					json.Unmarshal(raw, &exitCode)
 					sawExitCode = true
@@ -227,6 +291,9 @@ func execInteractive(args []string) (int, error) {
 			}
 		}
 	}
+
+	// Wait for all fork children (recursively) to finish.
+	ft.wg.Wait()
 
 	// If double Ctrl-C was detected, always return 130.
 	select {
@@ -243,6 +310,89 @@ func execInteractive(args []string) (int, error) {
 		return -1, errExecTerminatedUnexpectedly
 	}
 	return exitCode, nil
+}
+
+// attachToForkChild connects to a forked child VM's fork session and
+// multiplexes its PTY output to stdout. Supports recursive forks.
+func attachToForkChild(ctx context.Context, instance string, ft *forkTracker) {
+	defer ft.wg.Done()
+
+	client := apiClientFor(instance)
+
+	// Wait for the child VM to be reachable, then connect to the fork
+	// session. Use a short timeout — if the fork attach server isn't
+	// there, CRIU restore likely failed and we shouldn't hang.
+	var cws *websocket.Conn
+	var err error
+	for i := 0; i < 50; i++ {
+		cws, _, err = websocket.Dial(ctx, "ws://localhost/fork/ws", &websocket.DialOptions{
+			HTTPClient: client,
+		})
+		if err == nil {
+			break
+		}
+		// Once the child's status socket is reachable but /fork/ws fails
+		// with a real HTTP error (not connection refused), the fork session
+		// doesn't exist — bail immediately.
+		if i > 10 && err != nil && !isNoVM(err) {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if cws == nil {
+		slog.Debug("fork attach failed", "instance", instance, "error", err)
+		return
+	}
+	slog.Debug("fork attach connected", "instance", instance)
+	defer cws.CloseNow()
+	cws.SetReadLimit(-1)
+
+	ft.add(cws)
+	defer ft.remove(cws)
+
+	// Send request with current terminal dimensions.
+	var rows, cols uint16
+	if w, h, err := term.GetSize(int(os.Stdin.Fd())); err == nil {
+		rows = uint16(h)
+		cols = uint16(w)
+	}
+	reqJSON, _ := json.Marshal(lnx.ExecRequest{
+		PTY:       true,
+		Rows:      rows,
+		Cols:      cols,
+		ClientPID: os.Getpid(),
+	})
+	if err := cws.Write(ctx, websocket.MessageText, reqJSON); err != nil {
+		slog.Debug("failed to send fork attach request", "instance", instance, "error", err)
+		return
+	}
+
+	// Read child output → stdout, handle recursive forks.
+	for {
+		typ, data, err := cws.Read(ctx)
+		if err != nil {
+			break
+		}
+		switch typ {
+		case websocket.MessageBinary:
+			os.Stdout.Write(data)
+		case websocket.MessageText:
+			var msg map[string]json.RawMessage
+			if err := json.Unmarshal(data, &msg); err == nil {
+				if raw, ok := msg["fork"]; ok {
+					var forkInfo struct {
+						Instance string `json:"instance"`
+					}
+					json.Unmarshal(raw, &forkInfo)
+					ft.wg.Add(1)
+					go attachToForkChild(ctx, forkInfo.Instance, ft)
+				}
+				if _, ok := msg["exit_code"]; ok {
+					return
+				}
+			}
+		}
+	}
 }
 
 // waitForVM polls status.sock until the daemon is ready, up to timeout.
