@@ -23,7 +23,7 @@ func TestCLI_SharedMemoryMountExists(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(base, "vmlinuz")); err != nil {
 		t.Skipf("skipping: vmlinuz not found in ~/.lnx (run 'lnx init' first)")
 	}
-	if _, err := os.Stat(filepath.Join(base, "instances", "default", "rootfs.ext4")); err != nil {
+	if findDefaultRootfs(base) == "" {
 		t.Skipf("skipping: default instance rootfs not found (run 'lnx init' first)")
 	}
 

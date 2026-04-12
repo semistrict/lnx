@@ -64,8 +64,9 @@ func resolveRootfs(instanceDir string) (rootfsPath, socketDir string) {
 		return dev, workDir
 	}
 
-	// Normal case: rootfs is a file in the instance directory.
-	return filepath.Join(instanceDir, "rootfs.ext4"), instanceDir
+	// Normal case: rootfs is in the images directory. The socket directory
+	// (for status.sock, error.log) stays in the instance directory.
+	return resolveRootfsPath(), instanceDir
 }
 
 const nestedDrivesPath = "/var/lib/lnx/nested-drives.json"
@@ -106,7 +107,7 @@ func scanNestedInstances() []lnx.NestedRootfs {
 		if !e.IsDir() || !strings.HasPrefix(e.Name(), prefix) {
 			continue
 		}
-		rootfs := filepath.Join(instancesDir, e.Name(), "rootfs.ext4")
+		rootfs := resolveRootfsPathFor(e.Name())
 		if _, err := os.Stat(rootfs); err != nil {
 			continue
 		}

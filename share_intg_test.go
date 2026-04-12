@@ -29,18 +29,22 @@ func TestPTY_ShareDir(t *testing.T) {
 	home, _ := os.UserHomeDir()
 	base := filepath.Join(home, ".lnx")
 	instName := "test-share"
+	imgDir := filepath.Join(base, "images", instName)
 	instDir := filepath.Join(base, "instances", instName)
-	defaultRootfs := filepath.Join(base, "instances", "default", "rootfs.ext4")
-
-	if _, err := os.Stat(defaultRootfs); err != nil {
+	defaultRootfs := findDefaultRootfs(base)
+	if defaultRootfs == "" {
 		t.Skipf("skipping: default instance rootfs not found")
 	}
 
+	os.MkdirAll(imgDir, 0755)
 	os.MkdirAll(instDir, 0755)
-	rootfs := filepath.Join(instDir, "rootfs.ext4")
+	rootfs := filepath.Join(imgDir, "rootfs.ext4")
 	os.Remove(rootfs)
 	require.NoError(t, unix.Clonefile(defaultRootfs, rootfs, 0))
-	t.Cleanup(func() { os.RemoveAll(instDir) })
+	t.Cleanup(func() {
+		os.RemoveAll(imgDir)
+		os.RemoveAll(instDir)
+	})
 
 	// Create a temp directory to share.
 	shareDir := t.TempDir()

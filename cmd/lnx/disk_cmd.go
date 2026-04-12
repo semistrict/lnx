@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -37,7 +36,7 @@ func init() {
 }
 
 func runDiskGrow(cmd *cobra.Command, args []string) error {
-	rootfs := filepath.Join(instanceDir(), "rootfs.ext4")
+	rootfs := resolveRootfsPath()
 
 	info, err := os.Stat(rootfs)
 	if err != nil {

@@ -159,21 +159,30 @@ func isSubcommandOrFlag(arg string) bool {
 }
 
 func runVM(args []string) (int, error) {
-	dir := instanceDir()
+	if err := checkLegacyLayout(); err != nil {
+		return -1, err
+	}
 
 	// Auto-init on first run if kernel or rootfs is missing.
+	// checkImagesVolume runs after auto-init (which creates the volume).
 	kernelPath := filepath.Join(lnxBase(), "vmlinuz")
-	rootfsPath := filepath.Join(dir, "rootfs.ext4")
+	rootfsPath := resolveRootfsPath()
 	if _, err := os.Stat(kernelPath); os.IsNotExist(err) {
 		fmt.Fprintln(os.Stderr, "first run — downloading kernel and rootfs...")
 		if err := autoInit(); err != nil {
 			return -1, fmt.Errorf("auto-init failed: %w", err)
 		}
+		rootfsPath = resolveRootfsPath()
 	} else if _, err := os.Stat(rootfsPath); os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "instance %q not initialized — downloading rootfs...\n", instanceName)
 		if err := autoInit(); err != nil {
 			return -1, fmt.Errorf("auto-init failed: %w", err)
 		}
+		rootfsPath = resolveRootfsPath()
+	}
+
+	if err := checkImagesVolume(); err != nil {
+		return -1, err
 	}
 
 	// Check if a VM is already running for this instance.
@@ -342,11 +351,66 @@ func lnxBase() string {
 	return filepath.Join(home, ".lnx")
 }
 
-// instanceDir returns the directory for the current instance (~/.lnx/instances/<name>).
-// When LNX_PARENT is set (nested VM), the instance name is prefixed:
-// e.g., LNX_PARENT=default + instanceName=default → "default.default".
+// instanceDir returns the directory for the current instance's runtime state
+// (~/.lnx/instances/<name>). Contains sockets, logs, and other ephemeral files.
 func instanceDir() string {
-	return filepath.Join(lnxBase(), "instances", qualifiedInstanceName())
+	return instanceDirFor(qualifiedInstanceName())
+}
+
+// instanceDirFor returns the runtime state directory for a named instance.
+func instanceDirFor(name string) string {
+	return filepath.Join(lnxBase(), "instances", name)
+}
+
+// imagesDir returns the directory for the current instance's disk images
+// (~/.lnx/images/<name>). Contains rootfs, checkpoints, swap, and other
+// large files. When an APFS volume is configured, ~/.lnx/images is a
+// symlink to the volume mount point.
+func imagesDir() string {
+	return imagesDirFor(qualifiedInstanceName())
+}
+
+// imagesDirFor returns the disk images directory for a named instance.
+func imagesDirFor(name string) string {
+	return filepath.Join(lnxBase(), "images", name)
+}
+
+// resolveRootfsPath returns the rootfs path in the images/ directory.
+func resolveRootfsPath() string {
+	return filepath.Join(imagesDir(), "rootfs.ext4")
+}
+
+// resolveRootfsPathFor returns the rootfs path for a named instance.
+func resolveRootfsPathFor(name string) string {
+	return filepath.Join(imagesDirFor(name), "rootfs.ext4")
+}
+
+// checkLegacyLayout returns an error if rootfs files are found in the old
+// instances/ directory layout instead of the new images/ layout.
+func checkLegacyLayout() error {
+	instancesDir := filepath.Join(lnxBase(), "instances")
+	entries, err := os.ReadDir(instancesDir)
+	if err != nil {
+		return nil // no instances dir at all — fine
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		legacy := filepath.Join(instancesDir, e.Name(), "rootfs.ext4")
+		if _, err := os.Stat(legacy); err == nil {
+			return fmt.Errorf("legacy layout detected: rootfs found at %s\n"+
+				"lnx now stores disk images under ~/.lnx/images/ (separate from runtime state in ~/.lnx/instances/).\n"+
+				"To migrate, move your rootfs and checkpoint files:\n"+
+				"  mkdir -p ~/.lnx/images/%s\n"+
+				"  mv %s ~/.lnx/images/%s/\n"+
+				"  mv %s/checkpoints ~/.lnx/images/%s/ 2>/dev/null\n"+
+				"Repeat for each instance, then re-run your command.",
+				legacy, e.Name(), legacy, e.Name(),
+				filepath.Join(instancesDir, e.Name()), e.Name())
+		}
+	}
+	return nil
 }
 
 // qualifiedInstanceName returns the instance name with parent prefix if nested.

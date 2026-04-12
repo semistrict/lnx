@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -156,7 +155,7 @@ func forceKillDaemon() error {
 }
 
 func readDaemonPID() int {
-	return readPIDFile(filepath.Join(instanceDir(), "rootfs.ext4.pid"))
+	return readPIDFile(resolveRootfsPath() + ".pid")
 }
 
 func readPIDFile(path string) int {

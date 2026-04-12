@@ -82,17 +82,22 @@ func TestPTY_DoubleCtrlC_CobraPath(t *testing.T) {
 	home, _ := os.UserHomeDir()
 	base := filepath.Join(home, ".lnx")
 	instDir := filepath.Join(base, "instances", "test-forceq-cobra")
-	defaultRootfs := filepath.Join(base, "instances", "default", "rootfs.ext4")
-
-	if _, err := os.Stat(defaultRootfs); err != nil {
+	defaultRootfs := findDefaultRootfs(base)
+	if defaultRootfs == "" {
 		t.Skipf("skipping: default instance rootfs not found (run 'lnx init' first)")
 	}
 
+	// Clone rootfs into the images directory for the test instance.
+	imgDir := filepath.Join(base, "images", "test-forceq-cobra")
+	os.MkdirAll(imgDir, 0755)
 	os.MkdirAll(instDir, 0755)
-	rootfs := filepath.Join(instDir, "rootfs.ext4")
+	rootfs := filepath.Join(imgDir, "rootfs.ext4")
 	os.Remove(rootfs)
 	require.NoError(t, unix.Clonefile(defaultRootfs, rootfs, 0))
-	t.Cleanup(func() { os.RemoveAll(instDir) })
+	t.Cleanup(func() {
+		os.RemoveAll(instDir)
+		os.RemoveAll(imgDir)
+	})
 
 	term := midterm.NewTerminal(24, 80)
 

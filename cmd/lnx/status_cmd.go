@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -44,21 +45,21 @@ func runStatusAll() error {
 	running := runningInstances()
 	if len(running) == 0 {
 		fmt.Println("no VM running")
-		return nil
+	} else {
+		for i, name := range running {
+			if i > 0 {
+				fmt.Println()
+			}
+			if len(running) > 1 {
+				fmt.Println(instanceHeader.Render(name))
+			}
+			if err := runStatusOne(name); err != nil {
+				fmt.Printf("  error: %v\n", err)
+			}
+		}
 	}
 
-	for i, name := range running {
-		if i > 0 {
-			fmt.Println()
-		}
-		if len(running) > 1 {
-			fmt.Println(instanceHeader.Render(name))
-		}
-		if err := runStatusOne(name); err != nil {
-			fmt.Printf("  error: %v\n", err)
-		}
-	}
-	return nil
+	return printHostDisk()
 }
 
 func runStatusOne(name string) error {
@@ -128,4 +129,28 @@ func printStatus(r *lnx.StatusResponse) {
 	if r.Dmesg != "" {
 		fmt.Printf("\n%s\n%s", dimStyle.Render("--- dmesg ---"), r.Dmesg)
 	}
+}
+
+// printHostDisk shows the total host-side disk usage of lnx images.
+// Fails hard if the APFS volume is not configured.
+func printHostDisk() error {
+	if err := checkImagesVolume(); err != nil {
+		return err
+	}
+
+	imagesPath := filepath.Join(lnxBase(), "images")
+	used, containerFree, onVolume := hostDiskUsage(imagesPath)
+	if !onVolume {
+		return fmt.Errorf("~/.lnx/images/ is not on a dedicated APFS volume — run 'lnx init'")
+	}
+
+	kv := func(label, value string) {
+		fmt.Printf("%s  %s\n", labelStyle.Width(10).Align(lipgloss.Right).Render(label), valueStyle.Render(value))
+	}
+
+	fmt.Println()
+	usedGB := float64(used) / 1024 / 1024 / 1024
+	freeGB := float64(containerFree) / 1024 / 1024 / 1024
+	kv("Host Disk", fmt.Sprintf("%.1f GB used (%.1f GB free)", usedGB, freeGB))
+	return nil
 }

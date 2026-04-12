@@ -38,7 +38,7 @@ func runCheckpointCreate(cmd *cobra.Command, args []string) error {
 		name = args[0]
 	}
 
-	cpPath, err := createInstanceCheckpoint(instanceDir(), qualifiedInstanceName(), name)
+	cpPath, err := createInstanceCheckpoint(filepath.Dir(resolveRootfsPath()), qualifiedInstanceName(), name)
 	if err != nil {
 		return err
 	}
@@ -48,7 +48,7 @@ func runCheckpointCreate(cmd *cobra.Command, args []string) error {
 }
 
 func runCheckpointList(cmd *cobra.Command, args []string) error {
-	dir := filepath.Join(instanceDir(), "checkpoints")
+	dir := filepath.Join(filepath.Dir(resolveRootfsPath()), "checkpoints")
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {

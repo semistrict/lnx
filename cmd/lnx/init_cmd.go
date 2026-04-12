@@ -46,13 +46,22 @@ func runInit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("create ~/.lnx: %w", err)
 	}
 
+	if err := ensureImagesDir(base); err != nil {
+		return err
+	}
+
+	imgDir := imagesDir()
+	if err := os.MkdirAll(imgDir, 0755); err != nil {
+		return fmt.Errorf("create images dir: %w", err)
+	}
+
 	dir := instanceDir()
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("create instance dir: %w", err)
 	}
 
 	kernelDest := filepath.Join(base, "vmlinuz")
-	rootfsDest := filepath.Join(dir, "rootfs.ext4")
+	rootfsDest := filepath.Join(imgDir, "rootfs.ext4")
 
 	// Kernel.
 	if kernelFile != "" {
@@ -104,6 +113,13 @@ func autoInit() error {
 	base := lnxBase()
 	os.MkdirAll(base, 0755)
 
+	if err := ensureImagesDir(base); err != nil {
+		return err
+	}
+
+	imgDir := imagesDir()
+	os.MkdirAll(imgDir, 0755)
+
 	dir := instanceDir()
 	os.MkdirAll(dir, 0755)
 
@@ -112,7 +128,7 @@ func autoInit() error {
 		return fmt.Errorf("download kernel: %w", err)
 	}
 
-	rootfsDest := filepath.Join(dir, "rootfs.ext4")
+	rootfsDest := filepath.Join(imgDir, "rootfs.ext4")
 	if _, err := os.Stat(rootfsDest); os.IsNotExist(err) {
 		// Try to clone from an existing default rootfs first (fast, works nested).
 		if src := findDefaultRootfs(); src != "" {
@@ -175,6 +191,14 @@ func downloadRelease(dest, asset string) error {
 		}
 		progress.finish()
 		f.Close()
+
+		// Punch holes for zero-filled blocks to make the file sparse.
+		// A 4 GB rootfs with ~1 GB of data shrinks to ~1 GB on disk.
+		if err := punchHoles(tmp, 64*1024); err != nil {
+			os.Remove(tmp)
+			return fmt.Errorf("punch holes: %w", err)
+		}
+
 		return os.Rename(tmp, dest)
 	}
 

@@ -26,9 +26,13 @@ func setupTestDir(t *testing.T) string {
 		t.Skipf("skipping: vmlinuz not found in ~/.lnx (run 'lnx init' first)")
 	}
 
-	rootfsPath := filepath.Join(base, "instances", "default", "rootfs.ext4")
+	// Check new images/ layout first, then legacy instances/ layout.
+	rootfsPath := filepath.Join(base, "images", "default", "rootfs.ext4")
 	if _, err := os.Stat(rootfsPath); err != nil {
-		t.Skipf("skipping: rootfs.ext4 not found in ~/.lnx/instances/default/ (run 'lnx init' first)")
+		rootfsPath = filepath.Join(base, "instances", "default", "rootfs.ext4")
+		if _, err := os.Stat(rootfsPath); err != nil {
+			t.Skipf("skipping: rootfs.ext4 not found in ~/.lnx/images/default/ or ~/.lnx/instances/default/ (run 'lnx init' first)")
+		}
 	}
 
 	initPath := filepath.Join("cmd", "lnx", "init")
@@ -51,6 +55,18 @@ func setupTestDir(t *testing.T) string {
 	require.NoError(t, err)
 
 	return dir
+}
+
+// findDefaultRootfs returns the path to the default rootfs, checking the new
+// images/ layout first, then the legacy instances/ layout.
+func findDefaultRootfs(base string) string {
+	for _, sub := range []string{"images", "instances"} {
+		p := filepath.Join(base, sub, "default", "rootfs.ext4")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
 }
 
 func testConfig(dir string) *lnx.Config {

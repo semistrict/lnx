@@ -232,18 +232,22 @@ func createClonedInstance(t *testing.T, name string) {
 
 	home, _ := os.UserHomeDir()
 	base := filepath.Join(home, ".lnx")
+	imgDir := filepath.Join(base, "images", name)
 	instDir := filepath.Join(base, "instances", name)
-	defaultRootfs := filepath.Join(base, "instances", "default", "rootfs.ext4")
-
-	if _, err := os.Stat(defaultRootfs); err != nil {
+	defaultRootfs := findDefaultRootfs(base)
+	if defaultRootfs == "" {
 		t.Skipf("skipping: default instance rootfs not found (run 'lnx init' first)")
 	}
 
+	require.NoError(t, os.MkdirAll(imgDir, 0755))
 	require.NoError(t, os.MkdirAll(instDir, 0755))
-	rootfs := filepath.Join(instDir, "rootfs.ext4")
+	rootfs := filepath.Join(imgDir, "rootfs.ext4")
 	_ = os.Remove(rootfs)
 	require.NoError(t, unix.Clonefile(defaultRootfs, rootfs, 0))
-	t.Cleanup(func() { _ = os.RemoveAll(instDir) })
+	t.Cleanup(func() {
+		_ = os.RemoveAll(imgDir)
+		_ = os.RemoveAll(instDir)
+	})
 }
 
 func registerInstanceStopCleanup(t *testing.T, bin string, names ...string) {

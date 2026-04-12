@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -22,14 +23,12 @@ import (
 // Tries the un-prefixed "default" first (host's rootfs, always available
 // via the ~/.lnx share), then the qualified name for this nesting level.
 func findDefaultRootfs() string {
-	candidates := []string{
-		filepath.Join(lnxBase(), "instances", "default", "rootfs.ext4"),
+	names := []string{"default"}
+	if qualified := qualifyName("default"); qualified != "default" {
+		names = append(names, qualified)
 	}
-	qualified := qualifyName("default")
-	if qualified != "default" {
-		candidates = append(candidates, filepath.Join(lnxBase(), "instances", qualified, "rootfs.ext4"))
-	}
-	for _, p := range candidates {
+	for _, name := range names {
+		p := filepath.Join(imagesDirFor(name), "rootfs.ext4")
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
@@ -100,27 +99,32 @@ func init() {
 }
 
 func runInstanceList(cmd *cobra.Command, args []string) error {
-	instancesDir := filepath.Join(lnxBase(), "instances")
-	entries, err := os.ReadDir(instancesDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			fmt.Println("no instances")
-			return nil
+	base := lnxBase()
+	seen := make(map[string]bool)
+
+	// Collect instance names from both images/ (new layout) and instances/ (legacy).
+	for _, subdir := range []string{"images", "instances"} {
+		dir := filepath.Join(base, subdir)
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
 		}
-		return err
+		for _, e := range entries {
+			if !e.IsDir() || seen[e.Name()] {
+				continue
+			}
+			// Check for rootfs in the appropriate location.
+			if _, err := os.Stat(resolveRootfsPathFor(e.Name())); err == nil {
+				seen[e.Name()] = true
+			}
+		}
 	}
 
 	var instances []string
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		// Only list directories that contain a rootfs.
-		if _, err := os.Stat(filepath.Join(instancesDir, e.Name(), "rootfs.ext4")); err != nil {
-			continue
-		}
-		instances = append(instances, e.Name())
+	for name := range seen {
+		instances = append(instances, name)
 	}
+	sort.Strings(instances)
 
 	if len(instances) == 0 {
 		fmt.Println("no instances")
@@ -130,7 +134,7 @@ func runInstanceList(cmd *cobra.Command, args []string) error {
 	t := newTable("NAME", "STATUS")
 	for _, name := range instances {
 		status := dimStyle.Render("stopped")
-		sockPath := filepath.Join(instancesDir, name, "status.sock")
+		sockPath := filepath.Join(instanceDirFor(name), "status.sock")
 		conn, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
 		if err == nil {
 			conn.Close()
@@ -148,34 +152,46 @@ func runInstanceClone(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cannot clone into instance named 'default' (use 'lnx init' instead)")
 	}
 
-	dir := filepath.Join(lnxBase(), "instances", name)
-	if _, err := os.Stat(dir); err == nil {
+	// Check if instance already exists (images or instances dir).
+	imgDir := imagesDirFor(name)
+	instDir := instanceDirFor(name)
+	if _, err := os.Stat(imgDir); err == nil {
+		return fmt.Errorf("instance %q already exists", name)
+	}
+	if _, err := os.Stat(instDir); err == nil {
 		return fmt.Errorf("instance %q already exists", name)
 	}
 
 	sourceName := qualifiedInstanceName()
 	checkpointName := cloneCheckpoint
-	sourceDir, sourceResolvedName, err := resolveCloneSourceDir(sourceName)
+	sourceImgDir, sourceInstDir, sourceResolvedName, err := resolveCloneSourceDirs(sourceName)
 	if err != nil {
 		return err
 	}
 
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(imgDir, 0755); err != nil {
+		return fmt.Errorf("create images dir: %w", err)
+	}
+	if err := os.MkdirAll(instDir, 0755); err != nil {
+		_ = os.RemoveAll(imgDir)
 		return fmt.Errorf("create instance dir: %w", err)
 	}
 
-	checkpointPath, err := checkpointPathForClone(sourceDir, sourceResolvedName, checkpointName)
+	checkpointPath, err := checkpointPathForClone(sourceImgDir, sourceResolvedName, checkpointName)
 	if err != nil {
-		_ = os.RemoveAll(dir)
+		_ = os.RemoveAll(imgDir)
+		_ = os.RemoveAll(instDir)
 		return err
 	}
 
-	if err := cloneRootfs(checkpointPath, filepath.Join(dir, "rootfs.ext4")); err != nil {
-		_ = os.RemoveAll(dir)
+	if err := cloneRootfs(checkpointPath, filepath.Join(imgDir, "rootfs.ext4")); err != nil {
+		_ = os.RemoveAll(imgDir)
+		_ = os.RemoveAll(instDir)
 		return fmt.Errorf("clone rootfs: %w", err)
 	}
-	if err := cloneInstanceMetadata(sourceDir, dir); err != nil {
-		_ = os.RemoveAll(dir)
+	if err := cloneInstanceMetadata(sourceInstDir, instDir); err != nil {
+		_ = os.RemoveAll(imgDir)
+		_ = os.RemoveAll(instDir)
 		return fmt.Errorf("clone metadata: %w", err)
 	}
 
@@ -189,14 +205,18 @@ func runInstanceClone(cmd *cobra.Command, args []string) error {
 
 func runInstanceInit(cmd *cobra.Command, args []string) error {
 	name := qualifyName(args[0])
-	dir := filepath.Join(lnxBase(), "instances", name)
+	imgDir := imagesDirFor(name)
 
-	if _, err := os.Stat(filepath.Join(dir, "rootfs.ext4")); err == nil {
+	if _, err := os.Stat(filepath.Join(imgDir, "rootfs.ext4")); err == nil {
+		return fmt.Errorf("instance %q already exists", name)
+	}
+	// Also check legacy location.
+	if _, err := os.Stat(filepath.Join(instanceDirFor(name), "rootfs.ext4")); err == nil {
 		return fmt.Errorf("instance %q already exists", name)
 	}
 
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("create instance dir: %w", err)
+	if err := os.MkdirAll(imgDir, 0755); err != nil {
+		return fmt.Errorf("create images dir: %w", err)
 	}
 
 	// Copy kernel to shared location if provided.
@@ -210,7 +230,7 @@ func runInstanceInit(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  kernel: %s\n", kernelDest)
 	}
 
-	rootfsDest := filepath.Join(dir, "rootfs.ext4")
+	rootfsDest := filepath.Join(imgDir, "rootfs.ext4")
 
 	if instInitRootfs != "" {
 		// Copy from provided rootfs file.
@@ -221,11 +241,11 @@ func runInstanceInit(cmd *cobra.Command, args []string) error {
 		// Clone from default instance if it exists.
 		defaultRootfs := findDefaultRootfs()
 		if defaultRootfs == "" {
-			os.RemoveAll(dir)
+			os.RemoveAll(imgDir)
 			return fmt.Errorf("no --rootfs specified and no default rootfs found — run 'lnx init' first")
 		}
 		if err := cloneRootfs(defaultRootfs, rootfsDest); err != nil {
-			os.RemoveAll(dir)
+			os.RemoveAll(imgDir)
 			return fmt.Errorf("clone rootfs from default: %w", err)
 		}
 	}
@@ -241,13 +261,24 @@ func runInstanceDelete(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cannot delete the default instance")
 	}
 
-	dir := filepath.Join(lnxBase(), "instances", name)
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
+	imgDir := imagesDirFor(name)
+	instDir := instanceDirFor(name)
+
+	// Check that the instance exists (in either location).
+	imgExists := false
+	instExists := false
+	if _, err := os.Stat(imgDir); err == nil {
+		imgExists = true
+	}
+	if _, err := os.Stat(instDir); err == nil {
+		instExists = true
+	}
+	if !imgExists && !instExists {
 		return fmt.Errorf("instance %q does not exist", name)
 	}
 
 	// Refuse if the VM is running.
-	sockPath := filepath.Join(dir, "status.sock")
+	sockPath := filepath.Join(instDir, "status.sock")
 	conn, err := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
 	if err == nil {
 		conn.Close()
@@ -255,7 +286,8 @@ func runInstanceDelete(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check for rootfs lock.
-	lockPath := filepath.Join(dir, "rootfs.ext4.lock")
+	rootfs := resolveRootfsPathFor(name)
+	lockPath := rootfs + ".lock"
 	if f, err := os.OpenFile(lockPath, os.O_RDWR, 0); err == nil {
 		defer f.Close()
 		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
@@ -264,15 +296,24 @@ func runInstanceDelete(cmd *cobra.Command, args []string) error {
 		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 	}
 
-	if err := os.RemoveAll(dir); err != nil {
-		return fmt.Errorf("delete instance: %w", err)
+	if imgExists {
+		if err := os.RemoveAll(imgDir); err != nil {
+			return fmt.Errorf("delete instance images: %w", err)
+		}
+	}
+	if instExists {
+		if err := os.RemoveAll(instDir); err != nil {
+			return fmt.Errorf("delete instance: %w", err)
+		}
 	}
 
 	fmt.Printf("deleted instance %q\n", name)
 	return nil
 }
 
-func resolveCloneSourceDir(source string) (string, string, error) {
+// resolveCloneSourceDirs returns the images dir, instances dir, and resolved name
+// for the clone source instance.
+func resolveCloneSourceDirs(source string) (imgDir, instDir, resolvedName string, err error) {
 	var candidates []string
 	if source == "default" {
 		candidates = append(candidates, "default")
@@ -284,15 +325,15 @@ func resolveCloneSourceDir(source string) (string, string, error) {
 	}
 
 	for _, name := range candidates {
-		dir := filepath.Join(lnxBase(), "instances", name)
-		if _, err := os.Stat(filepath.Join(dir, "rootfs.ext4")); err == nil {
-			return dir, name, nil
+		rootfs := resolveRootfsPathFor(name)
+		if _, err := os.Stat(rootfs); err == nil {
+			return filepath.Dir(rootfs), instanceDirFor(name), name, nil
 		}
 	}
 	if source == "default" {
-		return "", "", fmt.Errorf("no default rootfs found — run 'lnx init' first")
+		return "", "", "", fmt.Errorf("no default rootfs found — run 'lnx init' first")
 	}
-	return "", "", fmt.Errorf("instance %q does not exist", qualifyName(source))
+	return "", "", "", fmt.Errorf("instance %q does not exist", qualifyName(source))
 }
 
 func checkpointPathForClone(sourceDir, sourceName, checkpointName string) (string, error) {
@@ -317,19 +358,19 @@ func resolveNamedCheckpoint(sourceDir, checkpointName string) (string, error) {
 	return "", fmt.Errorf("checkpoint %q not found", checkpointName)
 }
 
-func createInstanceCheckpoint(sourceDir, sourceName, checkpointName string) (string, error) {
+func createInstanceCheckpoint(sourceImgDir, sourceName, checkpointName string) (string, error) {
 	if isInstanceRunning(sourceName) {
 		return createCheckpointViaAPI(sourceName, checkpointName)
 	}
 
-	rootfsPath := filepath.Join(sourceDir, "rootfs.ext4")
+	rootfsPath := filepath.Join(sourceImgDir, "rootfs.ext4")
 	lock, err := lnx.LockRootfs(rootfsPath)
 	if err != nil {
 		return "", fmt.Errorf("lock rootfs: %w", err)
 	}
 	defer lock.Unlock()
 
-	return lnx.CreateCheckpoint(rootfsPath, filepath.Join(sourceDir, "checkpoints"), checkpointName)
+	return lnx.CreateCheckpoint(rootfsPath, filepath.Join(sourceImgDir, "checkpoints"), checkpointName)
 }
 
 func createCheckpointViaAPI(instanceName, checkpointName string) (string, error) {

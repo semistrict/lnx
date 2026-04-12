@@ -27,7 +27,7 @@ func TestCLI_MissingCommand(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(base, "vmlinuz")); err != nil {
 		t.Skipf("skipping: vmlinuz not found in ~/.lnx (run 'lnx init' first)")
 	}
-	if _, err := os.Stat(filepath.Join(base, "instances", "default", "rootfs.ext4")); err != nil {
+	if findDefaultRootfs(base) == "" {
 		t.Skipf("skipping: default instance rootfs not found (run 'lnx init' first)")
 	}
 
@@ -165,7 +165,7 @@ func TestCLI_CheckpointsCreateStoppedAndRunning(t *testing.T) {
 	createClonedInstance(t, stoppedInst)
 	stoppedOut := runCLISuccess(t, bin, "--instance", stoppedInst, "checkpoints", "create", "stopped")
 	assert.Contains(t, stoppedOut, `created checkpoint "stopped.ext4"`)
-	_, err = os.Stat(filepath.Join(base, "instances", stoppedInst, "checkpoints", "stopped.ext4"))
+	_, err = os.Stat(filepath.Join(base, "images", stoppedInst, "checkpoints", "stopped.ext4"))
 	require.NoError(t, err)
 
 	runningInst := "test-checkpoint-running"
@@ -177,7 +177,7 @@ func TestCLI_CheckpointsCreateStoppedAndRunning(t *testing.T) {
 
 	runningOut := runCLISuccess(t, bin, "--instance", runningInst, "checkpoints", "create", "running")
 	assert.Contains(t, runningOut, `created checkpoint "running.ext4"`)
-	_, err = os.Stat(filepath.Join(base, "instances", runningInst, "checkpoints", "running.ext4"))
+	_, err = os.Stat(filepath.Join(base, "images", runningInst, "checkpoints", "running.ext4"))
 	require.NoError(t, err)
 
 	waitForProcessSuccess(t, done, 12*time.Second, stderr.String())
@@ -197,7 +197,10 @@ func TestCLI_InstanceCreateFromNamedCheckpointCopiesMetadata(t *testing.T) {
 	dstInst := "test-clone-from-checkpoint-dst"
 	createClonedInstance(t, srcInst)
 	registerInstanceStopCleanup(t, bin, srcInst, dstInst)
-	t.Cleanup(func() { _ = os.RemoveAll(filepath.Join(base, "instances", dstInst)) })
+	t.Cleanup(func() {
+		_ = os.RemoveAll(filepath.Join(base, "instances", dstInst))
+		_ = os.RemoveAll(filepath.Join(base, "images", dstInst))
+	})
 
 	shareDir := t.TempDir()
 	runCLISuccess(t, bin, "--instance", srcInst, "share", "add", shareDir)
@@ -218,7 +221,8 @@ func TestCLI_InstanceCreateFromNamedCheckpointCopiesMetadata(t *testing.T) {
 	shareOut := runCLISuccess(t, bin, "--instance", dstInst, "share", "list")
 	assert.Contains(t, shareOut, shareDir)
 
-	_, err = os.Stat(filepath.Join(base, "instances", dstInst, "checkpoints", "base.ext4"))
+	// Checkpoint should not be copied to destination instance images dir.
+	_, err = os.Stat(filepath.Join(base, "images", dstInst, "checkpoints", "base.ext4"))
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
@@ -236,7 +240,10 @@ func TestCLI_InstanceCreateFromRunningSourceAutoCheckpoint(t *testing.T) {
 	dstInst := "test-clone-running-dst"
 	createClonedInstance(t, srcInst)
 	registerInstanceStopCleanup(t, bin, srcInst, dstInst)
-	t.Cleanup(func() { _ = os.RemoveAll(filepath.Join(base, "instances", dstInst)) })
+	t.Cleanup(func() {
+		_ = os.RemoveAll(filepath.Join(base, "instances", dstInst))
+		_ = os.RemoveAll(filepath.Join(base, "images", dstInst))
+	})
 
 	shareDir := t.TempDir()
 	runCLISuccess(t, bin, "--instance", srcInst, "share", "add", shareDir)
@@ -255,11 +262,11 @@ func TestCLI_InstanceCreateFromRunningSourceAutoCheckpoint(t *testing.T) {
 	shareOut := runCLISuccess(t, bin, "--instance", dstInst, "share", "list")
 	assert.Contains(t, shareOut, shareDir)
 
-	checkpoints, err := filepath.Glob(filepath.Join(base, "instances", srcInst, "checkpoints", "*.ext4"))
+	checkpoints, err := filepath.Glob(filepath.Join(base, "images", srcInst, "checkpoints", "*.ext4"))
 	require.NoError(t, err)
 	assert.NotEmpty(t, checkpoints)
 
-	_, err = os.Stat(filepath.Join(base, "instances", dstInst, "checkpoints"))
+	_, err = os.Stat(filepath.Join(base, "images", dstInst, "checkpoints"))
 	require.ErrorIs(t, err, os.ErrNotExist)
 
 	waitForProcessSuccess(t, done, 12*time.Second, stderr.String())
