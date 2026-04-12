@@ -8,11 +8,44 @@ Lightweight Linux VM runner for macOS using Apple's Virtualization.framework. Bo
 brew install semistrict/tap/lnx --HEAD
 ```
 
-Then download or build a kernel and rootfs:
+Or build from source:
 
 ```
-make kernel rootfs
-lnx init --kernel vmlinuz --rootfs rootfs.ext4
+make install
+```
+
+Then initialize (downloads kernel, rootfs, and creates a dedicated APFS volume):
+
+```
+lnx init
+```
+
+### Shell completion
+
+Zsh (add to `~/.zshrc`):
+
+```zsh
+eval "$(lnx completion zsh)"
+```
+
+Or generate a static file (faster shell startup):
+
+```zsh
+mkdir -p ~/.zsh/completions
+lnx completion zsh > ~/.zsh/completions/_lnx
+# Add to .zshrc before compinit: fpath=(~/.zsh/completions $fpath)
+```
+
+Bash (add to `~/.bashrc`):
+
+```bash
+eval "$(lnx completion bash)"
+```
+
+Fish:
+
+```fish
+lnx completion fish | source
 ```
 
 ## Usage
@@ -27,7 +60,7 @@ lnx --instance dev bash -l       # named instance
 
 ## Instances
 
-Each instance gets its own rootfs, sockets, logs, and checkpoints under `~/.lnx/instances/<name>/`.
+Each instance gets its own rootfs and checkpoints under `~/.lnx/images/<name>/`, with runtime state (sockets, logs) in `~/.lnx/instances/<name>/`.
 
 ```
 lnx clone dev                     # clone from the default instance

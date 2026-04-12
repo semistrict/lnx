@@ -74,10 +74,11 @@ Otherwise, if the default instance exists, clones its rootfs via APFS clonefile.
 }
 
 var instanceDeleteCmd = &cobra.Command{
-	Use:   "delete <name>",
-	Short: "Delete an instance",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runInstanceDelete,
+	Use:               "delete <name>",
+	Short:             "Delete an instance",
+	Args:              cobra.ExactArgs(1),
+	RunE:              runInstanceDelete,
+	ValidArgsFunction: completeInstanceNames,
 }
 
 var (
@@ -467,4 +468,30 @@ func shouldSkipClonedMetadata(rel string, d fs.DirEntry) bool {
 		return true
 	}
 	return strings.HasPrefix(base, "vsock_")
+}
+
+// completeInstanceNames provides shell completion for instance names.
+func completeInstanceNames(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	if len(args) > 0 {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	base := lnxBase()
+	seen := make(map[string]bool)
+	for _, subdir := range []string{"images", "instances"} {
+		entries, err := os.ReadDir(filepath.Join(base, subdir))
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				seen[e.Name()] = true
+			}
+		}
+	}
+	var names []string
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, cobra.ShellCompDirectiveNoFileComp
 }

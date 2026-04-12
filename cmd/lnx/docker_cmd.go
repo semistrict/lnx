@@ -15,10 +15,11 @@ var dockerCmd = &cobra.Command{
 }
 
 var dockerRunCmd = &cobra.Command{
-	Use:   "run IMAGE[:TAG]",
-	Short: "Pull and run an OCI container image",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runDockerRun,
+	Use:                "run IMAGE[:TAG] [COMMAND [ARGS...]]",
+	Short:              "Pull and run an OCI container image",
+	Args:               cobra.MinimumNArgs(1),
+	RunE:               runDockerRun,
+	DisableFlagParsing: true,
 }
 
 func init() {
@@ -40,10 +41,26 @@ func ociLayerDir() string {
 }
 
 func runDockerRun(cmd *cobra.Command, args []string) error {
+	// DisableFlagParsing means all args are raw. Skip docker-style flags
+	// before the image name (-i, -t, -it, --interactive, --tty).
+	for len(args) > 0 {
+		a := args[0]
+		if a == "-i" || a == "-t" || a == "-it" || a == "-ti" ||
+			a == "--interactive" || a == "--tty" {
+			args = args[1:]
+			continue
+		}
+		break
+	}
+	if len(args) == 0 {
+		return fmt.Errorf("requires image name")
+	}
+
 	imageRef := args[0]
 	if !strings.Contains(imageRef, ":") {
 		imageRef += ":latest"
 	}
+	cmdArgs := args[1:] // optional command override
 
 	// Ensure storage directories exist.
 	for _, d := range []string{ociBlobDir(), ociLayerDir()} {
@@ -77,7 +94,10 @@ func runDockerRun(cmd *cobra.Command, args []string) error {
 	instanceName = inst
 	instanceFlag = true
 
-	runArgs := img.defaultCmd()
+	runArgs := cmdArgs
+	if len(runArgs) == 0 {
+		runArgs = img.defaultCmd()
+	}
 	if len(runArgs) == 0 {
 		runArgs = []string{"/bin/sh"}
 	}
