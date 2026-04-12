@@ -477,6 +477,7 @@ func (s *apiServer) listenUnix(sockPath string) error {
 	mux.HandleFunc("GET /sessions", s.handleSessions)
 	mux.HandleFunc("POST /sessions/kill", s.handleSessionKill)
 	mux.HandleFunc("POST /stop", s.handleStop)
+	mux.HandleFunc("GET /ssh", s.handleSSHProxy)
 	mux.HandleFunc("/guest/debug/pprof/", s.handleGuestPprofProxy)
 	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
 	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
@@ -1385,6 +1386,53 @@ func (s *apiServer) handleStop(w http.ResponseWriter, r *http.Request) {
 	s.requestStop("stop requested by client")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, "stopping")
+}
+
+// handleSSHProxy hijacks the HTTP connection and splices it with a vsock
+// connection to the guest's embedded SSH server. This gives the CLI a raw
+// byte stream suitable for SSH's ProxyCommand.
+func (s *apiServer) handleSSHProxy(w http.ResponseWriter, r *http.Request) {
+	if s.sock == nil {
+		http.Error(w, "vsock unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	vsockConn, err := s.sock.Connect(protocol.SSHPort)
+	if err != nil {
+		http.Error(w, "guest ssh connect failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		vsockConn.Close()
+		http.Error(w, "hijack not supported", http.StatusInternalServerError)
+		return
+	}
+	conn, bufrw, err := hj.Hijack()
+	if err != nil {
+		vsockConn.Close()
+		http.Error(w, "hijack failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	bufrw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+	bufrw.Flush()
+
+	// Drain any buffered data from the hijacked reader before splicing.
+	if bufrw.Reader.Buffered() > 0 {
+		io.CopyN(vsockConn, bufrw.Reader, int64(bufrw.Reader.Buffered()))
+	}
+
+	done := make(chan struct{})
+	go func() {
+		io.Copy(vsockConn, conn)
+		vsockConn.Close()
+		close(done)
+	}()
+	io.Copy(conn, vsockConn)
+	conn.Close()
+	<-done
 }
 
 // runExec runs a command on the guest. Creates a new vsock exec connection

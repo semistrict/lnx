@@ -187,6 +187,7 @@ func run() error {
 	startEnabledServices()
 	startStatusServer()
 	startExecServer()
+	startSSHServer()
 	startGuestControlServer()
 	startPortForwarder()
 

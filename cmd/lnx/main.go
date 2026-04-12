@@ -51,6 +51,9 @@ func init() {
 		instanceName = env
 	}
 	rootCmd.PersistentFlags().StringVar(&instanceName, "instance", instanceName, "VM instance name (default: \"default\")")
+	_ = rootCmd.RegisterFlagCompletionFunc("instance", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return completeInstanceNames(cmd, nil, toComplete)
+	})
 	rootCmd.Flags().BoolVarP(&doCheckpoint, "checkpoint", "c", false, "snapshot rootfs before starting the VM")
 	rootCmd.Flags().BoolVar(&doEphemeral, "ephemeral", false, "clone rootfs to a temp file; discard on exit")
 	rootCmd.Flags().BoolVar(&doSSHAgent, "ssh-agent", false, "forward host SSH agent into the guest")
@@ -150,6 +153,11 @@ func isSubcommandOrFlag(arg string) bool {
 	if strings.HasPrefix(arg, "-") {
 		return true
 	}
+	// Cobra registers these hidden commands lazily during Execute(),
+	// so they're not in rootCmd.Commands() yet at this point.
+	if arg == "__complete" || arg == "__completeNoDesc" {
+		return true
+	}
 	for _, cmd := range rootCmd.Commands() {
 		if cmd.Name() == arg {
 			return true
@@ -158,9 +166,11 @@ func isSubcommandOrFlag(arg string) bool {
 	return false
 }
 
-func runVM(args []string) (int, error) {
+// ensureVMRunning checks for a running VM daemon and starts one if needed.
+// Handles auto-init of kernel/rootfs on first run.
+func ensureVMRunning() error {
 	if err := checkLegacyLayout(); err != nil {
-		return -1, err
+		return err
 	}
 
 	// Auto-init on first run if kernel or rootfs is missing.
@@ -170,30 +180,36 @@ func runVM(args []string) (int, error) {
 	if _, err := os.Stat(kernelPath); os.IsNotExist(err) {
 		fmt.Fprintln(os.Stderr, "first run — downloading kernel and rootfs...")
 		if err := autoInit(); err != nil {
-			return -1, fmt.Errorf("auto-init failed: %w", err)
+			return fmt.Errorf("auto-init failed: %w", err)
 		}
-		rootfsPath = resolveRootfsPath()
 	} else if _, err := os.Stat(rootfsPath); os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "instance %q not initialized — downloading rootfs...\n", instanceName)
 		if err := autoInit(); err != nil {
-			return -1, fmt.Errorf("auto-init failed: %w", err)
+			return fmt.Errorf("auto-init failed: %w", err)
 		}
-		rootfsPath = resolveRootfsPath()
 	}
 
 	if err := checkImagesVolume(); err != nil {
-		return -1, err
+		return err
 	}
 
 	// Check if a VM is already running for this instance.
 	if !vmIsRunning() {
 		// Spawn daemon in background.
 		if err := spawnDaemon(); err != nil {
-			return -1, err
+			return err
 		}
 		if err := waitForVM(60 * time.Second); err != nil {
-			return -1, err
+			return err
 		}
+	}
+
+	return nil
+}
+
+func runVM(args []string) (int, error) {
+	if err := ensureVMRunning(); err != nil {
+		return -1, err
 	}
 
 	// Exec into the running VM.

@@ -1,5 +1,28 @@
 # Release Notes
 
+## SSH access to lnx VMs
+
+`ssh <instance>.lnx` now works out of the box. An embedded SSH server runs inside the guest init (PID 1) over vsock — no sshd installation required.
+
+### How it works
+
+On `lnx init`, a `Host *.lnx` block is added to `~/.ssh/config` with a `ProxyCommand` that routes through `lnx _ssh-proxy`. When you run `ssh foo.lnx`:
+
+1. The proxy command auto-starts the VM if it isn't running
+2. The host daemon opens a vsock connection to the guest's embedded SSH server (port 1040)
+3. SSH protocol flows end-to-end over vsock — key exchange, auth, channels, PTY all work normally
+
+Commands run as the same user, in the same CWD, with the same environment as `lnx exec`. PTY, window resize, scp, and sftp all work.
+
+### SSH config (installed automatically by `lnx init`)
+
+```
+Host *.lnx
+  ProxyCommand lnx _ssh-proxy %h %p
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+```
+
 ## CRIU Checkpoints and VM Fork
 
 This release adds process-level checkpoint/restore using CRIU (Checkpoint/Restore In Userspace), enabling fast snapshotting and forking of running VMs.

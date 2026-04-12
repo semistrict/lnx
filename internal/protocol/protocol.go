@@ -43,6 +43,11 @@ const (
 	// ForkAttachDataPort is the vsock port for the fork session's raw PTY data.
 	// The guest listens; the host connects once after a fork restore.
 	ForkAttachDataPort = 1039
+
+	// SSHPort is the vsock port for the embedded SSH server in the guest.
+	// The guest listens; the host connects via VirtioSocketDevice.Connect
+	// to proxy SSH connections from the CLI.
+	SSHPort = 1040
 )
 
 // Msg is the envelope for all control messages.

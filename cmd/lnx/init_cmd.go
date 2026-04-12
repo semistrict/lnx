@@ -102,6 +102,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  vmlinuz-firecracker: %s (already exists)\n", fcKernelDest)
 	}
 
+	installSSHConfig()
+
 	fmt.Println("lnx init complete")
 	return nil
 }
@@ -146,6 +148,8 @@ func autoInit() error {
 	if err := downloadFirecracker(); err != nil {
 		return fmt.Errorf("download firecracker: %w", err)
 	}
+
+	installSSHConfig()
 
 	fmt.Fprintln(os.Stderr, "init complete")
 	return nil
