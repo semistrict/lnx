@@ -9,7 +9,6 @@ import (
 	"syscall"
 
 	"github.com/mdlayher/vsock"
-	"github.com/semistrict/lnx/internal/protocol"
 )
 
 func mountInitialFS() error {
@@ -43,37 +42,26 @@ func mountRootfs() error {
 	return nil
 }
 
-// mountHome mounts the host home directory via 9P over vsock (read-only).
-func mountHome(homeDir string) error {
-	target := "/mnt" + homeDir
-	os.MkdirAll(target, 0755)
-	return mount9P(target, protocol.P9Port, true)
-}
+// mountCachedLower mounts a 9P share read-only as the lower layer for
+// the FUSE lazy-cache. The FUSE server is started post-pivotRoot.
+func mountCachedLower(guestPath, tag string, port uint32) error {
+	lower := "/mnt/var/lnx/lower/" + tag
+	cache := "/mnt/var/lnx/cache/" + tag
 
-func mountCWD(cwdPath, method string) error {
-	target := "/mnt" + cwdPath
-	os.MkdirAll(target, 0755)
-
-	if method == "9p" {
-		return mount9P(target, protocol.P9CWDPort, false)
+	os.MkdirAll(lower, 0755)
+	if err := mount9P(lower, port, true); err != nil {
+		return fmt.Errorf("mount 9p lower %s: %w", tag, err)
 	}
-	if err := syscall.Mount("cwd", target, "virtiofs", 0, ""); err != nil {
-		return fmt.Errorf("mount virtiofs cwd on %s: %w", target, err)
-	}
+	os.MkdirAll(cache, 0755)
+	os.MkdirAll("/mnt"+guestPath, 0755)
 	return nil
 }
 
-func mountShare(path, tag, method string, index int) error {
-	target := "/mnt" + path
+// mountDirect mounts a 9P share directly at the guest path (no FUSE cache).
+func mountDirect(guestPath string, port uint32, readOnly bool) error {
+	target := "/mnt" + guestPath
 	os.MkdirAll(target, 0755)
-
-	if method == "9p" {
-		return mount9P(target, protocol.P9ShareBasePort+uint32(index), false)
-	}
-	if err := syscall.Mount(tag, target, "virtiofs", 0, ""); err != nil {
-		return fmt.Errorf("mount virtiofs share %s on %s: %w", tag, target, err)
-	}
-	return nil
+	return mount9P(target, port, readOnly)
 }
 
 // mount9P dials a 9P server on the host via vsock and mounts it at target.
@@ -110,6 +98,7 @@ func mount9P(target string, port uint32, readOnly bool) error {
 	}
 	return nil
 }
+
 
 func mountCgroups() error {
 	os.MkdirAll("/sys/fs/cgroup", 0755)

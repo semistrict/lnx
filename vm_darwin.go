@@ -119,7 +119,6 @@ func buildVMConfig(cfg *Config, initrdPath, cwd, swapPath, criuPath, homeDir, ma
 	}
 
 	for _, attach := range []func(*vz.VirtualMachineConfiguration) error{
-		func(c *vz.VirtualMachineConfiguration) error { return attachShares(c, cwd, cfg.Shares) },
 		func(c *vz.VirtualMachineConfiguration) error {
 			return attachSerialConsole(c, cfg.socketDir())
 		},

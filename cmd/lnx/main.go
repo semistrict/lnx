@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	lnx "github.com/semistrict/lnx"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -19,6 +20,8 @@ import (
 var doCheckpoint bool
 var doEphemeral bool
 var doSSHAgent bool
+var doNoGuestCache bool
+var cliOptions []string
 
 // instanceName is the resolved instance name. Set from --instance flag or LNX_INSTANCE env.
 var instanceName = "default"
@@ -57,6 +60,8 @@ func init() {
 	rootCmd.Flags().BoolVarP(&doCheckpoint, "checkpoint", "c", false, "snapshot rootfs before starting the VM")
 	rootCmd.Flags().BoolVar(&doEphemeral, "ephemeral", false, "clone rootfs to a temp file; discard on exit")
 	rootCmd.Flags().BoolVar(&doSSHAgent, "ssh-agent", false, "forward host SSH agent into the guest")
+	rootCmd.Flags().BoolVar(&doNoGuestCache, "no-guest-cache", false, "mount CWD/shares directly via 9P without FUSE cache")
+	rootCmd.Flags().StringArrayVarP(&cliOptions, "option", "O", nil, "runtime option key=value (see lnx options)")
 	rootCmd.Flags().StringArrayVarP(&forwardEnv, "env", "e", nil, "forward a host env var, set KEY=VALUE, or load dotenv vars from @file")
 	rootCmd.Flags().BoolVar(&forwardAllEnv, "preserve-env", false, "forward most host environment variables except host-specific path and session vars")
 
@@ -73,6 +78,29 @@ func init() {
 
 func main() {
 	initHostLogging()
+
+	// If this binary was created by `lnx pack`, extract embedded kernel+rootfs
+	// and run directly (no daemon — single-shot, ephemeral rootfs).
+	if cfg, err := readPackedConfig(); err == nil {
+		lnx.InitBinary = initBinary
+		kernelPath, rootfsPath, err := ensurePackedFiles(cfg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		hostname := filepath.Base(os.Args[0])
+		exitCode, err := lnx.Run(&lnx.Config{
+			KernelPath: kernelPath,
+			RootfsPath: rootfsPath,
+			Hostname:   hostname,
+			Ephemeral:  true,
+		}, cfg.Args...)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(exitCode)
+	}
 
 	// Default to login bash when no command is given.
 	if len(os.Args) == 1 {
@@ -114,6 +142,21 @@ func stripLnxFlags(args []string) []string {
 			i++
 		case a == "--ssh-agent":
 			doSSHAgent = true
+			i++
+		case a == "--no-guest-cache":
+			doNoGuestCache = true
+			i++
+		case a == "--option" || a == "-O":
+			if i+1 >= len(args) {
+				return append([]string(nil), args[i:]...)
+			}
+			cliOptions = append(cliOptions, args[i+1])
+			i += 2
+		case strings.HasPrefix(a, "--option="):
+			cliOptions = append(cliOptions, strings.TrimPrefix(a, "--option="))
+			i++
+		case strings.HasPrefix(a, "-O") && len(a) > 2:
+			cliOptions = append(cliOptions, a[2:])
 			i++
 		case a == "--preserve-env":
 			forwardAllEnv = true
@@ -279,6 +322,12 @@ func spawnDaemon() error {
 	if doSSHAgent {
 		daemonArgs = append(daemonArgs, "--ssh-agent")
 	}
+	if doNoGuestCache {
+		daemonArgs = append(daemonArgs, "--no-guest-cache")
+	}
+	for _, o := range cliOptions {
+		daemonArgs = append(daemonArgs, "-O", o)
+	}
 
 	cmd := buildDaemonCmd(self, daemonArgs)
 	// Capture daemon stderr for debugging if it fails to start.
@@ -387,7 +436,13 @@ func imagesDir() string {
 }
 
 // imagesDirFor returns the disk images directory for a named instance.
+// Docker container instances live under ~/.lnx/docker/containers/ and are
+// checked first so their rootfs is found without copying to ~/.lnx/images/.
 func imagesDirFor(name string) string {
+	containerDir := filepath.Join(lnxBase(), "docker", "containers", name)
+	if _, err := os.Stat(containerDir); err == nil {
+		return containerDir
+	}
 	return filepath.Join(lnxBase(), "images", name)
 }
 

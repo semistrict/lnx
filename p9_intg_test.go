@@ -31,7 +31,7 @@ func TestRun_9P_HomeReadable(t *testing.T) {
 	assert.Equal(t, 0, exitCode)
 }
 
-func TestRun_9P_HomeReadOnly(t *testing.T) {
+func TestRun_Home_WriteStaysInCache(t *testing.T) {
 	t.Parallel()
 	dir := setupTestDir(t)
 	cfg := testConfig(dir)
@@ -39,13 +39,14 @@ func TestRun_9P_HomeReadOnly(t *testing.T) {
 	home, err := os.UserHomeDir()
 	require.NoError(t, err)
 
-	// Attempting to write to the home 9P mount should fail (read-only).
-	target := filepath.Join(home, ".lnx_9p_test_readonly")
-	exitCode, err := lnx.Run(cfg, "sh", "-c", "echo fail > "+target)
+	// Writes to the home FUSE mount go to the ext4 cache (succeed in the guest)
+	// but must never appear on the host (lower virtiofs is read-only).
+	target := filepath.Join(home, ".lnx_home_cache_test")
+	exitCode, err := lnx.Run(cfg, "sh", "-c", "echo cache-write > "+target)
 	require.NoError(t, err)
-	assert.NotEqual(t, 0, exitCode)
+	assert.Equal(t, 0, exitCode)
 
-	// File should not exist on the host.
+	// File must not be visible on the host.
 	_, err = os.Stat(target)
 	assert.True(t, os.IsNotExist(err))
 }

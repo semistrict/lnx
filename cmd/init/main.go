@@ -92,18 +92,38 @@ func run() error {
 		return err
 	}
 	if setup.HomeDir != "" {
-		if err := mountHome(setup.HomeDir); err != nil {
-			slog.Warn("home 9p mount failed, continuing without it", "error", err)
+		if err := mountCachedLower(setup.HomeDir, "home", protocol.P9Port); err != nil {
+			slog.Warn("home mount failed, continuing without it", "error", err)
 		}
 	}
 	if setup.CWD != "" {
-		if err := mountCWD(setup.CWD, setup.ShareMethod); err != nil {
-			return err
+		if setup.DirectShare {
+			if err := mountDirect(setup.CWD, protocol.P9CWDPort, false); err != nil {
+				return err
+			}
+		} else {
+			if err := mountCachedLower(setup.CWD, "cwd", protocol.P9CWDPort); err != nil {
+				return err
+			}
 		}
 	}
 	for i, path := range setup.Shares {
-		if err := mountShare(path, fmt.Sprintf("share%d", i), setup.ShareMethod, i); err != nil {
-			slog.Warn("share mount failed", "path", path, "error", err)
+		tag := fmt.Sprintf("share%d", i)
+		port := protocol.P9ShareBasePort + uint32(i)
+		if setup.DirectShare {
+			if err := mountDirect(path, port, false); err != nil {
+				slog.Warn("share mount failed", "path", path, "error", err)
+			}
+		} else {
+			if err := mountCachedLower(path, tag, port); err != nil {
+				slog.Warn("share mount failed", "path", path, "error", err)
+			}
+		}
+	}
+	for i, path := range setup.SyncShares {
+		tag := fmt.Sprintf("sync%d", i)
+		if err := mountCachedLower(path, tag, protocol.P9SyncBasePort+uint32(i)); err != nil {
+			slog.Warn("sync share mount failed", "path", path, "error", err)
 		}
 	}
 	if err := mountInNewRoot(); err != nil {
@@ -185,6 +205,21 @@ func run() error {
 	installXdgOpen()
 	installForkRoleHelper()
 	startEnabledServices()
+	if setup.HomeDir != "" {
+		startCachedMount(setup.HomeDir, "home", homeSyncBlockedPaths)
+	}
+	if !setup.DirectShare {
+		if setup.CWD != "" {
+			startCachedMount(setup.CWD, "cwd", nil)
+		}
+		for i, path := range setup.Shares {
+			startCachedMount(path, fmt.Sprintf("share%d", i), nil)
+		}
+	}
+	for i, path := range setup.SyncShares {
+		startCachedMount(path, fmt.Sprintf("sync%d", i), nil)
+	}
+	go startInvalidationReceiver()
 	startStatusServer()
 	startExecServer()
 	startSSHServer()

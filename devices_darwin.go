@@ -65,49 +65,8 @@ func attachDisks(vmConfig *vz.VirtualMachineConfiguration, rootfsPath, swapPath,
 	return nil
 }
 
-// attachShares mounts the CWD and extra share directories read-write via virtiofs.
-// The home directory is served via 9P over vsock instead (for permission filtering).
-func attachShares(vmConfig *vz.VirtualMachineConfiguration, cwd string, extraShares []string) error {
-	var devices []vz.DirectorySharingDeviceConfiguration
-
-	// CWD share.
-	cwdFSConfig, err := vz.NewVirtioFileSystemDeviceConfiguration("cwd")
-	if err != nil {
-		return fmt.Errorf("cwd virtiofs config: %w", err)
-	}
-	cwdShared, err := vz.NewSharedDirectory(cwd, false)
-	if err != nil {
-		return fmt.Errorf("cwd shared dir: %w", err)
-	}
-	cwdShare, err := vz.NewSingleDirectoryShare(cwdShared)
-	if err != nil {
-		return fmt.Errorf("cwd dir share: %w", err)
-	}
-	cwdFSConfig.SetDirectoryShare(cwdShare)
-	devices = append(devices, cwdFSConfig)
-
-	// Extra shares.
-	for i, path := range extraShares {
-		tag := fmt.Sprintf("share%d", i)
-		fsCfg, err := vz.NewVirtioFileSystemDeviceConfiguration(tag)
-		if err != nil {
-			return fmt.Errorf("share %s virtiofs config: %w", path, err)
-		}
-		shared, err := vz.NewSharedDirectory(path, false)
-		if err != nil {
-			return fmt.Errorf("share %s shared dir: %w", path, err)
-		}
-		share, err := vz.NewSingleDirectoryShare(shared)
-		if err != nil {
-			return fmt.Errorf("share %s dir share: %w", path, err)
-		}
-		fsCfg.SetDirectoryShare(share)
-		devices = append(devices, fsCfg)
-	}
-
-	vmConfig.SetDirectorySharingDevicesVirtualMachineConfiguration(devices)
-	return nil
-}
+// All directory sharing now goes through 9P over vsock (no virtiofs).
+// See setupVsock in vm.go for the 9P server setup.
 
 func attachNetwork(vmConfig *vz.VirtualMachineConfiguration) error {
 	natAttachment, err := vz.NewNATNetworkDeviceAttachment()

@@ -16,6 +16,11 @@ var daemonCmd = &cobra.Command{
 	Short:  "Run VM as a background daemon (internal use)",
 	Hidden: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		for _, kv := range cliOptions {
+			if k, v, ok := strings.Cut(kv, "="); ok {
+				lnx.SetOption(k, v)
+			}
+		}
 		lnx.InitBinary = initBinary
 		dir := instanceDir()
 
@@ -32,6 +37,8 @@ var daemonCmd = &cobra.Command{
 			Ephemeral:    doEphemeral,
 			SSHAgent:     doSSHAgent,
 			Shares:       loadShares(dir),
+			SyncShares:   loadSyncShares(dir),
+			DirectShare:  doNoGuestCache,
 			SocketDir:    socketDir,
 			NestedRootfs: nested,
 		})
@@ -49,6 +56,8 @@ func init() {
 	daemonCmd.Flags().BoolVarP(&doCheckpoint, "checkpoint", "c", false, "snapshot rootfs before starting")
 	daemonCmd.Flags().BoolVar(&doEphemeral, "ephemeral", false, "clone rootfs to a temp file; discard on exit")
 	daemonCmd.Flags().BoolVar(&doSSHAgent, "ssh-agent", false, "forward host SSH agent into the guest")
+	daemonCmd.Flags().BoolVar(&doNoGuestCache, "no-guest-cache", false, "mount CWD/shares directly via 9P (no FUSE cache)")
+	daemonCmd.Flags().StringArrayVarP(&cliOptions, "option", "O", nil, "runtime option key=value")
 	rootCmd.AddCommand(daemonCmd)
 }
 

@@ -21,8 +21,8 @@ type Config struct {
 	// Defaults to 50% of host physical memory.
 	MemoryBytes uint64
 
-	// CWD is the host directory to mount read-write inside the VM
-	// at the same path via virtiofs. Defaults to os.Getwd().
+	// CWD is the host directory to mount inside the VM
+	// at the same path. Defaults to os.Getwd().
 	CWD string
 
 	// Env is a list of extra KEY=VALUE environment variables to set
@@ -38,7 +38,7 @@ type Config struct {
 	// Defaults to ~/.lnx/checkpoints/.
 	CheckpointDir string
 
-	// Shares is a list of extra host directories to share read-write via virtiofs.
+	// Shares is a list of extra host directories to share.
 	// Each path is mounted in the guest at the same absolute path.
 	Shares []string
 
@@ -63,6 +63,16 @@ type Config struct {
 	// NestedRootfs is a list of rootfs file paths for nested VM instances.
 	// Each is attached as an additional virtio-blk device (vdc, vdd, ...).
 	NestedRootfs []NestedRootfs
+
+	// SyncShares is a list of host directories to share with lazy caching.
+	// Each is lazily copied into the guest's ext4 rootfs for native-speed
+	// access after first read.
+	SyncShares []string
+
+	// DirectShare bypasses the FUSE lazy-cache for CWD and extra shares,
+	// mounting 9P directly (read-write). When false (default), all shares
+	// go through the lazy-cache FUSE for near-native read performance.
+	DirectShare bool
 }
 
 // NestedRootfs pairs a nested instance name with its rootfs file path.

@@ -23,10 +23,11 @@ func TestControlProtocol_SetupDelivered(t *testing.T) {
 		Env:         []string{"FOO=bar"},
 		Hostname:    "default.lnx",
 		SSHAgent:    true,
-		ShareMethod: "virtiofs",
+		DirectShare: true,
 		NestedDrives: []protocol.NestedDrive{
 			{InstanceName: "default.default", DevicePath: "/dev/vdc"},
 		},
+		SyncShares: []string{"/sync"},
 	}
 
 	go func() {
@@ -45,10 +46,12 @@ func TestControlProtocol_SetupDelivered(t *testing.T) {
 	assert.Equal(t, []string{"FOO=bar"}, msg.Setup.Env)
 	assert.Equal(t, "default.lnx", msg.Setup.Hostname)
 	assert.True(t, msg.Setup.SSHAgent)
-	assert.Equal(t, "virtiofs", msg.Setup.ShareMethod)
+	assert.True(t, msg.Setup.DirectShare)
 	require.Len(t, msg.Setup.NestedDrives, 1)
 	assert.Equal(t, "default.default", msg.Setup.NestedDrives[0].InstanceName)
 	assert.Equal(t, "/dev/vdc", msg.Setup.NestedDrives[0].DevicePath)
+	require.Len(t, msg.Setup.SyncShares, 1)
+	assert.Equal(t, "/sync", msg.Setup.SyncShares[0])
 }
 
 func TestControlProtocol_SignalDelivered(t *testing.T) {

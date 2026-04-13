@@ -29,25 +29,31 @@ const (
 	// to guest-local control/debug endpoints.
 	GuestHTTPPort = 1035
 
-	// P9CWDPort is the vsock port for 9P CWD share (host listens, guest dials).
-	// Used on Linux (Firecracker) where virtiofs is unavailable.
+	// P9CWDPort is the vsock port for the 9P CWD share (host listens, guest dials).
 	P9CWDPort = 1036
 	// P9ShareBasePort is the first vsock port for extra 9P shares.
-	// Share i uses port P9ShareBasePort + i.
+	// Share i uses port P9ShareBasePort + i. Supports up to 10 shares.
 	P9ShareBasePort = 1037
+	// InvalidatePort is the vsock port for cache invalidation messages
+	// (host pushes changed paths to guest). Host listens, guest dials.
+	InvalidatePort = 1045
+
+	// P9SyncBasePort is the first vsock port for 9P sync shares.
+	// Sync share i uses port P9SyncBasePort + i.
+	P9SyncBasePort = 1047
 
 	// ForkAttachPort is the vsock port for attaching to a CRIU-restored
 	// fork session's gob control (ExecStarted, ExecDone, ExecSignal, ExecResize).
 	// The guest listens; the host connects once after a fork restore.
-	ForkAttachPort = 1038
+	ForkAttachPort = 1060
 	// ForkAttachDataPort is the vsock port for the fork session's raw PTY data.
 	// The guest listens; the host connects once after a fork restore.
-	ForkAttachDataPort = 1039
+	ForkAttachDataPort = 1061
 
 	// SSHPort is the vsock port for the embedded SSH server in the guest.
 	// The guest listens; the host connects via VirtioSocketDevice.Connect
 	// to proxy SSH connections from the CLI.
-	SSHPort = 1040
+	SSHPort = 1062
 )
 
 // Msg is the envelope for all control messages.
@@ -84,17 +90,22 @@ type Setup struct {
 	HomeDir  string   // host home dir path (e.g. /Users/ramon), mounted read-only
 	Hostname string   // guest hostname (e.g. "default.lnx")
 	SSHAgent bool     // if true, host is forwarding SSH agent on SSHAgentPort
-	Shares   []string // extra shares to mount read-write (absolute paths)
+	Shares []string // extra shares to mount (absolute paths)
 
-	// ShareMethod is "virtiofs" (macOS/VZ) or "9p" (Linux/Firecracker).
-	// Tells the guest how to mount CWD and extra shares.
-	ShareMethod string
+	// DirectShare bypasses the FUSE lazy-cache for CWD and extra shares,
+	// mounting 9P directly (read-write, like pre-sync-share behavior).
+	DirectShare bool
 
 	// NestedDrives maps nested instance names to block device paths.
 	// Each nested instance rootfs is attached as a virtio-blk device
 	// (e.g., "default.default" → "/dev/vdc"). The guest writes this
 	// mapping so nested lnx can find its rootfs device.
 	NestedDrives []NestedDrive
+
+	// SyncShares are host directories shared as read-only 9P mounts
+	// and lazily cached into the guest's ext4 rootfs via FUSE.
+	// Each entry is the absolute host path; the guest mounts it at the same path.
+	SyncShares []string
 }
 
 // NestedDrive maps a nested instance name to its block device in the guest.
@@ -212,4 +223,11 @@ type ForkNotify struct {
 // PortForward notifies the host of the current set of listening TCP ports in the guest.
 type PortForward struct {
 	Ports []uint16
+}
+
+// Invalidation tells the guest that files in a share have changed on the host
+// and should be evicted from the FUSE cache.
+type Invalidation struct {
+	Tag   string   // share tag ("home", "cwd", "share0", "sync0", etc.)
+	Paths []string // relative paths that changed
 }

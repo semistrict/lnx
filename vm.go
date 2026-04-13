@@ -62,7 +62,10 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 
 	var ephCleanup func()
 	if cfg.Ephemeral {
-		tmpDir, err := os.MkdirTemp("", "lnx-ephemeral-*")
+		// Create the temp dir alongside the source rootfs so it stays on the
+		// same APFS volume — clonefile requires source and destination to be
+		// on the same filesystem, and /tmp is a different volume.
+		tmpDir, err := os.MkdirTemp(filepath.Dir(cfg.RootfsPath), "ephemeral-*")
 		if err != nil {
 			return nil, fmt.Errorf("create ephemeral dir: %w", err)
 		}
@@ -88,6 +91,8 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 			SSHAgent:      cfg.SSHAgent,
 			SocketDir:     cfg.SocketDir,
 			NestedRootfs:  cfg.NestedRootfs,
+			SyncShares:    cfg.SyncShares,
+			DirectShare:   cfg.DirectShare,
 		}
 	}
 
@@ -219,8 +224,9 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		Hostname:     hostname,
 		SSHAgent:     sshAgent,
 		Shares:       cfg.Shares,
-		ShareMethod:  shareMethod(),
+		DirectShare:  cfg.DirectShare,
 		NestedDrives: nestedDrives,
+		SyncShares:   cfg.SyncShares,
 	}
 	setupMsg.Env = append(setupMsg.Env, "LNX_PARENT="+parentInstance)
 
@@ -458,40 +464,79 @@ func setupVsock(sock VsockDevice, logDir, rootfsPath, instanceName string, setup
 		return nil, fmt.Errorf("vsock port forward listen: %w", err)
 	}
 
-	// 9P file server for home directory.
-	p9Listener, err := sock.Listen(protocol.P9Port)
-	if err != nil {
-		portFwdListener.Close()
-		guestCtrlListener.Close()
-		statusListener.Close()
-		ctrlListener.Close()
-		logListener.Close()
-		return nil, fmt.Errorf("vsock 9p listen: %w", err)
-	}
-	start9PServer(p9Listener, setupMsg.HomeDir)
+	// 9P file servers — all directory sharing goes through 9P.
+	// Each server is wrapped with a file tracker so the host can detect
+	// mtime changes and push invalidations to the guest.
+	var p9Listeners []net.Listener
+	var watchers []shareWatcher
 
-	// Additional 9P servers for CWD and shares when virtiofs is unavailable.
-	var p9ShareListeners []net.Listener
-	if setupMsg.ShareMethod == "9p" {
-		// CWD share.
+	// Home directory (filtered + tracked).
+	if setupMsg.HomeDir != "" {
+		homeListener, err := sock.Listen(protocol.P9Port)
+		if err != nil {
+			slog.Warn("vsock home 9p listen failed", "error", err)
+		} else {
+			tracker := newFileTracker(setupMsg.HomeDir)
+			start9PTrackedServer(homeListener, setupMsg.HomeDir, tracker, true)
+			watchers = append(watchers, shareWatcher{tag: "home", tracker: tracker})
+			p9Listeners = append(p9Listeners, homeListener)
+		}
+	}
+
+	// CWD.
+	if setupMsg.CWD != "" {
 		cwdListener, err := sock.Listen(protocol.P9CWDPort)
 		if err != nil {
 			slog.Warn("vsock cwd 9p listen failed", "error", err)
 		} else {
-			start9PServerUnfiltered(cwdListener, setupMsg.CWD)
-			p9ShareListeners = append(p9ShareListeners, cwdListener)
+			tracker := newFileTracker(setupMsg.CWD)
+			start9PTrackedServer(cwdListener, setupMsg.CWD, tracker, false)
+			watchers = append(watchers, shareWatcher{tag: "cwd", tracker: tracker})
+			p9Listeners = append(p9Listeners, cwdListener)
 		}
+	}
 
-		// Extra shares.
-		for i, path := range setupMsg.Shares {
-			shareListener, err := sock.Listen(protocol.P9ShareBasePort + uint32(i))
-			if err != nil {
-				slog.Warn("vsock share 9p listen failed", "path", path, "error", err)
-				continue
-			}
-			start9PServerUnfiltered(shareListener, path)
-			p9ShareListeners = append(p9ShareListeners, shareListener)
+	// Extra shares.
+	for i, path := range setupMsg.Shares {
+		shareListener, err := sock.Listen(protocol.P9ShareBasePort + uint32(i))
+		if err != nil {
+			slog.Warn("vsock share 9p listen failed", "path", path, "error", err)
+			continue
 		}
+		tag := fmt.Sprintf("share%d", i)
+		tracker := newFileTracker(path)
+		start9PTrackedServer(shareListener, path, tracker, false)
+		watchers = append(watchers, shareWatcher{tag: tag, tracker: tracker})
+		p9Listeners = append(p9Listeners, shareListener)
+	}
+
+	// Sync shares.
+	for i, path := range setupMsg.SyncShares {
+		syncListener, err := sock.Listen(protocol.P9SyncBasePort + uint32(i))
+		if err != nil {
+			slog.Warn("vsock sync 9p listen failed", "path", path, "error", err)
+			continue
+		}
+		tag := fmt.Sprintf("sync%d", i)
+		tracker := newFileTracker(path)
+		start9PTrackedServer(syncListener, path, tracker, false)
+		watchers = append(watchers, shareWatcher{tag: tag, tracker: tracker})
+		p9Listeners = append(p9Listeners, syncListener)
+	}
+
+	// Invalidation channel — host pushes changed paths to guest.
+	invalidateListener, err := sock.Listen(protocol.InvalidatePort)
+	if err != nil {
+		slog.Warn("vsock invalidate listen failed", "error", err)
+	} else {
+		p9Listeners = append(p9Listeners, invalidateListener)
+		go func() {
+			conn, err := invalidateListener.Accept()
+			if err != nil {
+				return
+			}
+			startInvalidationSender(conn, watchers)
+		}()
 	}
 
 	var sshAgentListener net.Listener
@@ -557,10 +602,9 @@ func setupVsock(sock VsockDevice, logDir, rootfsPath, instanceName string, setup
 		if sshAgentListener != nil {
 			sshAgentListener.Close()
 		}
-		for _, l := range p9ShareListeners {
+		for _, l := range p9Listeners {
 			l.Close()
 		}
-		p9Listener.Close()
 		portFwdListener.Close()
 		guestCtrlListener.Close()
 		statusListener.Close()
