@@ -8,13 +8,16 @@ require (
 	github.com/Code-Hex/vz/v3 v3.7.1
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/creack/pty v1.1.24
+	github.com/fsnotify/fsevents v0.2.0
 	github.com/gliderlabs/ssh v0.3.8
 	github.com/google/go-containerregistry v0.21.5
+	github.com/hanwen/go-fuse/v2 v2.9.0
 	github.com/hugelgupf/p9 v0.3.0
 	github.com/insomniacslk/dhcp v0.0.0-20260407060928-11b94ed970f2
 	github.com/joho/godotenv v1.5.1
+	github.com/klauspost/compress v1.18.5
 	github.com/mdlayher/vsock v1.2.1
-	github.com/semistrict/go2fs v0.2.2
+	github.com/semistrict/go2fs v0.3.0
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
 	github.com/vito/midterm v0.2.4
@@ -45,7 +48,6 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/josharian/native v1.1.0 // indirect
-	github.com/klauspost/compress v1.18.5 // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-runewidth v0.0.16 // indirect
