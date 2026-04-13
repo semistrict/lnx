@@ -62,6 +62,27 @@ func runDockerRun(cmd *cobra.Command, args []string) error {
 	}
 	cmdArgs := args[1:] // optional command override
 
+	inst := instanceNameFromRef(imageRef)
+	instanceName = inst
+	instanceFlag = true
+
+	// If the rootfs already exists, skip pull/build/create entirely.
+	rootfs := filepath.Join(imagesDirFor(inst), "rootfs.ext4")
+	if _, err := os.Stat(rootfs); err == nil {
+		runArgs := cmdArgs
+		if len(runArgs) == 0 {
+			runArgs = readDefaultCmd(inst)
+		}
+		if len(runArgs) == 0 {
+			runArgs = []string{"/bin/sh"}
+		}
+		exitCode, err := runVM(runArgs)
+		if err != nil {
+			return err
+		}
+		os.Exit(exitCode)
+	}
+
 	// Ensure storage directories exist.
 	for _, d := range []string{ociBlobDir(), ociLayerDir()} {
 		if err := os.MkdirAll(d, 0755); err != nil {
@@ -84,16 +105,15 @@ func runDockerRun(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create instance from the final layer.
-	inst := instanceNameFromRef(imageRef)
 	fmt.Fprintf(os.Stderr, "creating instance %q...\n", inst)
 	if err := createInstanceFromLayer(inst, finalLayerPath); err != nil {
 		return fmt.Errorf("create instance: %w", err)
 	}
 
-	// Boot the instance.
-	instanceName = inst
-	instanceFlag = true
+	// Persist default command for future runs.
+	writeDefaultCmd(inst, img.defaultCmd())
 
+	// Boot the instance.
 	runArgs := cmdArgs
 	if len(runArgs) == 0 {
 		runArgs = img.defaultCmd()
@@ -138,4 +158,20 @@ func createInstanceFromLayer(name string, layerPath string) error {
 		os.Remove(dst)
 	}
 	return cloneRootfs(layerPath, dst)
+}
+
+// writeDefaultCmd saves the image's default command alongside the rootfs.
+func writeDefaultCmd(inst string, cmd []string) {
+	p := filepath.Join(imagesDirFor(inst), "cmd")
+	_ = os.WriteFile(p, []byte(strings.Join(cmd, "\x00")), 0644)
+}
+
+// readDefaultCmd loads the saved default command for an instance.
+func readDefaultCmd(inst string) []string {
+	p := filepath.Join(imagesDirFor(inst), "cmd")
+	data, err := os.ReadFile(p)
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	return strings.Split(string(data), "\x00")
 }
