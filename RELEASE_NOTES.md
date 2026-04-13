@@ -1,5 +1,36 @@
 # Release Notes
 
+## Mach-O section injection for `lnx pack`
+
+`lnx pack` now embeds the kernel and rootfs in a proper `__LNX,__lnxpack` Mach-O section instead of appending bytes after the code signature. The packed binary is a valid Mach-O that can be re-signed with `codesign`. A CGo placeholder section is created at build time; the pack command replaces it with the compressed payloads.
+
+## Docker containers and `lnx clone --image`
+
+`lnx docker run` now creates ephemeral containers with APFS-cloned rootfs images, cleaned up on exit. Docker-style `-p`/`-P` port mapping and `lnx docker ps` are supported.
+
+`lnx clone --image <ref> <name>` creates a persistent instance from an OCI image.
+
+OCI pull/build logic has been extracted to `internal/lnxoci`.
+
+## Sync Shares
+
+Host directories can now be shared with near-native ext4 speed using lazy-cache FUSE overlays. Files are copied into the guest's rootfs on first access and served from ext4 on subsequent reads. A background goroutine keeps the cache fresh within ~5 seconds of host-side changes.
+
+```bash
+lnx sync add ~/src/myrepo
+```
+
+The home directory (`$HOME`) also uses this mechanism automatically, replacing the previous 9P mount. Sensitive paths (`.ssh`, `.gnupg`, `.aws`, etc.) remain blocked.
+
+**Performance** (`git status` on a ~3,600-file repo):
+
+| | virtiofs (before) | Sync share |
+|-|-------------------|------------|
+| Cold cache | 4.7s | 1.4s |
+| Warm cache | 4.7s | 0.05s |
+
+See [docs/sync-shares.md](docs/sync-shares.md) for the full design.
+
 ## SSH access to lnx VMs
 
 `ssh <instance>.lnx` now works out of the box. An embedded SSH server runs inside the guest init (PID 1) over vsock — no sshd installation required.

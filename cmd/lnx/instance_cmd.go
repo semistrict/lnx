@@ -85,12 +85,14 @@ var (
 	instInitKernel  string
 	instInitRootfs  string
 	cloneCheckpoint string
+	cloneImage      string
 )
 
 func init() {
 	instanceInitCmd.Flags().StringVar(&instInitKernel, "kernel", "", "path to kernel Image (copies to shared location)")
 	instanceInitCmd.Flags().StringVar(&instInitRootfs, "rootfs", "", "path to rootfs ext4 image")
 	cloneCmd.Flags().StringVar(&cloneCheckpoint, "checkpoint", "", "clone from an existing or newly created named checkpoint of the source instance")
+	cloneCmd.Flags().StringVar(&cloneImage, "image", "", "OCI container image to use as rootfs (e.g. alpine:latest)")
 
 	instanceCmd.AddCommand(instanceListCmd)
 	instanceCmd.AddCommand(instanceInitCmd)
@@ -153,6 +155,10 @@ func runInstanceClone(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cannot clone into instance named 'default' (use 'lnx init' instead)")
 	}
 
+	if cloneImage != "" {
+		return cloneFromImage(name, cloneImage)
+	}
+
 	// Check if instance already exists (images or instances dir).
 	imgDir := imagesDirFor(name)
 	instDir := instanceDirFor(name)
@@ -201,6 +207,41 @@ func runInstanceClone(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Printf("created instance %q from %q\n", name, sourceResolvedName+":"+checkpointName)
 	}
+	return nil
+}
+
+// cloneFromImage pulls an OCI container image and creates an lnx instance
+// with its filesystem as the rootfs.
+func cloneFromImage(name, imageRef string) error {
+	imgDir := imagesDirFor(name)
+	instDir := instanceDirFor(name)
+	if _, err := os.Stat(imgDir); err == nil {
+		return fmt.Errorf("instance %q already exists", name)
+	}
+	if _, err := os.Stat(instDir); err == nil {
+		return fmt.Errorf("instance %q already exists", name)
+	}
+
+	rootfsPath, err := ensureOCIRootfs(imageRef)
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(imgDir, 0755); err != nil {
+		return fmt.Errorf("create images dir: %w", err)
+	}
+	if err := os.MkdirAll(instDir, 0755); err != nil {
+		_ = os.RemoveAll(imgDir)
+		return fmt.Errorf("create instance dir: %w", err)
+	}
+
+	if err := cloneRootfs(rootfsPath, filepath.Join(imgDir, "rootfs.ext4")); err != nil {
+		_ = os.RemoveAll(imgDir)
+		_ = os.RemoveAll(instDir)
+		return fmt.Errorf("clone rootfs: %w", err)
+	}
+
+	fmt.Printf("created instance %q from image %q\n", name, imageRef)
 	return nil
 }
 
