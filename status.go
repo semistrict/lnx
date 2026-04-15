@@ -30,6 +30,10 @@ import (
 // `lnx echo hello && lnx echo world` to reuse the same VM.
 const idleTimeout = 5 * time.Second
 
+// forkQemuVMFunc is set by init() in vm_qemu_darwin.go when the QEMU
+// backend is compiled in. nil on non-darwin or when QEMU is not available.
+var forkQemuVMFunc func(qmpSock, srcDir, dstDir string) (exited bool, err error)
+
 // StatusResponse is the JSON structure served to `lnx status` clients.
 type StatusResponse struct {
 	Command     []string `json:"command"`
@@ -62,8 +66,13 @@ type apiServer struct {
 
 	guestCtrlConn net.Conn
 
+	vm   VirtualMachine
 	sock VsockDevice
 	pf   *portForwarder
+
+	// reverseExecCh receives connections from the guest for exec
+	// (used after fork/migration when host→guest Connect doesn't work).
+	reverseExecCh chan net.Conn
 
 	sockPath string
 	listener net.Listener
@@ -80,6 +89,15 @@ type apiServer struct {
 	sessionsMu sync.RWMutex
 	sessions   map[string]*SessionInfo
 	sessionSeq atomic.Int64
+
+	forkingMu sync.Mutex
+	forking   bool // true while VM is paused for fork snapshot
+
+	// forkReadyCh is signalled when the guest confirms it processed
+	// the early ForkResp (by sending ForkNotify on the exec connection).
+	// Used to synchronize QEMU fork: we must not pause the VM until
+	// the guest has flushed its exec output.
+	forkReadyCh chan struct{}
 }
 
 // SessionInfo describes an active exec session.
@@ -121,12 +139,37 @@ func newAPIServer(args []string, user, rootfsPath string) *apiServer {
 }
 
 func (s *apiServer) requestStop(reason string, attrs ...any) {
+	// During a fork, the VM is paused and exec sessions may error out.
+	// Suppress stop requests until the fork completes and the VM resumes.
+	s.forkingMu.Lock()
+	forking := s.forking
+	s.forkingMu.Unlock()
+	if forking {
+		slog.Debug("suppressing stop request during fork", attrs...)
+		return
+	}
 	if reason != "" {
 		slog.Warn(reason, attrs...)
 	}
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
 	})
+}
+
+// signalForkReady notifies handleGuestCtrl that the guest has processed
+// the early ForkResp and flushed its exec output. Safe to call multiple
+// times or when no fork is pending.
+func (s *apiServer) signalForkReady() {
+	s.forkingMu.Lock()
+	ch := s.forkReadyCh
+	s.forkingMu.Unlock()
+	if ch != nil {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
 }
 
 // registerSession creates a new session entry and returns its ID.
@@ -291,10 +334,21 @@ func (s *apiServer) setStatusConn(conn net.Conn) {
 
 // connectExec creates a new vsock connection to the guest's exec server.
 // Retries briefly since the guest may still be booting.
+// After fork/migration, the guest may offer reverse connections via
+// reverseExecCh (guest→host direction) since host→guest Connect
+// doesn't work after CPR-reboot.
 func (s *apiServer) connectExec() (*gob.Encoder, *gob.Decoder, net.Conn, error) {
 	var conn net.Conn
 	var err error
 	for i := 0; i < 300; i++ {
+		// Check for a reverse exec connection from the guest first.
+		if s.reverseExecCh != nil {
+			select {
+			case conn = <-s.reverseExecCh:
+				return gob.NewEncoder(conn), gob.NewDecoder(conn), conn, nil
+			default:
+			}
+		}
 		conn, err = s.sock.Connect(protocol.ExecPort)
 		if err == nil {
 			return gob.NewEncoder(conn), gob.NewDecoder(conn), conn, nil
@@ -354,12 +408,64 @@ func (s *apiServer) handleGuestCtrl(conn net.Conn) {
 		}
 
 		if msg.ForkReq != nil {
-			resp := s.executeFork()
-			if err := enc.Encode(protocol.Msg{ForkResp: resp}); err != nil {
+			s.pin()
+			if s.isQemuFork() {
+				// QEMU fork: send ForkResp BEFORE pausing the VM because
+				// the stop command closes all vsock connections. The guest
+				// needs the response while the connection is still alive.
+				childName := s.generateForkChildName()
+				ready := make(chan struct{})
+				s.forkingMu.Lock()
+				s.forkReadyCh = ready
+				s.forkingMu.Unlock()
+				if err := enc.Encode(protocol.Msg{ForkResp: &protocol.ForkResp{Instance: childName}}); err != nil {
+					s.unpin()
+					return
+				}
+				// Wait for the guest to process the response. The exec
+				// handler signals this channel when it receives ForkNotify,
+				// which means the guest output has been flushed to the host.
+				select {
+				case <-ready:
+				case <-time.After(5 * time.Second):
+					slog.Warn("fork: timed out waiting for ForkNotify")
+				}
+				s.forkingMu.Lock()
+				s.forkReadyCh = nil
+				s.forkingMu.Unlock()
+				s.executeQemuFork(childName)
+			} else {
+				resp := s.executeFork()
+				if err := enc.Encode(protocol.Msg{ForkResp: resp}); err != nil {
+					s.unpin()
+					return
+				}
+			}
+			s.unpin()
+		}
+
+		if msg.InstanceNameReq != nil {
+			if err := enc.Encode(protocol.Msg{InstanceNameResp: &protocol.InstanceNameResp{Name: s.instanceName}}); err != nil {
 				return
 			}
 		}
 	}
+}
+
+// generateForkChildName creates a unique child instance name.
+func (s *apiServer) generateForkChildName() string {
+	childName := s.instanceName + "-fork-" + time.Now().Format("150405.000")
+	return strings.ReplaceAll(childName, ".", "")
+}
+
+// isQemuFork returns true if the current VM uses QEMU (has a QMP socket).
+func (s *apiServer) isQemuFork() bool {
+	if forkQemuVMFunc == nil {
+		return false
+	}
+	qmpSock := filepath.Join(s.instanceDir, "qmp.sock")
+	_, err := os.Stat(qmpSock)
+	return err == nil
 }
 
 // executeFork handles the fork orchestration (shared between HTTP and gob paths).
@@ -368,9 +474,95 @@ func (s *apiServer) executeFork() *protocol.ForkResp {
 		return &protocol.ForkResp{Error: "fork requires daemon mode"}
 	}
 
-	// Generate child name with millisecond precision to avoid collisions.
-	childName := s.instanceName + "-fork-" + time.Now().Format("150405.000")
-	childName = strings.ReplaceAll(childName, ".", "")
+	childName := s.generateForkChildName()
+
+	// QEMU fork: snapshot via CPR-reboot migration + clonefile.
+	if s.isQemuFork() {
+		return s.executeQemuFork(childName)
+	}
+
+	return s.executeCRIUFork(childName)
+}
+
+// executeQemuFork snapshots the running QEMU VM via CPR-reboot migration
+// and boots a clone. The parent VM is paused during the snapshot and
+// resumed after the child's files are ready.
+func (s *apiServer) executeQemuFork(childName string) *protocol.ForkResp {
+	type qemuForker interface {
+		QMPSock() string
+		RamPath() string
+		Resume() error
+	}
+	qf, ok := s.vm.(qemuForker)
+	if !ok {
+		return &protocol.ForkResp{Error: "vm does not support fork"}
+	}
+
+	// Child images dir (rootfs, ram, incoming.bin, vmlinuz).
+	srcDir := filepath.Dir(s.rootfsPath)
+	childImagesDir := filepath.Join(filepath.Dir(srcDir), childName)
+	if err := os.MkdirAll(childImagesDir, 0755); err != nil {
+		return &protocol.ForkResp{Error: fmt.Sprintf("create child images dir: %v", err)}
+	}
+
+	// Mark fork in progress to suppress stop requests while the VM
+	// is paused. Exec sessions may stall and error out during the pause.
+	s.forkingMu.Lock()
+	s.forking = true
+	s.forkingMu.Unlock()
+
+	// Snapshot the VM. This pauses it, saves device state, and clones
+	// rootfs + ram.img to childImagesDir.
+	_, err := forkQemuVMFunc(qf.QMPSock(), srcDir, childImagesDir)
+	if err != nil {
+		s.forkingMu.Lock()
+		s.forking = false
+		s.forkingMu.Unlock()
+		os.RemoveAll(childImagesDir)
+		return &protocol.ForkResp{Error: fmt.Sprintf("qemu fork: %v", err)}
+	}
+
+	// ForkQemuVM clones "ram.img" (the base). If the active memory-backend
+	// file is an epoch clone (ram-EPOCH.img), overwrite with the real content.
+	ramPath := qf.RamPath()
+	baseRAM := filepath.Join(srcDir, "ram.img")
+	if ramPath != baseRAM {
+		childRAM := filepath.Join(childImagesDir, "ram.img")
+		os.Remove(childRAM)
+		if err := cloneFile(ramPath, childRAM); err != nil {
+			qf.Resume()
+			s.forkingMu.Lock()
+			s.forking = false
+			s.forkingMu.Unlock()
+			os.RemoveAll(childImagesDir)
+			return &protocol.ForkResp{Error: fmt.Sprintf("clone active ram: %v", err)}
+		}
+	}
+
+	// Resume the parent VM now that all cloning is done.
+	if err := qf.Resume(); err != nil {
+		slog.Error("failed to resume VM after fork", "error", err)
+	}
+	s.forkingMu.Lock()
+	s.forking = false
+	s.forkingMu.Unlock()
+
+	// Child instances dir (status.sock, metadata).
+	childDir := filepath.Join(filepath.Dir(s.instanceDir), childName)
+	if err := os.MkdirAll(childDir, 0755); err != nil {
+		os.RemoveAll(childImagesDir)
+		return &protocol.ForkResp{Error: fmt.Sprintf("create child instance dir: %v", err)}
+	}
+	copyForkMetadata(s.instanceDir, childDir)
+
+	return s.spawnChildDaemon(childName, childDir, func() {
+		os.RemoveAll(childDir)
+		os.RemoveAll(childImagesDir)
+	})
+}
+
+// executeCRIUFork clones rootfs + CRIU volume and boots a child.
+func (s *apiServer) executeCRIUFork(childName string) *protocol.ForkResp {
 	instancesDir := filepath.Dir(s.instanceDir)
 	childDir := filepath.Join(instancesDir, childName)
 	if err := os.MkdirAll(childDir, 0755); err != nil {
@@ -393,20 +585,26 @@ func (s *apiServer) executeFork() *protocol.ForkResp {
 		}
 	}
 
-	// Copy instance metadata.
 	copyForkMetadata(s.instanceDir, childDir)
 
-	// Spawn child daemon.
+	return s.spawnChildDaemon(childName, childDir, func() {
+		os.RemoveAll(childDir)
+	})
+}
+
+// spawnChildDaemon starts a child daemon and waits for it to be ready.
+// cleanup is called on failure before returning.
+func (s *apiServer) spawnChildDaemon(childName, childDir string, cleanup func()) *protocol.ForkResp {
 	self, err := os.Executable()
 	if err != nil {
-		os.RemoveAll(childDir)
+		cleanup()
 		return &protocol.ForkResp{Error: fmt.Sprintf("get executable: %v", err)}
 	}
 
 	childCmd := exec.Command(self, "_daemon", "--instance", childName)
 	childCmd.Env = os.Environ()
 	if err := childCmd.Start(); err != nil {
-		os.RemoveAll(childDir)
+		cleanup()
 		return &protocol.ForkResp{Error: fmt.Sprintf("start child daemon: %v", err)}
 	}
 	childCmd.Process.Release()
@@ -421,7 +619,7 @@ func (s *apiServer) executeFork() *protocol.ForkResp {
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	return &protocol.ForkResp{Instance: childName}
+	return &protocol.ForkResp{Instance: childName, Role: "parent"}
 }
 
 // queryGuest sends a StatusReq and reads the StatusResp.
@@ -748,16 +946,29 @@ func (s *apiServer) handleFork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 1: Tell guest to CRIU dump for fork.
-	var dumpResp struct {
-		Status string `json:"status"`
+	// Pin the daemon so idle timeout doesn't fire during fork.
+	// QEMU fork pauses the VM (killing exec sessions), which would
+	// otherwise trigger idle shutdown.
+	s.pin()
+	defer s.unpin()
+
+	// For CRIU: tell guest to dump processes first.
+	// For QEMU: skip — CPR-reboot migration captures the entire VM.
+	qmpSock := filepath.Join(s.instanceDir, "qmp.sock")
+	isQemu := false
+	if _, err := os.Stat(qmpSock); err == nil {
+		isQemu = true
 	}
-	if err := s.proxyGuestJSON(r.Context(), "/criu/fork-dump", nil, &dumpResp); err != nil {
-		http.Error(w, fmt.Sprintf("guest fork dump: %v", err), http.StatusBadGateway)
-		return
+	if !isQemu {
+		var dumpResp struct {
+			Status string `json:"status"`
+		}
+		if err := s.proxyGuestJSON(r.Context(), "/criu/fork-dump", nil, &dumpResp); err != nil {
+			http.Error(w, fmt.Sprintf("guest fork dump: %v", err), http.StatusBadGateway)
+			return
+		}
 	}
 
-	// Step 2: Clone rootfs + CRIU volume + spawn child.
 	resp := s.executeFork()
 	if resp.Error != "" {
 		http.Error(w, resp.Error, http.StatusInternalServerError)
@@ -932,10 +1143,19 @@ func (s *apiServer) handleExecStream(w http.ResponseWriter, execDec *gob.Decoder
 	for {
 		var msg protocol.Msg
 		if err := execDec.Decode(&msg); err != nil {
-			if err != io.EOF {
-				slog.Debug("exec decode failed", "error", err)
+			// During a QEMU fork the stop command closes all vsock
+			// connections. The exec output was already flushed before
+			// the pause so report success instead of an error.
+			exitCode := -1
+			s.forkingMu.Lock()
+			if s.forking {
+				exitCode = 0
 			}
-			enc.Encode(map[string]int{"exit_code": -1})
+			s.forkingMu.Unlock()
+			if exitCode < 0 {
+				slog.Warn("exec decode failed", "error", err, "session", sessID)
+			}
+			enc.Encode(map[string]int{"exit_code": exitCode})
 			flusher.Flush()
 			return
 		}
@@ -960,6 +1180,7 @@ func (s *apiServer) handleExecStream(w http.ResponseWriter, execDec *gob.Decoder
 				"fork": map[string]string{"instance": msg.ForkNotify.Instance},
 			})
 			flusher.Flush()
+			s.signalForkReady()
 		}
 
 		if msg.ExecDone != nil {
@@ -1127,6 +1348,7 @@ func (s *apiServer) handleExecWS(w http.ResponseWriter, r *http.Request) {
 				"fork": map[string]string{"instance": msg.ForkNotify.Instance},
 			})
 			ws.Write(ctx, websocket.MessageText, forkMsg)
+			s.signalForkReady()
 		}
 		if msg.ExecDone != nil {
 			exitCode = msg.ExecDone.ExitCode
@@ -1289,6 +1511,7 @@ func (s *apiServer) handleForkAttachWS(w http.ResponseWriter, r *http.Request) {
 				"fork": map[string]string{"instance": msg.ForkNotify.Instance},
 			})
 			ws.Write(ctx, websocket.MessageText, forkMsg)
+			s.signalForkReady()
 		}
 		if msg.ExecDone != nil {
 			exitCode = msg.ExecDone.ExitCode

@@ -14,7 +14,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func skipIfQemu(t *testing.T) {
+	t.Helper()
+	if parseQemuBackendForTest() != "" {
+		t.Skip("CRIU tests not supported with QEMU backend")
+	}
+}
+
 func TestCRIU_CheckpointAndRestore(t *testing.T) {
+	skipIfQemu(t)
 	bin := lnxBin()
 	if bin == "" {
 		t.Skip("lnx not in PATH")
@@ -96,6 +104,7 @@ python3 -u /tmp/server.py </dev/null >/dev/null 2>&1 &`)
 }
 
 func TestCRIU_Fork(t *testing.T) {
+	skipIfQemu(t)
 	t.Parallel()
 	bin := lnxBin()
 	if bin == "" {
@@ -157,6 +166,7 @@ python3 -u /tmp/server.py </dev/null >/dev/null 2>&1 &`)
 }
 
 func TestCRIU_ForkPipe(t *testing.T) {
+	skipIfQemu(t)
 	t.Parallel()
 	bin := lnxBin()
 	if bin == "" {
@@ -199,6 +209,7 @@ else:
 }
 
 func TestCRIU_CheckpointList(t *testing.T) {
+	skipIfQemu(t)
 	t.Parallel()
 	bin := lnxBin()
 	if bin == "" {
@@ -217,6 +228,7 @@ func TestCRIU_CheckpointList(t *testing.T) {
 }
 
 func TestCRIU_RestoreRequiresStoppedVM(t *testing.T) {
+	skipIfQemu(t)
 	t.Parallel()
 	bin := lnxBin()
 	if bin == "" {
@@ -249,6 +261,7 @@ func TestCRIU_RestoreRequiresStoppedVM(t *testing.T) {
 // its counter. After checkpoint and restore, counters roll back and the
 // ring continues to function.
 func TestCRIU_DiningPhilosophers(t *testing.T) {
+	skipIfQemu(t)
 	bin := lnxBin()
 	if bin == "" {
 		t.Skip("lnx not in PATH")

@@ -196,6 +196,15 @@ func runInstanceClone(cmd *cobra.Command, args []string) error {
 		_ = os.RemoveAll(instDir)
 		return fmt.Errorf("clone rootfs: %w", err)
 	}
+	// Clone ram.img (CoW) if the source has one (QEMU backend).
+	sourceRAM := filepath.Join(sourceImgDir, "ram.img")
+	if _, err := os.Stat(sourceRAM); err == nil {
+		if err := cloneRootfs(sourceRAM, filepath.Join(imgDir, "ram.img")); err != nil {
+			_ = os.RemoveAll(imgDir)
+			_ = os.RemoveAll(instDir)
+			return fmt.Errorf("clone ram: %w", err)
+		}
+	}
 	if err := cloneInstanceMetadata(sourceInstDir, instDir); err != nil {
 		_ = os.RemoveAll(imgDir)
 		_ = os.RemoveAll(instDir)
@@ -505,10 +514,13 @@ func shouldSkipClonedMetadata(rel string, d fs.DirEntry) bool {
 	}
 	switch base {
 	case "status.sock", "error.log", "serial.log", "lnx.log", "initramfs.cpio", "swap.img",
-		"rootfs.ext4.lock", "rootfs.ext4.pid", "firecracker.sock", "vsock", "hibernated":
+		"rootfs.ext4.lock", "rootfs.ext4.pid", "firecracker.sock", "vsock", "hibernated",
+		"qemu.log", "qmp.sock", "ram.img":
 		return true
 	}
-	return strings.HasPrefix(base, "vsock_")
+	return strings.HasPrefix(base, "vsock_") ||
+		strings.HasPrefix(base, "qemu-vsock") ||
+		strings.HasPrefix(base, "ram-")
 }
 
 // completeInstanceNames provides shell completion for instance names.

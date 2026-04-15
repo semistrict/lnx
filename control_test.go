@@ -88,3 +88,53 @@ func TestControlProtocol_ResizeDelivered(t *testing.T) {
 	assert.Equal(t, uint16(24), msg.Resize.Rows)
 	assert.Equal(t, uint16(80), msg.Resize.Cols)
 }
+
+func TestControlProtocol_InstanceNameRoundTrip(t *testing.T) {
+	hostConn, guestConn := net.Pipe()
+	defer hostConn.Close()
+	defer guestConn.Close()
+
+	// Simulate host handleGuestCtrl: read request, write response.
+	go func() {
+		dec := gob.NewDecoder(hostConn)
+		enc := gob.NewEncoder(hostConn)
+		var msg protocol.Msg
+		if err := dec.Decode(&msg); err != nil {
+			return
+		}
+		if msg.InstanceNameReq != nil {
+			enc.Encode(protocol.Msg{InstanceNameResp: &protocol.InstanceNameResp{Name: "test-instance"}})
+		}
+	}()
+
+	// Guest side: send request, read response.
+	enc := gob.NewEncoder(guestConn)
+	dec := gob.NewDecoder(guestConn)
+	require.NoError(t, enc.Encode(protocol.Msg{InstanceNameReq: &protocol.InstanceNameReq{}}))
+
+	var resp protocol.Msg
+	require.NoError(t, dec.Decode(&resp))
+	require.NotNil(t, resp.InstanceNameResp)
+	assert.Equal(t, "test-instance", resp.InstanceNameResp.Name)
+}
+
+func TestControlProtocol_ForkRespRole(t *testing.T) {
+	hostConn, guestConn := net.Pipe()
+	defer hostConn.Close()
+	defer guestConn.Close()
+
+	go func() {
+		enc := gob.NewEncoder(hostConn)
+		enc.Encode(protocol.Msg{ForkResp: &protocol.ForkResp{
+			Instance: "child-fork-001",
+			Role:     "parent",
+		}})
+	}()
+
+	dec := gob.NewDecoder(guestConn)
+	var msg protocol.Msg
+	require.NoError(t, dec.Decode(&msg))
+	require.NotNil(t, msg.ForkResp)
+	assert.Equal(t, "child-fork-001", msg.ForkResp.Instance)
+	assert.Equal(t, "parent", msg.ForkResp.Role)
+}

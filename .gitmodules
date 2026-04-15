@@ -6,3 +6,6 @@
 	path = third_party/criu
 	url = https://github.com/semistrict/criu.git
 	branch = lnx
+[submodule "third_party/qemu"]
+	path = third_party/qemu
+	url = /Users/ramon/src/qemu

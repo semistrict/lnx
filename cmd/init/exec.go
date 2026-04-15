@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"sort"
@@ -160,7 +161,8 @@ func handleForkPipe(reqR, resW *os.File, sess *execSession) {
 		// Notify the host BEFORE writing to the result pipe — the parent
 		// process may exit immediately after reading the result, and the
 		// CLI needs to know about the fork before ExecDone arrives.
-		if !strings.HasPrefix(result, "error:") {
+		// Skip for child (exec session is dead) and errors.
+		if !strings.HasPrefix(result, "error:") && result != "child" {
 			sess.encode(protocol.Msg{ForkNotify: &protocol.ForkNotify{Instance: result}})
 		}
 
@@ -168,15 +170,22 @@ func handleForkPipe(reqR, resW *os.File, sess *execSession) {
 	}
 }
 
-// doGuestFork triggers a CRIU fork dump and asks the host to clone.
-// Returns the child instance name or "error: ...".
+// doGuestFork asks the host to fork the VM.
+// For CRIU: dumps user processes first, then sends ForkReq.
+// For QEMU: sends ForkReq directly (host handles CPR-reboot migration).
+// Returns the child instance name for the parent, "child" for the child,
+// or "error: ...".
 func doGuestFork() string {
-	if err := criuDump("fork", criuForkDir, true); err != nil {
-		return "error: " + err.Error()
+	// CRIU dump if available — skip for QEMU VMs (no criu binary).
+	hasCRIU := false
+	if _, err := exec.LookPath("criu"); err == nil {
+		hasCRIU = true
+		if err := criuDump("fork", criuForkDir, true); err != nil {
+			return "error: " + err.Error()
+		}
+		syscall.Sync()
 	}
-	syscall.Sync()
 
-	// Ask the host to clone rootfs + CRIU volume and spawn child.
 	gc := getGuestControl()
 	if gc == nil {
 		return "error: guest control not available"
@@ -185,13 +194,29 @@ func doGuestFork() string {
 	gc.mu.Lock()
 	defer gc.mu.Unlock()
 
+	// Query the current instance name before forking.
+	if err := gc.enc.Encode(protocol.Msg{InstanceNameReq: &protocol.InstanceNameReq{}}); err != nil {
+		return "error: " + err.Error()
+	}
+	var nameMsg protocol.Msg
+	if err := gc.dec.Decode(&nameMsg); err != nil {
+		return "error: " + err.Error()
+	}
+	if nameMsg.InstanceNameResp == nil {
+		return "error: unexpected response to instance name query"
+	}
+	beforeName := nameMsg.InstanceNameResp.Name
+
+	// Ask the host to fork.
 	if err := gc.enc.Encode(protocol.Msg{ForkReq: &protocol.ForkReq{}}); err != nil {
 		return "error: " + err.Error()
 	}
 
 	var msg protocol.Msg
 	if err := gc.dec.Decode(&msg); err != nil {
-		return "error: " + err.Error()
+		// Connection died — likely forked (QEMU CPR-reboot).
+		// Reconnect to the (possibly new) host and check the instance name.
+		return detectForkRole(beforeName)
 	}
 	if msg.ForkResp == nil {
 		return "error: unexpected response"
@@ -201,36 +226,176 @@ func doGuestFork() string {
 	}
 
 	// Clean up fork dump from parent.
-	os.RemoveAll(criuForkDir)
+	if hasCRIU {
+		os.RemoveAll(criuForkDir)
+	}
 	return msg.ForkResp.Instance
 }
+
+// detectForkRole reconnects the guest control and compares the instance
+// name to determine if we're the parent or child after a QEMU fork.
+func detectForkRole(beforeName string) string {
+	conn, err := vsock.Dial(vsockHostCID, protocol.GuestControlPort, nil)
+	if err != nil {
+		return "error: reconnect guest control: " + err.Error()
+	}
+
+	enc := gob.NewEncoder(conn)
+	dec := gob.NewDecoder(conn)
+
+	if err := enc.Encode(protocol.Msg{InstanceNameReq: &protocol.InstanceNameReq{}}); err != nil {
+		conn.Close()
+		return "error: query instance name: " + err.Error()
+	}
+	var msg protocol.Msg
+	if err := dec.Decode(&msg); err != nil {
+		conn.Close()
+		return "error: read instance name: " + err.Error()
+	}
+	conn.Close()
+
+	if msg.InstanceNameResp == nil {
+		return "error: unexpected response to instance name query"
+	}
+
+	if msg.InstanceNameResp.Name != beforeName {
+		return "child"
+	}
+	// Same name — this wasn't a fork, the connection just died.
+	return "error: guest control connection lost"
+}
+
+var (
+	execListener      *vsock.Listener
+	execInteractiveLn *vsock.Listener
+	execListenerMu    sync.Mutex
+)
 
 // startExecServer listens on the exec vsock port and handles one
 // exec request per connection. Multiple connections are accepted
 // concurrently so `lnx exec` works while the main command runs.
 func startExecServer() {
-	execLn, err := vsock.Listen(protocol.ExecPort, nil)
+	execListenerMu.Lock()
+	// Close old listeners if restarting (e.g., after fork/migration).
+	if execListener != nil {
+		execListener.Close()
+		execListener = nil
+	}
+	if execInteractiveLn != nil {
+		execInteractiveLn.Close()
+		execInteractiveLn = nil
+	}
+	execListenerMu.Unlock()
+
+	ln, err := vsock.Listen(protocol.ExecPort, nil)
 	if err != nil {
 		slog.Warn("exec listen failed", "error", err)
 		return
 	}
 
-	interactiveLn, err := vsock.Listen(protocol.ExecInteractivePort, nil)
+	iln, err := vsock.Listen(protocol.ExecInteractivePort, nil)
 	if err != nil {
 		slog.Warn("exec interactive listen failed", "error", err)
-		execLn.Close()
+		ln.Close()
 		return
 	}
 
+	execListenerMu.Lock()
+	execListener = ln
+	execInteractiveLn = iln
+	execListenerMu.Unlock()
+
 	go func() {
 		for {
-			conn, err := execLn.Accept()
+			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			go handleExecConn(conn.(*vsock.Conn), interactiveLn)
+			go handleExecConn(conn.(*vsock.Conn), iln)
 		}
 	}()
+}
+
+// startReverseExecServer dials the host on the exec port to offer exec
+// services. After CPR-reboot migration, the guest kernel can't accept
+// host-initiated vsock connections at the userspace level (the kernel
+// handles the protocol handshake but never wakes up Accept). Guest→host
+// connections work fine, so we reverse the direction.
+func startReverseExecServer() {
+	execListenerMu.Lock()
+	if execListener != nil {
+		execListener.Close()
+		execListener = nil
+	}
+	if execInteractiveLn != nil {
+		execInteractiveLn.Close()
+		execInteractiveLn = nil
+	}
+	execListenerMu.Unlock()
+
+	go func() {
+		for {
+			// Dial the host's exec listener. The host accepts and uses
+			// this connection to send ExecReq when an exec is needed.
+			conn, err := vsock.Dial(vsockHostCID, protocol.ExecPort, nil)
+			if err != nil {
+				slog.Warn("reverse exec dial failed", "error", err)
+				return
+			}
+			// Block until the host sends an exec request on this connection.
+			handleExecConnNet(conn, nil)
+		}
+	}()
+}
+
+// handleExecConnNet handles an exec connection from a net.Conn
+// (used by the raw syscall path after migration). Simplified to
+// avoid dependencies on Go runtime features that break after CPR-reboot.
+func handleExecConnNet(conn net.Conn, interactiveLn *vsock.Listener) {
+	defer conn.Close()
+	enc := gob.NewEncoder(conn)
+	dec := gob.NewDecoder(conn)
+
+	var msg protocol.Msg
+	if err := dec.Decode(&msg); err != nil {
+		return
+	}
+	if msg.ExecReq == nil {
+		return
+	}
+	req := msg.ExecReq
+
+	cmd := exec.Command(req.Args[0], req.Args[1:]...)
+	cmd.Dir = "/"
+	if setupCWD != "" {
+		if _, err := os.Stat(setupCWD); err == nil {
+			cmd.Dir = setupCWD
+		}
+	}
+	cmd.Env = os.Environ()
+	if setupUID > 0 {
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Credential: &syscall.Credential{
+				Uid: uint32(setupUID),
+				Gid: uint32(setupUID),
+			},
+		}
+	}
+
+	output, err := cmd.CombinedOutput()
+	exitCode := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = 127
+		}
+	}
+
+	if len(output) > 0 {
+		enc.Encode(protocol.Msg{ExecOutput: &protocol.ExecOutput{Stdout: output}})
+	}
+	enc.Encode(protocol.Msg{ExecDone: &protocol.ExecDone{ExitCode: exitCode}})
 }
 
 // execSession holds per-session state for signal/resize forwarding.

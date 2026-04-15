@@ -74,9 +74,11 @@ type Msg struct {
 	CheckpointResp *CheckpointResp
 	OpenURLReq     *OpenURLReq
 	OpenURLResp    *OpenURLResp
-	ForkReq        *ForkReq
-	ForkResp       *ForkResp
-	ForkNotify     *ForkNotify
+	ForkReq          *ForkReq
+	ForkResp         *ForkResp
+	ForkNotify       *ForkNotify
+	InstanceNameReq  *InstanceNameReq
+	InstanceNameResp *InstanceNameResp
 }
 
 // Setup tells the guest the environment to configure (user, cwd, env vars).
@@ -204,20 +206,32 @@ type ExecResize struct {
 	Cols uint16
 }
 
-// ForkReq tells the host that the guest has completed a CRIU dump for fork
-// and is ready for the host to clone the rootfs and spawn a child instance.
+// ForkReq tells the host to fork the VM. For CRIU, the guest dumps
+// processes before sending this. For QEMU, the host handles everything
+// (CPR-reboot migration + clonefile).
 type ForkReq struct{}
 
 // ForkResp reports the result of a fork operation.
 type ForkResp struct {
-	Instance string // child instance name
+	Instance string // child instance name (set when Role == "parent")
 	Error    string // non-empty on failure
+	Role     string // "parent" or "child"
 }
 // ForkNotify tells the host that a fork happened in this exec session.
 // Sent on the per-session exec gob connection (port 1027) so the host
 // can forward the notification to the specific CLI WebSocket.
 type ForkNotify struct {
 	Instance string // child instance name
+}
+
+// InstanceNameReq asks the host for the current instance name.
+// Used by the guest to detect fork: query before ForkReq, reconnect
+// and query after — if the name changed, this is the child.
+type InstanceNameReq struct{}
+
+// InstanceNameResp returns the host's instance name.
+type InstanceNameResp struct {
+	Name string
 }
 
 // PortForward notifies the host of the current set of listening TCP ports in the guest.

@@ -61,6 +61,10 @@ func vzStateToVMState(s vz.VirtualMachineState) VMState {
 // macAddr is a stable MAC address string; if empty, one is generated.
 // epoch overrides lnx.epoch in the kernel cmdline (0 = use current time).
 func buildVM(cfg *Config, initrdPath, cwd, swapPath, criuPath, homeDir, macAddr string, epoch int64) (VirtualMachine, error) {
+	if qemuBin := parseQemuBackend(); qemuBin != "" {
+		return buildQemuVM(cfg, qemuBin, initrdPath, swapPath, criuPath, macAddr, epoch)
+	}
+
 	vmConfig, err := buildVMConfig(cfg, initrdPath, cwd, swapPath, criuPath, homeDir, macAddr, epoch)
 	if err != nil {
 		return nil, err

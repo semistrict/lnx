@@ -44,6 +44,15 @@ func NewBridge() (*Bridge, error) {
 	}, nil
 }
 
+// NewBridgeFromFd creates a bridge using an existing fd as the host end.
+// The caller is responsible for passing the other end to the VM.
+func NewBridgeFromFd(hostFd int) *Bridge {
+	return &Bridge{
+		hostFd: hostFd,
+		vmFd:   -1,
+	}
+}
+
 // VMFd returns the raw fd for the VM end.
 // Pass this to vz.NewFileHandleNetworkDeviceAttachmentWithFd.
 // Do NOT wrap in os.File — Go's kqueue registration will steal

@@ -257,6 +257,7 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		}
 		return nil, err
 	}
+	vs.api.vm = vm
 
 	if err := vm.Start(); err != nil {
 		vs.cleanup()
@@ -265,6 +266,25 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 			ephCleanup()
 		}
 		return nil, fmt.Errorf("start vm: %w", err)
+	}
+
+	// Restored VMs (fork): the guest is already running and configured.
+	// Skip the control connection handshake — the guest won't re-dial.
+	// Use a dummy connection so bootedVM.close() works.
+	type restoredChecker interface{ IsRestored() bool }
+	if rc, ok := vm.(restoredChecker); ok && rc.IsRestored() {
+		dummyConn, _ := net.Pipe()
+		return &bootedVM{
+			vm:         vm,
+			vs:         vs,
+			ctrlConn:   dummyConn,
+			ctrlEnc:    gob.NewEncoder(dummyConn),
+			cwd:        cwd,
+			sockDir:    sockDir,
+			criuPath:   criuPath,
+			ephCleanup: ephCleanup,
+			lock:       lock,
+		}, nil
 	}
 
 	// Wait for the guest to connect on the control port, with a timeout.
@@ -559,10 +579,30 @@ func setupVsock(sock VsockDevice, logDir, rootfsPath, instanceName string, setup
 		pf.run(conn)
 	}()
 
+	// Listen for reverse exec connections from the guest (used after
+	// fork/migration when host→guest Connect doesn't work).
+	reverseExecListener, err := sock.Listen(protocol.ExecPort)
+	if err != nil {
+		slog.Warn("vsock reverse exec listen failed", "error", err)
+	}
+	reverseExecCh := make(chan net.Conn, 16)
+	if reverseExecListener != nil {
+		go func() {
+			for {
+				conn, err := reverseExecListener.Accept()
+				if err != nil {
+					return
+				}
+				reverseExecCh <- conn
+			}
+		}()
+	}
+
 	criuImagePath := filepath.Join(filepath.Dir(rootfsPath), "criu.ext4")
 	api := newAPIServer(nil, setupMsg.User, rootfsPath)
 	api.sock = sock
 	api.pf = pf
+	api.reverseExecCh = reverseExecCh
 	api.instanceName = instanceName
 	api.instanceDir = logDir
 	api.criuPath = criuImagePath
@@ -604,6 +644,9 @@ func setupVsock(sock VsockDevice, logDir, rootfsPath, instanceName string, setup
 		}
 		for _, l := range p9Listeners {
 			l.Close()
+		}
+		if reverseExecListener != nil {
+			reverseExecListener.Close()
 		}
 		portFwdListener.Close()
 		guestCtrlListener.Close()

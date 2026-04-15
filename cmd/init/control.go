@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"syscall"
@@ -251,14 +252,18 @@ func (gc *guestControl) handleCRIUForkDump(w http.ResponseWriter, r *http.Reques
 }
 
 func (gc *guestControl) handleFork(w http.ResponseWriter, r *http.Request) {
-	// Dump all user processes with --leave-running.
-	if err := criuDump("fork", criuForkDir, true); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	// CRIU dump if available — skip for QEMU VMs.
+	hasCRIU := false
+	if _, err := exec.LookPath("criu"); err == nil {
+		hasCRIU = true
+		if err := criuDump("fork", criuForkDir, true); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		syscall.Sync()
 	}
-	syscall.Sync()
 
-	// Ask the host to clone rootfs + CRIU volume and spawn a child instance.
+	// Ask the host to clone rootfs + spawn a child instance.
 	gc.mu.Lock()
 	defer gc.mu.Unlock()
 
@@ -281,8 +286,9 @@ func (gc *guestControl) handleFork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Clean up fork dump from parent (child has it in its cloned CRIU volume).
-	os.RemoveAll(criuForkDir)
+	if hasCRIU {
+		os.RemoveAll(criuForkDir)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{

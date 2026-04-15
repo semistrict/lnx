@@ -229,6 +229,31 @@ func run() error {
 	slog.Info("guest ready", "user", setup.User, "uid", setup.UID)
 
 	// Block until the host closes the control connection.
+	// After a transport reset (migration/fork), the control connection
+	// dies. Try to reconnect — if successful, the VM was forked and
+	// should stay alive. If reconnect fails, this is a genuine shutdown.
+	<-ctrlDone
+
+	// Re-init logging — old vsock connection to log port is dead.
+	initLogging()
+
+	reconnConn, reconnErr := vsock.Dial(vsockHostCID, protocol.Port, nil)
+	if reconnErr != nil {
+		return nil // genuine shutdown
+	}
+	// Forked VM: host accepted reconnect. Block on the new connection
+	// until the host kills the QEMU process.
+	slog.Info("fork detected, restarting services")
+	ctrlConn = reconnConn
+	ctrlDec = gob.NewDecoder(reconnConn)
+	ctrlDone = make(chan struct{})
+	go controlReader()
+
+	// Use reverse exec: guest dials host instead of host dialing guest.
+	// After CPR-reboot migration, the guest kernel can't deliver
+	// host-initiated vsock connections to userspace Accept().
+	startReverseExecServer()
+
 	<-ctrlDone
 	return nil
 }
