@@ -168,13 +168,11 @@ pub enum PortConfig {
 /// Configuration for the vsock device
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub enum VsockConfig {
-    /// Default behavior - vsock created implicitly with heuristics-based TSI
+    /// No vsock device
     #[default]
-    Implicit,
+    Disabled,
     /// Explicit configuration with specified TSI features
     Explicit { tsi_flags: TsiFlags },
-    /// Vsock device disabled
-    Disabled,
 }
 
 /// A data structure that encapsulates the device configurations

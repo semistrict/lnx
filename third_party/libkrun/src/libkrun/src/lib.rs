@@ -445,7 +445,9 @@ impl VmBuilder {
     ) -> KrunResult<&mut Self> {
         let filepath = filepath.as_ref().to_path_buf();
         if self.cfg.vsock_config == VsockConfig::Disabled {
-            return Err(Error::from_errno(libc::ENODEV));
+            self.cfg.vsock_config = VsockConfig::Explicit {
+                tsi_flags: TsiFlags::empty(),
+            };
         }
         self.cfg
             .unix_ipc_port_map
@@ -1012,33 +1014,6 @@ fn start_enter_context(
                 tsi_flags: *tsi_flags,
             };
             ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
-        }
-        VsockConfig::Implicit => {
-            // Implicit vsock configuration - use heuristics
-            // Check if TSI should be enabled based on network configuration
-            #[cfg(feature = "net")]
-            let enable_tsi = ctx_cfg.vmr.net.list.is_empty();
-            #[cfg(not(feature = "net"))]
-            let enable_tsi = true;
-
-            let has_ipc_map = ctx_cfg.unix_ipc_port_map.is_some();
-
-            if enable_tsi || has_ipc_map {
-                let (tsi_flags, host_port_map) = if enable_tsi {
-                    (TsiFlags::HIJACK_INET, None)
-                } else {
-                    (TsiFlags::empty(), None)
-                };
-
-                let vsock_device_config = VsockDeviceConfig {
-                    vsock_id: "vsock0".to_string(),
-                    guest_cid: 3,
-                    host_port_map,
-                    unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
-                    tsi_flags,
-                };
-                ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
-            }
         }
     }
     vmm::timing_event("start_enter.vsock.configured");

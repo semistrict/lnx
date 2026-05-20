@@ -113,18 +113,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    if (getenv("KRUN_DISABLE_VSOCK")) {
-        rc = krun_disable_implicit_vsock((uint32_t)ctx_id);
-        if (rc != 0) {
-            fprintf(stderr, "krun_disable_implicit_vsock failed: %d\n", rc);
-            return 1;
-        }
-    } else if (getenv("KRUN_EXPLICIT_VSOCK_NO_TSI") || !getenv("KRUN_USE_IMPLICIT_VSOCK")) {
-        rc = krun_disable_implicit_vsock((uint32_t)ctx_id);
-        if (rc != 0) {
-            fprintf(stderr, "krun_disable_implicit_vsock failed: %d\n", rc);
-            return 1;
-        }
+    if (!getenv("KRUN_DISABLE_VSOCK")) {
         rc = krun_add_vsock((uint32_t)ctx_id, 0);
         if (rc != 0) {
             fprintf(stderr, "krun_add_vsock failed: %d\n", rc);
