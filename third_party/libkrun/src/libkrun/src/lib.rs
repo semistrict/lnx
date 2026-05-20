@@ -26,7 +26,7 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use utils::eventfd::EventFd;
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
-use vmm::resources::{TsiFlags, VmResources, VsockConfig};
+use vmm::resources::{TsiFlags, VirtioConsoleConfigMode, VmResources, VsockConfig};
 #[cfg(all(not(feature = "tee"), target_arch = "aarch64"))]
 use vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(not(feature = "tee"))]
@@ -293,7 +293,21 @@ impl VmBuilder {
     }
 
     pub fn console_output(&mut self, filepath: impl AsRef<Path>) -> &mut Self {
-        self.cfg.console_output = Some(filepath.as_ref().to_path_buf());
+        let filepath = filepath.as_ref().to_path_buf();
+
+        #[cfg(feature = "aws-nitro")]
+        {
+            self.cfg.nitro_console_output = Some(filepath);
+        }
+
+        #[cfg(all(not(feature = "aws-nitro"), unix))]
+        {
+            self.cfg
+                .vmr
+                .virtio_consoles
+                .push(VirtioConsoleConfigMode::OutputFile(filepath));
+        }
+
         self
     }
 
@@ -700,7 +714,8 @@ struct ContextConfig {
     tee_config_file: Option<PathBuf>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     shutdown_efd: Option<EventFd>,
-    console_output: Option<PathBuf>,
+    #[cfg(feature = "aws-nitro")]
+    nitro_console_output: Option<PathBuf>,
     /// If set, `krun_start_enter` will restore from this snapshot directory
     /// instead of doing a fresh boot.
     #[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
@@ -773,7 +788,7 @@ impl TryFrom<ContextConfig> for NitroEnclave {
             }
         };
 
-        let Some(output_path) = ctx.console_output else {
+        let Some(output_path) = ctx.nitro_console_output else {
             error!("console output path not specified");
             return Err(-libc::EINVAL);
         };
@@ -1028,9 +1043,6 @@ fn start_enter_context(
     }
     vmm::timing_event("start_enter.vsock.configured");
 
-    if let Some(console_output) = ctx_cfg.console_output {
-        ctx_cfg.vmr.set_console_output(console_output);
-    }
     vmm::timing_event("start_enter.resources.finalized");
 
     let (sender, _receiver) = unbounded();

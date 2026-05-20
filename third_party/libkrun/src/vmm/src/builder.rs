@@ -851,7 +851,7 @@ pub fn build_microvm(
     let mut serial_devices = Vec::new();
 
     // Create the legacy serial device if we're booting from a firmware
-    if vm_resources.firmware_config.is_some() && !vm_resources.disable_implicit_console {
+    if vm_resources.firmware_config.is_some() {
         serial_devices.push(setup_serial_device(
             event_manager,
             None,
@@ -1177,30 +1177,15 @@ pub fn build_microvm(
             crate::timing_event("build_microvm.rng.attached");
         }
     }
-    let mut console_id = 0;
-    if !vm_resources.disable_implicit_console {
-        attach_console_devices(
-            &mut vmm,
-            event_manager,
-            intc.clone(),
-            vm_resources,
-            None,
-            console_id,
-        )?;
-        console_id += 1;
-        crate::timing_event("build_microvm.implicit_console.attached");
-    }
-
-    for console_cfg in vm_resources.virtio_consoles.iter() {
+    for (console_id, console_cfg) in vm_resources.virtio_consoles.iter().enumerate() {
         attach_console_devices(
             &mut vmm,
             event_manager,
             intc.clone(),
             vm_resources,
             Some(console_cfg),
-            console_id,
+            console_id as u32,
         )?;
-        console_id += 1;
     }
 
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -2547,118 +2532,108 @@ fn attach_fs_devices(
 #[cfg(unix)]
 fn autoconfigure_console_ports(
     vmm: &mut Vmm,
-    vm_resources: &VmResources,
     cfg: Option<&DefaultVirtioConsoleConfig>,
-    creating_implicit_console: bool,
 ) -> std::result::Result<Vec<PortDescription>, StartMicrovmError> {
-    use self::StartMicrovmError::*;
+    let (input_fd, output_fd, err_fd) = match cfg {
+        Some(c) => (c.input_fd, c.output_fd, c.err_fd),
+        None => (STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO),
+    };
+    let input_is_terminal =
+        input_fd >= 0 && isatty(unsafe { BorrowedFd::borrow_raw(input_fd) }).unwrap_or(false);
+    let output_is_terminal =
+        output_fd >= 0 && isatty(unsafe { BorrowedFd::borrow_raw(output_fd) }).unwrap_or(false);
+    let error_is_terminal =
+        err_fd >= 0 && isatty(unsafe { BorrowedFd::borrow_raw(err_fd) }).unwrap_or(false);
 
-    let mut console_output_path: Option<PathBuf> = None;
-    if let Some(path) = vm_resources.console_output.clone()
-        && !vm_resources.disable_implicit_console
-        && creating_implicit_console
-    {
-        console_output_path = Some(path)
-    }
-
-    if let Some(console_output_path) = console_output_path {
-        let file = File::create(console_output_path).map_err(OpenConsoleFile)?;
-        // Manually emulate our Legacy behavior: In the case of output_path we have always used the
-        // stdin to determine the console size
-        let stdin_fd = unsafe { BorrowedFd::borrow_raw(STDIN_FILENO) };
-        let term_fd = if isatty(stdin_fd).is_ok_and(|v| v) {
-            port_io::term_fd(stdin_fd.as_raw_fd()).unwrap()
-        } else {
-            port_io::term_fixed_size(0, 0)
-        };
-        Ok(vec![PortDescription::console(
-            Some(port_io::input_empty().unwrap()),
-            Some(port_io::output_file(file).unwrap()),
-            term_fd,
-        )])
+    let term_fd = if input_is_terminal {
+        Some(unsafe { BorrowedFd::borrow_raw(input_fd) })
+    } else if output_is_terminal {
+        Some(unsafe { BorrowedFd::borrow_raw(output_fd) })
+    } else if error_is_terminal {
+        Some(unsafe { BorrowedFd::borrow_raw(err_fd) })
     } else {
-        let (input_fd, output_fd, err_fd) = match cfg {
-            Some(c) => (c.input_fd, c.output_fd, c.err_fd),
-            None => (STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO),
-        };
-        let input_is_terminal =
-            input_fd >= 0 && isatty(unsafe { BorrowedFd::borrow_raw(input_fd) }).unwrap_or(false);
-        let output_is_terminal =
-            output_fd >= 0 && isatty(unsafe { BorrowedFd::borrow_raw(output_fd) }).unwrap_or(false);
-        let error_is_terminal =
-            err_fd >= 0 && isatty(unsafe { BorrowedFd::borrow_raw(err_fd) }).unwrap_or(false);
+        None
+    };
 
-        let term_fd = if input_is_terminal {
-            Some(unsafe { BorrowedFd::borrow_raw(input_fd) })
-        } else if output_is_terminal {
-            Some(unsafe { BorrowedFd::borrow_raw(output_fd) })
-        } else if error_is_terminal {
-            Some(unsafe { BorrowedFd::borrow_raw(err_fd) })
-        } else {
-            None
-        };
-
-        let forwarding_sigint;
-        let console_input = if input_is_terminal && input_fd >= 0 {
+    let forwarding_sigint;
+    let console_input = if input_is_terminal && input_fd >= 0 {
+        forwarding_sigint = false;
+        Some(port_io::input_to_raw_fd_dup(input_fd).unwrap())
+    } else {
+        #[cfg(target_os = "linux")]
+        {
+            forwarding_sigint = true;
+            let sigint_input = port_io::PortInputSigInt::new();
+            let sigint_input_fd = sigint_input.sigint_evt().as_raw_fd();
+            register_sigint_handler(sigint_input_fd).map_err(StartMicrovmError::RegisterFsSigwinch)?;
+            Some(Box::new(sigint_input) as _)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
             forwarding_sigint = false;
-            Some(port_io::input_to_raw_fd_dup(input_fd).unwrap())
-        } else {
-            #[cfg(target_os = "linux")]
-            {
-                forwarding_sigint = true;
-                let sigint_input = port_io::PortInputSigInt::new();
-                let sigint_input_fd = sigint_input.sigint_evt().as_raw_fd();
-                register_sigint_handler(sigint_input_fd).map_err(RegisterFsSigwinch)?;
-                Some(Box::new(sigint_input) as _)
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                forwarding_sigint = false;
-                Some(port_io::input_empty().unwrap())
-            }
-        };
-
-        let console_output = if output_is_terminal && output_fd >= 0 {
-            Some(port_io::output_to_raw_fd_dup(output_fd).unwrap())
-        } else {
-            Some(port_io::output_to_log_as_err())
-        };
-
-        let terminal_properties = term_fd
-            .map(|fd| port_io::term_fd(fd.as_raw_fd()).unwrap())
-            .unwrap_or_else(|| port_io::term_fixed_size(0, 0));
-
-        setup_terminal_raw_mode(vmm, term_fd, forwarding_sigint);
-
-        let mut ports = vec![PortDescription::console(
-            console_input,
-            console_output,
-            terminal_properties,
-        )];
-
-        if input_fd >= 0 && !input_is_terminal {
-            ports.push(PortDescription::input_pipe(
-                "krun-stdin",
-                port_io::input_to_raw_fd_dup(input_fd).unwrap(),
-            ));
+            Some(port_io::input_empty().unwrap())
         }
+    };
 
-        if output_fd >= 0 && !output_is_terminal {
-            ports.push(PortDescription::output_pipe(
-                "krun-stdout",
-                port_io::output_to_raw_fd_dup(output_fd).unwrap(),
-            ));
-        };
+    let console_output = if output_is_terminal && output_fd >= 0 {
+        Some(port_io::output_to_raw_fd_dup(output_fd).unwrap())
+    } else {
+        Some(port_io::output_to_log_as_err())
+    };
 
-        if err_fd >= 0 && !error_is_terminal {
-            ports.push(PortDescription::output_pipe(
-                "krun-stderr",
-                port_io::output_to_raw_fd_dup(err_fd).unwrap(),
-            ));
-        }
+    let terminal_properties = term_fd
+        .map(|fd| port_io::term_fd(fd.as_raw_fd()).unwrap())
+        .unwrap_or_else(|| port_io::term_fixed_size(0, 0));
 
-        Ok(ports)
+    setup_terminal_raw_mode(vmm, term_fd, forwarding_sigint);
+
+    let mut ports = vec![PortDescription::console(
+        console_input,
+        console_output,
+        terminal_properties,
+    )];
+
+    if input_fd >= 0 && !input_is_terminal {
+        ports.push(PortDescription::input_pipe(
+            "krun-stdin",
+            port_io::input_to_raw_fd_dup(input_fd).unwrap(),
+        ));
     }
+
+    if output_fd >= 0 && !output_is_terminal {
+        ports.push(PortDescription::output_pipe(
+            "krun-stdout",
+            port_io::output_to_raw_fd_dup(output_fd).unwrap(),
+        ));
+    };
+
+    if err_fd >= 0 && !error_is_terminal {
+        ports.push(PortDescription::output_pipe(
+            "krun-stderr",
+            port_io::output_to_raw_fd_dup(err_fd).unwrap(),
+        ));
+    }
+
+    Ok(ports)
+}
+
+#[cfg(unix)]
+fn output_file_console_ports(
+    path: &PathBuf,
+) -> std::result::Result<Vec<PortDescription>, StartMicrovmError> {
+    let file = File::create(path).map_err(StartMicrovmError::OpenConsoleFile)?;
+    let stdin_fd = unsafe { BorrowedFd::borrow_raw(STDIN_FILENO) };
+    let term_fd = if isatty(stdin_fd).is_ok_and(|v| v) {
+        port_io::term_fd(stdin_fd.as_raw_fd()).unwrap()
+    } else {
+        port_io::term_fixed_size(0, 0)
+    };
+
+    Ok(vec![PortDescription::console(
+        Some(port_io::input_empty().unwrap()),
+        Some(port_io::output_file(file).unwrap()),
+        term_fd,
+    )])
 }
 
 #[cfg(windows)]
@@ -2669,111 +2644,83 @@ fn is_valid_handle(h: *mut core::ffi::c_void) -> bool {
 #[cfg(target_os = "windows")]
 fn autoconfigure_console_ports(
     vmm: &mut Vmm,
-    vm_resources: &VmResources,
     cfg: Option<&DefaultVirtioConsoleConfig>,
-    creating_implicit_console: bool,
 ) -> std::result::Result<Vec<PortDescription>, StartMicrovmError> {
-    use self::StartMicrovmError::*;
+    let (input_h, output_h, err_h) = match cfg {
+        Some(c) => (
+            c.input_handle.as_raw_handle(),
+            c.output_handle.as_raw_handle(),
+            c.err_handle.as_raw_handle(),
+        ),
+        None => unsafe {
+            (
+                GetStdHandle(STD_INPUT_HANDLE),
+                GetStdHandle(STD_OUTPUT_HANDLE),
+                GetStdHandle(STD_ERROR_HANDLE),
+            )
+        },
+    };
+    let input_is_terminal = (unsafe { BorrowedHandle::borrow_raw(input_h) }).is_terminal();
+    let output_is_terminal = (unsafe { BorrowedHandle::borrow_raw(output_h) }).is_terminal();
+    let error_is_terminal = (unsafe { BorrowedHandle::borrow_raw(err_h) }).is_terminal();
 
-    let mut console_output_path: Option<PathBuf> = None;
-    if let Some(path) = vm_resources.console_output.clone() {
-        if !vm_resources.disable_implicit_console && creating_implicit_console {
-            console_output_path = Some(path)
-        }
-    }
-
-    if let Some(console_output_path) = console_output_path {
-        let file = File::create(console_output_path).map_err(OpenConsoleFile)?;
-        // Manually emulate our Legacy behavior: In the case of output_path we have always used the
-        // stdin to determine the console size
-        let stdin_h = unsafe { BorrowedHandle::borrow_raw(GetStdHandle(STD_INPUT_HANDLE)) };
-        let term_h = if stdin_h.is_terminal() {
-            port_io::term_handle(stdin_h.as_raw_handle()).unwrap()
-        } else {
-            port_io::term_fixed_size(0, 0)
-        };
-        Ok(vec![PortDescription::console(
-            Some(port_io::input_empty().unwrap()),
-            Some(port_io::output_file(file).unwrap()),
-            term_h,
-        )])
+    let term_h = if input_is_terminal {
+        Some(SendHandle::new(input_h))
+    } else if output_is_terminal {
+        Some(SendHandle::new(output_h))
+    } else if error_is_terminal {
+        Some(SendHandle::new(err_h))
     } else {
-        let (input_h, output_h, err_h) = match cfg {
-            Some(c) => (
-                c.input_handle.as_raw_handle(),
-                c.output_handle.as_raw_handle(),
-                c.err_handle.as_raw_handle(),
-            ),
-            None => unsafe {
-                (
-                    GetStdHandle(STD_INPUT_HANDLE),
-                    GetStdHandle(STD_OUTPUT_HANDLE),
-                    GetStdHandle(STD_ERROR_HANDLE),
-                )
-            },
-        };
-        let input_is_terminal = (unsafe { BorrowedHandle::borrow_raw(input_h) }).is_terminal();
-        let output_is_terminal = (unsafe { BorrowedHandle::borrow_raw(output_h) }).is_terminal();
-        let error_is_terminal = (unsafe { BorrowedHandle::borrow_raw(err_h) }).is_terminal();
+        None
+    };
 
-        let term_h = if input_is_terminal {
-            Some(SendHandle::new(input_h))
-        } else if output_is_terminal {
-            Some(SendHandle::new(output_h))
-        } else if error_is_terminal {
-            Some(SendHandle::new(err_h))
-        } else {
-            None
-        };
+    let forwarding_sigint = false;
+    let console_input = if input_is_terminal {
+        Some(port_io::input_to_handle_dup(input_h).unwrap())
+    } else {
+        Some(port_io::input_empty().unwrap())
+    };
 
-        let forwarding_sigint = false;
-        let console_input = if input_is_terminal {
-            Some(port_io::input_to_handle_dup(input_h).unwrap())
-        } else {
-            Some(port_io::input_empty().unwrap())
-        };
+    let console_output = if output_is_terminal {
+        Some(port_io::output_to_handle_dup(output_h).unwrap())
+    } else {
+        Some(port_io::output_to_log_as_err())
+    };
 
-        let console_output = if output_is_terminal {
-            Some(port_io::output_to_handle_dup(output_h).unwrap())
-        } else {
-            Some(port_io::output_to_log_as_err())
-        };
+    let terminal_properties = term_h
+        .map(|h| port_io::term_handle(h.as_raw_handle()).unwrap())
+        .unwrap_or_else(|| port_io::term_fixed_size(0, 0));
 
-        let terminal_properties = term_h
-            .map(|h| port_io::term_handle(h.as_raw_handle()).unwrap())
-            .unwrap_or_else(|| port_io::term_fixed_size(0, 0));
+    setup_terminal_raw_mode(vmm, term_h, forwarding_sigint);
 
-        setup_terminal_raw_mode(vmm, term_h, forwarding_sigint);
+    let mut ports = vec![PortDescription::console(
+        console_input,
+        console_output,
+        terminal_properties,
+    )];
 
-        let mut ports = vec![PortDescription::console(
-            console_input,
-            console_output,
-            terminal_properties,
-        )];
-
-        if is_valid_handle(input_h) && !input_is_terminal {
-            ports.push(PortDescription::input_pipe(
-                "krun-stdin",
-                port_io::input_to_handle_dup(input_h).unwrap(),
-            ));
-        }
-
-        if is_valid_handle(output_h) && !output_is_terminal {
-            ports.push(PortDescription::output_pipe(
-                "krun-stdout",
-                port_io::output_to_handle_dup(output_h).unwrap(),
-            ));
-        };
-
-        if is_valid_handle(err_h) && !error_is_terminal {
-            ports.push(PortDescription::output_pipe(
-                "krun-stderr",
-                port_io::output_to_handle_dup(err_h).unwrap(),
-            ));
-        }
-
-        Ok(ports)
+    if is_valid_handle(input_h) && !input_is_terminal {
+        ports.push(PortDescription::input_pipe(
+            "krun-stdin",
+            port_io::input_to_handle_dup(input_h).unwrap(),
+        ));
     }
+
+    if is_valid_handle(output_h) && !output_is_terminal {
+        ports.push(PortDescription::output_pipe(
+            "krun-stdout",
+            port_io::output_to_handle_dup(output_h).unwrap(),
+        ));
+    };
+
+    if is_valid_handle(err_h) && !error_is_terminal {
+        ports.push(PortDescription::output_pipe(
+            "krun-stderr",
+            port_io::output_to_handle_dup(err_h).unwrap(),
+        ));
+    }
+
+    Ok(ports)
 }
 
 #[cfg(unix)]
@@ -2926,23 +2873,20 @@ fn attach_console_devices(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,
     intc: IrqChip,
-    vm_resources: &VmResources,
+    _vm_resources: &VmResources,
     cfg: Option<&VirtioConsoleConfigMode>,
     id_number: u32,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
-    let creating_implicit_console = cfg.is_none();
-
     let ports = match cfg {
-        None => autoconfigure_console_ports(vmm, vm_resources, None, creating_implicit_console)?,
-        Some(VirtioConsoleConfigMode::Autoconfigure(autocfg)) => autoconfigure_console_ports(
-            vmm,
-            vm_resources,
-            Some(autocfg),
-            creating_implicit_console,
-        )?,
+        None => autoconfigure_console_ports(vmm, None)?,
+        Some(VirtioConsoleConfigMode::Autoconfigure(autocfg)) => {
+            autoconfigure_console_ports(vmm, Some(autocfg))?
+        }
         Some(VirtioConsoleConfigMode::Explicit(ports)) => create_explicit_ports(vmm, ports)?,
+        #[cfg(unix)]
+        Some(VirtioConsoleConfigMode::OutputFile(path)) => output_file_console_ports(path)?,
     };
 
     let console = Arc::new(Mutex::new(devices::virtio::Console::new(ports).unwrap()));

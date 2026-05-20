@@ -58,8 +58,6 @@ mod host {
                 ))?;
                 let ctx = krun_call_u32!(krun_create_ctx())?;
 
-                krun_call!(krun_disable_implicit_console(ctx))?;
-
                 // Add a default console (as with other tests this uses stdout for writing "OK")
                 krun_call!(krun_add_virtio_console_default(
                     ctx,
