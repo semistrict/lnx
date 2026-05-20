@@ -636,7 +636,7 @@ pub fn init_logging(level: LogLevel) -> KrunResult {
     #[cfg(feature = "aws-nitro")]
     {
         // Notify krun-awsnitro to enable debug for log level.
-        if level == LogLevel::Debug {
+        if matches!(level, LogLevel::Debug | LogLevel::Trace) {
             let mut debug = KRUN_NITRO_DEBUG.lock().unwrap();
 
             *debug = true;
