@@ -73,6 +73,7 @@ mod host {
                     0
                 ))?;
                 let ctx = krun_call_u32!(krun_create_ctx())?;
+                krun_call!(krun_add_vsock(ctx, 0))?;
                 krun_call!(krun_add_vsock_port(
                     ctx,
                     VSOCK_PORT,
