@@ -1,117 +1,60 @@
 # lnx
 
-Lightweight Linux VM runner for macOS using Apple's Virtualization.framework. Boots a Linux kernel directly (no UEFI/bootloader), runs a custom init as PID 1, communicates over vsock.
+`lnx` is a Rust/libkrun Linux VM runner for macOS. It boots a Linux kernel
+directly, uses a normal systemd rootfs, and preserves VM memory plus disk state
+with libkrun snapshots between commands.
 
-## Install
+The important architectural difference from libkrun's simple `krun_set_root`
+examples is that `lnx` keeps using the existing `rootfs.ext4` as the real
+systemd root:
 
-```
-brew install semistrict/tap/lnx --HEAD
-```
+1. `krun_add_disk(ctx, "rootfs", rootfs.ext4, false)` attaches the rootfs image.
+2. The host generates an initramfs containing `lnx-agent` as both `/init` and
+   `/lnx-agent`.
+3. libkrun's bootstrap init execs `/init --init`.
+4. `/init --init` mounts `/dev/vda` at `/newroot`, copies `/lnx-agent` into
+   `/newroot/usr/local/lib/lnx/lnx-agent`, writes a systemd unit in
+   `/newroot/etc/systemd/system`, then `chroot`s and execs `/sbin/init`.
+5. Linux userspace therefore comes from the existing ext4 image, not from a
+   host-directory virtiofs root.
 
-Or build from source:
+Basic exec flow:
 
-```
-make install
-```
+1. The Rust build script compiles `src/guest_agent.rs` into a static Linux
+   binary named `lnx-agent`.
+2. Before boot, the host writes an initramfs containing that binary.
+3. The binary's `--init` mode stages itself into `/usr/local/lib/lnx` in the
+   real root.
+4. systemd starts `lnx-agent --agent 10240`.
+5. The host connects to `lnx-agent` over libkrun's vsock-to-Unix-socket port
+   mapping, sends one argv vector, streams stdout/stderr frames, and exits with
+   the guest command status.
 
-Then initialize (downloads kernel, rootfs, and creates a dedicated APFS volume):
-
-```
-lnx init
-```
-
-### Shell completion
-
-Zsh (add to `~/.zshrc`):
-
-```zsh
-eval "$(lnx completion zsh)"
-```
-
-Or generate a static file (faster shell startup):
-
-```zsh
-mkdir -p ~/.zsh/completions
-lnx completion zsh > ~/.zsh/completions/_lnx
-# Add to .zshrc before compinit: fpath=(~/.zsh/completions $fpath)
-```
-
-Bash (add to `~/.bashrc`):
-
-```bash
-eval "$(lnx completion bash)"
-```
-
-Fish:
-
-```fish
-lnx completion fish | source
-```
-
-## Usage
-
-```
-lnx                              # login shell (bash -l)
-lnx python3 server.py            # run a command
-lnx --ssh-agent git push         # with SSH agent forwarding
-lnx --ephemeral make test        # disposable VM, rootfs discarded on exit
-lnx --instance dev bash -l       # named instance
-```
-
-## Instances
-
-Each instance gets its own rootfs and checkpoints under `~/.lnx/images/<name>/`, with runtime state (sockets, logs) in `~/.lnx/instances/<name>/`.
-
-```
-lnx clone dev                     # clone from the default instance
-lnx instance list                  # show all instances
-lnx --instance dev bash -l         # boot a specific instance
-lnx instance delete dev            # remove an instance
-```
-
-## Shares
-
-Share host directories read-write into the VM via virtiofs:
-
-```
-lnx share add ~/src               # persisted per-instance
-lnx share list
-lnx share remove ~/src
-```
-
-The current working directory is always shared automatically.
-
-## Docker
-
-Docker works out of the box after installing it in the VM:
-
-```
-sudo apt install docker-ce docker-ce-cli containerd.io
-sudo systemctl enable docker
-```
-
-Docker auto-starts on boot. No `sudo` needed for `docker` commands.
-
-## Other commands
-
-```
-lnx status                        # VM status (all running instances)
-lnx ports list                    # forwarded ports
-lnx expose web:8080 --as=:8081    # expose web:8080 on localhost:8081
-lnx ingress enable                # install .lnx resolver and local HTTP ingress
-curl http://p8080.dev.lnx/        # route to dev:8080 (VM must already be running)
-lnx exec [-i] command             # exec into a running VM
-lnx disk grow 16G                 # grow rootfs (resized on next boot)
-lnx checkpoints list              # list rootfs checkpoints
-```
-
-Manual `.lnx` ingress test:
+Build requirements on macOS:
 
 ```sh
-# Terminal 1
-lnx python3 -m http.server 5173
-
-# Terminal 2
-sudo lnx ingress enable
-curl http://p5173.default.lnx/
+brew install FiloSottile/musl-cross/musl-cross
+brew install podman
+CC_LINUX=/opt/homebrew/bin/aarch64-linux-musl-gcc cargo build
+codesign --entitlements entitlements.plist --force -s - target/debug/lnx
+target/debug/lnx /bin/echo hello
 ```
+
+`lnx` builds against the `wip/snapshot-restore-20260525-0606` branch of
+`https://github.com/semistrict/libkrun`. `CC_LINUX` is needed because libkrun
+compiles its own embedded Linux init helper.
+
+Networking uses podman's `gvproxy` via libkrun's `krun_add_net_unixgram`
+backend. The default path is `/opt/homebrew/opt/podman/libexec/podman/gvproxy`;
+set `GVPROXY_PATH` if it lives somewhere else.
+
+Memory snapshot restore defaults to `~/.lnx/images/<instance>/memory-snapshots/latest`
+and can be overridden with `--snapshot <dir>`. The guest agent asks the host to
+snapshot after each command, so the next exec restores systemd, the agent, and
+the rootfs from that point. A fresh boot writes a full memory snapshot; restored
+runs use libkrun dirty tracking and APFS clones to patch only changed RAM and
+disk blocks.
+
+Per-run timings are appended to `~/.lnx/instances/<instance>/timings.log`.
+Incremental snapshots skip `fsync` by default for speed; set
+`KRUN_SNAPSHOT_SYNC=1` to make snapshot files crash-durable before returning.

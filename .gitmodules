@@ -1,12 +1,12 @@
-[submodule "third_party/vz"]
-	path = third_party/vz
+[submodule "old/third_party/vz"]
+	path = old/third_party/vz
 	url = https://github.com/semistrict/vz.git
 	branch = lnx-patches
-[submodule "third_party/criu"]
-	path = third_party/criu
+[submodule "old/third_party/criu"]
+	path = old/third_party/criu
 	url = https://github.com/semistrict/criu.git
 	branch = lnx
-[submodule "third_party/qemu"]
-	path = third_party/qemu
+[submodule "old/third_party/qemu"]
+	path = old/third_party/qemu
 	url = https://github.com/semistrict/qemu.git
 	branch = lnx

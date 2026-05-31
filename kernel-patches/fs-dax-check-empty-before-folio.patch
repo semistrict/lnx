@@ -1,0 +1,60 @@
+From: Seunguk Shin <seunguk.shin@canonical.com>
+Subject: [PATCH v3] fs/dax: check zero or empty entry before converting xarray entry
+Link: https://www.spinics.net/lists/linux-fsdevel/msg337679.html
+
+Backport note for lnx:
+Ubuntu linux-source-7.0.0 faults in dax_to_folio() when booting an ext4 DAX
+rootfs on virtio-pmem. The upstream patch explains the root cause:
+dax_associate_entry(), dax_disassociate_entry(), and dax_busy_page() converted
+zero/empty xarray entries with dax_to_folio(entry) before checking that those
+entries are not real folio entries. Move the zero/empty checks before the
+conversion.
+
+Fixes: 38607c62b34b ("fs/dax: properly refcount fs dax pages")
+Reviewed-by: Jan Kara <jack@suse.cz>
+Reviewed-by: Alistair Popple <apopple@nvidia.com>
+
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@ -443,11 +443,13 @@ static void dax_associate_entry(void *entry, struct address_space *mapping,
+ 				unsigned long address, bool shared)
+ {
+ 	unsigned long size = dax_entry_size(entry), index;
+-	struct folio *folio = dax_to_folio(entry);
++	struct folio *folio;
+ 
+ 	if (dax_is_zero_entry(entry) || dax_is_empty_entry(entry))
+ 		return;
+ 
++	folio = dax_to_folio(entry);
++
+ 	index = linear_page_index(vma, address & ~(size - 1));
+ 	if (shared && (folio->mapping || dax_folio_is_shared(folio))) {
+ 		if (folio->mapping)
+@@ -468,20 +470,24 @@ static void dax_disassociate_entry(void *entry, struct address_space *mapping,
+ 				bool trunc)
+ {
+-	struct folio *folio = dax_to_folio(entry);
++	struct folio *folio;
+ 
+ 	if (dax_is_zero_entry(entry) || dax_is_empty_entry(entry))
+ 		return;
+ 
++	folio = dax_to_folio(entry);
++
+ 	dax_folio_put(folio);
+ }
+ 
+ static struct page *dax_busy_page(void *entry)
+ {
+-	struct folio *folio = dax_to_folio(entry);
++	struct folio *folio;
+ 
+ 	if (dax_is_zero_entry(entry) || dax_is_empty_entry(entry))
+ 		return NULL;
+ 
++	folio = dax_to_folio(entry);
++
+ 	if (folio_ref_count(folio) - folio_mapcount(folio))
+ 		return &folio->page;
+ 	else

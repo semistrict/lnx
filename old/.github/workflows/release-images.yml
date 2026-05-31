@@ -87,8 +87,7 @@ jobs:
             - `vmlinuz.gz` — Linux kernel (arm64, gzip compressed)
             - `rootfs.ext4.zst` — Ubuntu rootfs (zstd compressed)
 
-            Place the decompressed images at `~/.lnx/vmlinuz` and
-            `~/.lnx/images/default/rootfs.ext4`.
+            Install with: `lnx init`
           files: |
             vmlinuz.gz
             rootfs.ext4.zst

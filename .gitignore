@@ -1,16 +1,10 @@
 # Build artifacts
-/lnx
-/lnx-linux
-/init
-/cmd/lnx/init
+/target/
 /kernel.Image
 /rootfs.ext4
 /vmlinuz
-/vmlinuz-for-firecracker
-
-# Go workspace (local override)
-go.work
-go.work.sum
+/vmlinuz.gz
+/rootfs.ext4.zst
 
 # Claude Code
 .claude/settings.local.json
@@ -18,6 +12,3 @@ go.work.sum
 
 # Test artifacts
 /tmp/
-
-# Codesign helper
-/tmp/lnx-codesign

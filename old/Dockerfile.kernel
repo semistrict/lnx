@@ -17,9 +17,6 @@ RUN mkdir /build && \
 
 WORKDIR /build
 
-COPY kernel-patches /kernel-patches
-RUN for patch in /kernel-patches/*.patch; do patch -p1 < "$patch"; done
-
 COPY kernel.config .config
 RUN make olddefconfig && make -j$(nproc)
 
