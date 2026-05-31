@@ -37,4 +37,4 @@ RUN chroot /rootfs apt-get clean && rm -rf /rootfs/var/lib/apt/lists/*
 
 # Layer 9: build ext4
 RUN truncate -s 4G /rootfs.ext4 && \
-    mke2fs -t ext4 -d /rootfs -L lnx /rootfs.ext4
+    mke2fs -F -t ext4 -b 16384 -d /rootfs -L lnx /rootfs.ext4
