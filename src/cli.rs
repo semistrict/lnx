@@ -20,7 +20,7 @@ pub struct Cli {
     #[arg(long, default_value_t = 2)]
     cpus: u8,
 
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = 8192)]
     memory_mib: u32,
 
     #[arg(

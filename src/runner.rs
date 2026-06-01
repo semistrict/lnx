@@ -16,6 +16,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 use anyhow::{Context, Result, bail};
 
 use crate::{
@@ -46,8 +49,29 @@ pub fn run(config: RunConfig) -> Result<i32> {
         .with_context(|| format!("create {}", config.layout.run_dir.display()))?;
     fs::create_dir_all(&config.layout.snapshot_dir)
         .with_context(|| format!("create {}", config.layout.snapshot_dir.display()))?;
+    let run_log = Arc::new(RunLog::open(&config.layout)?);
+    run_log.line(format!(
+        "run.start pid={} instance={} cmd={:?} cwd={} restore={}",
+        std::process::id(),
+        config.layout.instance,
+        config.command,
+        config.cwd.display(),
+        config
+            .restore_snapshot
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "false".to_string())
+    ));
+    run_log.line(format!(
+        "logs lnx={} timings={} console={} gvproxy={}",
+        run_log.path.display(),
+        config.layout.run_dir.join("timings.log").display(),
+        config.layout.console_log.display(),
+        config.layout.run_dir.join("gvproxy.log").display()
+    ));
     let broker_socket = config.layout.run_dir.join("broker.sock");
-    if let Some(status) = run_existing_broker_client(&broker_socket, &config.command, &config.cwd)?
+    if let Some(status) =
+        run_existing_broker_client(&broker_socket, &config.command, &config.cwd, Some(&run_log))?
     {
         return Ok(status);
     }
@@ -57,16 +81,22 @@ pub fn run(config: RunConfig) -> Result<i32> {
         &broker_socket,
         &config.command,
         &config.cwd,
+        &run_log,
     )? {
         BootstrapOutcome::Lock(lock) => lock,
         BootstrapOutcome::Status(status) => return Ok(status),
     };
-    if let Some(status) = run_existing_broker_client(&broker_socket, &config.command, &config.cwd)?
+    if let Some(status) =
+        run_existing_broker_client(&broker_socket, &config.command, &config.cwd, Some(&run_log))?
     {
         drop(bootstrap_lock);
         return Ok(status);
     }
     if broker_socket.exists() {
+        run_log.line(format!(
+            "broker.stale_socket.remove path={}",
+            broker_socket.display()
+        ));
         let _ = fs::remove_file(&broker_socket);
     }
 
@@ -88,10 +118,38 @@ pub fn run(config: RunConfig) -> Result<i32> {
     let requested_restore_snapshot = config.restore_snapshot.clone();
     let restore_snapshot = if rebuilt_initramfs && config.restore_snapshot.is_some() {
         timings.event("snapshot.restore.skipped.initramfs_rebuilt");
+        run_log.line("snapshot.restore.skipped reason=initramfs_rebuilt");
         None
+    } else if let Some(snapshot) = &config.restore_snapshot {
+        match snapshot_vm_config(snapshot) {
+            Ok(Some(snapshot_config))
+                if !snapshot_config.matches(config.cpus, config.memory_mib) =>
+            {
+                timings.event("snapshot.restore.skipped.config_mismatch");
+                run_log.line(format!(
+                    "snapshot.restore.skipped reason=config_mismatch snapshot_cpus={} configured_cpus={} snapshot_memory_mib={} configured_memory_mib={}",
+                    snapshot_config.vcpu_count,
+                    config.cpus,
+                    snapshot_config.memory_mib(),
+                    config.memory_mib
+                ));
+                None
+            }
+            Ok(_) => config.restore_snapshot.clone(),
+            Err(e) => {
+                timings.event("snapshot.restore.skipped.unreadable_header");
+                run_log.line(format!(
+                    "snapshot.restore.skipped reason=unreadable_header error={e:#}"
+                ));
+                None
+            }
+        }
     } else {
         config.restore_snapshot.clone()
     };
+    if let Some(snapshot) = &requested_restore_snapshot {
+        log_snapshot_summary(&run_log, "snapshot.requested", snapshot);
+    }
 
     let socket = config.layout.run_dir.join("lnx-agent.sock");
     let snapshot_socket = config.layout.run_dir.join("lnx-snapshot.sock");
@@ -109,8 +167,19 @@ pub fn run(config: RunConfig) -> Result<i32> {
     let broker_listener = UnixListener::bind(&broker_socket)
         .with_context(|| format!("listen on {}", broker_socket.display()))?;
     timings.event("listeners.ready");
+    run_log.line(format!(
+        "listeners.ready agent={} snapshot={} control={} broker={}",
+        socket.display(),
+        snapshot_socket.display(),
+        control_socket.display(),
+        broker_socket.display()
+    ));
     let network = start_gvproxy(&config.layout.run_dir)?;
     timings.event("gvproxy.ready");
+    run_log.line(format!(
+        "gvproxy.ready socket={}",
+        config.layout.run_dir.join("gvproxy.sock").display()
+    ));
 
     KrunContext::set_log_level(2)?;
     let ctx = Arc::new(KrunContext::create()?);
@@ -121,6 +190,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
         .map(|snapshot| snapshot.join("rootfs.ext4"))
         .filter(|path| path.exists())
         .unwrap_or_else(|| config.layout.rootfs.clone());
+    log_file_summary(&run_log, "rootfs.selected", &rootfs);
     ctx.add_root_pmem(&rootfs)?;
     ctx.set_kernel(
         &config.layout.kernel,
@@ -136,6 +206,10 @@ pub fn run(config: RunConfig) -> Result<i32> {
     if let Some(snapshot) = &restore_snapshot {
         ctx.set_snapshot_path(snapshot)?;
         timings.event("snapshot.restore.configured");
+        run_log.line(format!(
+            "snapshot.restore.configured path={}",
+            snapshot.display()
+        ));
     }
 
     ctx.set_workdir("/")?;
@@ -157,17 +231,21 @@ pub fn run(config: RunConfig) -> Result<i32> {
     let console_log = config.layout.console_log.clone();
     let vm_ctx = Arc::clone(&ctx);
     let vm_timings = Arc::clone(&timings);
+    let vm_run_log = Arc::clone(&run_log);
+    let (vm_error_tx, vm_error_rx) = mpsc::channel::<i32>();
     thread::spawn(move || {
         vm_timings.event("krun.start_enter.begin");
         let rc = vm_ctx.start_enter();
         vm_timings.event(&format!("krun.start_enter.return rc={rc}"));
         if rc < 0 {
-            eprintln!(
-                "krun_start_enter failed: {}{}",
-                std::io::Error::from_raw_os_error(-rc),
-                console_hint(&console_log)
-            );
-            std::process::exit(1);
+            vm_run_log.line(format!(
+                "krun.start_enter.error rc={rc} error={}",
+                krun_return_error(rc)
+            ));
+            log_console_tail(&vm_run_log, &console_log);
+            let _ = vm_error_tx.send(rc);
+        } else {
+            vm_run_log.line(format!("krun.start_enter.return rc={rc}"));
         }
     });
     timings.event("krun.thread.spawned");
@@ -184,11 +262,19 @@ pub fn run(config: RunConfig) -> Result<i32> {
         broker_socket.clone(),
         restore_snapshot,
         Arc::clone(&timings),
+        Arc::clone(&run_log),
+        vm_error_rx,
     );
     let owner = match owner {
         Ok(owner) => owner,
         Err(e) => {
             timings.event(&format!("restore.owner.error {e:#}"));
+            run_log.line(format!("owner.start.error {e:#}"));
+            log_console_tail(&run_log, &config.layout.console_log);
+            cleanup_runtime_sockets(
+                &run_log,
+                &[&broker_socket, &socket, &snapshot_socket, &control_socket],
+            );
             return Err(e);
         }
     };
@@ -203,14 +289,22 @@ pub fn run(config: RunConfig) -> Result<i32> {
         Ok(status) => status,
         Err(e) => {
             timings.event(&format!("restore.client.error {e:#}"));
+            run_log.line(format!("client.error {e:#}"));
+            log_console_tail(&run_log, &config.layout.console_log);
             return Err(e);
         }
     };
     let _ = owner.join();
     let result = Ok(status);
     match &result {
-        Ok(status) => timings.event(&format!("run.done status={status}")),
-        Err(e) => timings.event(&format!("run.error {e:#}")),
+        Ok(status) => {
+            timings.event(&format!("run.done status={status}"));
+            run_log.line(format!("run.done status={status}"));
+        }
+        Err(e) => {
+            timings.event(&format!("run.error {e:#}"));
+            run_log.line(format!("run.error {e:#}"));
+        }
     }
     drop(network);
     drop(bootstrap_lock);
@@ -222,6 +316,26 @@ struct TimingLog {
     state_path: PathBuf,
     base_unix_nanos: u128,
     state: Mutex<TimingState>,
+}
+
+struct RunLog {
+    path: PathBuf,
+    file: Mutex<fs::File>,
+}
+
+struct SnapshotVmConfig {
+    memory_bytes: u64,
+    vcpu_count: u32,
+}
+
+impl SnapshotVmConfig {
+    fn memory_mib(&self) -> u64 {
+        self.memory_bytes / 1024 / 1024
+    }
+
+    fn matches(&self, cpus: u8, memory_mib: u32) -> bool {
+        self.vcpu_count == cpus as u32 && self.memory_mib() == memory_mib as u64
+    }
 }
 
 struct TimingState {
@@ -280,6 +394,39 @@ impl BootstrapLock {
 impl Drop for BootstrapLock {
     fn drop(&mut self) {
         let _ = fs::remove_dir(&self.path);
+    }
+}
+
+impl RunLog {
+    fn open(layout: &Layout) -> Result<Self> {
+        let path = layout.run_dir.join("lnx.log");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        Ok(Self {
+            path,
+            file: Mutex::new(file),
+        })
+    }
+
+    fn line(&self, message: impl AsRef<str>) {
+        let mut file = match self.file.lock() {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let message = message.as_ref().replace('\r', "").replace('\n', " | ");
+        let _ = writeln!(
+            file,
+            "{}.{:09} {}",
+            now.as_secs(),
+            now.subsec_nanos(),
+            message
+        );
     }
 }
 
@@ -368,6 +515,39 @@ fn unix_nanos() -> u128 {
         .as_nanos()
 }
 
+fn krun_return_error(rc: i32) -> String {
+    if rc < 0 {
+        std::io::Error::from_raw_os_error(-rc).to_string()
+    } else {
+        format!("unexpected return code {rc}")
+    }
+}
+
+fn snapshot_vm_config(snapshot: &Path) -> Result<Option<SnapshotVmConfig>> {
+    let path = snapshot.join("vmstate.bin");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut file = fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+    let mut header = [0u8; 40];
+    file.read_exact(&mut header)
+        .with_context(|| format!("read {}", path.display()))?;
+    if &header[0..8] != b"LKRNSS01" {
+        bail!("bad snapshot magic in {}", path.display());
+    }
+    let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
+    if version != 1 {
+        bail!(
+            "unsupported snapshot version {version} in {}",
+            path.display()
+        );
+    }
+    Ok(Some(SnapshotVmConfig {
+        memory_bytes: u64::from_le_bytes(header[16..24].try_into().unwrap()),
+        vcpu_count: u32::from_le_bytes(header[32..36].try_into().unwrap()),
+    }))
+}
+
 fn replace_timing_state(file: &mut fs::File, base: u128, now: u128) -> std::io::Result<u128> {
     file.seek(SeekFrom::Start(0))?;
     let mut raw = String::new();
@@ -404,6 +584,11 @@ impl Drop for Gvproxy {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = fs::remove_file(&self.socket);
+        if let (Some(parent), Some(name)) = (self.socket.parent(), self.socket.file_name()) {
+            let krun_socket = parent.join(format!("{}-krun.sock", name.to_string_lossy()));
+            let _ = fs::remove_file(krun_socket);
+        }
     }
 }
 
@@ -480,16 +665,30 @@ fn acquire_bootstrap_or_run_client(
     socket: &Path,
     command: &[String],
     cwd: &Path,
+    run_log: &RunLog,
 ) -> Result<BootstrapOutcome> {
     let start = Instant::now();
+    let mut logged_wait = false;
     loop {
         if let Some(lock) = BootstrapLock::try_acquire(lock_path)? {
+            run_log.line(format!(
+                "bootstrap.lock.acquired path={}",
+                lock_path.display()
+            ));
             return Ok(BootstrapOutcome::Lock(lock));
         }
-        if let Some(status) = run_existing_broker_client(socket, command, cwd)? {
+        if !logged_wait {
+            run_log.line(format!("bootstrap.lock.busy path={}", lock_path.display()));
+            logged_wait = true;
+        }
+        if let Some(status) = run_existing_broker_client(socket, command, cwd, Some(run_log))? {
             return Ok(BootstrapOutcome::Status(status));
         }
         if start.elapsed() > Duration::from_secs(120) {
+            run_log.line(format!(
+                "bootstrap.lock.timeout path={}",
+                lock_path.display()
+            ));
             bail!("timed out waiting for {}", lock_path.display());
         }
         thread::sleep(Duration::from_millis(10));
@@ -500,10 +699,29 @@ fn run_existing_broker_client(
     socket: &Path,
     command: &[String],
     cwd: &Path,
+    run_log: Option<&RunLog>,
 ) -> Result<Option<i32>> {
     match connect_broker(socket) {
-        Ok(stream) => run_broker_session(stream, command, cwd).map(Some),
-        Err(_) => Ok(None),
+        Ok(stream) => {
+            if let Some(log) = run_log {
+                log.line(format!(
+                    "broker.client.connected socket={}",
+                    socket.display()
+                ));
+            }
+            run_broker_session(stream, command, cwd).map(Some)
+        }
+        Err(e) => {
+            if socket.exists() {
+                if let Some(log) = run_log {
+                    log.line(format!(
+                        "broker.client.connect_failed socket={} error={e:#}",
+                        socket.display()
+                    ));
+                }
+            }
+            Ok(None)
+        }
     }
 }
 
@@ -709,6 +927,8 @@ fn run_broker_owner(
     broker_socket: PathBuf,
     restore_snapshot: Option<PathBuf>,
     timings: Arc<TimingLog>,
+    run_log: Arc<RunLog>,
+    vm_error_rx: mpsc::Receiver<i32>,
 ) -> Result<thread::JoinHandle<()>> {
     listener
         .set_nonblocking(true)
@@ -719,13 +939,29 @@ fn run_broker_owner(
         Duration::from_secs(90)
     };
     timings.event("agent.accept.begin");
-    let mut agent_stream = accept_unix_with_progress(
+    run_log.line(format!(
+        "agent.accept.begin timeout_ms={} restore={}",
+        agent_timeout.as_millis(),
+        restore_snapshot
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "false".to_string())
+    ));
+    let mut agent_stream = match accept_unix_with_progress(
         &listener,
         agent_timeout,
         Some((&timings, "agent.accept.waiting")),
-    )
-    .with_context(|| console_hint(&console_log))?;
+        Some(&vm_error_rx),
+    ) {
+        Ok(stream) => stream,
+        Err(e) => {
+            run_log.line(format!("agent.accept.error {e:#}"));
+            log_console_tail(&run_log, &console_log);
+            return Err(e).with_context(|| console_hint(&console_log));
+        }
+    };
     timings.event("agent.accepted");
+    run_log.line("agent.accepted");
     agent_stream
         .set_nonblocking(false)
         .context("set lnx-agent stream blocking")?;
@@ -798,18 +1034,24 @@ fn run_broker_owner(
         .set_nonblocking(true)
         .context("set broker listener nonblocking")?;
     let owner_timings = Arc::clone(&timings);
+    let owner_log = Arc::clone(&run_log);
     let force_full_snapshot = restore_snapshot.is_none();
     Ok(thread::spawn(move || {
         owner_timings.event("broker.ready");
+        owner_log.line(format!("broker.ready socket={}", broker_socket.display()));
         loop {
             match broker_listener.accept() {
                 Ok((client, _)) => {
+                    owner_log.line("broker.client.accepted");
                     let tx = agent_tx.clone();
                     let clients = Arc::clone(&client_senders);
                     let active = Arc::clone(&active);
                     let seen = Arc::clone(&seen_active);
+                    let client_log = Arc::clone(&owner_log);
                     thread::spawn(move || {
-                        let _ = handle_broker_client(client, tx, clients, active, seen);
+                        if let Err(e) = handle_broker_client(client, tx, clients, active, seen) {
+                            client_log.line(format!("broker.client.error {e:#}"));
+                        }
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -824,15 +1066,25 @@ fn run_broker_owner(
         let _ = fs::remove_file(&broker_socket);
         drop(broker_listener);
         owner_timings.event("snapshot.request.guest");
+        owner_log.line(format!(
+            "snapshot.request.guest path={} full={force_full_snapshot}",
+            snapshot_path.display()
+        ));
         let _ = agent_tx.send(Message::SnapshotReady);
-        let _ = serve_snapshot(
+        match serve_snapshot(
             snapshot_listener,
             &ctx,
             &snapshot_path,
             &rootfs,
             force_full_snapshot,
             &owner_timings,
-        );
+        ) {
+            Ok(()) => {
+                owner_log.line("snapshot.done");
+                log_snapshot_summary(&owner_log, "snapshot.latest", &snapshot_path);
+            }
+            Err(e) => owner_log.line(format!("snapshot.error {e:#}")),
+        }
     }))
 }
 
@@ -899,17 +1151,23 @@ fn handle_broker_client(
 }
 
 fn accept_unix(listener: &UnixListener, timeout: Duration) -> Result<UnixStream> {
-    accept_unix_with_progress(listener, timeout, None)
+    accept_unix_with_progress(listener, timeout, None, None)
 }
 
 fn accept_unix_with_progress(
     listener: &UnixListener,
     timeout: Duration,
     progress: Option<(&TimingLog, &str)>,
+    vm_error_rx: Option<&mpsc::Receiver<i32>>,
 ) -> Result<UnixStream> {
     let start = Instant::now();
     let mut last = None;
     while start.elapsed() < timeout {
+        if let Some(rx) = vm_error_rx {
+            if let Ok(rc) = rx.try_recv() {
+                bail!("krun_start_enter failed: {}", krun_return_error(rc));
+            }
+        }
         let remaining = timeout.saturating_sub(start.elapsed());
         let poll_timeout = remaining.min(Duration::from_millis(250));
         let timeout_ms = poll_timeout.as_millis().min(i32::MAX as u128) as i32;
@@ -934,6 +1192,11 @@ fn accept_unix_with_progress(
                 ));
             }
             continue;
+        }
+        if let Some(rx) = vm_error_rx {
+            if let Ok(rc) = rx.try_recv() {
+                bail!("krun_start_enter failed: {}", krun_return_error(rc));
+            }
         }
         match listener.accept() {
             Ok((stream, _)) => return Ok(stream),
@@ -1123,6 +1386,81 @@ fn remove_path_if_exists(path: &Path) -> Result<()> {
             Err(file_err) if file_err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(_) => Err(dir_err).with_context(|| format!("remove {}", path.display())),
         },
+    }
+}
+
+fn cleanup_runtime_sockets(run_log: &RunLog, paths: &[&Path]) {
+    for path in paths {
+        match fs::remove_file(path) {
+            Ok(()) => run_log.line(format!("runtime_socket.removed path={}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => run_log.line(format!(
+                "runtime_socket.remove_failed path={} error={e}",
+                path.display()
+            )),
+        }
+    }
+}
+
+fn log_snapshot_summary(run_log: &RunLog, label: &str, path: &Path) {
+    log_file_summary(run_log, label, path);
+    for name in ["vmstate.bin", "pages.img", "rootfs.ext4"] {
+        let file_label = format!("{label}.{name}");
+        log_file_summary(run_log, &file_label, &path.join(name));
+    }
+}
+
+fn log_file_summary(run_log: &RunLog, label: &str, path: &Path) {
+    match fs::metadata(path) {
+        Ok(meta) => {
+            let kind = if meta.is_dir() {
+                "dir"
+            } else if meta.is_file() {
+                "file"
+            } else {
+                "other"
+            };
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|time| time.as_secs().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            #[cfg(unix)]
+            let allocation = format!(
+                " blocks={} allocated_bytes={}",
+                meta.blocks(),
+                meta.blocks().saturating_mul(512)
+            );
+            #[cfg(not(unix))]
+            let allocation = String::new();
+            run_log.line(format!(
+                "{label} path={} kind={kind} size={}{} modified_unix={modified}",
+                path.display(),
+                meta.len(),
+                allocation
+            ));
+        }
+        Err(e) => run_log.line(format!("{label} path={} stat_error={e}", path.display())),
+    }
+}
+
+fn log_console_tail(run_log: &RunLog, path: &Path) {
+    match fs::read(path) {
+        Ok(bytes) if !bytes.is_empty() => {
+            let start = bytes.len().saturating_sub(4096);
+            let tail = String::from_utf8_lossy(&bytes[start..]);
+            let mut lines = tail.lines().rev().take(12).collect::<Vec<_>>();
+            lines.reverse();
+            for line in lines {
+                run_log.line(format!("console.tail {}", line.trim_end()));
+            }
+        }
+        Ok(_) => run_log.line(format!("console.tail path={} empty=true", path.display())),
+        Err(e) => run_log.line(format!(
+            "console.tail path={} read_error={e}",
+            path.display()
+        )),
     }
 }
 
