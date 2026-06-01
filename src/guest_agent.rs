@@ -75,33 +75,6 @@ struct SockaddrVm {
     svm_zero: [u8; 3],
 }
 
-static AGENT_VSOCK_ADDR: SockaddrVm = SockaddrVm {
-    svm_family: AF_VSOCK as u16,
-    svm_reserved1: 0,
-    svm_port: AGENT_PORT,
-    svm_cid: VMADDR_CID_HOST,
-    svm_flags: 0,
-    svm_zero: [0; 3],
-};
-
-static SNAPSHOT_VSOCK_ADDR: SockaddrVm = SockaddrVm {
-    svm_family: AF_VSOCK as u16,
-    svm_reserved1: 0,
-    svm_port: SNAPSHOT_PORT,
-    svm_cid: VMADDR_CID_HOST,
-    svm_flags: 0,
-    svm_zero: [0; 3],
-};
-
-static CONTROL_VSOCK_ADDR: SockaddrVm = SockaddrVm {
-    svm_family: AF_VSOCK as u16,
-    svm_reserved1: 0,
-    svm_port: CONTROL_PORT,
-    svm_cid: VMADDR_CID_HOST,
-    svm_flags: 0,
-    svm_zero: [0; 3],
-};
-
 #[repr(C)]
 struct SockaddrUn {
     sun_family: u16,
@@ -447,16 +420,7 @@ WantedBy=multi-user.target\n";
 
 fn connect_vsock(port: u32) -> c_int {
     for _ in 0..600 {
-        let stack_addr;
-        let addr = match port {
-            AGENT_PORT => &AGENT_VSOCK_ADDR,
-            SNAPSHOT_PORT => &SNAPSHOT_VSOCK_ADDR,
-            CONTROL_PORT => &CONTROL_VSOCK_ADDR,
-            _ => {
-                stack_addr = vsock_addr(port);
-                &stack_addr
-            }
-        };
+        let addr = Box::new(vsock_addr(port));
         let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
         if fd < 0 {
             die("socket(AF_VSOCK)");
@@ -464,7 +428,7 @@ fn connect_vsock(port: u32) -> c_int {
         let ret = unsafe {
             connect(
                 fd,
-                addr as *const SockaddrVm as *const Sockaddr,
+                addr.as_ref() as *const SockaddrVm as *const Sockaddr,
                 size_of::<SockaddrVm>() as c_uint,
             )
         };
