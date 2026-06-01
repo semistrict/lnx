@@ -3,7 +3,10 @@ use std::io::Error;
 use std::mem::size_of;
 use std::os::unix::fs::PermissionsExt;
 use std::ptr;
-use std::{env, fs};
+use std::sync::{mpsc, Arc, Mutex};
+use std::{env, fs, thread};
+
+use crate::protocol::{Message, MAX_MESSAGE_SIZE, PROTOCOL_VERSION};
 
 const AF_VSOCK: c_int = 40;
 const AF_UNIX: c_int = 1;
@@ -31,6 +34,7 @@ const TIOCSWINSZ: c_ulong = 0x5414;
 const CLOCK_REALTIME: c_int = 0;
 const MS_MOVE: c_ulong = 8192;
 const MS_BIND: c_ulong = 4096;
+const POLLOUT: i16 = 0x0004;
 
 const FRAME_OUTPUT: u8 = b'O';
 const FRAME_STDERR: u8 = b'E';
@@ -47,6 +51,12 @@ const SERVICE_PATH: &str = "/etc/systemd/system/lnx-agent.service";
 const WANTS_DIR: &str = "/etc/systemd/system/multi-user.target.wants";
 const WANTS_LINK: &str = "/etc/systemd/system/multi-user.target.wants/lnx-agent.service";
 const WANTS_LINK_C: &[u8] = b"/newroot/etc/systemd/system/multi-user.target.wants/lnx-agent.service\0";
+
+enum ChannelInput {
+    Data(Vec<u8>),
+    Eof,
+    Resize(u16, u16),
+}
 
 #[repr(C)]
 struct Sockaddr {
@@ -654,6 +664,40 @@ fn read_u16(fd: c_int) -> u16 {
     u16::from_be_bytes(buf)
 }
 
+fn read_message(fd: c_int) -> Option<Message> {
+    let mut len = [0u8; 4];
+    if !try_read_exact(fd, &mut len) {
+        return None;
+    }
+    let len = u32::from_be_bytes(len);
+    if len > MAX_MESSAGE_SIZE {
+        die("message too large");
+    }
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 && !try_read_exact(fd, &mut buf) {
+        return None;
+    }
+    postcard::from_bytes(&buf).ok()
+}
+
+fn write_message(fd: c_int, message: &Message) -> bool {
+    let Ok(buf) = postcard::to_allocvec(message) else {
+        return false;
+    };
+    if buf.len() > MAX_MESSAGE_SIZE as usize {
+        return false;
+    }
+    let len = (buf.len() as u32).to_be_bytes();
+    write_all(fd, &len) && write_all(fd, &buf)
+}
+
+fn write_message_locked(agent_fd: &Arc<Mutex<c_int>>, message: &Message) -> bool {
+    let Ok(fd) = agent_fd.lock() else {
+        return false;
+    };
+    write_message(*fd, message)
+}
+
 fn read_string(fd: c_int, max_len: usize, label: &str) -> String {
     let len = read_u32(fd) as usize;
     if len > max_len {
@@ -1237,7 +1281,356 @@ fn exit_status(status: c_int) -> c_int {
     }
 }
 
-fn main() {
+fn make_argv(argv: &[String]) -> (Vec<CString>, Vec<*const c_char>) {
+    let storage = argv
+        .iter()
+        .map(|arg| CString::new(arg.as_str()).unwrap_or_else(|_| CString::new("").unwrap()))
+        .collect::<Vec<_>>();
+    let mut ptrs = storage.iter().map(|arg| arg.as_ptr()).collect::<Vec<_>>();
+    ptrs.push(ptr::null());
+    (storage, ptrs)
+}
+
+fn send_status(agent_fd: &Arc<Mutex<c_int>>, channel_id: u64, status: c_int) {
+    let _ = write_message_locked(
+        agent_fd,
+        &Message::ExitStatus {
+            channel_id,
+            status: exit_status(status),
+        },
+    );
+    let _ = write_message_locked(agent_fd, &Message::Close { channel_id });
+}
+
+fn drain_output_message(
+    output_fd: c_int,
+    agent_fd: &Arc<Mutex<c_int>>,
+    stderr: bool,
+    channel_id: u64,
+    buf: &mut [u8],
+) -> bool {
+    let mut saw_eof = false;
+    loop {
+        let n = unsafe { read(output_fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+        if n > 0 {
+            let bytes = buf[..n as usize].to_vec();
+            let message = if stderr {
+                Message::Stderr { channel_id, bytes }
+            } else {
+                Message::Data { channel_id, bytes }
+            };
+            let _ = write_message_locked(agent_fd, &message);
+            continue;
+        }
+        if n < 0 && errno() == EINTR {
+            continue;
+        }
+        if n < 0 && errno() == EAGAIN {
+            break;
+        }
+        if n < 0 && errno() == EIO {
+            saw_eof = true;
+            break;
+        }
+        saw_eof = true;
+        break;
+    }
+    saw_eof
+}
+
+fn run_channel_pty(
+    agent_fd: Arc<Mutex<c_int>>,
+    channel_id: u64,
+    argv: Vec<String>,
+    cwd: String,
+    term: String,
+    colorterm: String,
+    rows: u16,
+    cols: u16,
+    rx: mpsc::Receiver<ChannelInput>,
+) {
+    let mut pty_master = -1;
+    let mut pty_slave = -1;
+    if unsafe {
+        openpty(
+            &mut pty_master,
+            &mut pty_slave,
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null(),
+        )
+    } < 0
+    {
+        let _ = write_message_locked(&agent_fd, &Message::Error { channel_id, message: "openpty failed".to_string() });
+        send_status(&agent_fd, channel_id, 127 << 8);
+        return;
+    }
+    let winsize = Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    unsafe {
+        ioctl(pty_master, TIOCSWINSZ, &winsize as *const Winsize);
+    }
+
+    let pid = unsafe { fork() };
+    if pid < 0 {
+        send_status(&agent_fd, channel_id, 127 << 8);
+        return;
+    }
+    if pid == 0 {
+        unsafe {
+            close(pty_master);
+            setsid();
+            ioctl(pty_slave, TIOCSCTTY, 0);
+            dup2(pty_slave, STDIN_FILENO);
+            dup2(pty_slave, STDOUT_FILENO);
+            dup2(pty_slave, STDERR_FILENO);
+            if pty_slave > STDERR_FILENO {
+                close(pty_slave);
+            }
+        }
+        if !cwd.is_empty() {
+            if let Ok(cwd) = CString::new(cwd) {
+                unsafe { chdir(cwd.as_ptr()); }
+            }
+        }
+        if let (Ok(name), Ok(value)) = (CString::new("TERM"), CString::new(term)) {
+            unsafe { setenv(name.as_ptr(), value.as_ptr(), 1); }
+        }
+        if !colorterm.is_empty() {
+            if let (Ok(name), Ok(value)) = (CString::new("COLORTERM"), CString::new(colorterm)) {
+                unsafe { setenv(name.as_ptr(), value.as_ptr(), 1); }
+            }
+        }
+        set_lnx_request_id(channel_id);
+        let (_storage, ptrs) = make_argv(&argv);
+        unsafe {
+            execvp(ptrs[0], ptrs.as_ptr());
+            exec_failed(ptrs[0]);
+        }
+    }
+    unsafe { close(pty_slave); }
+    set_nonblocking(pty_master);
+    let mut buf = [0u8; 8192];
+    let mut status = 0;
+    let mut child_exited = false;
+    let mut pty_eof = false;
+    loop {
+        let mut pollfds = [PollFd { fd: pty_master, events: POLLIN, revents: 0 }];
+        let n = unsafe { poll(pollfds.as_mut_ptr(), 1, 25) };
+        if n > 0 && pollfds[0].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
+            pty_eof |= drain_output_message(pty_master, &agent_fd, false, channel_id, &mut buf);
+        }
+        while let Ok(input) = rx.try_recv() {
+            match input {
+                ChannelInput::Data(bytes) => {
+                    let _ = write_all(pty_master, &bytes);
+                }
+                ChannelInput::Eof => {
+                    let _ = write_all(pty_master, &[0x04]);
+                }
+                ChannelInput::Resize(rows, cols) => {
+                    let winsize = Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+                    unsafe { ioctl(pty_master, TIOCSWINSZ, &winsize as *const Winsize); }
+                }
+            }
+        }
+        if !child_exited {
+            let waited = unsafe { waitpid(pid, &mut status, WNOHANG) };
+            if waited == pid || (waited < 0 && errno() == ECHILD) {
+                child_exited = true;
+            } else if waited < 0 {
+                status = 127 << 8;
+                child_exited = true;
+            }
+        }
+        if child_exited {
+            pty_eof |= drain_output_message(pty_master, &agent_fd, false, channel_id, &mut buf);
+        }
+        if child_exited && pty_eof {
+            break;
+        }
+    }
+    unsafe { close(pty_master); }
+    send_status(&agent_fd, channel_id, status);
+}
+
+fn run_channel_pipe(
+    agent_fd: Arc<Mutex<c_int>>,
+    channel_id: u64,
+    argv: Vec<String>,
+    cwd: String,
+    rx: mpsc::Receiver<ChannelInput>,
+) {
+    let mut stdin_pipe = [-1; 2];
+    let mut stdout_pipe = [-1; 2];
+    let mut stderr_pipe = [-1; 2];
+    if unsafe { pipe(stdin_pipe.as_mut_ptr()) } < 0
+        || unsafe { pipe(stdout_pipe.as_mut_ptr()) } < 0
+        || unsafe { pipe(stderr_pipe.as_mut_ptr()) } < 0
+    {
+        send_status(&agent_fd, channel_id, 127 << 8);
+        return;
+    }
+    let pid = unsafe { fork() };
+    if pid < 0 {
+        send_status(&agent_fd, channel_id, 127 << 8);
+        return;
+    }
+    if pid == 0 {
+        unsafe {
+            close(stdin_pipe[1]);
+            close(stdout_pipe[0]);
+            close(stderr_pipe[0]);
+            dup2(stdin_pipe[0], STDIN_FILENO);
+            dup2(stdout_pipe[1], STDOUT_FILENO);
+            dup2(stderr_pipe[1], STDERR_FILENO);
+            if stdin_pipe[0] > STDERR_FILENO { close(stdin_pipe[0]); }
+            if stdout_pipe[1] > STDERR_FILENO { close(stdout_pipe[1]); }
+            if stderr_pipe[1] > STDERR_FILENO { close(stderr_pipe[1]); }
+        }
+        if !cwd.is_empty() {
+            if let Ok(cwd) = CString::new(cwd) {
+                unsafe { chdir(cwd.as_ptr()); }
+            }
+        }
+        set_lnx_request_id(channel_id);
+        let (_storage, ptrs) = make_argv(&argv);
+        unsafe {
+            execvp(ptrs[0], ptrs.as_ptr());
+            exec_failed(ptrs[0]);
+        }
+    }
+    unsafe {
+        close(stdin_pipe[0]);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
+    }
+    let mut stdin_write = stdin_pipe[1];
+    let stdout_read = stdout_pipe[0];
+    let stderr_read = stderr_pipe[0];
+    set_nonblocking(stdout_read);
+    set_nonblocking(stderr_read);
+    let mut buf = [0u8; 8192];
+    let mut status = 0;
+    let mut child_exited = false;
+    let mut stdout_eof = false;
+    let mut stderr_eof = false;
+    loop {
+        let mut pollfds = [
+            PollFd { fd: stdout_read, events: POLLIN, revents: 0 },
+            PollFd { fd: stderr_read, events: POLLIN, revents: 0 },
+        ];
+        let n = unsafe { poll(pollfds.as_mut_ptr(), 2, 25) };
+        if n > 0 && pollfds[0].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
+            stdout_eof |= drain_output_message(stdout_read, &agent_fd, false, channel_id, &mut buf);
+        }
+        if n > 0 && pollfds[1].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
+            stderr_eof |= drain_output_message(stderr_read, &agent_fd, true, channel_id, &mut buf);
+        }
+        while let Ok(input) = rx.try_recv() {
+            match input {
+                ChannelInput::Data(bytes) if stdin_write >= 0 => {
+                    if !write_all(stdin_write, &bytes) {
+                        unsafe { close(stdin_write); }
+                        stdin_write = -1;
+                    }
+                }
+                ChannelInput::Eof if stdin_write >= 0 => {
+                    unsafe { close(stdin_write); }
+                    stdin_write = -1;
+                }
+                _ => {}
+            }
+        }
+        if !child_exited {
+            let waited = unsafe { waitpid(pid, &mut status, WNOHANG) };
+            if waited == pid || (waited < 0 && errno() == ECHILD) {
+                child_exited = true;
+            } else if waited < 0 {
+                status = 127 << 8;
+                child_exited = true;
+            }
+        }
+        if child_exited {
+            if stdin_write >= 0 {
+                unsafe { close(stdin_write); }
+                stdin_write = -1;
+            }
+            stdout_eof |= drain_output_message(stdout_read, &agent_fd, false, channel_id, &mut buf);
+            stderr_eof |= drain_output_message(stderr_read, &agent_fd, true, channel_id, &mut buf);
+        }
+        if child_exited && stdout_eof && stderr_eof {
+            break;
+        }
+    }
+    unsafe {
+        if stdin_write >= 0 { close(stdin_write); }
+        close(stdout_read);
+        close(stderr_read);
+    }
+    send_status(&agent_fd, channel_id, status);
+}
+
+fn agent_loop() {
+    let mut fd = connect_vsock(AGENT_PORT);
+    set_nonblocking(fd);
+    let agent_fd = Arc::new(Mutex::new(fd));
+    let _ = write_message_locked(&agent_fd, &Message::Hello { version: PROTOCOL_VERSION });
+    let mut channels: Vec<(u64, mpsc::Sender<ChannelInput>)> = Vec::new();
+    loop {
+        let message = read_message(fd);
+        let Some(message) = message else {
+            unsafe { usleep(1_000); }
+            continue;
+        };
+        match message {
+            Message::Hello { version } if version == PROTOCOL_VERSION => {}
+            Message::OpenExec { channel_id, argv, cwd, pty, term, colorterm, rows, cols } => {
+                let (tx, rx) = mpsc::channel();
+                channels.push((channel_id, tx));
+                let writer = Arc::clone(&agent_fd);
+                if pty {
+                    thread::spawn(move || run_channel_pty(writer, channel_id, argv, cwd, term, colorterm, rows, cols, rx));
+                } else {
+                    thread::spawn(move || run_channel_pipe(writer, channel_id, argv, cwd, rx));
+                }
+            }
+            Message::Data { channel_id, bytes } => {
+                if let Some((_, tx)) = channels.iter().find(|(id, _)| *id == channel_id) {
+                    let _ = tx.send(ChannelInput::Data(bytes));
+                }
+            }
+            Message::Eof { channel_id } => {
+                if let Some((_, tx)) = channels.iter().find(|(id, _)| *id == channel_id) {
+                    let _ = tx.send(ChannelInput::Eof);
+                }
+            }
+            Message::WindowResize { channel_id, rows, cols } => {
+                if let Some((_, tx)) = channels.iter().find(|(id, _)| *id == channel_id) {
+                    let _ = tx.send(ChannelInput::Resize(rows, cols));
+                }
+            }
+            Message::Close { channel_id } | Message::ExitStatus { channel_id, .. } => {
+                channels.retain(|(id, _)| *id != channel_id);
+            }
+            Message::SnapshotReady => {
+                unsafe {
+                    sync();
+                    close(fd);
+                }
+                request_snapshot_and_wait_for_resume();
+                fd = connect_vsock(AGENT_PORT);
+                set_nonblocking(fd);
+                if let Ok(mut shared) = agent_fd.lock() {
+                    *shared = fd;
+                }
+                let _ = write_message_locked(&agent_fd, &Message::Hello { version: PROTOCOL_VERSION });
+            }
+            _ => {}
+        }
+    }
+}
+
+pub fn main() {
     let args = env::args().collect::<Vec<_>>();
     if args
         .first()
@@ -1258,20 +1651,5 @@ fn main() {
         unsafe { _exit(125) }
     }
     let _port = args[2].parse::<u32>().unwrap_or(AGENT_PORT);
-    let mut fd = connect_vsock(AGENT_PORT);
-    loop {
-        let (request_id, status) = run_command(&mut fd);
-        unsafe {
-            sync();
-        }
-        if !write_command_frame(fd, FRAME_STATUS, request_id, &status.to_be_bytes()) {
-            reconnect_agent_fd(&mut fd);
-            let _ = write_command_frame(fd, FRAME_STATUS, request_id, &status.to_be_bytes());
-        }
-        unsafe {
-            close(fd);
-        }
-        request_snapshot_and_wait_for_resume();
-        fd = reconnect_after_snapshot_point();
-    }
+    agent_loop();
 }

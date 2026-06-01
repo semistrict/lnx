@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::{self, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     net::TcpListener,
@@ -6,14 +7,23 @@ use std::{
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 
-use crate::{initramfs, krun::Context as KrunContext, paths::Layout};
+use crate::{
+    initramfs,
+    krun::Context as KrunContext,
+    paths::Layout,
+    protocol::{MAX_MESSAGE_SIZE, Message, PROTOCOL_VERSION},
+};
 
 const AGENT_PORT: u32 = 10240;
 const SNAPSHOT_PORT: u32 = 10241;
@@ -44,6 +54,33 @@ pub fn run(config: RunConfig) -> Result<i32> {
         .with_context(|| format!("create {}", config.layout.run_dir.display()))?;
     fs::create_dir_all(&config.layout.snapshot_dir)
         .with_context(|| format!("create {}", config.layout.snapshot_dir.display()))?;
+    let broker_socket = config.layout.run_dir.join("broker.sock");
+    if let Ok(status) = run_broker_client(&broker_socket, &config.command, &config.cwd) {
+        return Ok(status);
+    }
+
+    let bootstrap_lock = BootstrapLock::acquire(config.layout.run_dir.join("bootstrap.lock.d"))?;
+    if let Ok(status) = run_broker_client(&broker_socket, &config.command, &config.cwd) {
+        drop(bootstrap_lock);
+        return Ok(status);
+    }
+    if broker_socket.exists() {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if UnixStream::connect(&broker_socket).is_ok() {
+                drop(bootstrap_lock);
+                return run_broker_client_retry(
+                    &broker_socket,
+                    &config.command,
+                    &config.cwd,
+                    Duration::from_secs(2),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = fs::remove_file(&broker_socket);
+    }
+
     let timings = Arc::new(TimingLog::open(
         &config.layout,
         &config.command,
@@ -73,12 +110,15 @@ pub fn run(config: RunConfig) -> Result<i32> {
     let _ = fs::remove_file(&socket);
     let _ = fs::remove_file(&snapshot_socket);
     let _ = fs::remove_file(&control_socket);
+    let _ = fs::remove_file(&broker_socket);
     let listener =
         UnixListener::bind(&socket).with_context(|| format!("listen on {}", socket.display()))?;
     let snapshot_listener = UnixListener::bind(&snapshot_socket)
         .with_context(|| format!("listen on {}", snapshot_socket.display()))?;
     let control_listener = UnixListener::bind(&control_socket)
         .with_context(|| format!("listen on {}", control_socket.display()))?;
+    let broker_listener = UnixListener::bind(&broker_socket)
+        .with_context(|| format!("listen on {}", broker_socket.display()))?;
     timings.event("listeners.ready");
     let network = start_gvproxy(&config.layout.run_dir)?;
     timings.event("gvproxy.ready");
@@ -143,19 +183,34 @@ pub fn run(config: RunConfig) -> Result<i32> {
     });
     timings.event("krun.thread.spawned");
 
-    let result = run_exec_client(
+    let owner = run_broker_owner(
         listener,
-        config.command,
-        config.cwd,
         config.layout.console_log.clone(),
         Arc::clone(&ctx),
         config.layout.snapshot_dir.join("latest"),
         rootfs,
         snapshot_listener,
         control_listener,
+        broker_listener,
+        broker_socket.clone(),
         restore_snapshot,
         Arc::clone(&timings),
     );
+    drop(bootstrap_lock);
+    let status = run_broker_client_retry(
+        &broker_socket,
+        &config.command,
+        &config.cwd,
+        Duration::from_secs(5),
+    )
+    .with_context(|| console_hint(&config.layout.console_log))?;
+    let result = match owner {
+        Ok(handle) => {
+            let _ = handle.join();
+            Ok(status)
+        }
+        Err(e) => Err(e),
+    };
     match &result {
         Ok(status) => timings.event(&format!("run.done status={status}")),
         Err(e) => timings.event(&format!("run.error {e:#}")),
@@ -174,6 +229,34 @@ struct TimingLog {
 struct TimingState {
     file: fs::File,
     state_file: fs::File,
+}
+
+struct BootstrapLock {
+    path: PathBuf,
+}
+
+impl BootstrapLock {
+    fn acquire(path: PathBuf) -> Result<Self> {
+        let start = Instant::now();
+        loop {
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if start.elapsed() > Duration::from_secs(120) {
+                        bail!("timed out waiting for {}", path.display());
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
+            }
+        }
+    }
+}
+
+impl Drop for BootstrapLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
 }
 
 impl TimingLog {
@@ -348,6 +431,413 @@ fn wait_for_path(path: &Path, timeout: Duration) -> Result<()> {
     bail!("timed out waiting for {}", path.display())
 }
 
+fn write_message(stream: &mut UnixStream, message: &Message) -> Result<()> {
+    let bytes = postcard::to_allocvec(message).context("encode protocol message")?;
+    if bytes.len() > MAX_MESSAGE_SIZE as usize {
+        bail!("protocol message too large: {}", bytes.len());
+    }
+    stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
+    stream.write_all(&bytes)?;
+    Ok(())
+}
+
+fn read_message(stream: &mut UnixStream) -> Result<Message> {
+    let len = read_u32(stream)?;
+    if len > MAX_MESSAGE_SIZE {
+        bail!("protocol message too large: {len}");
+    }
+    let mut bytes = vec![0u8; len as usize];
+    stream.read_exact(&mut bytes)?;
+    postcard::from_bytes(&bytes).context("decode protocol message")
+}
+
+fn run_broker_client(socket: &Path, command: &[String], cwd: &Path) -> Result<i32> {
+    let mut stream =
+        UnixStream::connect(socket).with_context(|| format!("connect {}", socket.display()))?;
+    let channel_id = new_request_id()?;
+    write_message(
+        &mut stream,
+        &Message::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )?;
+    let use_pty = should_request_pty();
+    let raw_mode = if use_pty { RawTerminal::enter() } else { None };
+    let (term, colorterm, rows, cols) = if use_pty {
+        (
+            std::env::var("TERM")
+                .ok()
+                .filter(|value| !value.is_empty() && value != "dumb")
+                .unwrap_or_else(|| "xterm-256color".to_string()),
+            std::env::var("COLORTERM").unwrap_or_default(),
+            terminal_size().0,
+            terminal_size().1,
+        )
+    } else {
+        (String::new(), String::new(), 1, 1)
+    };
+    write_message(
+        &mut stream,
+        &Message::OpenExec {
+            channel_id,
+            argv: command.to_vec(),
+            cwd: guest_cwd(cwd),
+            pty: use_pty,
+            term,
+            colorterm,
+            rows,
+            cols,
+        },
+    )?;
+
+    if !is_tty(std::io::stdin().as_raw_fd()) {
+        let mut bytes = Vec::new();
+        let stdin_fd = std::io::stdin().as_raw_fd();
+        let flags = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
+        if flags >= 0 {
+            unsafe {
+                libc::fcntl(stdin_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+        let mut input = [0u8; 8192];
+        loop {
+            match std::io::stdin().read(&mut input) {
+                Ok(0) => break,
+                Ok(n) => bytes.extend_from_slice(&input[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e).context("read stdin"),
+            }
+        }
+        if flags >= 0 {
+            unsafe {
+                libc::fcntl(stdin_fd, libc::F_SETFL, flags);
+            }
+        }
+        if !bytes.is_empty() {
+            write_message(&mut stream, &Message::Data { channel_id, bytes })?;
+        }
+        write_message(&mut stream, &Message::Eof { channel_id })?;
+        loop {
+            match read_message(&mut stream)? {
+                Message::Data {
+                    channel_id: id,
+                    bytes,
+                } if id == channel_id => {
+                    std::io::stdout().write_all(&bytes)?;
+                    std::io::stdout().flush()?;
+                }
+                Message::Stderr {
+                    channel_id: id,
+                    bytes,
+                } if id == channel_id => {
+                    std::io::stderr().write_all(&bytes)?;
+                    std::io::stderr().flush()?;
+                }
+                Message::ExitStatus {
+                    channel_id: id,
+                    status,
+                } if id == channel_id => {
+                    return Ok(status);
+                }
+                Message::Error {
+                    channel_id: id,
+                    message,
+                } if id == channel_id => {
+                    bail!("{message}");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let stdin_handle = std::io::stdin();
+    let stdin_fd = stdin_handle.as_raw_fd();
+    let stream_fd = stream.as_raw_fd();
+    let mut stdin = stdin_handle.lock();
+    let mut stdin_open = true;
+    let mut input = [0u8; 8192];
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: stream_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if stdin_open { stdin_fd } else { -1 },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(e).context("poll broker and terminal");
+        }
+        if stdin_open && (fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
+            match stdin.read(&mut input) {
+                Ok(0) => {
+                    stdin_open = false;
+                    write_message(&mut stream, &Message::Eof { channel_id })?;
+                }
+                Ok(n) => {
+                    write_message(
+                        &mut stream,
+                        &Message::Data {
+                            channel_id,
+                            bytes: input[..n].to_vec(),
+                        },
+                    )?;
+                    if (fds[1].revents & (libc::POLLHUP | libc::POLLERR)) != 0 {
+                        stdin_open = false;
+                        write_message(&mut stream, &Message::Eof { channel_id })?;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e).context("read stdin"),
+            }
+        }
+        if (fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) == 0 {
+            continue;
+        }
+        match read_message(&mut stream)? {
+            Message::Data {
+                channel_id: id,
+                bytes,
+            } if id == channel_id => {
+                std::io::stdout().write_all(&bytes)?;
+                std::io::stdout().flush()?;
+            }
+            Message::Stderr {
+                channel_id: id,
+                bytes,
+            } if id == channel_id => {
+                std::io::stderr().write_all(&bytes)?;
+                std::io::stderr().flush()?;
+            }
+            Message::ExitStatus {
+                channel_id: id,
+                status,
+            } if id == channel_id => {
+                drop(raw_mode);
+                return Ok(status);
+            }
+            Message::Error {
+                channel_id: id,
+                message,
+            } if id == channel_id => {
+                bail!("{message}");
+            }
+            _ => {}
+        }
+    }
+}
+
+fn run_broker_client_retry(
+    socket: &Path,
+    command: &[String],
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<i32> {
+    let start = Instant::now();
+    let mut last = None;
+    while start.elapsed() < timeout {
+        match run_broker_client(socket, command, cwd) {
+            Ok(status) => return Ok(status),
+            Err(e) => {
+                last = Some(e);
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    match last {
+        Some(e) => Err(e),
+        None => bail!("timed out connecting to broker"),
+    }
+}
+
+fn run_broker_owner(
+    listener: UnixListener,
+    console_log: PathBuf,
+    ctx: Arc<KrunContext>,
+    snapshot_path: PathBuf,
+    rootfs: PathBuf,
+    snapshot_listener: UnixListener,
+    _control_listener: UnixListener,
+    broker_listener: UnixListener,
+    broker_socket: PathBuf,
+    restore_snapshot: Option<PathBuf>,
+    timings: Arc<TimingLog>,
+) -> Result<thread::JoinHandle<()>> {
+    listener
+        .set_nonblocking(true)
+        .context("set lnx-agent listener nonblocking")?;
+    let agent_timeout = if restore_snapshot.is_some() {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(90)
+    };
+    timings.event("agent.accept.begin");
+    let mut agent_stream = accept_unix_with_progress(
+        &listener,
+        agent_timeout,
+        Some((&timings, "agent.accept.waiting")),
+    )
+    .with_context(|| console_hint(&console_log))?;
+    timings.event("agent.accepted");
+    agent_stream
+        .set_nonblocking(false)
+        .context("set lnx-agent stream blocking")?;
+    match read_message(&mut agent_stream)? {
+        Message::Hello { version } if version == PROTOCOL_VERSION => {}
+        other => bail!("bad lnx-agent hello: {other:?}"),
+    }
+    write_message(
+        &mut agent_stream,
+        &Message::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )?;
+
+    let (agent_tx, agent_rx) = mpsc::channel::<Message>();
+    let client_senders = Arc::new(Mutex::new(HashMap::<u64, mpsc::Sender<Message>>::new()));
+    let active = Arc::new(AtomicUsize::new(0));
+    let seen_active = Arc::new(AtomicBool::new(false));
+
+    let mut agent_writer = agent_stream
+        .try_clone()
+        .context("clone lnx-agent stream for writer")?;
+    thread::spawn(move || {
+        while let Ok(message) = agent_rx.recv() {
+            if write_message(&mut agent_writer, &message).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut agent_reader = agent_stream;
+    let reader_clients = Arc::clone(&client_senders);
+    let reader_active = Arc::clone(&active);
+    thread::spawn(move || {
+        while let Ok(message) = read_message(&mut agent_reader) {
+            let channel_id = match &message {
+                Message::Data { channel_id, .. }
+                | Message::Stderr { channel_id, .. }
+                | Message::ExitStatus { channel_id, .. }
+                | Message::Close { channel_id }
+                | Message::Error { channel_id, .. } => Some(*channel_id),
+                _ => None,
+            };
+            if let Some(channel_id) = channel_id {
+                let tx = reader_clients
+                    .lock()
+                    .ok()
+                    .and_then(|clients| clients.get(&channel_id).cloned());
+                if let Some(tx) = tx {
+                    let _ = tx.send(message.clone());
+                }
+                if matches!(message, Message::Close { .. }) {
+                    if let Ok(mut clients) = reader_clients.lock() {
+                        clients.remove(&channel_id);
+                    }
+                    reader_active.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+        }
+    });
+
+    broker_listener
+        .set_nonblocking(true)
+        .context("set broker listener nonblocking")?;
+    let owner_timings = Arc::clone(&timings);
+    let force_full_snapshot = restore_snapshot.is_none();
+    Ok(thread::spawn(move || {
+        owner_timings.event("broker.ready");
+        loop {
+            match broker_listener.accept() {
+                Ok((client, _)) => {
+                    let tx = agent_tx.clone();
+                    let clients = Arc::clone(&client_senders);
+                    let active = Arc::clone(&active);
+                    let seen = Arc::clone(&seen_active);
+                    thread::spawn(move || {
+                        let _ = handle_broker_client(client, tx, clients, active, seen);
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if seen_active.load(Ordering::SeqCst) && active.load(Ordering::SeqCst) == 0 {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+        owner_timings.event("snapshot.request.guest");
+        let _ = agent_tx.send(Message::SnapshotReady);
+        let _ = serve_snapshot(
+            snapshot_listener,
+            &ctx,
+            &snapshot_path,
+            &rootfs,
+            force_full_snapshot,
+            &owner_timings,
+        );
+        let _ = fs::remove_file(&broker_socket);
+    }))
+}
+
+fn handle_broker_client(
+    mut client: UnixStream,
+    agent_tx: mpsc::Sender<Message>,
+    clients: Arc<Mutex<HashMap<u64, mpsc::Sender<Message>>>>,
+    active: Arc<AtomicUsize>,
+    seen_active: Arc<AtomicBool>,
+) -> Result<()> {
+    match read_message(&mut client)? {
+        Message::Hello { version } if version == PROTOCOL_VERSION => {}
+        other => bail!("bad client hello: {other:?}"),
+    }
+    let first = read_message(&mut client)?;
+    let Message::OpenExec { channel_id, .. } = &first else {
+        bail!("client did not open an exec channel");
+    };
+    let channel_id = *channel_id;
+    let (to_client_tx, to_client_rx) = mpsc::channel::<Message>();
+    clients
+        .lock()
+        .map_err(|_| anyhow::anyhow!("lock broker clients"))?
+        .insert(channel_id, to_client_tx);
+    active.fetch_add(1, Ordering::SeqCst);
+    seen_active.store(true, Ordering::SeqCst);
+    agent_tx.send(first).context("send open exec to agent")?;
+    let mut writer = client.try_clone().context("clone broker client")?;
+    thread::spawn(move || {
+        while let Ok(message) = to_client_rx.recv() {
+            if write_message(&mut writer, &message).is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        match read_message(&mut client) {
+            Ok(message) => {
+                agent_tx
+                    .send(message)
+                    .context("send client message to agent")?;
+            }
+            Err(_) => {
+                let _ = agent_tx.send(Message::Eof { channel_id });
+                return Ok(());
+            }
+        }
+    }
+}
+
 fn run_exec_client(
     listener: UnixListener,
     command: Vec<String>,
@@ -501,10 +991,11 @@ fn accept_unix_with_progress(
 }
 
 fn new_request_id() -> Result<u64> {
-    Ok(SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("host clock is before Unix epoch")?
-        .as_nanos() as u64)
+        .as_nanos() as u64;
+    Ok(nanos ^ ((std::process::id() as u64) << 32))
 }
 
 fn write_exec_request(

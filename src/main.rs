@@ -3,6 +3,7 @@ mod init;
 mod initramfs;
 mod krun;
 mod paths;
+mod protocol;
 mod runner;
 
 use anyhow::Result;
