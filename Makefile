@@ -3,8 +3,9 @@ CARGO ?= cargo
 CODESIGN ?= codesign
 BIN := target/debug/lnx
 RELEASE_BIN := target/release/lnx
+INSTALL_BIN ?= $(HOME)/.cargo/bin
 
-.PHONY: all build cargo-build sign release release-build release-sign run apt-update deps check test fmt clean
+.PHONY: all build cargo-build sign release release-build release-sign install run apt-update deps check test fmt clean
 
 all: build
 
@@ -23,6 +24,10 @@ release-sign: release-build
 	$(CODESIGN) --entitlements entitlements.plist --force -s - $(RELEASE_BIN)
 
 release: release-sign
+
+install: release
+	mkdir -p $(INSTALL_BIN)
+	install -m 755 $(RELEASE_BIN) $(INSTALL_BIN)/lnx
 
 run: build
 	$(BIN) /bin/echo hello

@@ -47,6 +47,7 @@ const REQUEST_FLAG_PTY: u8 = 1;
 const AGENT_PATH: &str = "/usr/local/lib/lnx/lnx-agent";
 const LNXCTL_PATH: &str = "/usr/local/bin/lnxctl";
 const CONTROL_SOCKET: &str = "/run/lnx-agent.sock";
+const CONTROL_SOCKET_ENV: &str = "LNX_CONTROL_SOCKET";
 const SERVICE_PATH: &str = "/etc/systemd/system/lnx-agent.service";
 const WANTS_DIR: &str = "/etc/systemd/system/multi-user.target.wants";
 const WANTS_LINK: &str = "/etc/systemd/system/multi-user.target.wants/lnx-agent.service";
@@ -73,6 +74,33 @@ struct SockaddrVm {
     svm_flags: u8,
     svm_zero: [u8; 3],
 }
+
+static AGENT_VSOCK_ADDR: SockaddrVm = SockaddrVm {
+    svm_family: AF_VSOCK as u16,
+    svm_reserved1: 0,
+    svm_port: AGENT_PORT,
+    svm_cid: VMADDR_CID_HOST,
+    svm_flags: 0,
+    svm_zero: [0; 3],
+};
+
+static SNAPSHOT_VSOCK_ADDR: SockaddrVm = SockaddrVm {
+    svm_family: AF_VSOCK as u16,
+    svm_reserved1: 0,
+    svm_port: SNAPSHOT_PORT,
+    svm_cid: VMADDR_CID_HOST,
+    svm_flags: 0,
+    svm_zero: [0; 3],
+};
+
+static CONTROL_VSOCK_ADDR: SockaddrVm = SockaddrVm {
+    svm_family: AF_VSOCK as u16,
+    svm_reserved1: 0,
+    svm_port: CONTROL_PORT,
+    svm_cid: VMADDR_CID_HOST,
+    svm_flags: 0,
+    svm_zero: [0; 3],
+};
 
 #[repr(C)]
 struct SockaddrUn {
@@ -418,21 +446,33 @@ WantedBy=multi-user.target\n";
 }
 
 fn connect_vsock(port: u32) -> c_int {
-    let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
-    if fd < 0 {
-        die("socket(AF_VSOCK)");
-    }
-    let addr = vsock_addr(port);
     for _ in 0..600 {
+        let stack_addr;
+        let addr = match port {
+            AGENT_PORT => &AGENT_VSOCK_ADDR,
+            SNAPSHOT_PORT => &SNAPSHOT_VSOCK_ADDR,
+            CONTROL_PORT => &CONTROL_VSOCK_ADDR,
+            _ => {
+                stack_addr = vsock_addr(port);
+                &stack_addr
+            }
+        };
+        let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
+        if fd < 0 {
+            die("socket(AF_VSOCK)");
+        }
         let ret = unsafe {
             connect(
                 fd,
-                &addr as *const SockaddrVm as *const Sockaddr,
+                addr as *const SockaddrVm as *const Sockaddr,
                 size_of::<SockaddrVm>() as c_uint,
             )
         };
         if ret == 0 {
             return fd;
+        }
+        unsafe {
+            close(fd);
         }
         unsafe {
             usleep(100_000);
@@ -483,7 +523,8 @@ fn lnxctl_mode(args: &[String]) -> ! {
         write_all(STDERR_FILENO, b"usage: lnxctl snapshot-exit\n");
         unsafe { _exit(2) }
     }
-    let fd = connect_unix(CONTROL_SOCKET);
+    let socket = env::var(CONTROL_SOCKET_ENV).unwrap_or_else(|_| CONTROL_SOCKET.to_string());
+    let fd = connect_unix(&socket);
     if !write_frame(fd, FRAME_CONTROL_SNAPSHOT_EXIT, &[]) {
         unsafe { _exit(1) }
     }
@@ -563,6 +604,7 @@ fn read_local_control_response(fd: c_int) -> c_int {
 }
 
 fn snapshot_resume_wait(fd: c_int) {
+    let _ = write_all(fd, b"R");
     let mut buf = [0u8; 1];
     loop {
         let n = unsafe { read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
@@ -573,31 +615,15 @@ fn snapshot_resume_wait(fd: c_int) {
     }
 }
 
-fn request_snapshot_and_wait_for_resume() {
-    let pid = unsafe { fork() };
-    if pid < 0 {
-        die("fork");
+fn request_snapshot_and_reconnect() -> c_int {
+    let fd = connect_vsock(SNAPSHOT_PORT);
+    request_snapshot(fd);
+    snapshot_resume_wait(fd);
+    let agent_fd = reconnect_after_snapshot_point();
+    unsafe {
+        close(fd);
     }
-    if pid == 0 {
-        let fd = connect_vsock(SNAPSHOT_PORT);
-        request_snapshot(fd);
-        snapshot_resume_wait(fd);
-        unsafe {
-            close(fd);
-            _exit(0);
-        }
-    }
-
-    let mut status = 0;
-    loop {
-        let waited = unsafe { waitpid(pid, &mut status, 0) };
-        if waited == pid {
-            return;
-        }
-        if waited < 0 && errno() != EINTR {
-            return;
-        }
-    }
+    agent_fd
 }
 
 fn reconnect_after_snapshot_point() -> c_int {
@@ -897,6 +923,55 @@ fn handle_local_control(listener_fd: c_int, agent_fd: &mut c_int, request_id: u6
     let _ = write_frame(client_fd, FRAME_CONTROL_OK, &[]);
     unsafe {
         close(client_fd);
+    }
+}
+
+fn handle_channel_control(listener_fd: c_int) -> bool {
+    let client_fd = unsafe { accept(listener_fd, ptr::null_mut(), ptr::null_mut()) };
+    if client_fd < 0 {
+        return false;
+    }
+    let mut frame_type = [0u8; 1];
+    let mut len = [0u8; 4];
+    let ok = try_read_exact(client_fd, &mut frame_type)
+        && try_read_exact(client_fd, &mut len)
+        && frame_type[0] == FRAME_CONTROL_SNAPSHOT_EXIT
+        && u32::from_be_bytes(len) == 0;
+    if ok {
+        unsafe {
+            sync();
+        }
+        let _ = write_frame(client_fd, FRAME_CONTROL_OK, &[]);
+    }
+    unsafe {
+        close(client_fd);
+    }
+    ok
+}
+
+fn close_channel_control(fd: c_int) {
+    unsafe {
+        close(fd);
+    }
+    let _ = fs::remove_file(CONTROL_SOCKET);
+}
+
+fn channel_control_socket(channel_id: u64) -> String {
+    format!("/run/lnx-agent-{channel_id:016x}.sock")
+}
+
+fn close_channel_control_socket(fd: c_int, path: &str) {
+    unsafe {
+        close(fd);
+    }
+    let _ = fs::remove_file(path);
+}
+
+fn set_lnx_control_socket(path: &str) {
+    if let (Ok(name), Ok(value)) = (CString::new(CONTROL_SOCKET_ENV), CString::new(path)) {
+        unsafe {
+            setenv(name.as_ptr(), value.as_ptr(), 1);
+        }
     }
 }
 
@@ -1351,6 +1426,7 @@ fn run_channel_pty(
 ) {
     let mut pty_master = -1;
     let mut pty_slave = -1;
+    let control_socket = channel_control_socket(channel_id);
     if unsafe {
         openpty(
             &mut pty_master,
@@ -1401,6 +1477,7 @@ fn run_channel_pty(
             }
         }
         set_lnx_request_id(channel_id);
+        set_lnx_control_socket(&control_socket);
         let (_storage, ptrs) = make_argv(&argv);
         unsafe {
             execvp(ptrs[0], ptrs.as_ptr());
@@ -1409,15 +1486,23 @@ fn run_channel_pty(
     }
     unsafe { close(pty_slave); }
     set_nonblocking(pty_master);
+    let control_fd = listen_unix(&control_socket);
     let mut buf = [0u8; 8192];
     let mut status = 0;
     let mut child_exited = false;
     let mut pty_eof = false;
     loop {
-        let mut pollfds = [PollFd { fd: pty_master, events: POLLIN, revents: 0 }];
-        let n = unsafe { poll(pollfds.as_mut_ptr(), 1, 25) };
+        let mut pollfds = [
+            PollFd { fd: pty_master, events: POLLIN, revents: 0 },
+            PollFd { fd: control_fd, events: POLLIN, revents: 0 },
+        ];
+        let n = unsafe { poll(pollfds.as_mut_ptr(), 2, 25) };
         if n > 0 && pollfds[0].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
             pty_eof |= drain_output_message(pty_master, &agent_fd, false, channel_id, &mut buf);
+        }
+        if n > 0 && pollfds[1].revents & POLLIN != 0 && handle_channel_control(control_fd) {
+            status = 0;
+            break;
         }
         while let Ok(input) = rx.try_recv() {
             match input {
@@ -1450,6 +1535,7 @@ fn run_channel_pty(
         }
     }
     unsafe { close(pty_master); }
+    close_channel_control_socket(control_fd, &control_socket);
     send_status(&agent_fd, channel_id, status);
 }
 
@@ -1460,6 +1546,7 @@ fn run_channel_pipe(
     cwd: String,
     rx: mpsc::Receiver<ChannelInput>,
 ) {
+    let control_socket = channel_control_socket(channel_id);
     let mut stdin_pipe = [-1; 2];
     let mut stdout_pipe = [-1; 2];
     let mut stderr_pipe = [-1; 2];
@@ -1493,6 +1580,7 @@ fn run_channel_pipe(
             }
         }
         set_lnx_request_id(channel_id);
+        set_lnx_control_socket(&control_socket);
         let (_storage, ptrs) = make_argv(&argv);
         unsafe {
             execvp(ptrs[0], ptrs.as_ptr());
@@ -1509,6 +1597,7 @@ fn run_channel_pipe(
     let stderr_read = stderr_pipe[0];
     set_nonblocking(stdout_read);
     set_nonblocking(stderr_read);
+    let control_fd = listen_unix(&control_socket);
     let mut buf = [0u8; 8192];
     let mut status = 0;
     let mut child_exited = false;
@@ -1518,13 +1607,18 @@ fn run_channel_pipe(
         let mut pollfds = [
             PollFd { fd: stdout_read, events: POLLIN, revents: 0 },
             PollFd { fd: stderr_read, events: POLLIN, revents: 0 },
+            PollFd { fd: control_fd, events: POLLIN, revents: 0 },
         ];
-        let n = unsafe { poll(pollfds.as_mut_ptr(), 2, 25) };
+        let n = unsafe { poll(pollfds.as_mut_ptr(), 3, 25) };
         if n > 0 && pollfds[0].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
             stdout_eof |= drain_output_message(stdout_read, &agent_fd, false, channel_id, &mut buf);
         }
         if n > 0 && pollfds[1].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
             stderr_eof |= drain_output_message(stderr_read, &agent_fd, true, channel_id, &mut buf);
+        }
+        if n > 0 && pollfds[2].revents & POLLIN != 0 && handle_channel_control(control_fd) {
+            status = 0;
+            break;
         }
         while let Ok(input) = rx.try_recv() {
             match input {
@@ -1567,6 +1661,7 @@ fn run_channel_pipe(
         close(stdout_read);
         close(stderr_read);
     }
+    close_channel_control_socket(control_fd, &control_socket);
     send_status(&agent_fd, channel_id, status);
 }
 
@@ -1617,8 +1712,7 @@ fn agent_loop() {
                     sync();
                     close(fd);
                 }
-                request_snapshot_and_wait_for_resume();
-                fd = connect_vsock(AGENT_PORT);
+                fd = request_snapshot_and_reconnect();
                 set_nonblocking(fd);
                 if let Ok(mut shared) = agent_fd.lock() {
                     *shared = fd;

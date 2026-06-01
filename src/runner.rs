@@ -28,18 +28,10 @@ use crate::{
 const AGENT_PORT: u32 = 10240;
 const SNAPSHOT_PORT: u32 = 10241;
 const CONTROL_PORT: u32 = 10242;
-const FRAME_OUTPUT: u8 = b'O';
-const FRAME_STDERR: u8 = b'E';
-const FRAME_INPUT: u8 = b'I';
-const FRAME_STATUS: u8 = b'S';
 const FRAME_SNAPSHOT: u8 = b'K';
-const FRAME_CONTROL_SNAPSHOT_EXIT: u8 = b'X';
-const FRAME_CONTROL_OK: u8 = b'x';
-const REQUEST_FLAG_PTY: u8 = 1;
-const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
-const MID_COMMAND_META: &str = "lnx-mid-command";
+const BROKER_HELLO_TIMEOUT: Duration = Duration::from_millis(500);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RunConfig {
     pub layout: Layout,
     pub command: Vec<String>,
@@ -55,29 +47,26 @@ pub fn run(config: RunConfig) -> Result<i32> {
     fs::create_dir_all(&config.layout.snapshot_dir)
         .with_context(|| format!("create {}", config.layout.snapshot_dir.display()))?;
     let broker_socket = config.layout.run_dir.join("broker.sock");
-    if let Ok(status) = run_broker_client(&broker_socket, &config.command, &config.cwd) {
+    if let Some(status) = run_existing_broker_client(&broker_socket, &config.command, &config.cwd)?
+    {
         return Ok(status);
     }
 
-    let bootstrap_lock = BootstrapLock::acquire(config.layout.run_dir.join("bootstrap.lock.d"))?;
-    if let Ok(status) = run_broker_client(&broker_socket, &config.command, &config.cwd) {
+    let bootstrap_lock = match acquire_bootstrap_or_run_client(
+        &config.layout.run_dir.join("bootstrap.lock.d"),
+        &broker_socket,
+        &config.command,
+        &config.cwd,
+    )? {
+        BootstrapOutcome::Lock(lock) => lock,
+        BootstrapOutcome::Status(status) => return Ok(status),
+    };
+    if let Some(status) = run_existing_broker_client(&broker_socket, &config.command, &config.cwd)?
+    {
         drop(bootstrap_lock);
         return Ok(status);
     }
     if broker_socket.exists() {
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(2) {
-            if UnixStream::connect(&broker_socket).is_ok() {
-                drop(bootstrap_lock);
-                return run_broker_client_retry(
-                    &broker_socket,
-                    &config.command,
-                    &config.cwd,
-                    Duration::from_secs(2),
-                );
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
         let _ = fs::remove_file(&broker_socket);
     }
 
@@ -196,26 +185,35 @@ pub fn run(config: RunConfig) -> Result<i32> {
         restore_snapshot,
         Arc::clone(&timings),
     );
-    drop(bootstrap_lock);
-    let status = run_broker_client_retry(
+    let owner = match owner {
+        Ok(owner) => owner,
+        Err(e) => {
+            timings.event(&format!("restore.owner.error {e:#}"));
+            return Err(e);
+        }
+    };
+    let status = match run_broker_client_retry(
         &broker_socket,
         &config.command,
         &config.cwd,
         Duration::from_secs(5),
     )
-    .with_context(|| console_hint(&config.layout.console_log))?;
-    let result = match owner {
-        Ok(handle) => {
-            let _ = handle.join();
-            Ok(status)
+    .with_context(|| console_hint(&config.layout.console_log))
+    {
+        Ok(status) => status,
+        Err(e) => {
+            timings.event(&format!("restore.client.error {e:#}"));
+            return Err(e);
         }
-        Err(e) => Err(e),
     };
+    let _ = owner.join();
+    let result = Ok(status);
     match &result {
         Ok(status) => timings.event(&format!("run.done status={status}")),
         Err(e) => timings.event(&format!("run.error {e:#}")),
     }
     drop(network);
+    drop(bootstrap_lock);
     result
 }
 
@@ -235,20 +233,46 @@ struct BootstrapLock {
     path: PathBuf,
 }
 
+enum BootstrapOutcome {
+    Lock(BootstrapLock),
+    Status(i32),
+}
+
+struct ActiveReservation {
+    active: Arc<AtomicUsize>,
+    armed: bool,
+}
+
+impl ActiveReservation {
+    fn new(active: Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::SeqCst);
+        Self {
+            active,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ActiveReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 impl BootstrapLock {
-    fn acquire(path: PathBuf) -> Result<Self> {
-        let start = Instant::now();
-        loop {
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self { path }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if start.elapsed() > Duration::from_secs(120) {
-                        bail!("timed out waiting for {}", path.display());
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
-            }
+    fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        match fs::create_dir(path) {
+            Ok(()) => Ok(Some(Self {
+                path: path.to_path_buf(),
+            })),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("create {}", path.display())),
         }
     }
 }
@@ -451,16 +475,63 @@ fn read_message(stream: &mut UnixStream) -> Result<Message> {
     postcard::from_bytes(&bytes).context("decode protocol message")
 }
 
-fn run_broker_client(socket: &Path, command: &[String], cwd: &Path) -> Result<i32> {
+fn acquire_bootstrap_or_run_client(
+    lock_path: &Path,
+    socket: &Path,
+    command: &[String],
+    cwd: &Path,
+) -> Result<BootstrapOutcome> {
+    let start = Instant::now();
+    loop {
+        if let Some(lock) = BootstrapLock::try_acquire(lock_path)? {
+            return Ok(BootstrapOutcome::Lock(lock));
+        }
+        if let Some(status) = run_existing_broker_client(socket, command, cwd)? {
+            return Ok(BootstrapOutcome::Status(status));
+        }
+        if start.elapsed() > Duration::from_secs(120) {
+            bail!("timed out waiting for {}", lock_path.display());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn run_existing_broker_client(
+    socket: &Path,
+    command: &[String],
+    cwd: &Path,
+) -> Result<Option<i32>> {
+    match connect_broker(socket) {
+        Ok(stream) => run_broker_session(stream, command, cwd).map(Some),
+        Err(_) => Ok(None),
+    }
+}
+
+fn connect_broker(socket: &Path) -> Result<UnixStream> {
     let mut stream =
         UnixStream::connect(socket).with_context(|| format!("connect {}", socket.display()))?;
-    let channel_id = new_request_id()?;
     write_message(
         &mut stream,
         &Message::Hello {
             version: PROTOCOL_VERSION,
         },
     )?;
+    stream
+        .set_read_timeout(Some(BROKER_HELLO_TIMEOUT))
+        .context("set broker hello timeout")?;
+    match read_message(&mut stream) {
+        Ok(Message::Hello { version }) if version == PROTOCOL_VERSION => {}
+        Ok(other) => bail!("bad broker hello: {other:?}"),
+        Err(e) => return Err(e).context("read broker hello"),
+    }
+    stream
+        .set_read_timeout(None)
+        .context("clear broker hello timeout")?;
+    Ok(stream)
+}
+
+fn run_broker_session(mut stream: UnixStream, command: &[String], cwd: &Path) -> Result<i32> {
+    let channel_id = new_request_id()?;
     let use_pty = should_request_pty();
     let raw_mode = if use_pty { RawTerminal::enter() } else { None };
     let (term, colorterm, rows, cols) = if use_pty {
@@ -492,26 +563,13 @@ fn run_broker_client(socket: &Path, command: &[String], cwd: &Path) -> Result<i3
 
     if !is_tty(std::io::stdin().as_raw_fd()) {
         let mut bytes = Vec::new();
-        let stdin_fd = std::io::stdin().as_raw_fd();
-        let flags = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
-        if flags >= 0 {
-            unsafe {
-                libc::fcntl(stdin_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
-        }
         let mut input = [0u8; 8192];
         loop {
             match std::io::stdin().read(&mut input) {
                 Ok(0) => break,
                 Ok(n) => bytes.extend_from_slice(&input[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e).context("read stdin"),
-            }
-        }
-        if flags >= 0 {
-            unsafe {
-                libc::fcntl(stdin_fd, libc::F_SETFL, flags);
             }
         }
         if !bytes.is_empty() {
@@ -551,59 +609,38 @@ fn run_broker_client(socket: &Path, command: &[String], cwd: &Path) -> Result<i3
         }
     }
 
-    let stdin_handle = std::io::stdin();
-    let stdin_fd = stdin_handle.as_raw_fd();
-    let stream_fd = stream.as_raw_fd();
-    let mut stdin = stdin_handle.lock();
-    let mut stdin_open = true;
-    let mut input = [0u8; 8192];
-    loop {
-        let mut fds = [
-            libc::pollfd {
-                fd: stream_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: if stdin_open { stdin_fd } else { -1 },
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
-        if rc < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(e).context("poll broker and terminal");
-        }
-        if stdin_open && (fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
+    let mut input_stream = stream
+        .try_clone()
+        .context("clone broker stream for stdin")?;
+    thread::spawn(move || {
+        let stdin_handle = std::io::stdin();
+        let mut stdin = stdin_handle.lock();
+        let mut input = [0u8; 8192];
+        loop {
             match stdin.read(&mut input) {
                 Ok(0) => {
-                    stdin_open = false;
-                    write_message(&mut stream, &Message::Eof { channel_id })?;
+                    let _ = write_message(&mut input_stream, &Message::Eof { channel_id });
+                    break;
                 }
                 Ok(n) => {
-                    write_message(
-                        &mut stream,
+                    let result = write_message(
+                        &mut input_stream,
                         &Message::Data {
                             channel_id,
                             bytes: input[..n].to_vec(),
                         },
-                    )?;
-                    if (fds[1].revents & (libc::POLLHUP | libc::POLLERR)) != 0 {
-                        stdin_open = false;
-                        write_message(&mut stream, &Message::Eof { channel_id })?;
+                    );
+                    if result.is_err() {
+                        break;
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e).context("read stdin"),
+                Err(_) => break,
             }
         }
-        if (fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) == 0 {
-            continue;
-        }
+    });
+
+    loop {
         match read_message(&mut stream)? {
             Message::Data {
                 channel_id: id,
@@ -646,8 +683,8 @@ fn run_broker_client_retry(
     let start = Instant::now();
     let mut last = None;
     while start.elapsed() < timeout {
-        match run_broker_client(socket, command, cwd) {
-            Ok(status) => return Ok(status),
+        match connect_broker(socket) {
+            Ok(stream) => return run_broker_session(stream, command, cwd),
             Err(e) => {
                 last = Some(e);
                 thread::sleep(Duration::from_millis(10));
@@ -748,6 +785,13 @@ fn run_broker_owner(
                 }
             }
         }
+        if let Ok(mut clients) = reader_clients.lock() {
+            let dropped = clients.len();
+            clients.clear();
+            if dropped > 0 {
+                reader_active.fetch_sub(dropped, Ordering::SeqCst);
+            }
+        }
     });
 
     broker_listener
@@ -777,6 +821,8 @@ fn run_broker_owner(
                 Err(_) => break,
             }
         }
+        let _ = fs::remove_file(&broker_socket);
+        drop(broker_listener);
         owner_timings.event("snapshot.request.guest");
         let _ = agent_tx.send(Message::SnapshotReady);
         let _ = serve_snapshot(
@@ -787,7 +833,6 @@ fn run_broker_owner(
             force_full_snapshot,
             &owner_timings,
         );
-        let _ = fs::remove_file(&broker_socket);
     }))
 }
 
@@ -798,10 +843,21 @@ fn handle_broker_client(
     active: Arc<AtomicUsize>,
     seen_active: Arc<AtomicBool>,
 ) -> Result<()> {
+    let mut active_reservation = ActiveReservation::new(Arc::clone(&active));
+    seen_active.store(true, Ordering::SeqCst);
+    client
+        .set_nonblocking(false)
+        .context("set broker client blocking")?;
     match read_message(&mut client)? {
         Message::Hello { version } if version == PROTOCOL_VERSION => {}
         other => bail!("bad client hello: {other:?}"),
     }
+    write_message(
+        &mut client,
+        &Message::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )?;
     let first = read_message(&mut client)?;
     let Message::OpenExec { channel_id, .. } = &first else {
         bail!("client did not open an exec channel");
@@ -812,9 +868,13 @@ fn handle_broker_client(
         .lock()
         .map_err(|_| anyhow::anyhow!("lock broker clients"))?
         .insert(channel_id, to_client_tx);
-    active.fetch_add(1, Ordering::SeqCst);
-    seen_active.store(true, Ordering::SeqCst);
-    agent_tx.send(first).context("send open exec to agent")?;
+    if let Err(e) = agent_tx.send(first) {
+        if let Ok(mut clients) = clients.lock() {
+            clients.remove(&channel_id);
+        }
+        return Err(e).context("send open exec to agent");
+    }
+    active_reservation.disarm();
     let mut writer = client.try_clone().context("clone broker client")?;
     thread::spawn(move || {
         while let Ok(message) = to_client_rx.recv() {
@@ -836,108 +896,6 @@ fn handle_broker_client(
             }
         }
     }
-}
-
-fn run_exec_client(
-    listener: UnixListener,
-    command: Vec<String>,
-    cwd: PathBuf,
-    console_log: PathBuf,
-    ctx: Arc<KrunContext>,
-    snapshot_path: PathBuf,
-    rootfs: PathBuf,
-    snapshot_listener: UnixListener,
-    control_listener: UnixListener,
-    restore_snapshot: Option<PathBuf>,
-    timings: Arc<TimingLog>,
-) -> Result<i32> {
-    listener
-        .set_nonblocking(true)
-        .context("set lnx-agent listener nonblocking")?;
-    let agent_timeout = if restore_snapshot.is_some() {
-        Duration::from_secs(10)
-    } else {
-        Duration::from_secs(90)
-    };
-    timings.event("agent.accept.begin");
-    let mut stream = accept_unix_with_progress(
-        &listener,
-        agent_timeout,
-        Some((&timings, "agent.accept.waiting")),
-    )
-    .with_context(|| console_hint(&console_log))?;
-    timings.event("agent.accepted");
-    drop(listener);
-    stream
-        .set_nonblocking(false)
-        .context("set lnx-agent stream blocking")?;
-    let restored_request_id = restore_snapshot
-        .as_deref()
-        .and_then(read_mid_command_request_id)
-        .transpose()?;
-    let request_id = match restored_request_id {
-        Some(request_id) => request_id,
-        None => new_request_id()?,
-    };
-    let force_full_snapshot = restored_request_id.is_some() || restore_snapshot.is_none();
-    if std::env::var_os("LNX_DEBUG_FRAMES").is_some() {
-        eprintln!("request id: {request_id:#x}");
-    }
-    timings.event(&format!("request.ready id={request_id:#x}"));
-    let use_pty = should_request_pty();
-    let raw_mode = if use_pty { RawTerminal::enter() } else { None };
-    timings.event(&format!(
-        "tty.mode pty={use_pty} raw={}",
-        raw_mode.is_some()
-    ));
-    let (control_tx, control_rx) = mpsc::channel();
-    spawn_control_server(
-        control_listener,
-        Arc::clone(&ctx),
-        snapshot_path.clone(),
-        rootfs.clone(),
-        stream
-            .try_clone()
-            .context("clone agent stream for control")?,
-        control_tx,
-        force_full_snapshot,
-        Arc::clone(&timings),
-    );
-    timings.event("control.thread.spawned");
-    if restored_request_id.is_none() {
-        write_exec_request(&mut stream, request_id, &command, &cwd, use_pty)?;
-        timings.event("exec.request.sent");
-    } else {
-        timings.event("exec.request.skipped.mid_command_restore");
-    }
-    timings.event("frames.read.begin");
-    let frame_result = read_frames(&mut stream, request_id, &timings);
-    drop(raw_mode);
-    timings.event("tty.restored");
-    let status = match frame_result {
-        Ok(status) => {
-            timings.event(&format!("guest.status status={status}"));
-            clear_mid_command_meta(&snapshot_path)?;
-            serve_snapshot(
-                snapshot_listener,
-                &ctx,
-                &snapshot_path,
-                &rootfs,
-                force_full_snapshot,
-                &timings,
-            )
-            .with_context(|| console_hint(&console_log))?;
-            status
-        }
-        Err(e) => match control_rx.recv_timeout(Duration::from_secs(300)) {
-            Ok(status) => {
-                timings.event(&format!("control.done status={status}"));
-                status
-            }
-            Err(_) => return Err(e).with_context(|| console_hint(&console_log)),
-        },
-    };
-    Ok(status)
 }
 
 fn accept_unix(listener: &UnixListener, timeout: Duration) -> Result<UnixStream> {
@@ -998,52 +956,12 @@ fn new_request_id() -> Result<u64> {
     Ok(nanos ^ ((std::process::id() as u64) << 32))
 }
 
-fn write_exec_request(
-    stream: &mut UnixStream,
-    request_id: u64,
-    command: &[String],
-    cwd: &Path,
-    use_pty: bool,
-) -> Result<()> {
-    stream.write_all(&request_id.to_be_bytes())?;
-    let cwd = guest_cwd(cwd);
-    write_u32(stream, cwd.len().try_into()?)?;
-    stream.write_all(cwd.as_bytes())?;
-    stream.write_all(&[if use_pty { REQUEST_FLAG_PTY } else { 0 }])?;
-    if use_pty {
-        let term = std::env::var("TERM")
-            .ok()
-            .filter(|value| !value.is_empty() && value != "dumb")
-            .unwrap_or_else(|| "xterm-256color".to_string());
-        write_string(stream, &term)?;
-        let colorterm = std::env::var("COLORTERM").unwrap_or_default();
-        write_string(stream, &colorterm)?;
-        let (rows, cols) = terminal_size();
-        write_u16(stream, rows)?;
-        write_u16(stream, cols)?;
-    }
-    write_u32(stream, command.len().try_into()?)?;
-    for arg in command {
-        let bytes = arg.as_bytes();
-        write_u32(stream, bytes.len().try_into()?)?;
-        stream.write_all(bytes)?;
-    }
-    Ok(())
-}
-
 fn should_request_pty() -> bool {
     is_tty(std::io::stdin().as_raw_fd()) && is_tty(std::io::stdout().as_raw_fd())
 }
 
 fn is_tty(fd: i32) -> bool {
     (unsafe { libc::isatty(fd) }) == 1
-}
-
-fn write_string(stream: &mut UnixStream, value: &str) -> Result<()> {
-    let bytes = value.as_bytes();
-    write_u32(stream, bytes.len().try_into()?)?;
-    stream.write_all(bytes)?;
-    Ok(())
 }
 
 fn terminal_size() -> (u16, u16) {
@@ -1133,129 +1051,6 @@ fn guest_cwd(cwd: &Path) -> String {
     }
 }
 
-fn read_frames(stream: &mut UnixStream, request_id: u64, timings: &TimingLog) -> Result<i32> {
-    let stdin_handle = std::io::stdin();
-    let stdin_fd = stdin_handle.as_raw_fd();
-    let stream_fd = stream.as_raw_fd();
-    let mut stdin = stdin_handle.lock();
-    let mut stdin_open = true;
-    let mut input = [0u8; 8192];
-    let mut saw_output = false;
-
-    loop {
-        let mut fds = [
-            libc::pollfd {
-                fd: stream_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: if stdin_open { stdin_fd } else { -1 },
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
-        if rc < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(e).context("poll terminal and lnx-agent");
-        }
-
-        if stdin_open && (fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
-            match stdin.read(&mut input) {
-                Ok(0) => {
-                    stdin_open = false;
-                    write_input_frame(stream, request_id, &[])?;
-                    timings.event("stdin.eof.sent");
-                }
-                Ok(n) => write_input_frame(stream, request_id, &input[..n])?,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e).context("read stdin"),
-            }
-        }
-
-        if (fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) == 0 {
-            continue;
-        }
-
-        let mut frame_type = [0u8; 1];
-        stream
-            .read_exact(&mut frame_type)
-            .context("agent closed before exit status")?;
-        let len = read_u32(stream).context("read frame length")?;
-        if len > MAX_FRAME_SIZE {
-            bail!("agent frame too large: {len}");
-        }
-        match frame_type[0] {
-            FRAME_OUTPUT | FRAME_STDERR => {
-                if len < 8 {
-                    bail!("bad output frame length: {len}");
-                }
-                let is_stderr = frame_type[0] == FRAME_STDERR;
-                let mut frame_request_id = [0u8; 8];
-                stream.read_exact(&mut frame_request_id)?;
-                let frame_request_id = u64::from_be_bytes(frame_request_id);
-                let mut remaining = len as usize - 8;
-                let mut buf = [0u8; 8192];
-                while remaining > 0 {
-                    let n = remaining.min(buf.len());
-                    stream.read_exact(&mut buf[..n])?;
-                    if frame_request_id == request_id {
-                        if !saw_output {
-                            saw_output = true;
-                            timings.event("guest.output.first");
-                        }
-                        if is_stderr {
-                            std::io::stderr().write_all(&buf[..n])?;
-                        } else {
-                            std::io::stdout().write_all(&buf[..n])?;
-                        }
-                    }
-                    remaining -= n;
-                }
-                if frame_request_id == request_id {
-                    if is_stderr {
-                        std::io::stderr().flush()?;
-                    } else {
-                        std::io::stdout().flush()?;
-                    }
-                }
-            }
-            FRAME_STATUS => {
-                if len != 12 {
-                    bail!("bad status frame length: {len}");
-                }
-                let mut frame_request_id = [0u8; 8];
-                stream.read_exact(&mut frame_request_id)?;
-                let frame_request_id = u64::from_be_bytes(frame_request_id);
-                let mut status = [0u8; 4];
-                stream.read_exact(&mut status)?;
-                if frame_request_id == request_id {
-                    return Ok(i32::from_be_bytes(status));
-                }
-                if std::env::var_os("LNX_DEBUG_FRAMES").is_some() {
-                    eprintln!(
-                        "ignored stale status frame: got {frame_request_id:#x}, want {request_id:#x}"
-                    );
-                }
-            }
-            other => bail!("unknown agent frame type: {other}"),
-        }
-    }
-}
-
-fn write_input_frame(stream: &mut UnixStream, request_id: u64, payload: &[u8]) -> Result<()> {
-    let len = u32::try_from(payload.len() + 8)?;
-    stream.write_all(&[FRAME_INPUT])?;
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(&request_id.to_be_bytes())?;
-    stream.write_all(payload)?;
-    Ok(())
-}
-
 fn serve_snapshot(
     listener: UnixListener,
     ctx: &KrunContext,
@@ -1280,6 +1075,14 @@ fn serve_snapshot(
         bail!("bad snapshot request");
     }
     timings.event(&format!("snapshot.request.read full={force_full}"));
+    let mut ready = [0u8; 1];
+    stream
+        .read_exact(&mut ready)
+        .context("read snapshot ready")?;
+    if ready[0] != b'R' {
+        bail!("bad snapshot ready");
+    }
+    timings.event("snapshot.ready.read");
     timings.event("snapshot.capture.begin");
     if force_full {
         snapshot_with_file_copy_full(ctx, snapshot_path, rootfs)?;
@@ -1321,101 +1124,6 @@ fn remove_path_if_exists(path: &Path) -> Result<()> {
             Err(_) => Err(dir_err).with_context(|| format!("remove {}", path.display())),
         },
     }
-}
-
-fn spawn_control_server(
-    listener: UnixListener,
-    ctx: Arc<KrunContext>,
-    snapshot_path: PathBuf,
-    rootfs: PathBuf,
-    exec_stream: UnixStream,
-    done: mpsc::Sender<i32>,
-    force_full: bool,
-    timings: Arc<TimingLog>,
-) {
-    thread::spawn(move || {
-        timings.event("control.accept.begin");
-        let result = handle_control_request(listener, &ctx, &snapshot_path, &rootfs, force_full);
-        match &result {
-            Ok(()) => timings.event("control.snapshot.done"),
-            Err(e) => timings.event(&format!("control.error {e:#}")),
-        }
-        let status = if result.is_ok() { 0 } else { 1 };
-        let _ = done.send(status);
-        let _ = exec_stream.shutdown(std::net::Shutdown::Both);
-    });
-}
-
-fn handle_control_request(
-    listener: UnixListener,
-    ctx: &KrunContext,
-    snapshot_path: &Path,
-    rootfs: &Path,
-    force_full: bool,
-) -> Result<()> {
-    let mut stream = accept_unix(&listener, Duration::from_secs(u64::MAX / 2))?;
-    stream
-        .set_nonblocking(false)
-        .context("set control stream blocking")?;
-    let mut frame_type = [0u8; 1];
-    stream.read_exact(&mut frame_type)?;
-    let len = read_u32(&mut stream)?;
-    if frame_type[0] != FRAME_CONTROL_SNAPSHOT_EXIT || len != 8 {
-        bail!("bad control request");
-    }
-    let mut request_id = [0u8; 8];
-    stream.read_exact(&mut request_id)?;
-    let request_id = u64::from_be_bytes(request_id);
-    if force_full {
-        snapshot_with_file_copy_full(ctx, snapshot_path, rootfs)?;
-    } else {
-        ctx.snapshot_with_file_copy(snapshot_path, rootfs, "rootfs.ext4")?;
-    }
-    write_mid_command_meta(snapshot_path, request_id)?;
-    let _ = stream.write_all(&[FRAME_CONTROL_OK]);
-    let _ = stream.write_all(&0u32.to_be_bytes());
-    Ok(())
-}
-
-fn mid_command_meta_path(snapshot_path: &Path) -> PathBuf {
-    snapshot_path.join(MID_COMMAND_META)
-}
-
-fn write_mid_command_meta(snapshot_path: &Path, request_id: u64) -> Result<()> {
-    fs::create_dir_all(snapshot_path)
-        .with_context(|| format!("create {}", snapshot_path.display()))?;
-    fs::write(
-        mid_command_meta_path(snapshot_path),
-        format!("{request_id:016x}\n"),
-    )
-    .with_context(|| format!("write {}", mid_command_meta_path(snapshot_path).display()))
-}
-
-fn read_mid_command_request_id(snapshot_path: &Path) -> Option<Result<u64>> {
-    let path = mid_command_meta_path(snapshot_path);
-    let raw = match fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => return Some(Err(e).with_context(|| format!("read {}", path.display()))),
-    };
-    Some(u64::from_str_radix(raw.trim(), 16).with_context(|| format!("parse {}", path.display())))
-}
-
-fn clear_mid_command_meta(snapshot_path: &Path) -> Result<()> {
-    match fs::remove_file(mid_command_meta_path(snapshot_path)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e)
-            .with_context(|| format!("remove {}", mid_command_meta_path(snapshot_path).display())),
-    }
-}
-
-fn write_u32(stream: &mut UnixStream, value: u32) -> Result<()> {
-    stream.write_all(&value.to_be_bytes()).map_err(Into::into)
-}
-
-fn write_u16(stream: &mut UnixStream, value: u16) -> Result<()> {
-    stream.write_all(&value.to_be_bytes()).map_err(Into::into)
 }
 
 fn read_u32(stream: &mut UnixStream) -> Result<u32> {

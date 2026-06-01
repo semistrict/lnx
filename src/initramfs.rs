@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 
 pub fn write_from_agent(agent_path: &Path, dir: PathBuf) -> Result<(PathBuf, bool)> {
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -44,11 +45,14 @@ fn stamp(agent_path: &Path) -> Result<String> {
     let modified = meta.modified().unwrap_or(UNIX_EPOCH);
     let modified = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
     Ok(format!(
-        "path={}\nlen={}\nmtime_secs={}\nmtime_nanos={}\n",
+        "path={}\nlen={}\nmtime_secs={}\nmtime_nanos={}\nsha256={:x}\n",
         agent_path.display(),
         meta.len(),
         modified.as_secs(),
-        modified.subsec_nanos()
+        modified.subsec_nanos(),
+        Sha256::digest(
+            fs::read(agent_path).with_context(|| format!("read {}", agent_path.display()))?
+        )
     ))
 }
 
