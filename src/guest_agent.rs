@@ -420,7 +420,7 @@ WantedBy=multi-user.target\n";
 
 fn connect_vsock(port: u32) -> c_int {
     for _ in 0..600 {
-        let addr = Box::new(vsock_addr(port));
+        let addr = vsock_addr(port);
         let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
         if fd < 0 {
             die("socket(AF_VSOCK)");
@@ -428,7 +428,7 @@ fn connect_vsock(port: u32) -> c_int {
         let ret = unsafe {
             connect(
                 fd,
-                addr.as_ref() as *const SockaddrVm as *const Sockaddr,
+                &addr as *const SockaddrVm as *const Sockaddr,
                 size_of::<SockaddrVm>() as c_uint,
             )
         };
