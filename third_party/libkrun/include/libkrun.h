@@ -86,21 +86,6 @@ int32_t krun_set_vm_config(uint32_t ctx_id, uint8_t num_vcpus, uint32_t ram_mib)
 #define KRUN_FS_ROOT_TAG "/dev/root"
 
 /**
- * Sets the path to be use as root for the microVM. Not available in libkrun-SEV.
- *
- * For more control over the root filesystem (e.g. read-only, DAX window size),
- * use krun_add_virtiofs3() with KRUN_FS_ROOT_TAG instead.
- *
- * Arguments:
- *  "ctx_id"    - the configuration context ID.
- *  "root_path" - a null-terminated string representing the path to be used as root.
- *
- * Returns:
- *  Zero on success or a negative error number on failure.
- */
-int32_t krun_set_root(uint32_t ctx_id, const char *root_path);
-
-/**
  * Adds a disk image to be used as a general partition for the microVM. The only supported image
  * format is "raw".
  *
@@ -799,8 +784,7 @@ int32_t krun_set_smbios_oem_strings(uint32_t ctx_id, const char *const oem_strin
  *
  * Arguments:
  *  "ctx_id"        - the configuration context ID.
- *  "workdir_path"  - the path to the working directory, relative to the root configured with
- *                    "krun_set_root".
+ *  "workdir_path"  - the path to the working directory, relative to the root filesystem.
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
@@ -814,7 +798,7 @@ int32_t krun_set_workdir(uint32_t ctx_id,
  *
  * Arguments:
  *  "ctx_id"    - the configuration context ID.
- *  "exec_path" - the path to the executable, relative to the root configured with "krun_set_root".
+ *  "exec_path" - the path to the executable, relative to the root filesystem.
  *  "argv"      - an array of string pointers to be passed as arguments.
  *  "envp"      - an array of string pointers to be injected as environment variables into the
  *                context of the executable. If NULL, it will auto-generate an array collecting the
@@ -1067,7 +1051,7 @@ int32_t krun_split_irqchip(uint32_t ctx_id, bool enable);
 
 /**
  * Do not inject the default init binary (/init.krun) into the root
- * filesystem. Must be called before krun_set_root().
+ * filesystem. Must be called before configuring the root filesystem.
  *
  * Arguments:
  *  "ctx_id" - the configuration context ID.
