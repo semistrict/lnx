@@ -97,9 +97,10 @@ fn main() -> Result<()> {
         )?;
 
         let rootfs_c = cstring_path(&rootfs)?;
+        let root_tag_c = CString::new("/dev/root")?;
         call_i32(
-            libkrun::krun_set_root(ctx, rootfs_c.as_ptr()),
-            "libkrun::krun_set_root",
+            libkrun::krun_add_virtiofs3(ctx, root_tag_c.as_ptr(), rootfs_c.as_ptr(), 0, false),
+            "libkrun::krun_add_virtiofs3(root)",
         )?;
 
         let home_tag_c = CString::new(HOME_TAG)?;
