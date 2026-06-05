@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
     Hello {
         version: u16,
@@ -49,4 +49,45 @@ pub enum Message {
         channel_id: u64,
     },
     SnapshotReady,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn postcard_round_trips_open_exec() {
+        let message = Message::OpenExec {
+            channel_id: 42,
+            argv: vec!["bash".into(), "-lc".into(), "echo hi".into()],
+            cwd: "/Users/ramon/src/project".into(),
+            pty: true,
+            term: "xterm-256color".into(),
+            colorterm: "truecolor".into(),
+            rows: 48,
+            cols: 160,
+        };
+
+        let encoded = postcard::to_allocvec(&message).expect("encode");
+        assert!(encoded.len() < MAX_MESSAGE_SIZE as usize);
+        let decoded: Message = postcard::from_bytes(&encoded).expect("decode");
+
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn protocol_version_is_encoded_in_hello() {
+        let encoded = postcard::to_allocvec(&Message::Hello {
+            version: PROTOCOL_VERSION,
+        })
+        .expect("encode");
+        let decoded: Message = postcard::from_bytes(&encoded).expect("decode");
+
+        assert_eq!(
+            decoded,
+            Message::Hello {
+                version: PROTOCOL_VERSION
+            }
+        );
+    }
 }

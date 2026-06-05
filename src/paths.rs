@@ -42,3 +42,50 @@ impl Layout {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_builds_per_instance_paths() {
+        let layout = Layout::resolve("dev", None, None).expect("resolve layout");
+
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(layout.base, home.join(".lnx"));
+        assert_eq!(layout.instance, "dev");
+        assert_eq!(layout.kernel, home.join(".lnx").join("vmlinuz"));
+        assert_eq!(
+            layout.rootfs,
+            home.join(".lnx")
+                .join("images")
+                .join("dev")
+                .join("rootfs.ext4")
+        );
+        assert_eq!(
+            layout.snapshot_dir,
+            home.join(".lnx")
+                .join("images")
+                .join("dev")
+                .join("memory-snapshots")
+        );
+        assert_eq!(
+            layout.run_dir,
+            home.join(".lnx").join("instances").join("dev")
+        );
+        assert_eq!(layout.console_log, layout.run_dir.join("console.log"));
+    }
+
+    #[test]
+    fn resolve_honors_explicit_kernel_and_rootfs() {
+        let kernel = PathBuf::from("/tmp/lnx-test-kernel");
+        let rootfs = PathBuf::from("/tmp/lnx-test-rootfs.ext4");
+
+        let layout =
+            Layout::resolve("custom", Some(kernel.clone()), Some(rootfs.clone())).expect("layout");
+
+        assert_eq!(layout.kernel, kernel);
+        assert_eq!(layout.rootfs, rootfs);
+        assert_eq!(layout.instance, "custom");
+    }
+}

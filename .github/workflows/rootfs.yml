@@ -21,7 +21,7 @@ jobs:
           docker create --name lnx-rootfs-extract lnx-rootfs true
           docker cp lnx-rootfs-extract:/rootfs.ext4 rootfs.ext4
           docker rm lnx-rootfs-extract
-          ls -lh rootfs.ext4
+          scripts/prepare-rootfs-image.sh rootfs.ext4
 
       - name: Compress rootfs
         run: zstd -T0 -9 rootfs.ext4 -o rootfs.ext4.zst && ls -lh rootfs.ext4.zst

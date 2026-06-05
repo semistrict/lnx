@@ -176,6 +176,18 @@ fn mount_fs(source: &'static [u8], target: &'static [u8], fstype: &'static [u8],
     }
 }
 
+fn wait_for_path(path: &str) -> bool {
+    for _ in 0..100 {
+        if fs::metadata(path).is_ok() {
+            return true;
+        }
+        unsafe {
+            usleep(50_000);
+        }
+    }
+    false
+}
+
 fn ensure_dir(path: &str) {
     if let Err(e) = fs::create_dir_all(path) {
         eprintln!("create {path}: {e}");
@@ -288,6 +300,9 @@ fn init_mode() -> ! {
             ptr::null(),
         )
     };
+    if !wait_for_path("/dev/pmem0") {
+        log("timed out waiting for /dev/pmem0");
+    }
     mount_fs(
         b"/dev/pmem0\0",
         b"/newroot\0",

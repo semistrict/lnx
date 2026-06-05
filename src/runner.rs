@@ -382,10 +382,34 @@ impl Drop for ActiveReservation {
 impl BootstrapLock {
     fn try_acquire(path: &Path) -> Result<Option<Self>> {
         match fs::create_dir(path) {
-            Ok(()) => Ok(Some(Self {
-                path: path.to_path_buf(),
-            })),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Ok(()) => {
+                fs::write(path.join("owner.pid"), std::process::id().to_string())
+                    .with_context(|| format!("write {}", path.join("owner.pid").display()))?;
+                Ok(Some(Self {
+                    path: path.to_path_buf(),
+                }))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if bootstrap_lock_is_stale(path)? {
+                    let _ = fs::remove_dir_all(path);
+                    match fs::create_dir(path) {
+                        Ok(()) => {
+                            fs::write(path.join("owner.pid"), std::process::id().to_string())
+                                .with_context(|| {
+                                    format!("write {}", path.join("owner.pid").display())
+                                })?;
+                            return Ok(Some(Self {
+                                path: path.to_path_buf(),
+                            }));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(e) => {
+                            return Err(e).with_context(|| format!("create {}", path.display()));
+                        }
+                    }
+                }
+                Ok(None)
+            }
             Err(e) => Err(e).with_context(|| format!("create {}", path.display())),
         }
     }
@@ -393,7 +417,34 @@ impl BootstrapLock {
 
 impl Drop for BootstrapLock {
     fn drop(&mut self) {
+        let _ = fs::remove_file(self.path.join("owner.pid"));
         let _ = fs::remove_dir(&self.path);
+    }
+}
+
+fn bootstrap_lock_is_stale(path: &Path) -> Result<bool> {
+    let owner_pid = path.join("owner.pid");
+    if let Ok(pid) = fs::read_to_string(&owner_pid) {
+        if let Ok(pid) = pid.trim().parse::<libc::pid_t>() {
+            return Ok(!process_alive(pid));
+        }
+        return Ok(true);
+    }
+
+    let modified = fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .modified()
+        .with_context(|| format!("stat modified time {}", path.display()))?;
+    Ok(modified.elapsed().unwrap_or_default() > Duration::from_secs(10))
+}
+
+fn process_alive(pid: libc::pid_t) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    unsafe {
+        libc::kill(pid, 0) == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 }
 
@@ -1468,6 +1519,118 @@ fn read_u32(stream: &mut UnixStream) -> Result<u32> {
     let mut buf = [0u8; 4];
     stream.read_exact(&mut buf)?;
     Ok(u32::from_be_bytes(buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("lnx-{name}-{}-{unique}", std::process::id()));
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_vmstate_header(snapshot: &Path, memory_bytes: u64, vcpu_count: u32) {
+        fs::create_dir_all(snapshot).expect("create snapshot dir");
+        let mut header = [0u8; 40];
+        header[0..8].copy_from_slice(b"LKRNSS01");
+        header[8..12].copy_from_slice(&1u32.to_le_bytes());
+        header[16..24].copy_from_slice(&memory_bytes.to_le_bytes());
+        header[32..36].copy_from_slice(&vcpu_count.to_le_bytes());
+        fs::write(snapshot.join("vmstate.bin"), header).expect("write vmstate");
+    }
+
+    #[test]
+    fn snapshot_vm_config_returns_none_when_vmstate_is_absent() {
+        let temp = TempDir::new("snapshot-missing");
+
+        assert!(
+            snapshot_vm_config(temp.path())
+                .expect("read config")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn snapshot_vm_config_parses_header_and_matches_config() {
+        let temp = TempDir::new("snapshot-header");
+        write_vmstate_header(temp.path(), 4 * 1024 * 1024 * 1024, 2);
+
+        let config = snapshot_vm_config(temp.path())
+            .expect("read config")
+            .expect("config present");
+
+        assert_eq!(config.vcpu_count, 2);
+        assert_eq!(config.memory_mib(), 4096);
+        assert!(config.matches(2, 4096));
+        assert!(!config.matches(1, 4096));
+        assert!(!config.matches(2, 8192));
+    }
+
+    #[test]
+    fn snapshot_vm_config_rejects_bad_magic_and_version() {
+        let temp = TempDir::new("snapshot-bad");
+        fs::create_dir_all(temp.path()).expect("create snapshot dir");
+        fs::write(temp.path().join("vmstate.bin"), [0u8; 40]).expect("write bad vmstate");
+        assert!(snapshot_vm_config(temp.path()).is_err());
+
+        let mut header = [0u8; 40];
+        header[0..8].copy_from_slice(b"LKRNSS01");
+        header[8..12].copy_from_slice(&2u32.to_le_bytes());
+        fs::write(temp.path().join("vmstate.bin"), header).expect("write bad version");
+        assert!(snapshot_vm_config(temp.path()).is_err());
+    }
+
+    #[test]
+    fn framed_message_round_trips_over_unix_stream() {
+        let (mut left, mut right) = UnixStream::pair().expect("unix pair");
+        let message = Message::Data {
+            channel_id: 7,
+            bytes: b"hello".to_vec(),
+        };
+
+        write_message(&mut left, &message).expect("write message");
+        let decoded = read_message(&mut right).expect("read message");
+
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn framed_message_rejects_oversized_writes_and_reads() {
+        let (mut left, mut right) = UnixStream::pair().expect("unix pair");
+        let too_large = Message::Data {
+            channel_id: 1,
+            bytes: vec![0; MAX_MESSAGE_SIZE as usize + 1],
+        };
+        assert!(write_message(&mut left, &too_large).is_err());
+
+        left.write_all(&(MAX_MESSAGE_SIZE + 1).to_be_bytes())
+            .expect("write oversized length");
+        assert!(read_message(&mut right).is_err());
+    }
 }
 
 fn console_hint(path: &Path) -> String {

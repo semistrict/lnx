@@ -50,6 +50,7 @@ jobs:
           docker create --name lnx-rootfs-extract lnx-rootfs true
           docker cp lnx-rootfs-extract:/rootfs.ext4 rootfs.ext4
           docker rm lnx-rootfs-extract
+          scripts/prepare-rootfs-image.sh rootfs.ext4
 
       - name: Compress rootfs
         run: zstd -T0 -9 rootfs.ext4 -o rootfs.ext4.zst
@@ -85,7 +86,7 @@ jobs:
             Pre-built kernel and rootfs images for lnx.
 
             - `vmlinuz.gz` — Linux kernel (arm64, gzip compressed)
-            - `rootfs.ext4.zst` — Ubuntu rootfs (zstd compressed)
+            - `rootfs.ext4.zst` — Ubuntu rootfs (64G sparse ext4, 16K block size, zstd compressed)
 
             Place the decompressed images at `~/.lnx/vmlinuz` and
             `~/.lnx/images/default/rootfs.ext4`.

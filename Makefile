@@ -5,7 +5,7 @@ BIN := target/debug/lnx
 RELEASE_BIN := target/release/lnx
 INSTALL_BIN ?= $(HOME)/.cargo/bin
 
-.PHONY: all build cargo-build sign release release-build release-sign install run apt-update deps check test fmt clean
+.PHONY: all build cargo-build sign release release-build release-sign install run apt-update deps check test test-system rootfs fmt clean
 
 all: build
 
@@ -43,6 +43,17 @@ check:
 
 test:
 	CC_LINUX=$(CC_LINUX) $(CARGO) test
+
+test-system: build
+	LNX_BIN=$(BIN) scripts/system-test.sh
+
+rootfs:
+	docker buildx build --platform linux/arm64 -f Dockerfile.rootfs -t lnx-rootfs --load .
+	docker rm -f lnx-rootfs-extract >/dev/null 2>&1 || true
+	docker create --name lnx-rootfs-extract lnx-rootfs true
+	docker cp lnx-rootfs-extract:/rootfs.ext4 rootfs.ext4
+	docker rm lnx-rootfs-extract
+	scripts/prepare-rootfs-image.sh rootfs.ext4
 
 fmt:
 	$(CARGO) fmt
