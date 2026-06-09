@@ -5,7 +5,7 @@ BIN := target/debug/lnx
 RELEASE_BIN := target/release/lnx
 INSTALL_BIN ?= $(HOME)/.cargo/bin
 
-.PHONY: all build release install run apt-update deps check test test-system test-checkpoint test-fork-fanout test-snapshot-compat test-dirty-fs test-broker-recovery test-client-chaos test-pty-resume test-browser test-privileged-ingress test-stress test-stock test-ingress test-longevity test-full rootfs fmt clean
+.PHONY: all build release install sign-notarize run apt-update deps check test test-system test-checkpoint test-fork-fanout test-snapshot-compat test-dirty-fs test-broker-recovery test-client-chaos test-pty-resume test-browser test-privileged-ingress test-stress test-stock test-ingress test-longevity test-full rootfs fmt clean
 
 all: build
 
@@ -17,6 +17,9 @@ release:
 
 install:
 	bun run install
+
+sign-notarize: release
+	scripts/sign-notarize.sh $(RELEASE_BIN)
 
 run: build
 	$(BIN) /bin/echo hello
