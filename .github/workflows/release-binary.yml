@@ -47,3 +47,37 @@ jobs:
           path: |
             lnx-macos-arm64.tar.gz
             lnx-macos-arm64.tar.gz.sha256
+
+  build-github-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install Linux musl cross compiler
+        run: brew install FiloSottile/musl-cross/musl-cross
+
+      - name: Build release binary
+        run: CC_LINUX=/opt/homebrew/bin/aarch64-linux-musl-gcc cargo build --release
+
+      - name: Codesign release binary
+        run: codesign --entitlements entitlements.plist --force -s - target/release/lnx
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          cp target/release/lnx dist/lnx
+          tar -C dist -czf lnx-macos-arm64-github.tar.gz lnx
+          shasum -a 256 lnx-macos-arm64-github.tar.gz > lnx-macos-arm64-github.tar.gz.sha256
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lnx-macos-arm64-github
+          path: |
+            lnx-macos-arm64-github.tar.gz
+            lnx-macos-arm64-github.tar.gz.sha256
