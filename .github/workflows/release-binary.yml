@@ -25,7 +25,7 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Build release binary
-        run: depot cargo build --release
+        run: CC_LINUX=/opt/homebrew/bin/aarch64-linux-musl-gcc depot cargo build --release
 
       - name: Codesign release binary
         run: codesign --entitlements entitlements.plist --force -s - target/release/lnx
