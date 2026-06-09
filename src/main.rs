@@ -1,4 +1,6 @@
+mod checkpoints;
 mod cli;
+mod ingress;
 mod init;
 mod initramfs;
 mod krun;

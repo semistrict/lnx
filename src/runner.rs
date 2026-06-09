@@ -1,14 +1,14 @@
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
-    net::TcpListener,
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
+    net::{Shutdown, TcpListener, TcpStream},
     os::fd::AsRawFd,
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Once,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
@@ -33,6 +33,14 @@ const SNAPSHOT_PORT: u32 = 10241;
 const CONTROL_PORT: u32 = 10242;
 const FRAME_SNAPSHOT: u8 = b'K';
 const BROKER_HELLO_TIMEOUT: Duration = Duration::from_millis(500);
+const INTERRUPT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
+
+static SIGNAL_INIT: Once = Once::new();
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_sigint(_: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
 
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -42,9 +50,21 @@ pub struct RunConfig {
     pub cpus: u8,
     pub memory_mib: u32,
     pub restore_snapshot: Option<PathBuf>,
+    pub forwards: Vec<PortForward>,
+    pub snapshot_output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortForward {
+    pub listen_host: String,
+    pub listen_port: u16,
+    pub guest_host: String,
+    pub guest_port: u16,
 }
 
 pub fn run(config: RunConfig) -> Result<i32> {
+    install_signal_handlers();
+    INTERRUPTED.store(false, Ordering::SeqCst);
     fs::create_dir_all(&config.layout.run_dir)
         .with_context(|| format!("create {}", config.layout.run_dir.display()))?;
     fs::create_dir_all(&config.layout.snapshot_dir)
@@ -116,11 +136,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
         "initramfs.cached"
     });
     let requested_restore_snapshot = config.restore_snapshot.clone();
-    let restore_snapshot = if rebuilt_initramfs && config.restore_snapshot.is_some() {
-        timings.event("snapshot.restore.skipped.initramfs_rebuilt");
-        run_log.line("snapshot.restore.skipped reason=initramfs_rebuilt");
-        None
-    } else if let Some(snapshot) = &config.restore_snapshot {
+    let restore_snapshot = if let Some(snapshot) = &config.restore_snapshot {
         match snapshot_vm_config(snapshot) {
             Ok(Some(snapshot_config))
                 if !snapshot_config.matches(config.cpus, config.memory_mib) =>
@@ -250,17 +266,22 @@ pub fn run(config: RunConfig) -> Result<i32> {
     });
     timings.event("krun.thread.spawned");
 
+    let snapshot_output = config
+        .snapshot_output
+        .clone()
+        .unwrap_or_else(|| config.layout.snapshot_dir.join("latest"));
     let owner = run_broker_owner(
         listener,
         config.layout.console_log.clone(),
         Arc::clone(&ctx),
-        config.layout.snapshot_dir.join("latest"),
+        snapshot_output,
         rootfs,
         snapshot_listener,
         control_listener,
         broker_listener,
         broker_socket.clone(),
         restore_snapshot,
+        config.forwards.clone(),
         Arc::clone(&timings),
         Arc::clone(&run_log),
         vm_error_rx,
@@ -311,6 +332,141 @@ pub fn run(config: RunConfig) -> Result<i32> {
     result
 }
 
+pub fn request_checkpoint(socket: &Path, checkpoint_path: &Path) -> Result<()> {
+    let mut stream = connect_broker(socket)?;
+    let channel_id = new_request_id()?;
+    write_message(
+        &mut stream,
+        &Message::Checkpoint {
+            channel_id,
+            path: checkpoint_path.to_string_lossy().into_owned(),
+        },
+    )?;
+    loop {
+        match read_message(&mut stream)? {
+            Message::CheckpointCreated { channel_id: id } if id == channel_id => return Ok(()),
+            Message::Error {
+                channel_id: id,
+                message,
+            } if id == channel_id => bail!("{message}"),
+            _ => {}
+        }
+    }
+}
+
+pub fn proxy_stream_to_guest(
+    broker_socket: &Path,
+    mut local: TcpStream,
+    initial_bytes: Vec<u8>,
+    guest_host: &str,
+    guest_port: u16,
+) -> Result<()> {
+    let first_response_deadline = Instant::now() + Duration::from_secs(5);
+    let (mut broker, channel_id, first_bytes) = 'connect: loop {
+        let mut broker = connect_broker(broker_socket)?;
+        let channel_id = new_request_id()?;
+        write_message(
+            &mut broker,
+            &Message::OpenTcp {
+                channel_id,
+                host: guest_host.to_string(),
+                port: guest_port,
+            },
+        )?;
+        if !initial_bytes.is_empty() {
+            write_message(
+                &mut broker,
+                &Message::Data {
+                    channel_id,
+                    bytes: initial_bytes.clone(),
+                },
+            )?;
+        }
+        loop {
+            match read_message(&mut broker)? {
+                Message::Data {
+                    channel_id: id,
+                    bytes,
+                } if id == channel_id => break 'connect (broker, channel_id, bytes),
+                Message::Eof { channel_id: id } if id == channel_id => {
+                    let _ = local.shutdown(Shutdown::Write);
+                }
+                Message::Close { channel_id: id } if id == channel_id => return Ok(()),
+                Message::Error {
+                    channel_id: id,
+                    message,
+                } if id == channel_id => {
+                    if Instant::now() >= first_response_deadline {
+                        let _ = local.shutdown(Shutdown::Both);
+                        bail!("{message}");
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                    break;
+                }
+                _ => {}
+            }
+        }
+    };
+
+    local.write_all(&first_bytes)?;
+
+    let mut broker_input = broker.try_clone().context("clone ingress broker stream")?;
+    let mut local_reader = local.try_clone().context("clone ingress local stream")?;
+    thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match local_reader.read(&mut buf) {
+                Ok(0) => {
+                    let _ = write_message(&mut broker_input, &Message::Eof { channel_id });
+                    break;
+                }
+                Ok(n) => {
+                    if write_message(
+                        &mut broker_input,
+                        &Message::Data {
+                            channel_id,
+                            bytes: buf[..n].to_vec(),
+                        },
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => {
+                    let _ = write_message(&mut broker_input, &Message::Close { channel_id });
+                    break;
+                }
+            }
+        }
+    });
+
+    loop {
+        match read_message(&mut broker)? {
+            Message::Data {
+                channel_id: id,
+                bytes,
+            } if id == channel_id => local.write_all(&bytes)?,
+            Message::Eof { channel_id: id } if id == channel_id => {
+                let _ = local.shutdown(Shutdown::Write);
+            }
+            Message::Close { channel_id: id } if id == channel_id => return Ok(()),
+            Message::Error {
+                channel_id: id,
+                message,
+            } if id == channel_id => {
+                let _ = local.shutdown(Shutdown::Both);
+                bail!("{message}");
+            }
+            _ => {}
+        }
+    }
+}
+
 struct TimingLog {
     path: PathBuf,
     state_path: PathBuf,
@@ -355,6 +511,17 @@ enum BootstrapOutcome {
 struct ActiveReservation {
     active: Arc<AtomicUsize>,
     armed: bool,
+}
+
+#[derive(Clone)]
+struct BrokerChannel {
+    tx: mpsc::Sender<Message>,
+    active_owned_by_reader: bool,
+}
+
+struct CheckpointRequest {
+    path: PathBuf,
+    reply: mpsc::Sender<Result<(), String>>,
 }
 
 impl ActiveReservation {
@@ -420,6 +587,15 @@ impl Drop for BootstrapLock {
         let _ = fs::remove_file(self.path.join("owner.pid"));
         let _ = fs::remove_dir(&self.path);
     }
+}
+
+fn install_signal_handlers() {
+    SIGNAL_INIT.call_once(|| unsafe {
+        libc::signal(
+            libc::SIGINT,
+            handle_sigint as *const () as libc::sighandler_t,
+        );
+    });
 }
 
 fn bootstrap_lock_is_stale(path: &Path) -> Result<bool> {
@@ -711,6 +887,45 @@ fn read_message(stream: &mut UnixStream) -> Result<Message> {
     postcard::from_bytes(&bytes).context("decode protocol message")
 }
 
+fn read_message_interruptible(stream: &mut UnixStream) -> Result<Option<Message>> {
+    stream
+        .set_read_timeout(Some(INTERRUPT_POLL_TIMEOUT))
+        .context("set interruptible read timeout")?;
+    loop {
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            let _ = stream.set_read_timeout(None);
+            return Ok(None);
+        }
+        match read_message(stream) {
+            Ok(message) => {
+                let _ = stream.set_read_timeout(None);
+                return Ok(Some(message));
+            }
+            Err(e) if is_timeout_error(&e) => {}
+            Err(e) => {
+                let _ = stream.set_read_timeout(None);
+                return Err(e);
+            }
+        }
+    }
+}
+
+fn is_timeout_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
 fn acquire_bootstrap_or_run_client(
     lock_path: &Path,
     socket: &Path,
@@ -788,10 +1003,21 @@ fn connect_broker(socket: &Path) -> Result<UnixStream> {
     stream
         .set_read_timeout(Some(BROKER_HELLO_TIMEOUT))
         .context("set broker hello timeout")?;
-    match read_message(&mut stream) {
-        Ok(Message::Hello { version }) if version == PROTOCOL_VERSION => {}
-        Ok(other) => bail!("bad broker hello: {other:?}"),
-        Err(e) => return Err(e).context("read broker hello"),
+    let deadline = Instant::now() + BROKER_HELLO_TIMEOUT;
+    loop {
+        match read_message(&mut stream) {
+            Ok(Message::Hello { version }) if version == PROTOCOL_VERSION => break,
+            Ok(other) => bail!("bad broker hello: {other:?}"),
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+                    Some(ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted)
+                ) && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => return Err(e).context("read broker hello"),
+        }
     }
     stream
         .set_read_timeout(None)
@@ -800,6 +1026,7 @@ fn connect_broker(socket: &Path) -> Result<UnixStream> {
 }
 
 fn run_broker_session(mut stream: UnixStream, command: &[String], cwd: &Path) -> Result<i32> {
+    INTERRUPTED.store(false, Ordering::SeqCst);
     let channel_id = new_request_id()?;
     let use_pty = should_request_pty();
     let raw_mode = if use_pty { RawTerminal::enter() } else { None };
@@ -846,7 +1073,12 @@ fn run_broker_session(mut stream: UnixStream, command: &[String], cwd: &Path) ->
         }
         write_message(&mut stream, &Message::Eof { channel_id })?;
         loop {
-            match read_message(&mut stream)? {
+            let Some(message) = read_message_interruptible(&mut stream)? else {
+                let _ = write_message(&mut stream, &Message::Eof { channel_id });
+                let _ = write_message(&mut stream, &Message::Close { channel_id });
+                return Ok(130);
+            };
+            match message {
                 Message::Data {
                     channel_id: id,
                     bytes,
@@ -910,7 +1142,13 @@ fn run_broker_session(mut stream: UnixStream, command: &[String], cwd: &Path) ->
     });
 
     loop {
-        match read_message(&mut stream)? {
+        let Some(message) = read_message_interruptible(&mut stream)? else {
+            let _ = write_message(&mut stream, &Message::Eof { channel_id });
+            let _ = write_message(&mut stream, &Message::Close { channel_id });
+            drop(raw_mode);
+            return Ok(130);
+        };
+        match message {
             Message::Data {
                 channel_id: id,
                 bytes,
@@ -977,6 +1215,7 @@ fn run_broker_owner(
     broker_listener: UnixListener,
     broker_socket: PathBuf,
     restore_snapshot: Option<PathBuf>,
+    forwards: Vec<PortForward>,
     timings: Arc<TimingLog>,
     run_log: Arc<RunLog>,
     vm_error_rx: mpsc::Receiver<i32>,
@@ -1028,7 +1267,8 @@ fn run_broker_owner(
     )?;
 
     let (agent_tx, agent_rx) = mpsc::channel::<Message>();
-    let client_senders = Arc::new(Mutex::new(HashMap::<u64, mpsc::Sender<Message>>::new()));
+    let (checkpoint_tx, checkpoint_rx) = mpsc::channel::<CheckpointRequest>();
+    let client_senders = Arc::new(Mutex::new(HashMap::<u64, BrokerChannel>::new()));
     let active = Arc::new(AtomicUsize::new(0));
     let seen_active = Arc::new(AtomicBool::new(false));
 
@@ -1051,29 +1291,38 @@ fn run_broker_owner(
             let channel_id = match &message {
                 Message::Data { channel_id, .. }
                 | Message::Stderr { channel_id, .. }
+                | Message::Eof { channel_id }
                 | Message::ExitStatus { channel_id, .. }
                 | Message::Close { channel_id }
                 | Message::Error { channel_id, .. } => Some(*channel_id),
                 _ => None,
             };
             if let Some(channel_id) = channel_id {
-                let tx = reader_clients
+                let channel = reader_clients
                     .lock()
                     .ok()
                     .and_then(|clients| clients.get(&channel_id).cloned());
-                if let Some(tx) = tx {
-                    let _ = tx.send(message.clone());
+                if let Some(channel) = channel {
+                    let _ = channel.tx.send(message.clone());
                 }
                 if matches!(message, Message::Close { .. }) {
-                    if let Ok(mut clients) = reader_clients.lock() {
-                        clients.remove(&channel_id);
+                    let decrement = reader_clients
+                        .lock()
+                        .ok()
+                        .and_then(|mut clients| clients.remove(&channel_id))
+                        .map(|channel| channel.active_owned_by_reader)
+                        .unwrap_or(false);
+                    if decrement {
+                        reader_active.fetch_sub(1, Ordering::SeqCst);
                     }
-                    reader_active.fetch_sub(1, Ordering::SeqCst);
                 }
             }
         }
         if let Ok(mut clients) = reader_clients.lock() {
-            let dropped = clients.len();
+            let dropped = clients
+                .values()
+                .filter(|channel| channel.active_owned_by_reader)
+                .count();
             clients.clear();
             if dropped > 0 {
                 reader_active.fetch_sub(dropped, Ordering::SeqCst);
@@ -1087,6 +1336,16 @@ fn run_broker_owner(
     let owner_timings = Arc::clone(&timings);
     let owner_log = Arc::clone(&run_log);
     let force_full_snapshot = restore_snapshot.is_none();
+    for forward in forwards {
+        start_forward_listener(
+            forward,
+            agent_tx.clone(),
+            Arc::clone(&client_senders),
+            Arc::clone(&active),
+            Arc::clone(&seen_active),
+            Arc::clone(&run_log),
+        )?;
+    }
     Ok(thread::spawn(move || {
         owner_timings.event("broker.ready");
         owner_log.line(format!("broker.ready socket={}", broker_socket.display()));
@@ -1098,14 +1357,32 @@ fn run_broker_owner(
                     let clients = Arc::clone(&client_senders);
                     let active = Arc::clone(&active);
                     let seen = Arc::clone(&seen_active);
+                    let checkpoint_tx = checkpoint_tx.clone();
                     let client_log = Arc::clone(&owner_log);
                     thread::spawn(move || {
-                        if let Err(e) = handle_broker_client(client, tx, clients, active, seen) {
+                        if let Err(e) =
+                            handle_broker_client(client, tx, checkpoint_tx, clients, active, seen)
+                        {
                             client_log.line(format!("broker.client.error {e:#}"));
                         }
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    while let Ok(request) = checkpoint_rx.try_recv() {
+                        owner_timings.event("checkpoint.request.begin");
+                        owner_log.line(format!(
+                            "checkpoint.request path={}",
+                            request.path.display()
+                        ));
+                        let result = snapshot_with_file_copy_full(&ctx, &request.path, &rootfs)
+                            .map_err(|e| format!("{e:#}"));
+                        if result.is_ok() {
+                            owner_log
+                                .line(format!("checkpoint.done path={}", request.path.display()));
+                            log_snapshot_summary(&owner_log, "checkpoint", &request.path);
+                        }
+                        let _ = request.reply.send(result);
+                    }
                     if seen_active.load(Ordering::SeqCst) && active.load(Ordering::SeqCst) == 0 {
                         break;
                     }
@@ -1142,12 +1419,11 @@ fn run_broker_owner(
 fn handle_broker_client(
     mut client: UnixStream,
     agent_tx: mpsc::Sender<Message>,
-    clients: Arc<Mutex<HashMap<u64, mpsc::Sender<Message>>>>,
+    checkpoint_tx: mpsc::Sender<CheckpointRequest>,
+    clients: Arc<Mutex<HashMap<u64, BrokerChannel>>>,
     active: Arc<AtomicUsize>,
     seen_active: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut active_reservation = ActiveReservation::new(Arc::clone(&active));
-    seen_active.store(true, Ordering::SeqCst);
     client
         .set_nonblocking(false)
         .context("set broker client blocking")?;
@@ -1162,15 +1438,43 @@ fn handle_broker_client(
         },
     )?;
     let first = read_message(&mut client)?;
-    let Message::OpenExec { channel_id, .. } = &first else {
-        bail!("client did not open an exec channel");
+    if let Message::Checkpoint { channel_id, path } = first {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        checkpoint_tx
+            .send(CheckpointRequest {
+                path: PathBuf::from(path),
+                reply: reply_tx,
+            })
+            .context("send checkpoint request to owner")?;
+        match reply_rx.recv().context("receive checkpoint result")? {
+            Ok(()) => write_message(&mut client, &Message::CheckpointCreated { channel_id })?,
+            Err(message) => write_message(
+                &mut client,
+                &Message::Error {
+                    channel_id,
+                    message,
+                },
+            )?,
+        }
+        return Ok(());
     };
-    let channel_id = *channel_id;
+    let channel_id = match &first {
+        Message::OpenExec { channel_id, .. } | Message::OpenTcp { channel_id, .. } => *channel_id,
+        _ => bail!("client did not open a channel"),
+    };
+    let mut active_reservation = ActiveReservation::new(Arc::clone(&active));
+    seen_active.store(true, Ordering::SeqCst);
     let (to_client_tx, to_client_rx) = mpsc::channel::<Message>();
     clients
         .lock()
         .map_err(|_| anyhow::anyhow!("lock broker clients"))?
-        .insert(channel_id, to_client_tx);
+        .insert(
+            channel_id,
+            BrokerChannel {
+                tx: to_client_tx,
+                active_owned_by_reader: true,
+            },
+        );
     if let Err(e) = agent_tx.send(first) {
         if let Ok(mut clients) = clients.lock() {
             clients.remove(&channel_id);
@@ -1199,6 +1503,168 @@ fn handle_broker_client(
             }
         }
     }
+}
+
+fn start_forward_listener(
+    forward: PortForward,
+    agent_tx: mpsc::Sender<Message>,
+    clients: Arc<Mutex<HashMap<u64, BrokerChannel>>>,
+    active: Arc<AtomicUsize>,
+    seen_active: Arc<AtomicBool>,
+    run_log: Arc<RunLog>,
+) -> Result<()> {
+    let listener = TcpListener::bind((forward.listen_host.as_str(), forward.listen_port))
+        .with_context(|| format!("listen on {}:{}", forward.listen_host, forward.listen_port))?;
+    listener.set_nonblocking(true).with_context(|| {
+        format!(
+            "set forward listener nonblocking {}:{}",
+            forward.listen_host, forward.listen_port
+        )
+    })?;
+    run_log.line(format!(
+        "forward.listen host={} port={} guest_host={} guest_port={}",
+        forward.listen_host, forward.listen_port, forward.guest_host, forward.guest_port
+    ));
+    thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                Ok((stream, peer)) => {
+                    let _ = stream.set_nonblocking(false);
+                    run_log.line(format!(
+                        "forward.accept listen_port={} peer={peer}",
+                        forward.listen_port
+                    ));
+                    let connection_forward = forward.clone();
+                    let connection_tx = agent_tx.clone();
+                    let connection_clients = Arc::clone(&clients);
+                    let connection_active = Arc::clone(&active);
+                    let connection_seen = Arc::clone(&seen_active);
+                    let connection_log = Arc::clone(&run_log);
+                    thread::spawn(move || {
+                        if let Err(e) = handle_forward_connection(
+                            stream,
+                            connection_forward,
+                            connection_tx,
+                            connection_clients,
+                            connection_active,
+                            connection_seen,
+                            Arc::clone(&connection_log),
+                        ) {
+                            connection_log.line(format!("forward.connection.error {e:#}"));
+                        }
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    run_log.line(format!("forward.accept.error {e:#}"));
+                    break;
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+fn handle_forward_connection(
+    mut local: TcpStream,
+    forward: PortForward,
+    agent_tx: mpsc::Sender<Message>,
+    clients: Arc<Mutex<HashMap<u64, BrokerChannel>>>,
+    active: Arc<AtomicUsize>,
+    seen_active: Arc<AtomicBool>,
+    run_log: Arc<RunLog>,
+) -> Result<()> {
+    let reservation = ActiveReservation::new(active);
+    seen_active.store(true, Ordering::SeqCst);
+    let channel_id = new_request_id()?;
+    let (to_forward_tx, to_forward_rx) = mpsc::channel::<Message>();
+    clients
+        .lock()
+        .map_err(|_| anyhow::anyhow!("lock broker clients"))?
+        .insert(
+            channel_id,
+            BrokerChannel {
+                tx: to_forward_tx,
+                active_owned_by_reader: false,
+            },
+        );
+    if let Err(e) = agent_tx.send(Message::OpenTcp {
+        channel_id,
+        host: forward.guest_host,
+        port: forward.guest_port,
+    }) {
+        if let Ok(mut clients) = clients.lock() {
+            clients.remove(&channel_id);
+        }
+        return Err(e).context("send open tcp to agent");
+    }
+
+    let mut local_reader = local.try_clone().context("clone local forward stream")?;
+    let input_tx = agent_tx.clone();
+    thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match local_reader.read(&mut buf) {
+                Ok(0) => {
+                    let _ = input_tx.send(Message::Eof { channel_id });
+                    break;
+                }
+                Ok(n) => {
+                    if input_tx
+                        .send(Message::Data {
+                            channel_id,
+                            bytes: buf[..n].to_vec(),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => {
+                    let _ = input_tx.send(Message::Close { channel_id });
+                    break;
+                }
+            }
+        }
+    });
+
+    while let Ok(message) = to_forward_rx.recv() {
+        match message {
+            Message::Data {
+                channel_id: id,
+                bytes,
+            } if id == channel_id => {
+                if local.write_all(&bytes).is_err() {
+                    run_log.line(format!("forward.local_write.error channel={channel_id}"));
+                    break;
+                }
+            }
+            Message::Eof { channel_id: id } if id == channel_id => {
+                let _ = local.shutdown(Shutdown::Write);
+            }
+            Message::Close { channel_id: id } if id == channel_id => {
+                break;
+            }
+            Message::Error {
+                channel_id: id,
+                message,
+            } if id == channel_id => bail!("{message}"),
+            _ => {}
+        }
+    }
+    if let Ok(mut clients) = clients.lock() {
+        clients.remove(&channel_id);
+    }
+    let _ = agent_tx.send(Message::Close { channel_id });
+    thread::sleep(Duration::from_secs(60));
+    drop(reservation);
+    Ok(())
 }
 
 fn accept_unix(listener: &UnixListener, timeout: Duration) -> Result<UnixStream> {

@@ -1,6 +1,7 @@
 use std::ffi::{c_char, c_int, c_uint, c_ulong, c_void, CStr, CString};
-use std::io::Error;
+use std::io::{Error, Read, Write};
 use std::mem::size_of;
+use std::net::{Shutdown, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::ptr;
 use std::sync::{mpsc, Arc, Mutex};
@@ -28,12 +29,16 @@ const POLLHUP: i16 = 0x0010;
 const STDIN_FILENO: c_int = 0;
 const STDOUT_FILENO: c_int = 1;
 const STDERR_FILENO: c_int = 2;
+const SIGTERM: c_int = 15;
 const WNOHANG: c_int = 1;
 const TIOCSCTTY: c_ulong = 0x540e;
 const TIOCSWINSZ: c_ulong = 0x5414;
 const CLOCK_REALTIME: c_int = 0;
-const MS_MOVE: c_ulong = 8192;
 const MS_BIND: c_ulong = 4096;
+const MS_REC: c_ulong = 16384;
+const MS_PRIVATE: c_ulong = 262144;
+const MNT_DETACH: c_int = 2;
+const SYS_PIVOT_ROOT: isize = 41;
 const POLLOUT: i16 = 0x0004;
 
 const FRAME_OUTPUT: u8 = b'O';
@@ -44,19 +49,24 @@ const FRAME_SNAPSHOT: u8 = b'K';
 const FRAME_CONTROL_SNAPSHOT_EXIT: u8 = b'X';
 const FRAME_CONTROL_OK: u8 = b'x';
 const REQUEST_FLAG_PTY: u8 = 1;
-const AGENT_PATH: &str = "/usr/local/lib/lnx/lnx-agent";
-const LNXCTL_PATH: &str = "/usr/local/bin/lnxctl";
+const AGENT_PATH: &str = "/run/lnx/lnx-agent";
+const LNXCTL_PATH: &str = "/run/lnx/lnxctl";
+const OLD_AGENT_PATH: &str = "/usr/local/lib/lnx/lnx-agent";
+const OLD_LNXCTL_PATH: &str = "/usr/local/bin/lnxctl";
+const OLD_SERVICE_PATH: &str = "/etc/systemd/system/lnx-agent.service";
+const OLD_WANTS_LINK: &str = "/etc/systemd/system/multi-user.target.wants/lnx-agent.service";
 const CONTROL_SOCKET: &str = "/run/lnx-agent.sock";
 const CONTROL_SOCKET_ENV: &str = "LNX_CONTROL_SOCKET";
-const SERVICE_PATH: &str = "/etc/systemd/system/lnx-agent.service";
-const WANTS_DIR: &str = "/etc/systemd/system/multi-user.target.wants";
-const WANTS_LINK: &str = "/etc/systemd/system/multi-user.target.wants/lnx-agent.service";
-const WANTS_LINK_C: &[u8] = b"/newroot/etc/systemd/system/multi-user.target.wants/lnx-agent.service\0";
+const SERVICE_PATH: &str = "/run/systemd/system/lnx-agent.service";
+const WANTS_DIR: &str = "/run/systemd/system/multi-user.target.wants";
+const WANTS_LINK: &str = "/run/systemd/system/multi-user.target.wants/lnx-agent.service";
+const WANTS_LINK_C: &[u8] = b"/newroot/run/systemd/system/multi-user.target.wants/lnx-agent.service\0";
 
 enum ChannelInput {
     Data(Vec<u8>),
     Eof,
     Resize(u16, u16),
+    Close,
 }
 
 #[repr(C)]
@@ -107,7 +117,6 @@ unsafe extern "C" {
     fn bind(fd: c_int, addr: *const Sockaddr, len: c_uint) -> c_int;
     fn chdir(path: *const c_char) -> c_int;
     fn chmod(path: *const c_char, mode: c_uint) -> c_int;
-    fn chroot(path: *const c_char) -> c_int;
     fn clock_settime(clockid: c_int, tp: *const Timespec) -> c_int;
     fn close(fd: c_int) -> c_int;
     fn connect(fd: c_int, addr: *const Sockaddr, len: c_uint) -> c_int;
@@ -117,6 +126,7 @@ unsafe extern "C" {
     fn fork() -> c_int;
     fn listen(fd: c_int, backlog: c_int) -> c_int;
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    fn kill(pid: c_int, sig: c_int) -> c_int;
     fn openpty(
         amaster: *mut c_int,
         aslave: *mut c_int,
@@ -138,7 +148,9 @@ unsafe extern "C" {
     fn setsid() -> c_int;
     fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int;
     fn symlink(target: *const c_char, linkpath: *const c_char) -> c_int;
+    fn syscall(num: isize, ...) -> isize;
     fn sync();
+    fn umount2(target: *const c_char, flags: c_int) -> c_int;
     fn usleep(usec: c_uint) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
@@ -313,26 +325,56 @@ fn init_mode() -> ! {
 
     ensure_dir("/newroot/usr/local/lib/lnx");
     ensure_dir("/newroot/usr/local/bin");
-    ensure_dir(&format!("/newroot{WANTS_DIR}"));
     ensure_dir("/newroot/dev");
     ensure_dir("/newroot/proc");
     ensure_dir("/newroot/sys");
+    ensure_dir("/newroot/run");
+    for path in [
+        OLD_AGENT_PATH,
+        OLD_LNXCTL_PATH,
+        OLD_SERVICE_PATH,
+        OLD_WANTS_LINK,
+    ] {
+        let _ = fs::remove_file(format!("/newroot{path}"));
+    }
+    let _ = unsafe {
+        mount(
+            cstr(b"tmpfs\0"),
+            cstr(b"/newroot/run\0"),
+            cstr(b"tmpfs\0"),
+            0,
+            cstr(b"mode=0755\0") as *const c_void,
+        )
+    };
+    ensure_dir("/newroot/run/lnx");
+    ensure_dir(&format!("/newroot{WANTS_DIR}"));
 
-    if let Err(e) = fs::copy("/lnx-agent", format!("/newroot{AGENT_PATH}")) {
-        log(&format!("copy lnx-agent: {e}"));
-        unsafe { _exit(125) }
-    }
-    if let Err(e) = fs::set_permissions(format!("/newroot{AGENT_PATH}"), fs::Permissions::from_mode(0o755)) {
-        log(&format!("chmod lnx-agent: {e}"));
-        unsafe { _exit(125) }
-    }
-    if let Err(e) = fs::copy("/lnxctl", format!("/newroot{LNXCTL_PATH}")) {
-        log(&format!("copy lnxctl: {e}"));
-        unsafe { _exit(125) }
-    }
-    if let Err(e) = fs::set_permissions(format!("/newroot{LNXCTL_PATH}"), fs::Permissions::from_mode(0o755)) {
-        log(&format!("chmod lnxctl: {e}"));
-        unsafe { _exit(125) }
+    for (source, target) in [
+        ("/lnx-agent", format!("/newroot{AGENT_PATH}")),
+        ("/lnxctl", format!("/newroot{LNXCTL_PATH}")),
+    ] {
+        if let Err(e) = fs::write(&target, []) {
+            log(&format!("create bind target {target}: {e}"));
+            unsafe { _exit(125) }
+        }
+        let source = CString::new(source).unwrap();
+        let target_c = CString::new(target.clone()).unwrap();
+        if unsafe {
+            mount(
+                source.as_ptr(),
+                target_c.as_ptr(),
+                ptr::null(),
+                MS_BIND,
+                ptr::null(),
+            )
+        } < 0
+        {
+            die("bind mount lnx payload");
+        }
+        if let Err(e) = fs::set_permissions(&target, fs::Permissions::from_mode(0o755)) {
+            log(&format!("chmod bind target {target}: {e}"));
+            unsafe { _exit(125) }
+        }
     }
 
     let unit = "[Unit]\n\
@@ -342,7 +384,8 @@ Before=multi-user.target\n\
 \n\
 [Service]\n\
 Type=simple\n\
-ExecStart=/usr/local/lib/lnx/lnx-agent --agent 10240\n\
+ExecStart=/run/lnx/lnx-agent --agent 10240\n\
+Environment=LNX_CONTROL_SOCKET=/run/lnx-agent.sock\n\
 StandardOutput=journal+console\n\
 StandardError=journal+console\n\
 Restart=always\n\
@@ -416,12 +459,28 @@ WantedBy=multi-user.target\n";
         )
     };
 
-    if unsafe { chroot(cstr(b"/newroot\0")) } < 0 {
-        die("chroot");
+    if unsafe {
+        mount(
+            ptr::null(),
+            cstr(b"/\0"),
+            ptr::null(),
+            MS_REC | MS_PRIVATE,
+            ptr::null(),
+        )
+    } < 0
+    {
+        die("make mounts private");
+    }
+
+    ensure_dir("/newroot/oldroot");
+    if unsafe { syscall(SYS_PIVOT_ROOT, cstr(b"/newroot\0"), cstr(b"/newroot/oldroot\0")) } < 0 {
+        die("pivot_root");
     }
     if unsafe { chdir(cstr(b"/\0")) } < 0 {
         die("chdir");
     }
+    let _ = unsafe { umount2(cstr(b"/oldroot\0"), MNT_DETACH) };
+    let _ = fs::remove_dir("/oldroot");
 
     configure_network();
 
@@ -742,7 +801,6 @@ fn reconnect_agent_fd(agent_fd: &mut c_int) {
         }
     }
     *agent_fd = reconnect_after_snapshot_point();
-    set_nonblocking(*agent_fd);
 }
 
 fn write_command_frame_reconnect(
@@ -1495,6 +1553,11 @@ fn run_channel_pty(
                     let winsize = Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
                     unsafe { ioctl(pty_master, TIOCSWINSZ, &winsize as *const Winsize); }
                 }
+                ChannelInput::Close => {
+                    unsafe { kill(pid, SIGTERM); }
+                    status = 130 << 8;
+                    break;
+                }
             }
         }
         if !child_exited {
@@ -1611,6 +1674,11 @@ fn run_channel_pipe(
                     unsafe { close(stdin_write); }
                     stdin_write = -1;
                 }
+                ChannelInput::Close => {
+                    unsafe { kill(pid, SIGTERM); }
+                    status = 130 << 8;
+                    break;
+                }
                 _ => {}
             }
         }
@@ -1644,16 +1712,123 @@ fn run_channel_pipe(
     send_status(&agent_fd, channel_id, status);
 }
 
+fn run_channel_tcp(
+    agent_fd: Arc<Mutex<c_int>>,
+    channel_id: u64,
+    host: String,
+    port: u16,
+    rx: mpsc::Receiver<ChannelInput>,
+) {
+    let stream = match TcpStream::connect((host.as_str(), port)) {
+        Ok(stream) => stream,
+        Err(e) => {
+            let _ = write_message_locked(
+                &agent_fd,
+                &Message::Error {
+                    channel_id,
+                    message: format!("connect {host}:{port}: {e}"),
+                },
+            );
+            let _ = write_message_locked(&agent_fd, &Message::Close { channel_id });
+            return;
+        }
+    };
+    let mut reader = match stream.try_clone() {
+        Ok(reader) => reader,
+        Err(e) => {
+            let _ = write_message_locked(
+                &agent_fd,
+                &Message::Error {
+                    channel_id,
+                    message: format!("clone tcp stream: {e}"),
+                },
+            );
+            let _ = write_message_locked(&agent_fd, &Message::Close { channel_id });
+            return;
+        }
+    };
+    let reader_agent_fd = Arc::clone(&agent_fd);
+    let (done_tx, done_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    let _ = write_message_locked(&reader_agent_fd, &Message::Eof { channel_id });
+                    break;
+                }
+                Ok(n) => {
+                    let _ = write_message_locked(
+                        &reader_agent_fd,
+                        &Message::Data {
+                            channel_id,
+                            bytes: buf[..n].to_vec(),
+                        },
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    let _ = write_message_locked(
+                        &reader_agent_fd,
+                        &Message::Error {
+                            channel_id,
+                            message: format!("tcp read: {e}"),
+                        },
+                    );
+                    break;
+                }
+            }
+        }
+        let _ = done_tx.send(());
+    });
+
+    let mut writer = stream;
+    loop {
+        if done_rx.try_recv().is_ok() {
+            break;
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(25)) {
+            Ok(ChannelInput::Data(bytes)) => {
+                if let Err(e) = writer.write_all(&bytes) {
+                    let _ = write_message_locked(
+                        &agent_fd,
+                        &Message::Error {
+                            channel_id,
+                            message: format!("tcp write: {e}"),
+                        },
+                    );
+                    break;
+                }
+            }
+            Ok(ChannelInput::Eof) => {
+                let _ = writer.shutdown(Shutdown::Write);
+            }
+            Ok(ChannelInput::Resize(_, _)) => {}
+            Ok(ChannelInput::Close) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let _ = writer.shutdown(Shutdown::Both);
+    let _ = write_message_locked(&agent_fd, &Message::Close { channel_id });
+}
+
 fn agent_loop() {
     let mut fd = connect_vsock(AGENT_PORT);
-    set_nonblocking(fd);
     let agent_fd = Arc::new(Mutex::new(fd));
     let _ = write_message_locked(&agent_fd, &Message::Hello { version: PROTOCOL_VERSION });
     let mut channels: Vec<(u64, mpsc::Sender<ChannelInput>)> = Vec::new();
     loop {
         let message = read_message(fd);
         let Some(message) = message else {
-            unsafe { usleep(1_000); }
+            unsafe {
+                close(fd);
+            }
+            fd = reconnect_after_snapshot_point();
+            if let Ok(mut shared) = agent_fd.lock() {
+                *shared = fd;
+            }
+            let _ = write_message_locked(&agent_fd, &Message::Hello { version: PROTOCOL_VERSION });
             continue;
         };
         match message {
@@ -1667,6 +1842,12 @@ fn agent_loop() {
                 } else {
                     thread::spawn(move || run_channel_pipe(writer, channel_id, argv, cwd, rx));
                 }
+            }
+            Message::OpenTcp { channel_id, host, port } => {
+                let (tx, rx) = mpsc::channel();
+                channels.push((channel_id, tx));
+                let writer = Arc::clone(&agent_fd);
+                thread::spawn(move || run_channel_tcp(writer, channel_id, host, port, rx));
             }
             Message::Data { channel_id, bytes } => {
                 if let Some((_, tx)) = channels.iter().find(|(id, _)| *id == channel_id) {
@@ -1683,7 +1864,13 @@ fn agent_loop() {
                     let _ = tx.send(ChannelInput::Resize(rows, cols));
                 }
             }
-            Message::Close { channel_id } | Message::ExitStatus { channel_id, .. } => {
+            Message::Close { channel_id } => {
+                if let Some((_, tx)) = channels.iter().find(|(id, _)| *id == channel_id) {
+                    let _ = tx.send(ChannelInput::Close);
+                }
+                channels.retain(|(id, _)| *id != channel_id);
+            }
+            Message::ExitStatus { channel_id, .. } => {
                 channels.retain(|(id, _)| *id != channel_id);
             }
             Message::SnapshotReady => {
@@ -1692,7 +1879,6 @@ fn agent_loop() {
                     close(fd);
                 }
                 fd = request_snapshot_and_reconnect();
-                set_nonblocking(fd);
                 if let Ok(mut shared) = agent_fd.lock() {
                     *shared = fd;
                 }

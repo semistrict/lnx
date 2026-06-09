@@ -18,6 +18,18 @@ pub enum Message {
         rows: u16,
         cols: u16,
     },
+    OpenTcp {
+        channel_id: u64,
+        host: String,
+        port: u16,
+    },
+    Checkpoint {
+        channel_id: u64,
+        path: String,
+    },
+    CheckpointCreated {
+        channel_id: u64,
+    },
     Data {
         channel_id: u64,
         bytes: Vec<u8>,

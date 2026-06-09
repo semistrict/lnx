@@ -10,6 +10,7 @@ pub struct Layout {
     pub rootfs: PathBuf,
     pub instance_dir: PathBuf,
     pub snapshot_dir: PathBuf,
+    pub checkpoint_dir: PathBuf,
     pub run_dir: PathBuf,
     pub console_log: PathBuf,
 }
@@ -25,6 +26,7 @@ impl Layout {
         let image_dir = base.join("images").join(instance);
         let instance_dir = base.join("instances").join(instance);
         let snapshot_dir = image_dir.join("memory-snapshots");
+        let checkpoint_dir = image_dir.join("checkpoints");
         let run_dir = instance_dir.clone();
         let kernel = kernel.unwrap_or_else(|| base.join("vmlinuz"));
         let rootfs = rootfs.unwrap_or_else(|| image_dir.join("rootfs.ext4"));
@@ -37,6 +39,7 @@ impl Layout {
             rootfs,
             instance_dir,
             snapshot_dir,
+            checkpoint_dir,
             run_dir,
             console_log,
         })
@@ -68,6 +71,13 @@ mod tests {
                 .join("images")
                 .join("dev")
                 .join("memory-snapshots")
+        );
+        assert_eq!(
+            layout.checkpoint_dir,
+            home.join(".lnx")
+                .join("images")
+                .join("dev")
+                .join("checkpoints")
         );
         assert_eq!(
             layout.run_dir,
