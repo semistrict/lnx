@@ -60,6 +60,14 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           name: rootfs.ext4.zst
+      - name: Gate release assets
+        run: |
+          set -euo pipefail
+          gzip -t vmlinuz.gz
+          zstd -t rootfs.ext4.zst
+          zstd -d --force --sparse -o rootfs.ext4 rootfs.ext4.zst
+          debugfs -R 'stat /sbin/init' rootfs.ext4
+          debugfs -R 'stat /usr/lib/systemd/systemd' rootfs.ext4
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
