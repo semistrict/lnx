@@ -180,7 +180,13 @@ fn sanitize_name(name: &str) -> String {
 
 fn clone_snapshot_dir(src: &Path, dest: &Path) -> Result<()> {
     fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
-    for name in ["vmstate.bin", "pages.img", "rootfs.ext4", "checkpoint.meta"] {
+    for name in [
+        "vmstate.bin",
+        "pages.img",
+        "rootfs.ext4",
+        "checkpoint.meta",
+        "initramfs.stamp",
+    ] {
         let src_file = src.join(name);
         if src_file.exists() {
             clone_or_copy(&src_file, &dest.join(name))?;
@@ -329,6 +335,7 @@ mod tests {
         fs::write(checkpoint.path.join("rootfs.ext4"), b"rootfs").expect("rootfs");
         fs::write(checkpoint.path.join("vmstate.bin"), b"vmstate").expect("vmstate");
         fs::write(checkpoint.path.join("pages.img"), b"pages").expect("pages");
+        fs::write(checkpoint.path.join("initramfs.stamp"), b"stamp").expect("stamp");
         write_metadata(&source, &checkpoint).expect("metadata");
 
         fork(&source, &checkpoint, &dest).expect("fork");
@@ -342,6 +349,10 @@ mod tests {
         assert_eq!(
             fs::read(dest.snapshot_dir.join("latest/pages.img")).expect("read pages"),
             b"pages"
+        );
+        assert_eq!(
+            fs::read(dest.snapshot_dir.join("latest/initramfs.stamp")).expect("read stamp"),
+            b"stamp"
         );
         assert!(dest.snapshot_dir.join("latest/checkpoint.meta").exists());
     }

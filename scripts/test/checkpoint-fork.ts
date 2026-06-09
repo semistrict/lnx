@@ -32,7 +32,7 @@ try {
       "--no-snapshot-restore",
       "bash",
       "-lc",
-      "printf disk-before >/root/lnx-checkpoint-disk; printf memory-before >/run/lnx-checkpoint-memory; echo ready",
+      "printf disk-before | sudo tee /root/lnx-checkpoint-disk >/dev/null; printf memory-before | sudo tee /run/lnx-checkpoint-memory >/dev/null; echo ready",
     ]);
     assertEq(write.stdout, "ready", "checkpoint source write");
     const checkpoint = await run([ctx.lnxBin, "--instance", ctx.instance, "checkpoint", "-m", "named-before"]);
@@ -46,7 +46,7 @@ try {
     await lnx(ctx, [
       "bash",
       "-lc",
-      "printf disk-after >/root/lnx-checkpoint-disk; printf memory-after >/run/lnx-checkpoint-memory",
+      "printf disk-after | sudo tee /root/lnx-checkpoint-disk >/dev/null; printf memory-after | sudo tee /run/lnx-checkpoint-memory >/dev/null",
     ]);
     assertEq((await run([ctx.lnxBin, "--instance", ctx.instance, "fork", "--checkpoint", "named-before", forkA])).stdout, forkA, "fork name");
     const forkRead = await run([
@@ -55,13 +55,13 @@ try {
       forkA,
       "bash",
       "-lc",
-      'printf "%s/%s" "$(cat /root/lnx-checkpoint-disk)" "$(cat /run/lnx-checkpoint-memory)"',
+      'printf "%s/%s" "$(sudo cat /root/lnx-checkpoint-disk)" "$(sudo cat /run/lnx-checkpoint-memory)"',
     ]);
     assertEq(forkRead.stdout, "disk-before/memory-before", "named fork restored checkpoint state");
     const sourceRead = await lnx(ctx, [
       "bash",
       "-lc",
-      'printf "%s/%s" "$(cat /root/lnx-checkpoint-disk)" "$(cat /run/lnx-checkpoint-memory)"',
+      'printf "%s/%s" "$(sudo cat /root/lnx-checkpoint-disk)" "$(sudo cat /run/lnx-checkpoint-memory)"',
     ]);
     assertEq(sourceRead.stdout, "disk-after/memory-after", "source kept later state");
   });
@@ -70,7 +70,7 @@ try {
     await lnx(ctx, [
       "bash",
       "-lc",
-      "printf current-disk >/root/lnx-checkpoint-disk; printf current-memory >/run/lnx-checkpoint-memory",
+      "printf current-disk | sudo tee /root/lnx-checkpoint-disk >/dev/null; printf current-memory | sudo tee /run/lnx-checkpoint-memory >/dev/null",
     ]);
     assertEq((await run([ctx.lnxBin, "--instance", ctx.instance, "fork", forkB])).stdout, forkB, "implicit fork name");
     const forkRead = await run([
@@ -79,7 +79,7 @@ try {
       forkB,
       "bash",
       "-lc",
-      'printf "%s/%s" "$(cat /root/lnx-checkpoint-disk)" "$(cat /run/lnx-checkpoint-memory)"',
+      'printf "%s/%s" "$(sudo cat /root/lnx-checkpoint-disk)" "$(sudo cat /run/lnx-checkpoint-memory)"',
     ]);
     assertEq(forkRead.stdout, "current-disk/current-memory", "implicit fork restored current state");
   });

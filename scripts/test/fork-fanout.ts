@@ -13,7 +13,7 @@ try {
       "--no-snapshot-restore",
       "bash",
       "-lc",
-      "printf base >/root/fanout-marker; printf base-memory >/run/fanout-marker",
+      "printf base | sudo tee /root/fanout-marker >/dev/null; printf base-memory | sudo tee /run/fanout-marker >/dev/null",
     ]);
     assertEq((await run([ctx.lnxBin, "--instance", ctx.instance, "checkpoint", "-m", "fanout-base"])).stdout, "fanout-base", "checkpoint name");
   });
@@ -28,13 +28,13 @@ try {
           fork,
           "bash",
           "-lc",
-          'printf "%s/%s" "$(cat /root/fanout-marker)" "$(cat /run/fanout-marker)"',
+          'printf "%s/%s" "$(sudo cat /root/fanout-marker)" "$(sudo cat /run/fanout-marker)"',
         ]);
         assertEq(read.stdout, "base/base-memory", `fork ${i} restored base`);
-        await run([ctx.lnxBin, "--instance", fork, "bash", "-lc", `printf fork-${i} >/root/fanout-marker`]);
+        await run([ctx.lnxBin, "--instance", fork, "bash", "-lc", `printf fork-${i} | sudo tee /root/fanout-marker >/dev/null`]);
       }),
     );
-    const source = await lnx(ctx, ["cat", "/root/fanout-marker"]);
+    const source = await lnx(ctx, ["sudo", "cat", "/root/fanout-marker"]);
     assertEq(source.stdout, "base", "source checkpoint clone not mutated by forks");
   });
 } finally {

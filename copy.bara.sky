@@ -1,0 +1,22 @@
+core.workflow(
+    name = "libkrun",
+    origin = git.origin(
+        url = "https://github.com/semistrict/libkrun.git",
+        ref = "main",
+    ),
+    destination = folder.destination(
+        path = "third_party/libkrun",
+    ),
+    origin_files = glob(
+        ["**"],
+        exclude = [
+            ".git/**",
+            "target/**",
+            "build/**",
+            ".codex-scratch/**",
+        ],
+    ),
+    authoring = authoring.pass_thru("lnx copybara <noreply@semistrict.com>"),
+    mode = "SQUASH",
+    transformations = [],
+)

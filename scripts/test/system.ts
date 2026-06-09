@@ -76,10 +76,13 @@ try {
   });
 
   await testStep("guest shape", async () => {
+    assertEq((await lnx(ctx, ["id", "-un"])).stdout, "lnxuser", "exec runs as lnxuser");
+    assertEq((await lnx(ctx, ["bash", "-lc", 'printf "%s:%s:%s" "$USER" "$LOGNAME" "$HOME"'])).stdout, "lnxuser:lnxuser:/home/lnxuser", "exec user environment");
+    assertContains((await lnx(ctx, ["bash", "-lc", "id -u; id -g"])).stdout, `${process.getuid?.() ?? 0}\n${process.getgid?.() ?? 0}`, "exec uid/gid match host");
     assertEq((await lnx(ctx, ["getconf", "PAGESIZE"])).stdout, "16384", "guest page size");
     assertEq((await lnx(ctx, ["nproc"])).stdout, "2", "default cpu count");
     assertContains((await lnx(ctx, ["bash", "-lc", "printf %s \"$PATH\""])).stdout, "/snap/bin", "exec PATH includes snap commands");
-    const pid1 = await lnx(ctx, ["bash", "-lc", "cat /proc/1/comm; readlink /proc/1/root; test ! -e /newroot; test ! -e /oldroot; echo clean"]);
+    const pid1 = await lnx(ctx, ["bash", "-lc", "cat /proc/1/comm; sudo readlink /proc/1/root; test ! -e /newroot; test ! -e /oldroot; echo clean"]);
     assertEq(pid1.stdout, "systemd\n/\nclean", "systemd owns final root");
     const rootMount = await lnx(ctx, ["findmnt", "-n", "-o", "FSTYPE,OPTIONS", "/"]);
     assertContains(rootMount.stdout, "ext4", "root is ext4");

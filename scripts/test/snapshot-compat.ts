@@ -13,12 +13,12 @@ try {
       "--no-snapshot-restore",
       "bash",
       "-lc",
-      "printf disk-from-snapshot >/root/compat-disk; printf memory-from-snapshot >/run/compat-memory",
+      "printf disk-from-snapshot | sudo tee /root/compat-disk >/dev/null; printf memory-from-snapshot | sudo tee /run/compat-memory >/dev/null",
     ]);
     const restored = await lnx(ctx, [
       "bash",
       "-lc",
-      'printf "%s/%s" "$(cat /root/compat-disk)" "$(cat /run/compat-memory)"',
+      'printf "%s/%s" "$(sudo cat /root/compat-disk)" "$(sudo cat /run/compat-memory)"',
     ]);
     assertEq(restored.stdout, "disk-from-snapshot/memory-from-snapshot", "baseline restores memory and disk");
   });
@@ -35,7 +35,7 @@ try {
       badSnapshot,
       "bash",
       "-lc",
-      'disk="$(cat /root/compat-disk 2>/dev/null || true)"; memory="$(cat /run/compat-memory 2>/dev/null || true)"; printf "%s/%s" "$disk" "$memory"',
+      'disk="$(sudo cat /root/compat-disk 2>/dev/null || true)"; memory="$(sudo cat /run/compat-memory 2>/dev/null || true)"; printf "%s/%s" "$disk" "$memory"',
     ]);
     assertEq(result.stdout, "disk-from-snapshot/", "mismatch skips memory restore while using requested snapshot rootfs");
     const log = await run(["bash", "-lc", `cat ${join(ctx.runDir, "lnx.log")}`]);

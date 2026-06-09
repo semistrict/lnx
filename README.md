@@ -20,7 +20,7 @@ systemd root:
 
 Basic exec flow:
 
-1. The Rust build script compiles `src/guest_agent.rs` into a static Linux
+1. The Rust build script compiles `guest-agent/src/main.rs` into a static Linux
    binary named `lnx-agent`.
 2. Before boot, the host writes an initramfs containing that binary.
 3. The binary's `--init` mode stages itself into `/usr/local/lib/lnx` in the
@@ -47,6 +47,18 @@ compiles its own embedded Linux init helper.
 Networking uses podman's `gvproxy` via libkrun's `krun_add_net_unixgram`
 backend. The default path is `/opt/homebrew/opt/podman/libexec/podman/gvproxy`;
 set `GVPROXY_PATH` if it lives somewhere else.
+
+Ingress:
+
+```sh
+sudo lnx ingress enable
+open https://p6080.default.lnx/
+```
+
+`ingress enable` installs the `.lnx` resolver, starts local HTTP and HTTPS
+listeners, and trusts a local `lnx` CA in the macOS System keychain. HTTPS
+certificates are generated per `.lnx` host on first use and terminate at the
+host ingress before proxying plain HTTP/WebSocket traffic to the guest port.
 
 Memory snapshot restore defaults to `~/.lnx/images/<instance>/memory-snapshots/latest`
 and can be overridden with `--snapshot <dir>`. The guest agent asks the host to

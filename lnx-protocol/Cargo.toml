@@ -1,0 +1,11 @@
+[package]
+name = "lnx-protocol"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+postcard = { version = "1.1", features = ["alloc"] }

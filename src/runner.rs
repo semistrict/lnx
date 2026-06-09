@@ -20,13 +20,9 @@ use std::{
 use std::os::unix::fs::MetadataExt;
 
 use anyhow::{Context, Result, bail};
+use lnx_protocol::{MAX_MESSAGE_SIZE, Message, PROTOCOL_VERSION};
 
-use crate::{
-    initramfs,
-    krun::Context as KrunContext,
-    paths::Layout,
-    protocol::{MAX_MESSAGE_SIZE, Message, PROTOCOL_VERSION},
-};
+use crate::{initramfs, krun::Context as KrunContext, paths::Layout};
 
 const AGENT_PORT: u32 = 10240;
 const SNAPSHOT_PORT: u32 = 10241;
@@ -136,7 +132,16 @@ pub fn run(config: RunConfig) -> Result<i32> {
         "initramfs.cached"
     });
     let requested_restore_snapshot = config.restore_snapshot.clone();
-    let restore_snapshot = if let Some(snapshot) = &config.restore_snapshot {
+    let initramfs_stamp = config.layout.run_dir.join("initramfs.stamp");
+    let restore_snapshot = if config
+        .restore_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| !snapshot_initramfs_is_compatible(snapshot, &initramfs_stamp))
+    {
+        timings.event("snapshot.restore.skipped.agent_changed");
+        run_log.line("snapshot.restore.skipped reason=agent_changed");
+        None
+    } else if let Some(snapshot) = &config.restore_snapshot {
         match snapshot_vm_config(snapshot) {
             Ok(Some(snapshot_config))
                 if !snapshot_config.matches(config.cpus, config.memory_mib) =>
@@ -170,18 +175,10 @@ pub fn run(config: RunConfig) -> Result<i32> {
     let socket = config.layout.run_dir.join("lnx-agent.sock");
     let snapshot_socket = config.layout.run_dir.join("lnx-snapshot.sock");
     let control_socket = config.layout.run_dir.join("lnx-control.sock");
-    let _ = fs::remove_file(&socket);
-    let _ = fs::remove_file(&snapshot_socket);
-    let _ = fs::remove_file(&control_socket);
-    let _ = fs::remove_file(&broker_socket);
-    let listener =
-        UnixListener::bind(&socket).with_context(|| format!("listen on {}", socket.display()))?;
-    let snapshot_listener = UnixListener::bind(&snapshot_socket)
-        .with_context(|| format!("listen on {}", snapshot_socket.display()))?;
-    let control_listener = UnixListener::bind(&control_socket)
-        .with_context(|| format!("listen on {}", control_socket.display()))?;
-    let broker_listener = UnixListener::bind(&broker_socket)
-        .with_context(|| format!("listen on {}", broker_socket.display()))?;
+    let listener = bind_unix_listener(&socket)?;
+    let snapshot_listener = bind_unix_listener(&snapshot_socket)?;
+    let control_listener = bind_unix_listener(&control_socket)?;
+    let broker_listener = bind_unix_listener(&broker_socket)?;
     timings.event("listeners.ready");
     run_log.line(format!(
         "listeners.ready agent={} snapshot={} control={} broker={}",
@@ -280,6 +277,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
         control_listener,
         broker_listener,
         broker_socket.clone(),
+        initramfs_stamp,
         restore_snapshot,
         config.forwards.clone(),
         Arc::clone(&timings),
@@ -330,6 +328,16 @@ pub fn run(config: RunConfig) -> Result<i32> {
     drop(network);
     drop(bootstrap_lock);
     result
+}
+
+pub fn seed_checkpoint_from_base(
+    layout: &Layout,
+    checkpoint_path: &Path,
+    restore_snapshot: Option<&Path>,
+    latest_snapshot: &Path,
+) -> Result<()> {
+    let run_log = RunLog::open(layout)?;
+    seed_incremental_snapshot(checkpoint_path, restore_snapshot, latest_snapshot, &run_log)
 }
 
 pub fn request_checkpoint(socket: &Path, checkpoint_path: &Path) -> Result<()> {
@@ -775,6 +783,23 @@ fn snapshot_vm_config(snapshot: &Path) -> Result<Option<SnapshotVmConfig>> {
     }))
 }
 
+fn snapshot_initramfs_is_compatible(snapshot_path: &Path, current_stamp: &Path) -> bool {
+    let Some(snapshot_sha) = stamp_sha256(&snapshot_path.join("initramfs.stamp")) else {
+        return false;
+    };
+    let Some(current_sha) = stamp_sha256(current_stamp) else {
+        return false;
+    };
+    snapshot_sha == current_sha
+}
+
+fn stamp_sha256(path: &Path) -> Option<String> {
+    fs::read_to_string(path).ok()?.lines().find_map(|line| {
+        let value = line.strip_prefix("sha256=")?;
+        Some(value.to_string())
+    })
+}
+
 fn replace_timing_state(file: &mut fs::File, base: u128, now: u128) -> std::io::Result<u128> {
     file.seek(SeekFrom::Start(0))?;
     let mut raw = String::new();
@@ -867,7 +892,24 @@ fn wait_for_path(path: &Path, timeout: Duration) -> Result<()> {
     bail!("timed out waiting for {}", path.display())
 }
 
-fn write_message(stream: &mut UnixStream, message: &Message) -> Result<()> {
+fn bind_unix_listener(path: &Path) -> Result<UnixListener> {
+    let mut last_error = None;
+    for _ in 0..20 {
+        let _ = fs::remove_file(path);
+        match UnixListener::bind(path) {
+            Ok(listener) => return Ok(listener),
+            Err(e) if e.kind() == ErrorKind::AddrInUse => {
+                last_error = Some(e);
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => return Err(e).with_context(|| format!("listen on {}", path.display())),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| ErrorKind::AddrInUse.into()))
+        .with_context(|| format!("listen on {}", path.display()))
+}
+
+pub(crate) fn write_message(stream: &mut UnixStream, message: &Message) -> Result<()> {
     let bytes = postcard::to_allocvec(message).context("encode protocol message")?;
     if bytes.len() > MAX_MESSAGE_SIZE as usize {
         bail!("protocol message too large: {}", bytes.len());
@@ -877,7 +919,7 @@ fn write_message(stream: &mut UnixStream, message: &Message) -> Result<()> {
     Ok(())
 }
 
-fn read_message(stream: &mut UnixStream) -> Result<Message> {
+pub(crate) fn read_message(stream: &mut UnixStream) -> Result<Message> {
     let len = read_u32(stream)?;
     if len > MAX_MESSAGE_SIZE {
         bail!("protocol message too large: {len}");
@@ -910,7 +952,7 @@ fn read_message_interruptible(stream: &mut UnixStream) -> Result<Option<Message>
     }
 }
 
-fn is_timeout_error(error: &anyhow::Error) -> bool {
+pub(crate) fn is_timeout_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()
@@ -991,7 +1033,7 @@ fn run_existing_broker_client(
     }
 }
 
-fn connect_broker(socket: &Path) -> Result<UnixStream> {
+pub(crate) fn connect_broker(socket: &Path) -> Result<UnixStream> {
     let mut stream =
         UnixStream::connect(socket).with_context(|| format!("connect {}", socket.display()))?;
     write_message(
@@ -1054,6 +1096,8 @@ fn run_broker_session(mut stream: UnixStream, command: &[String], cwd: &Path) ->
             colorterm,
             rows,
             cols,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
         },
     )?;
 
@@ -1214,6 +1258,7 @@ fn run_broker_owner(
     _control_listener: UnixListener,
     broker_listener: UnixListener,
     broker_socket: PathBuf,
+    initramfs_stamp: PathBuf,
     restore_snapshot: Option<PathBuf>,
     forwards: Vec<PortForward>,
     timings: Arc<TimingLog>,
@@ -1381,8 +1426,17 @@ fn run_broker_owner(
                             "checkpoint.request path={}",
                             request.path.display()
                         ));
-                        let result = snapshot_with_file_copy_full(&ctx, &request.path, &rootfs)
-                            .map_err(|e| format!("{e:#}"));
+                        let result = seed_incremental_snapshot(
+                            &request.path,
+                            restore_snapshot.as_deref(),
+                            &snapshot_path,
+                            &owner_log,
+                        )
+                        .and_then(|()| {
+                            ctx.snapshot_with_file_copy(&request.path, &rootfs, "rootfs.ext4")?;
+                            copy_snapshot_stamp(&request.path, &initramfs_stamp)
+                        })
+                        .map_err(|e| format!("{e:#}"));
                         if result.is_ok() {
                             owner_log
                                 .line(format!("checkpoint.done path={}", request.path.display()));
@@ -1396,7 +1450,12 @@ fn run_broker_owner(
                             "snapshot_exit.request channel_id={channel_id} path={}",
                             snapshot_path.display()
                         ));
-                        let result = snapshot_with_file_copy_full(&ctx, &snapshot_path, &rootfs);
+                        let result = snapshot_with_file_copy_full(
+                            &ctx,
+                            &snapshot_path,
+                            &rootfs,
+                            &initramfs_stamp,
+                        );
                         match result {
                             Ok(()) => {
                                 owner_log.line(format!(
@@ -1438,6 +1497,7 @@ fn run_broker_owner(
             &ctx,
             &snapshot_path,
             &rootfs,
+            &initramfs_stamp,
             force_full_snapshot,
             &owner_timings,
         ) {
@@ -1762,7 +1822,7 @@ fn accept_unix_with_progress(
     }
 }
 
-fn new_request_id() -> Result<u64> {
+pub(crate) fn new_request_id() -> Result<u64> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("host clock is before Unix epoch")?
@@ -1870,6 +1930,7 @@ fn serve_snapshot(
     ctx: &KrunContext,
     snapshot_path: &Path,
     rootfs: &Path,
+    initramfs_stamp: &Path,
     force_full: bool,
     timings: &TimingLog,
 ) -> Result<()> {
@@ -1899,9 +1960,10 @@ fn serve_snapshot(
     timings.event("snapshot.ready.read");
     timings.event("snapshot.capture.begin");
     if force_full {
-        snapshot_with_file_copy_full(ctx, snapshot_path, rootfs)?;
+        snapshot_with_file_copy_full(ctx, snapshot_path, rootfs, initramfs_stamp)?;
     } else {
         ctx.snapshot_with_file_copy(snapshot_path, rootfs, "rootfs.ext4")?;
+        copy_snapshot_stamp(snapshot_path, initramfs_stamp)?;
     }
     timings.event("snapshot.done");
     Ok(())
@@ -1911,6 +1973,7 @@ fn snapshot_with_file_copy_full(
     ctx: &KrunContext,
     snapshot_path: &Path,
     rootfs: &Path,
+    initramfs_stamp: &Path,
 ) -> Result<()> {
     let parent = snapshot_path
         .parent()
@@ -1925,6 +1988,85 @@ fn snapshot_with_file_copy_full(
     remove_path_if_exists(snapshot_path)?;
     fs::rename(&temp, snapshot_path)
         .with_context(|| format!("rename {} to {}", temp.display(), snapshot_path.display()))?;
+    copy_snapshot_stamp(snapshot_path, initramfs_stamp)?;
+    Ok(())
+}
+
+fn seed_incremental_snapshot(
+    snapshot_path: &Path,
+    restore_snapshot: Option<&Path>,
+    latest_snapshot: &Path,
+    run_log: &RunLog,
+) -> Result<()> {
+    if snapshot_path.join("pages.img").exists() {
+        return Ok(());
+    }
+    let base = restore_snapshot
+        .filter(|path| path.join("pages.img").exists())
+        .or_else(|| {
+            latest_snapshot
+                .join("pages.img")
+                .exists()
+                .then_some(latest_snapshot)
+        });
+    let Some(base) = base else {
+        run_log.line(format!(
+            "snapshot.seed.skip path={} reason=no_base",
+            snapshot_path.display()
+        ));
+        return Ok(());
+    };
+    remove_path_if_exists(snapshot_path)?;
+    fs::create_dir_all(snapshot_path)
+        .with_context(|| format!("create {}", snapshot_path.display()))?;
+    for name in ["pages.img", "vmstate.bin", "rootfs.ext4", "initramfs.stamp"] {
+        let src = base.join(name);
+        if src.exists() {
+            clone_or_copy_file(&src, &snapshot_path.join(name))?;
+        }
+    }
+    run_log.line(format!(
+        "snapshot.seed.incremental path={} base={}",
+        snapshot_path.display(),
+        base.display()
+    ));
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let c_src = CString::new(src.as_os_str().as_bytes())?;
+    let c_dst = CString::new(dst.as_os_str().as_bytes())?;
+    if unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) } == 0 {
+        return Ok(());
+    }
+    fs::copy(src, dst).with_context(|| format!("copy {} to {}", src.display(), dst.display()))?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::copy(src, dst).with_context(|| format!("copy {} to {}", src.display(), dst.display()))?;
+    Ok(())
+}
+
+fn copy_snapshot_stamp(snapshot_path: &Path, initramfs_stamp: &Path) -> Result<()> {
+    fs::copy(initramfs_stamp, snapshot_path.join("initramfs.stamp")).with_context(|| {
+        format!(
+            "copy {} to {}",
+            initramfs_stamp.display(),
+            snapshot_path.join("initramfs.stamp").display()
+        )
+    })?;
     Ok(())
 }
 

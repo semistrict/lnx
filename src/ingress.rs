@@ -1,12 +1,12 @@
 use std::{
     fs,
-    io::{Read, Write},
+    io::{BufReader, ErrorKind, Read, Write},
     net::{TcpListener, TcpStream, UdpSocket},
     os::unix::{
         net::{UnixListener, UnixStream},
         process::CommandExt,
     },
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         Arc,
@@ -17,12 +17,22 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use lnx_protocol::Message;
+use rustls::{
+    ServerConfig as TlsServerConfig, ServerConnection,
+    crypto::aws_lc_rs::sign::any_supported_type,
+    pki_types::CertificateDer,
+    server::{ClientHello, ResolvesServerCert},
+    sign::CertifiedKey,
+};
 
 use crate::{paths::Layout, runner};
 
 const DEFAULT_DOMAIN: &str = "lnx";
 const DEFAULT_DNS_ADDR: &str = "127.0.0.1:5354";
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:80";
+const DEFAULT_HTTPS_ADDR: &str = "127.0.0.1:443";
+const CA_COMMON_NAME: &str = "lnx local ingress CA";
 const SERVICE_LABEL: &str = "com.semistrict.lnx.ingress";
 const LAUNCH_DAEMON_PATH: &str = "/Library/LaunchDaemons/com.semistrict.lnx.ingress.plist";
 const LAUNCH_AGENT_NAME: &str = "com.semistrict.lnx.ingress.plist";
@@ -32,6 +42,7 @@ pub struct Config {
     pub domain: String,
     pub dns_addr: String,
     pub http_addr: String,
+    pub https_addr: String,
     pub resolver_dir: PathBuf,
     pub state_dir: PathBuf,
 }
@@ -48,6 +59,7 @@ pub fn load_config() -> Result<Config> {
         domain: env_or("LNX_INGRESS_DOMAIN", DEFAULT_DOMAIN),
         dns_addr: env_or("LNX_INGRESS_DNS_ADDR", DEFAULT_DNS_ADDR),
         http_addr: env_or("LNX_INGRESS_HTTP_ADDR", DEFAULT_HTTP_ADDR),
+        https_addr: env_or("LNX_INGRESS_HTTPS_ADDR", DEFAULT_HTTPS_ADDR),
         resolver_dir: PathBuf::from(env_or("LNX_INGRESS_RESOLVER_DIR", "/etc/resolver")),
         state_dir: PathBuf::from(env_or(
             "LNX_INGRESS_STATE_DIR",
@@ -57,16 +69,21 @@ pub fn load_config() -> Result<Config> {
 }
 
 pub fn enable(config: &Config) -> Result<()> {
-    if status(config).is_ok() && service_loaded(config) {
+    if status(config).is_ok_and(|status| status.https_addr == config.https_addr)
+        && service_loaded(config)
+        && config.ca_cert_path().exists()
+    {
         println!("ingress enabled for .{}", config.domain);
         return Ok(());
     }
     println!("writing {}", config.resolver_path().display());
     println!("starting dns on {}", config.dns_addr);
     println!("starting http on {}", config.http_addr);
+    println!("starting https on {}", config.https_addr);
+    println!("installing local CA {}", config.ca_cert_path().display());
     if config.needs_privileges() {
         println!(
-            "lnx needs your password to install the macOS .{} resolver, register the launchd service, and listen on privileged local ports.",
+            "lnx needs your password to install the macOS .{} resolver, trust the local lnx HTTPS CA, register the launchd service, and listen on privileged local ports.",
             config.domain
         );
     }
@@ -101,6 +118,7 @@ pub fn print_status(config: &Config) -> Result<()> {
             println!("domain: .{}", status.domain);
             println!("dns: {}", status.dns_addr);
             println!("http: {}", status.http_addr);
+            println!("https: {}", status.https_addr);
             println!("resolver: {}", status.resolver_path);
         }
         Err(_) => println!("disabled"),
@@ -141,6 +159,22 @@ impl Config {
         self.state_dir.join("ingress.log")
     }
 
+    fn ca_dir(&self) -> PathBuf {
+        self.state_dir.join("ca")
+    }
+
+    fn cert_dir(&self) -> PathBuf {
+        self.state_dir.join("certs")
+    }
+
+    fn ca_cert_path(&self) -> PathBuf {
+        self.ca_dir().join("lnx-ca.crt")
+    }
+
+    fn ca_key_path(&self) -> PathBuf {
+        self.ca_dir().join("lnx-ca.key")
+    }
+
     fn resolver_path(&self) -> PathBuf {
         self.resolver_dir.join(&self.domain)
     }
@@ -162,6 +196,7 @@ impl Config {
 
     fn requires_privileged_service(&self) -> bool {
         is_privileged_addr(&self.http_addr)
+            || is_privileged_addr(&self.https_addr)
             || is_privileged_addr(&self.dns_addr)
             || self.resolver_dir == PathBuf::from("/etc/resolver")
     }
@@ -196,6 +231,7 @@ struct Status {
     domain: String,
     dns_addr: String,
     http_addr: String,
+    https_addr: String,
     resolver_path: String,
 }
 
@@ -222,6 +258,7 @@ fn start_helper(config: &Config, args: &[&str]) -> Result<()> {
             "LNX_INGRESS_DOMAIN",
             "LNX_INGRESS_DNS_ADDR",
             "LNX_INGRESS_HTTP_ADDR",
+            "LNX_INGRESS_HTTPS_ADDR",
             "LNX_INGRESS_RESOLVER_DIR",
             "LNX_INGRESS_STATE_DIR",
             "LNX_INGRESS_USER",
@@ -243,6 +280,10 @@ fn start_helper(config: &Config, args: &[&str]) -> Result<()> {
 fn install_service(config: &Config) -> Result<()> {
     fs::create_dir_all(&config.state_dir)
         .with_context(|| format!("create {}", config.state_dir.display()))?;
+    ensure_ca(config)?;
+    if config.requires_privileged_service() {
+        trust_ca(config)?;
+    }
     if let Some(parent) = config.launchd_path().parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
@@ -268,6 +309,7 @@ fn uninstall_service(config: &Config) -> Result<()> {
     let _ = fs::remove_file(config.launchd_path());
     let _ = fs::remove_file(config.resolver_path());
     let _ = fs::remove_file(config.socket_path());
+    let _ = untrust_ca(config);
     Ok(())
 }
 
@@ -340,6 +382,8 @@ fn launchd_plist(config: &Config) -> Result<String> {
     <string>{dns_addr}</string>
     <key>LNX_INGRESS_HTTP_ADDR</key>
     <string>{http_addr}</string>
+    <key>LNX_INGRESS_HTTPS_ADDR</key>
+    <string>{https_addr}</string>
     <key>LNX_INGRESS_RESOLVER_DIR</key>
     <string>{resolver_dir}</string>
     <key>LNX_INGRESS_STATE_DIR</key>
@@ -364,6 +408,7 @@ fn launchd_plist(config: &Config) -> Result<String> {
         domain = xml_escape(&config.domain),
         dns_addr = xml_escape(&config.dns_addr),
         http_addr = xml_escape(&config.http_addr),
+        https_addr = xml_escape(&config.https_addr),
         resolver_dir = xml_escape(&config.resolver_dir.display().to_string()),
         state_dir = xml_escape(&config.state_dir.display().to_string()),
         user = xml_escape(&user),
@@ -415,6 +460,12 @@ fn run_daemon(config: Config) -> Result<()> {
     http_listener
         .set_nonblocking(true)
         .context("set ingress http nonblocking")?;
+    let https_listener = TcpListener::bind(&config.https_addr)
+        .with_context(|| format!("listen https {}", config.https_addr))?;
+    https_listener
+        .set_nonblocking(true)
+        .context("set ingress https nonblocking")?;
+    let tls_config = Arc::new(tls_server_config(&config)?);
     let dns = UdpSocket::bind(&config.dns_addr)
         .with_context(|| format!("listen dns {}", config.dns_addr))?;
     dns.set_read_timeout(Some(Duration::from_millis(250)))
@@ -442,6 +493,20 @@ fn run_daemon(config: Config) -> Result<()> {
                 thread::spawn(move || {
                     if let Err(e) = handle_http(stream, config) {
                         eprintln!("http error: {e:#}");
+                    }
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => break,
+        }
+        match https_listener.accept() {
+            Ok((stream, _)) => {
+                let _ = stream.set_nonblocking(false);
+                let config = config.clone();
+                let tls_config = Arc::clone(&tls_config);
+                thread::spawn(move || {
+                    if let Err(e) = handle_https(stream, config, tls_config) {
+                        eprintln!("https error: {e:#}");
                     }
                 });
             }
@@ -482,10 +547,11 @@ fn handle_admin(mut stream: UnixStream, config: &Config, stop: Arc<AtomicBool>) 
     let request = String::from_utf8_lossy(&buf[..n]);
     if request.starts_with("GET /status ") {
         let body = format!(
-            "{{\"enabled\":true,\"domain\":\"{}\",\"dns_addr\":\"{}\",\"http_addr\":\"{}\",\"resolver_path\":\"{}\",\"pid\":{}}}",
+            "{{\"enabled\":true,\"domain\":\"{}\",\"dns_addr\":\"{}\",\"http_addr\":\"{}\",\"https_addr\":\"{}\",\"resolver_path\":\"{}\",\"pid\":{}}}",
             config.domain,
             config.dns_addr,
             config.http_addr,
+            config.https_addr,
             config.resolver_path().display(),
             std::process::id()
         );
@@ -505,6 +571,7 @@ fn status(config: &Config) -> Result<Status> {
         domain: json_field(body, "domain").unwrap_or_else(|| config.domain.clone()),
         dns_addr: json_field(body, "dns_addr").unwrap_or_else(|| config.dns_addr.clone()),
         http_addr: json_field(body, "http_addr").unwrap_or_else(|| config.http_addr.clone()),
+        https_addr: json_field(body, "https_addr").unwrap_or_else(|| config.https_addr.clone()),
         resolver_path: json_field(body, "resolver_path")
             .unwrap_or_else(|| config.resolver_path().display().to_string()),
     })
@@ -551,6 +618,379 @@ fn json_field(body: &str, field: &str) -> Option<String> {
     Some(rest.split('"').next()?.to_string())
 }
 
+fn ensure_ca(config: &Config) -> Result<()> {
+    fs::create_dir_all(config.ca_dir())
+        .with_context(|| format!("create {}", config.ca_dir().display()))?;
+    if config.ca_cert_path().exists() && config.ca_key_path().exists() {
+        return Ok(());
+    }
+    let key = config.ca_key_path();
+    let cert = config.ca_cert_path();
+    run_command(
+        Command::new("openssl")
+            .arg("genrsa")
+            .arg("-out")
+            .arg(&key)
+            .arg("2048"),
+    )
+    .context("generate ingress CA key")?;
+    run_command(
+        Command::new("openssl")
+            .arg("req")
+            .arg("-x509")
+            .arg("-new")
+            .arg("-nodes")
+            .arg("-key")
+            .arg(&key)
+            .arg("-sha256")
+            .arg("-days")
+            .arg("3650")
+            .arg("-subj")
+            .arg(format!("/CN={CA_COMMON_NAME}"))
+            .arg("-out")
+            .arg(&cert),
+    )
+    .context("generate ingress CA certificate")?;
+    Ok(())
+}
+
+fn trust_ca(config: &Config) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    run_command(
+        Command::new("security")
+            .arg("add-trusted-cert")
+            .arg("-d")
+            .arg("-r")
+            .arg("trustRoot")
+            .arg("-k")
+            .arg("/Library/Keychains/System.keychain")
+            .arg(config.ca_cert_path()),
+    )
+    .context("trust ingress CA")
+}
+
+fn untrust_ca(_config: &Config) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    let _ = Command::new("security")
+        .arg("delete-certificate")
+        .arg("-c")
+        .arg(CA_COMMON_NAME)
+        .arg("/Library/Keychains/System.keychain")
+        .status();
+    Ok(())
+}
+
+fn run_command(command: &mut Command) -> Result<()> {
+    let debug = format!("{command:?}");
+    let status = command.status().with_context(|| format!("run {debug}"))?;
+    if !status.success() {
+        bail!("{debug} failed with {status}");
+    }
+    Ok(())
+}
+
+fn tls_server_config(config: &Config) -> Result<TlsServerConfig> {
+    ensure_ca(config)?;
+    Ok(TlsServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(IngressCertResolver {
+            config: config.clone(),
+        })))
+}
+
+#[derive(Debug)]
+struct IngressCertResolver {
+    config: Config,
+}
+
+impl ResolvesServerCert for IngressCertResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let host = client_hello.server_name()?.to_ascii_lowercase();
+        if parse_host(&host, &self.config.domain).is_err() {
+            return None;
+        }
+        ensure_host_cert(&self.config, &host)
+            .and_then(|(cert, key)| load_certified_key(&cert, &key))
+            .ok()
+            .map(Arc::new)
+    }
+}
+
+fn ensure_host_cert(config: &Config, host: &str) -> Result<(PathBuf, PathBuf)> {
+    fs::create_dir_all(config.cert_dir())
+        .with_context(|| format!("create {}", config.cert_dir().display()))?;
+    let safe = host
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let key = config.cert_dir().join(format!("{safe}.key"));
+    let csr = config.cert_dir().join(format!("{safe}.csr"));
+    let cert = config.cert_dir().join(format!("{safe}.crt"));
+    let ext = config.cert_dir().join(format!("{safe}.ext"));
+    if cert.exists() && key.exists() {
+        return Ok((cert, key));
+    }
+    fs::write(
+        &ext,
+        format!("subjectAltName=DNS:{host}\nextendedKeyUsage=serverAuth\n"),
+    )
+    .with_context(|| format!("write {}", ext.display()))?;
+    run_command(
+        Command::new("openssl")
+            .arg("genrsa")
+            .arg("-out")
+            .arg(&key)
+            .arg("2048"),
+    )
+    .context("generate ingress host key")?;
+    run_command(
+        Command::new("openssl")
+            .arg("req")
+            .arg("-new")
+            .arg("-key")
+            .arg(&key)
+            .arg("-subj")
+            .arg(format!("/CN={host}"))
+            .arg("-out")
+            .arg(&csr),
+    )
+    .context("generate ingress host csr")?;
+    run_command(
+        Command::new("openssl")
+            .arg("x509")
+            .arg("-req")
+            .arg("-in")
+            .arg(&csr)
+            .arg("-CA")
+            .arg(config.ca_cert_path())
+            .arg("-CAkey")
+            .arg(config.ca_key_path())
+            .arg("-CAcreateserial")
+            .arg("-out")
+            .arg(&cert)
+            .arg("-days")
+            .arg("825")
+            .arg("-sha256")
+            .arg("-extfile")
+            .arg(&ext),
+    )
+    .context("sign ingress host certificate")?;
+    let _ = fs::remove_file(csr);
+    Ok((cert, key))
+}
+
+fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey> {
+    let cert_file =
+        fs::File::open(cert_path).with_context(|| format!("open {}", cert_path.display()))?;
+    let certs = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
+        .with_context(|| format!("read {}", cert_path.display()))?;
+    let key_file =
+        fs::File::open(key_path).with_context(|| format!("open {}", key_path.display()))?;
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+        .with_context(|| format!("read {}", key_path.display()))?
+        .context("missing private key")?;
+    let signing_key = any_supported_type(&key).context("unsupported private key")?;
+    Ok(CertifiedKey::new(certs, signing_key))
+}
+
+fn handle_https(
+    mut stream: TcpStream,
+    config: Config,
+    tls_config: Arc<TlsServerConfig>,
+) -> Result<()> {
+    let mut conn = ServerConnection::new(tls_config).context("create tls server connection")?;
+    while conn.is_handshaking() {
+        conn.complete_io(&mut stream).context("tls handshake")?;
+    }
+
+    let mut request = Vec::new();
+    let mut buf = [0u8; 8192];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") && request.len() < 1024 * 1024 {
+        match conn.reader().read(&mut buf) {
+            Ok(0) => {
+                conn.complete_io(&mut stream).context("read tls request")?;
+            }
+            Ok(n) => request.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                conn.complete_io(&mut stream).context("read tls request")?;
+            }
+            Err(e) => return Err(e).context("read tls plaintext"),
+        }
+    }
+
+    let host = match request.split(|byte| *byte == b'\n').find_map(|line| {
+        let line = String::from_utf8_lossy(line);
+        line.trim_end_matches('\r')
+            .strip_prefix("Host:")
+            .map(str::trim)
+            .map(ToOwned::to_owned)
+    }) {
+        Some(host) => host,
+        None => {
+            write_http_response(
+                &mut conn.writer(),
+                "400 Bad Request",
+                "text/plain",
+                b"missing Host\n",
+            )?;
+            flush_tls(&mut conn, &mut stream)?;
+            return Ok(());
+        }
+    };
+
+    let Some((broker_socket, route)) = route_http_host(&mut conn.writer(), &host, &config)? else {
+        flush_tls(&mut conn, &mut stream)?;
+        return Ok(());
+    };
+    flush_tls(&mut conn, &mut stream)?;
+    proxy_tls_to_guest(stream, conn, &broker_socket, request, route.port)
+}
+
+fn proxy_tls_to_guest(
+    mut stream: TcpStream,
+    mut conn: ServerConnection,
+    broker_socket: &Path,
+    initial_bytes: Vec<u8>,
+    guest_port: u16,
+) -> Result<()> {
+    let first_response_deadline = Instant::now() + Duration::from_secs(5);
+    let (mut broker, channel_id, first_bytes) = 'connect: loop {
+        let mut broker = runner::connect_broker(broker_socket)?;
+        let channel_id = runner::new_request_id()?;
+        runner::write_message(
+            &mut broker,
+            &Message::OpenTcp {
+                channel_id,
+                host: "127.0.0.1".to_string(),
+                port: guest_port,
+            },
+        )?;
+        if !initial_bytes.is_empty() {
+            runner::write_message(
+                &mut broker,
+                &Message::Data {
+                    channel_id,
+                    bytes: initial_bytes.clone(),
+                },
+            )?;
+        }
+        loop {
+            match runner::read_message(&mut broker)? {
+                Message::Data {
+                    channel_id: id,
+                    bytes,
+                } if id == channel_id => break 'connect (broker, channel_id, bytes),
+                Message::Eof { channel_id: id } if id == channel_id => conn.send_close_notify(),
+                Message::Close { channel_id: id } if id == channel_id => return Ok(()),
+                Message::Error {
+                    channel_id: id,
+                    message,
+                } if id == channel_id => {
+                    if Instant::now() >= first_response_deadline {
+                        bail!("{message}");
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                    break;
+                }
+                _ => {}
+            }
+        }
+    };
+
+    conn.writer().write_all(&first_bytes)?;
+    flush_tls(&mut conn, &mut stream)?;
+    stream
+        .set_nonblocking(true)
+        .context("set tls stream nonblocking")?;
+    broker
+        .set_read_timeout(Some(Duration::from_millis(10)))
+        .context("set ingress broker timeout")?;
+
+    let mut sent_client_eof = false;
+    let mut buf = [0u8; 8192];
+    loop {
+        match conn.read_tls(&mut stream) {
+            Ok(0) if !sent_client_eof => {
+                sent_client_eof = true;
+                let _ = runner::write_message(&mut broker, &Message::Eof { channel_id });
+            }
+            Ok(_) => {
+                conn.process_new_packets().context("process tls packets")?;
+                loop {
+                    match conn.reader().read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => runner::write_message(
+                            &mut broker,
+                            &Message::Data {
+                                channel_id,
+                                bytes: buf[..n].to_vec(),
+                            },
+                        )?,
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e).context("read tls plaintext"),
+                    }
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e).context("read tls"),
+        }
+
+        match runner::read_message(&mut broker) {
+            Ok(Message::Data {
+                channel_id: id,
+                bytes,
+            }) if id == channel_id => {
+                conn.writer().write_all(&bytes)?;
+            }
+            Ok(Message::Eof { channel_id: id }) if id == channel_id => {
+                conn.send_close_notify();
+            }
+            Ok(Message::Close { channel_id: id }) if id == channel_id => return Ok(()),
+            Ok(Message::Error {
+                channel_id: id,
+                message,
+            }) if id == channel_id => bail!("{message}"),
+            Ok(_) => {}
+            Err(e) if runner::is_timeout_error(&e) => {}
+            Err(e) => return Err(e),
+        }
+
+        flush_tls_nonblocking(&mut conn, &mut stream)?;
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn flush_tls(conn: &mut ServerConnection, stream: &mut TcpStream) -> Result<()> {
+    while conn.wants_write() {
+        conn.write_tls(stream).context("write tls")?;
+    }
+    Ok(())
+}
+
+fn flush_tls_nonblocking(conn: &mut ServerConnection, stream: &mut TcpStream) -> Result<()> {
+    while conn.wants_write() {
+        match conn.write_tls(stream) {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e).context("write tls"),
+        }
+    }
+    Ok(())
+}
+
 fn handle_http(mut stream: TcpStream, config: Config) -> Result<()> {
     let mut request = Vec::new();
     let mut buf = [0u8; 8192];
@@ -579,18 +1019,29 @@ fn handle_http(mut stream: TcpStream, config: Config) -> Result<()> {
             return Ok(());
         }
     };
-    let route = match parse_host(&host, &config.domain) {
+    let Some((broker_socket, route)) = route_http_host(&mut stream, &host, &config)? else {
+        return Ok(());
+    };
+    runner::proxy_stream_to_guest(&broker_socket, stream, request, "127.0.0.1", route.port)
+}
+
+fn route_http_host(
+    response: &mut impl Write,
+    host: &str,
+    config: &Config,
+) -> Result<Option<(PathBuf, Route)>> {
+    let route = match parse_host(host, &config.domain) {
         Ok(route) => route,
         Err(e) => {
-            eprintln!("http route miss host={host:?}: {e:#}");
-            write_http_response(&mut stream, "404 Not Found", "text/plain", b"not found\n")?;
-            return Ok(());
+            eprintln!("ingress route miss host={host:?}: {e:#}");
+            write_http_response(response, "404 Not Found", "text/plain", b"not found\n")?;
+            return Ok(None);
         }
     };
     let layout = Layout::resolve(&route.instance, None, None)?;
     let broker_socket = layout.run_dir.join("broker.sock");
     ensure_instance_broker(&route.instance, &broker_socket, &config)?;
-    runner::proxy_stream_to_guest(&broker_socket, stream, request, "127.0.0.1", route.port)
+    Ok(Some((broker_socket, route)))
 }
 
 fn ensure_instance_broker(instance: &str, broker_socket: &PathBuf, config: &Config) -> Result<()> {

@@ -547,6 +547,12 @@ fn create_checkpoint(
                 latest.exists().then_some(latest)
             })
         };
+        runner::seed_checkpoint_from_base(
+            &layout,
+            &path,
+            restore_snapshot.as_deref(),
+            &layout.snapshot_dir.join("latest"),
+        )?;
         let status = runner::run(runner::RunConfig {
             layout: layout.clone(),
             command: vec!["true".to_string()],
@@ -658,6 +664,12 @@ fn create_internal_fork_checkpoint(
                 latest.exists().then_some(latest)
             })
         };
+        runner::seed_checkpoint_from_base(
+            layout,
+            &path,
+            restore_snapshot.as_deref(),
+            &layout.snapshot_dir.join("latest"),
+        )?;
         let status = runner::run(runner::RunConfig {
             layout: layout.clone(),
             command: vec!["true".to_string()],
