@@ -8,6 +8,7 @@ RUN apt-get update && \
     vim less file strace gdb \
     iproute2 iputils-ping dnsutils net-tools tcpdump \
     procps sysstat iptables nftables isc-dhcp-client \
+    systemd systemd-sysv systemd-resolved dbus \
     e2fsprogs \
     linux-tools-common \
     podman buildah skopeo uidmap slirp4netns fuse-overlayfs && \
