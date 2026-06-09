@@ -1,0 +1,30 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "CC_LINUX=${CC_LINUX:-/opt/homebrew/bin/aarch64-linux-musl-gcc} cargo build && codesign --entitlements entitlements.plist --force -s - target/debug/lnx",
+    "release": "CC_LINUX=${CC_LINUX:-/opt/homebrew/bin/aarch64-linux-musl-gcc} cargo build --release && codesign --entitlements entitlements.plist --force -s - target/release/lnx",
+    "install": "bun run release && mkdir -p ${INSTALL_BIN:-$HOME/.cargo/bin} && install -m 755 target/release/lnx ${INSTALL_BIN:-$HOME/.cargo/bin}/lnx",
+    "check": "CC_LINUX=${CC_LINUX:-/opt/homebrew/bin/aarch64-linux-musl-gcc} cargo check",
+    "test": "CC_LINUX=${CC_LINUX:-/opt/homebrew/bin/aarch64-linux-musl-gcc} cargo test",
+    "test:system": "bun run build && LNX_BIN=target/debug/lnx bun test scripts/test/system.test.ts",
+    "test:cp": "bun run build && LNX_BIN=target/debug/lnx bun test scripts/test/cp.test.ts",
+    "test:checkpoint": "bun run build && LNX_BIN=target/debug/lnx bun test scripts/test/checkpoint-fork.test.ts",
+    "test:fork-fanout": "bun run build && LNX_BIN=target/debug/lnx bun test scripts/test/fork-fanout.test.ts",
+    "test:snapshot-compat": "bun run build && LNX_BIN=target/debug/lnx bun test scripts/test/snapshot-compat.test.ts",
+    "test:dirty-fs": "bun run build && LNX_BIN=target/debug/lnx bun test scripts/test/dirty-fs.test.ts",
+    "test:broker-recovery": "bun run build && LNX_BIN=target/debug/lnx bun test scripts/test/broker-recovery.test.ts",
+    "test:client-chaos": "bun run build && LNX_BIN=target/debug/lnx bun test scripts/test/client-chaos.test.ts",
+    "test:pty-resume": "bun run build && LNX_BIN=target/debug/lnx bun test scripts/test/pty-resume.test.ts",
+    "test:browser": "bun run build && LNX_BIN=target/debug/lnx bun test scripts/test/browser-snapshot.test.ts",
+    "test:privileged-ingress": "bun run build && LNX_BIN=target/debug/lnx bun test scripts/test/privileged-ingress.test.ts",
+    "test:stress": "bun run build && LNX_BIN=target/debug/lnx bun test scripts/test/stress.test.ts",
+    "test:stock": "bun run build && LNX_BIN=target/debug/lnx bun test scripts/test/stock-ubuntu.test.ts",
+    "test:ingress": "bun run build && LNX_BIN=target/debug/lnx bun test scripts/test/ingress.test.ts",
+    "test:longevity": "bun run build && LNX_BIN=target/debug/lnx bun test scripts/test/longevity.test.ts",
+    "test:full": "bun run build && LNX_BIN=target/debug/lnx bun test scripts/test/system.test.ts scripts/test/cp.test.ts scripts/test/checkpoint-fork.test.ts scripts/test/fork-fanout.test.ts scripts/test/snapshot-compat.test.ts scripts/test/dirty-fs.test.ts scripts/test/broker-recovery.test.ts scripts/test/client-chaos.test.ts scripts/test/pty-resume.test.ts scripts/test/stress.test.ts scripts/test/stock-ubuntu.test.ts scripts/test/ingress.test.ts scripts/test/browser-snapshot.test.ts scripts/test/privileged-ingress.test.ts",
+    "test:all": "bun run test && bun run test:full",
+    "fmt": "cargo fmt",
+    "clean": "cargo clean"
+  }
+}

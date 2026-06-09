@@ -1,4 +1,8 @@
-use std::path::PathBuf;
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    process::{Command as ProcessCommand, Stdio},
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -247,6 +251,17 @@ fn run_guest(
     } else {
         command
     };
+    if command.first().map(String::as_str) == Some("cp")
+        && command.iter().any(|arg| is_host_path(arg))
+    {
+        copy_between_host_and_guest(
+            &layout,
+            &command[1..],
+            explicit_kernel.then_some(layout.kernel.as_path()),
+            explicit_rootfs.then_some(layout.rootfs.as_path()),
+        )?;
+        return Ok(());
+    }
     let cwd = std::env::current_dir().context("current directory")?;
 
     let restore_snapshot = if no_snapshot_restore {
@@ -271,6 +286,223 @@ fn run_guest(
 
     let status = runner::run(config)?;
     std::process::exit(status);
+}
+
+fn copy_between_host_and_guest(
+    layout: &Layout,
+    args: &[String],
+    explicit_kernel: Option<&Path>,
+    explicit_rootfs: Option<&Path>,
+) -> Result<()> {
+    let operands = cp_transfer_operands(args)?;
+    if operands.len() < 2 {
+        bail!("usage: lnx cp host:SOURCE... GUEST_DIR or lnx cp GUEST_SOURCE... host:DEST_DIR");
+    }
+    let host_flags = operands
+        .iter()
+        .map(|arg| is_host_path(arg))
+        .collect::<Vec<_>>();
+    let dest_is_host = *host_flags.last().unwrap_or(&false);
+    let sources_are_host = host_flags[..host_flags.len() - 1]
+        .iter()
+        .all(|value| *value);
+    let sources_are_guest = host_flags[..host_flags.len() - 1]
+        .iter()
+        .all(|value| !*value);
+
+    match (sources_are_host, dest_is_host, sources_are_guest) {
+        (true, false, _) => copy_host_to_guest(layout, &operands, explicit_kernel, explicit_rootfs),
+        (false, true, true) => {
+            copy_guest_to_host(layout, &operands, explicit_kernel, explicit_rootfs)
+        }
+        _ => bail!(
+            "host transfers must copy only host: sources to one guest destination, or only guest sources to one host: destination"
+        ),
+    }
+}
+
+fn cp_transfer_operands(args: &[String]) -> Result<Vec<String>> {
+    let mut operands = Vec::new();
+    let mut parsing_options = true;
+    for arg in args {
+        if parsing_options && arg == "--" {
+            parsing_options = false;
+            continue;
+        }
+        if parsing_options && arg.starts_with('-') && arg != "-" {
+            if is_supported_cp_transfer_option(arg) {
+                continue;
+            }
+            bail!("lnx cp host transfers support only -R, -r, and -a");
+        }
+        parsing_options = false;
+        operands.push(arg.clone());
+    }
+    Ok(operands)
+}
+
+fn is_supported_cp_transfer_option(arg: &str) -> bool {
+    matches!(arg, "-R" | "-r" | "-a") || {
+        arg.starts_with('-')
+            && arg.len() > 1
+            && arg[1..].chars().all(|c| matches!(c, 'R' | 'r' | 'a'))
+    }
+}
+
+fn is_host_path(value: &str) -> bool {
+    value.starts_with("host:")
+}
+
+fn strip_host_prefix(value: &str) -> Result<&str> {
+    value
+        .strip_prefix("host:")
+        .filter(|path| !path.is_empty())
+        .context("host: path must include a path after the colon")
+}
+
+fn copy_host_to_guest(
+    layout: &Layout,
+    args: &[String],
+    explicit_kernel: Option<&Path>,
+    explicit_rootfs: Option<&Path>,
+) -> Result<()> {
+    let guest_dest = args.last().context("missing guest destination")?;
+    run_lnx_child(
+        layout,
+        explicit_kernel,
+        explicit_rootfs,
+        &["mkdir", "-p", guest_dest],
+        None,
+        false,
+    )
+    .context("create guest destination")?;
+
+    let mut tar_args = vec!["-cf".to_string(), "-".to_string()];
+    for source in &args[..args.len() - 1] {
+        let source = PathBuf::from(strip_host_prefix(source)?);
+        let parent = source.parent().unwrap_or_else(|| Path::new("."));
+        let name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("host source has no file name: {}", source.display()))?;
+        tar_args.push("-C".to_string());
+        tar_args.push(parent.display().to_string());
+        tar_args.push(name.to_string());
+    }
+    let tar_output = ProcessCommand::new("tar")
+        .args(&tar_args)
+        .output()
+        .context("archive host sources with tar")?;
+    if !tar_output.status.success() {
+        std::io::stderr().write_all(&tar_output.stderr)?;
+        bail!("host tar failed");
+    }
+    run_lnx_child(
+        layout,
+        explicit_kernel,
+        explicit_rootfs,
+        &["tar", "-C", guest_dest, "-xf", "-"],
+        Some(&tar_output.stdout),
+        false,
+    )
+    .context("extract archive in guest")?;
+    Ok(())
+}
+
+fn copy_guest_to_host(
+    layout: &Layout,
+    args: &[String],
+    explicit_kernel: Option<&Path>,
+    explicit_rootfs: Option<&Path>,
+) -> Result<()> {
+    let host_dest = PathBuf::from(strip_host_prefix(
+        args.last().context("missing host destination")?,
+    )?);
+    std::fs::create_dir_all(&host_dest)
+        .with_context(|| format!("create host destination {}", host_dest.display()))?;
+    let mut guest_tar_args = vec!["tar".to_string(), "-cf".to_string(), "-".to_string()];
+    guest_tar_args.extend(args[..args.len() - 1].iter().cloned());
+    let archive = run_lnx_child(
+        layout,
+        explicit_kernel,
+        explicit_rootfs,
+        &guest_tar_args
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        None,
+        true,
+    )
+    .context("archive guest sources")?;
+    let mut tar = ProcessCommand::new("tar")
+        .arg("-C")
+        .arg(&host_dest)
+        .arg("-xf")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("start host tar extract")?;
+    tar.stdin
+        .as_mut()
+        .context("open host tar stdin")?
+        .write_all(&archive)?;
+    let status = tar.wait().context("wait for host tar extract")?;
+    if !status.success() {
+        bail!("host tar extract failed with status {status}");
+    }
+    Ok(())
+}
+
+fn run_lnx_child(
+    layout: &Layout,
+    explicit_kernel: Option<&Path>,
+    explicit_rootfs: Option<&Path>,
+    command: &[&str],
+    stdin: Option<&[u8]>,
+    capture_stdout: bool,
+) -> Result<Vec<u8>> {
+    let exe = std::env::current_exe().context("current executable")?;
+    let mut child = ProcessCommand::new(exe);
+    child.arg("--instance").arg(&layout.instance);
+    if let Some(kernel) = explicit_kernel {
+        child.arg("--kernel").arg(kernel);
+    }
+    if let Some(rootfs) = explicit_rootfs {
+        child.arg("--rootfs").arg(rootfs);
+    }
+    child.args(command);
+    child.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    child.stdout(if capture_stdout {
+        Stdio::piped()
+    } else {
+        Stdio::inherit()
+    });
+    child.stderr(Stdio::inherit());
+    let mut child = child.spawn().context("spawn lnx child")?;
+    if let Some(stdin) = stdin {
+        child
+            .stdin
+            .as_mut()
+            .context("open lnx child stdin")?
+            .write_all(stdin)?;
+    }
+    if capture_stdout {
+        let output = child.wait_with_output().context("wait for lnx child")?;
+        if !output.status.success() {
+            bail!("lnx child failed with status {}", output.status);
+        }
+        Ok(output.stdout)
+    } else {
+        let status = child.wait().context("wait for lnx child")?;
+        if !status.success() {
+            bail!("lnx child failed with status {status}");
+        }
+        Ok(Vec::new())
+    }
 }
 
 fn create_checkpoint(
@@ -489,5 +721,26 @@ mod tests {
         assert_eq!(forward.listen_port, 18080);
         assert_eq!(forward.guest_host, "localhost");
         assert_eq!(forward.guest_port, 8080);
+    }
+
+    #[test]
+    fn cp_transfer_operands_allow_basic_recursive_flags() {
+        let args = ["-a", "-R", "host:file", "/guest"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let operands = cp_transfer_operands(&args).expect("operands");
+
+        assert_eq!(operands, ["host:file", "/guest"]);
+    }
+
+    #[test]
+    fn cp_transfer_operands_reject_unsupported_flags() {
+        let args = ["-f", "host:file", "/guest"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        assert!(cp_transfer_operands(&args).is_err());
     }
 }

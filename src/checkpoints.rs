@@ -283,4 +283,89 @@ mod tests {
             checkpoint.id
         );
     }
+
+    #[test]
+    fn resolve_rejects_ambiguous_checkpoint_names() {
+        let temp = TempDir::new("checkpoint-ambiguous");
+        let layout = layout(&temp.path);
+        for id in ["one", "two"] {
+            let checkpoint = Checkpoint {
+                id: id.to_string(),
+                name: Some("same-name".to_string()),
+                created_unix: now_unix(),
+                path: layout.checkpoint_dir.join(id),
+            };
+            write_metadata(&layout, &checkpoint).expect("write metadata");
+        }
+
+        let err = resolve(&layout, "same-name").expect_err("ambiguous name should fail");
+        assert!(err.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn fork_clones_checkpoint_files_to_destination_layout() {
+        let temp = TempDir::new("checkpoint-fork");
+        let source = layout(&temp.path.join("source"));
+        let dest = Layout {
+            base: temp.path.join("dest"),
+            instance: "forked".to_string(),
+            kernel: temp.path.join("dest/vmlinuz"),
+            rootfs: temp.path.join("dest/images/forked/rootfs.ext4"),
+            instance_dir: temp.path.join("dest/instances/forked"),
+            snapshot_dir: temp.path.join("dest/images/forked/memory-snapshots"),
+            checkpoint_dir: temp.path.join("dest/images/forked/checkpoints"),
+            run_dir: temp.path.join("dest/instances/forked"),
+            console_log: temp.path.join("dest/instances/forked/console.log"),
+        };
+        let checkpoint = Checkpoint {
+            id: "checkpoint".to_string(),
+            name: Some("checkpoint".to_string()),
+            created_unix: now_unix(),
+            path: source.checkpoint_dir.join("checkpoint"),
+        };
+        fs::create_dir_all(&checkpoint.path).expect("create checkpoint");
+        fs::create_dir_all(source.kernel.parent().unwrap()).expect("create kernel parent");
+        fs::write(&source.kernel, b"kernel").expect("kernel");
+        fs::write(checkpoint.path.join("rootfs.ext4"), b"rootfs").expect("rootfs");
+        fs::write(checkpoint.path.join("vmstate.bin"), b"vmstate").expect("vmstate");
+        fs::write(checkpoint.path.join("pages.img"), b"pages").expect("pages");
+        write_metadata(&source, &checkpoint).expect("metadata");
+
+        fork(&source, &checkpoint, &dest).expect("fork");
+
+        assert_eq!(fs::read(&dest.kernel).expect("read kernel"), b"kernel");
+        assert_eq!(fs::read(&dest.rootfs).expect("read rootfs"), b"rootfs");
+        assert_eq!(
+            fs::read(dest.snapshot_dir.join("latest/vmstate.bin")).expect("read vmstate"),
+            b"vmstate"
+        );
+        assert_eq!(
+            fs::read(dest.snapshot_dir.join("latest/pages.img")).expect("read pages"),
+            b"pages"
+        );
+        assert!(dest.snapshot_dir.join("latest/checkpoint.meta").exists());
+    }
+
+    #[test]
+    fn fork_rejects_existing_destination_rootfs() {
+        let temp = TempDir::new("checkpoint-fork-existing");
+        let source = layout(&temp.path.join("source"));
+        let mut dest = layout(&temp.path.join("dest"));
+        dest.instance = "dest".to_string();
+        let checkpoint = Checkpoint {
+            id: "checkpoint".to_string(),
+            name: None,
+            created_unix: now_unix(),
+            path: source.checkpoint_dir.join("checkpoint"),
+        };
+        fs::create_dir_all(dest.rootfs.parent().unwrap()).expect("create dest parent");
+        fs::write(&dest.rootfs, b"existing").expect("existing rootfs");
+
+        let err = fork(&source, &checkpoint, &dest).expect_err("existing rootfs should fail");
+
+        assert!(
+            err.to_string()
+                .contains("destination rootfs already exists")
+        );
+    }
 }

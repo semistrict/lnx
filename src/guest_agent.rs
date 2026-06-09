@@ -49,6 +49,8 @@ const FRAME_SNAPSHOT: u8 = b'K';
 const FRAME_CONTROL_SNAPSHOT_EXIT: u8 = b'X';
 const FRAME_CONTROL_OK: u8 = b'x';
 const REQUEST_FLAG_PTY: u8 = 1;
+const DEFAULT_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin";
 const AGENT_PATH: &str = "/run/lnx/lnx-agent";
 const LNXCTL_PATH: &str = "/run/lnx/lnxctl";
 const OLD_AGENT_PATH: &str = "/usr/local/lib/lnx/lnx-agent";
@@ -67,6 +69,8 @@ enum ChannelInput {
     Eof,
     Resize(u16, u16),
     Close,
+    SnapshotComplete,
+    SnapshotFailed,
 }
 
 #[repr(C)]
@@ -376,6 +380,8 @@ fn init_mode() -> ! {
             unsafe { _exit(125) }
         }
     }
+    let lnxctl_link = CString::new(format!("/newroot{OLD_LNXCTL_PATH}")).unwrap();
+    let _ = unsafe { symlink(cstr(b"/run/lnx/lnxctl\0"), lnxctl_link.as_ptr()) };
 
     let unit = "[Unit]\n\
 Description=lnx guest agent\n\
@@ -963,10 +969,10 @@ fn handle_local_control(listener_fd: c_int, agent_fd: &mut c_int, request_id: u6
     }
 }
 
-fn handle_channel_control(listener_fd: c_int) -> bool {
+fn accept_channel_control(listener_fd: c_int) -> Option<c_int> {
     let client_fd = unsafe { accept(listener_fd, ptr::null_mut(), ptr::null_mut()) };
     if client_fd < 0 {
-        return false;
+        return None;
     }
     let mut frame_type = [0u8; 1];
     let mut len = [0u8; 4];
@@ -978,12 +984,13 @@ fn handle_channel_control(listener_fd: c_int) -> bool {
         unsafe {
             sync();
         }
-        let _ = write_frame(client_fd, FRAME_CONTROL_OK, &[]);
+        Some(client_fd)
+    } else {
+        unsafe {
+            close(client_fd);
+        }
+        None
     }
-    unsafe {
-        close(client_fd);
-    }
-    ok
 }
 
 fn close_channel_control(fd: c_int) {
@@ -1136,6 +1143,7 @@ fn run_pty_command(
                     }
                 }
             }
+            set_default_exec_environment();
             set_lnx_request_id(request_id);
             execvp(argv[0], argv.as_ptr());
             exec_failed(argv[0]);
@@ -1255,6 +1263,7 @@ fn run_pipe_command(fd: &mut c_int, request_id: u64, argv: &[*const c_char]) -> 
             if stderr_pipe[1] > STDERR_FILENO {
                 close(stderr_pipe[1]);
             }
+            set_default_exec_environment();
             set_lnx_request_id(request_id);
             execvp(argv[0], argv.as_ptr());
             exec_failed(argv[0]);
@@ -1371,6 +1380,14 @@ fn set_lnx_request_id(request_id: u64) {
             unsafe {
                 setenv(name.as_ptr(), value.as_ptr(), 1);
             }
+        }
+    }
+}
+
+fn set_default_exec_environment() {
+    if let (Ok(name), Ok(value)) = (CString::new("PATH"), CString::new(DEFAULT_PATH)) {
+        unsafe {
+            setenv(name.as_ptr(), value.as_ptr(), 1);
         }
     }
 }
@@ -1513,6 +1530,7 @@ fn run_channel_pty(
                 unsafe { setenv(name.as_ptr(), value.as_ptr(), 1); }
             }
         }
+        set_default_exec_environment();
         set_lnx_request_id(channel_id);
         set_lnx_control_socket(&control_socket);
         let (_storage, ptrs) = make_argv(&argv);
@@ -1524,6 +1542,7 @@ fn run_channel_pty(
     unsafe { close(pty_slave); }
     set_nonblocking(pty_master);
     let control_fd = listen_unix(&control_socket);
+    let mut pending_control_fd = -1;
     let mut buf = [0u8; 8192];
     let mut status = 0;
     let mut child_exited = false;
@@ -1537,9 +1556,11 @@ fn run_channel_pty(
         if n > 0 && pollfds[0].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
             pty_eof |= drain_output_message(pty_master, &agent_fd, false, channel_id, &mut buf);
         }
-        if n > 0 && pollfds[1].revents & POLLIN != 0 && handle_channel_control(control_fd) {
-            status = 0;
-            break;
+        if n > 0 && pollfds[1].revents & POLLIN != 0 && pending_control_fd < 0 {
+            if let Some(fd) = accept_channel_control(control_fd) {
+                pending_control_fd = fd;
+                let _ = write_message_locked(&agent_fd, &Message::SnapshotExit { channel_id });
+            }
         }
         while let Ok(input) = rx.try_recv() {
             match input {
@@ -1557,6 +1578,19 @@ fn run_channel_pty(
                     unsafe { kill(pid, SIGTERM); }
                     status = 130 << 8;
                     break;
+                }
+                ChannelInput::SnapshotComplete => {
+                    if pending_control_fd >= 0 {
+                        let _ = write_frame(pending_control_fd, FRAME_CONTROL_OK, &[]);
+                        unsafe { close(pending_control_fd); }
+                        pending_control_fd = -1;
+                    }
+                }
+                ChannelInput::SnapshotFailed => {
+                    if pending_control_fd >= 0 {
+                        unsafe { close(pending_control_fd); }
+                        pending_control_fd = -1;
+                    }
                 }
             }
         }
@@ -1577,6 +1611,9 @@ fn run_channel_pty(
         }
     }
     unsafe { close(pty_master); }
+    if pending_control_fd >= 0 {
+        unsafe { close(pending_control_fd); }
+    }
     close_channel_control_socket(control_fd, &control_socket);
     send_status(&agent_fd, channel_id, status);
 }
@@ -1621,6 +1658,7 @@ fn run_channel_pipe(
                 unsafe { chdir(cwd.as_ptr()); }
             }
         }
+        set_default_exec_environment();
         set_lnx_request_id(channel_id);
         set_lnx_control_socket(&control_socket);
         let (_storage, ptrs) = make_argv(&argv);
@@ -1640,6 +1678,7 @@ fn run_channel_pipe(
     set_nonblocking(stdout_read);
     set_nonblocking(stderr_read);
     let control_fd = listen_unix(&control_socket);
+    let mut pending_control_fd = -1;
     let mut buf = [0u8; 8192];
     let mut status = 0;
     let mut child_exited = false;
@@ -1658,9 +1697,11 @@ fn run_channel_pipe(
         if n > 0 && pollfds[1].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
             stderr_eof |= drain_output_message(stderr_read, &agent_fd, true, channel_id, &mut buf);
         }
-        if n > 0 && pollfds[2].revents & POLLIN != 0 && handle_channel_control(control_fd) {
-            status = 0;
-            break;
+        if n > 0 && pollfds[2].revents & POLLIN != 0 && pending_control_fd < 0 {
+            if let Some(fd) = accept_channel_control(control_fd) {
+                pending_control_fd = fd;
+                let _ = write_message_locked(&agent_fd, &Message::SnapshotExit { channel_id });
+            }
         }
         while let Ok(input) = rx.try_recv() {
             match input {
@@ -1678,6 +1719,19 @@ fn run_channel_pipe(
                     unsafe { kill(pid, SIGTERM); }
                     status = 130 << 8;
                     break;
+                }
+                ChannelInput::SnapshotComplete => {
+                    if pending_control_fd >= 0 {
+                        let _ = write_frame(pending_control_fd, FRAME_CONTROL_OK, &[]);
+                        unsafe { close(pending_control_fd); }
+                        pending_control_fd = -1;
+                    }
+                }
+                ChannelInput::SnapshotFailed => {
+                    if pending_control_fd >= 0 {
+                        unsafe { close(pending_control_fd); }
+                        pending_control_fd = -1;
+                    }
                 }
                 _ => {}
             }
@@ -1707,6 +1761,9 @@ fn run_channel_pipe(
         if stdin_write >= 0 { close(stdin_write); }
         close(stdout_read);
         close(stderr_read);
+    }
+    if pending_control_fd >= 0 {
+        unsafe { close(pending_control_fd); }
     }
     close_channel_control_socket(control_fd, &control_socket);
     send_status(&agent_fd, channel_id, status);
@@ -1803,7 +1860,9 @@ fn run_channel_tcp(
             Ok(ChannelInput::Eof) => {
                 let _ = writer.shutdown(Shutdown::Write);
             }
-            Ok(ChannelInput::Resize(_, _)) => {}
+            Ok(ChannelInput::Resize(_, _))
+            | Ok(ChannelInput::SnapshotComplete)
+            | Ok(ChannelInput::SnapshotFailed) => {}
             Ok(ChannelInput::Close) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1869,6 +1928,16 @@ fn agent_loop() {
                     let _ = tx.send(ChannelInput::Close);
                 }
                 channels.retain(|(id, _)| *id != channel_id);
+            }
+            Message::CheckpointCreated { channel_id } => {
+                if let Some((_, tx)) = channels.iter().find(|(id, _)| *id == channel_id) {
+                    let _ = tx.send(ChannelInput::SnapshotComplete);
+                }
+            }
+            Message::Error { channel_id, .. } => {
+                if let Some((_, tx)) = channels.iter().find(|(id, _)| *id == channel_id) {
+                    let _ = tx.send(ChannelInput::SnapshotFailed);
+                }
             }
             Message::ExitStatus { channel_id, .. } => {
                 channels.retain(|(id, _)| *id != channel_id);

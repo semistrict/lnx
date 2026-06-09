@@ -1268,6 +1268,7 @@ fn run_broker_owner(
 
     let (agent_tx, agent_rx) = mpsc::channel::<Message>();
     let (checkpoint_tx, checkpoint_rx) = mpsc::channel::<CheckpointRequest>();
+    let (snapshot_exit_tx, snapshot_exit_rx) = mpsc::channel::<u64>();
     let client_senders = Arc::new(Mutex::new(HashMap::<u64, BrokerChannel>::new()));
     let active = Arc::new(AtomicUsize::new(0));
     let seen_active = Arc::new(AtomicBool::new(false));
@@ -1286,6 +1287,7 @@ fn run_broker_owner(
     let mut agent_reader = agent_stream;
     let reader_clients = Arc::clone(&client_senders);
     let reader_active = Arc::clone(&active);
+    let reader_snapshot_exit_tx = snapshot_exit_tx.clone();
     thread::spawn(move || {
         while let Ok(message) = read_message(&mut agent_reader) {
             let channel_id = match &message {
@@ -1294,9 +1296,14 @@ fn run_broker_owner(
                 | Message::Eof { channel_id }
                 | Message::ExitStatus { channel_id, .. }
                 | Message::Close { channel_id }
-                | Message::Error { channel_id, .. } => Some(*channel_id),
+                | Message::Error { channel_id, .. }
+                | Message::SnapshotExit { channel_id } => Some(*channel_id),
                 _ => None,
             };
+            if let Message::SnapshotExit { channel_id } = message {
+                let _ = reader_snapshot_exit_tx.send(channel_id);
+                continue;
+            }
             if let Some(channel_id) = channel_id {
                 let channel = reader_clients
                     .lock()
@@ -1382,6 +1389,33 @@ fn run_broker_owner(
                             log_snapshot_summary(&owner_log, "checkpoint", &request.path);
                         }
                         let _ = request.reply.send(result);
+                    }
+                    while let Ok(channel_id) = snapshot_exit_rx.try_recv() {
+                        owner_timings.event("snapshot_exit.request.begin");
+                        owner_log.line(format!(
+                            "snapshot_exit.request channel_id={channel_id} path={}",
+                            snapshot_path.display()
+                        ));
+                        let result = snapshot_with_file_copy_full(&ctx, &snapshot_path, &rootfs);
+                        match result {
+                            Ok(()) => {
+                                owner_log.line(format!(
+                                    "snapshot_exit.done channel_id={channel_id} path={}",
+                                    snapshot_path.display()
+                                ));
+                                log_snapshot_summary(&owner_log, "snapshot.latest", &snapshot_path);
+                                let _ = agent_tx.send(Message::CheckpointCreated { channel_id });
+                            }
+                            Err(e) => {
+                                owner_log.line(format!(
+                                    "snapshot_exit.error channel_id={channel_id} error={e:#}"
+                                ));
+                                let _ = agent_tx.send(Message::Error {
+                                    channel_id,
+                                    message: format!("snapshot-exit failed: {e:#}"),
+                                });
+                            }
+                        }
                     }
                     if seen_active.load(Ordering::SeqCst) && active.load(Ordering::SeqCst) == 0 {
                         break;

@@ -22,7 +22,8 @@ RUN chroot /rootfs apt-get install -y --no-install-recommends \
 # Layer 5: system / network tools
 RUN chroot /rootfs apt-get install -y --no-install-recommends \
     iproute2 iputils-ping dnsutils net-tools tcpdump \
-    procps sysstat iptables nftables isc-dhcp-client
+    procps sysstat iptables nftables isc-dhcp-client \
+    e2fsprogs
 
 # Layer 6: perf
 RUN chroot /rootfs apt-get install -y --no-install-recommends \

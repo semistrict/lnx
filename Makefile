@@ -5,29 +5,18 @@ BIN := target/debug/lnx
 RELEASE_BIN := target/release/lnx
 INSTALL_BIN ?= $(HOME)/.cargo/bin
 
-.PHONY: all build cargo-build sign release release-build release-sign install run apt-update deps check test test-system rootfs fmt clean
+.PHONY: all build release install run apt-update deps check test test-system test-checkpoint test-fork-fanout test-snapshot-compat test-dirty-fs test-broker-recovery test-client-chaos test-pty-resume test-browser test-privileged-ingress test-stress test-stock test-ingress test-longevity test-full rootfs fmt clean
 
 all: build
 
-cargo-build:
-	CC_LINUX=$(CC_LINUX) $(CARGO) build
+build:
+	bun run build
 
-sign: cargo-build
-	$(CODESIGN) --entitlements entitlements.plist --force -s - $(BIN)
+release:
+	bun run release
 
-build: sign
-
-release-build:
-	CC_LINUX=$(CC_LINUX) $(CARGO) build --release
-
-release-sign: release-build
-	$(CODESIGN) --entitlements entitlements.plist --force -s - $(RELEASE_BIN)
-
-release: release-sign
-
-install: release
-	mkdir -p $(INSTALL_BIN)
-	install -m 755 $(RELEASE_BIN) $(INSTALL_BIN)/lnx
+install:
+	bun run install
 
 run: build
 	$(BIN) /bin/echo hello
@@ -39,13 +28,55 @@ deps:
 	brew install FiloSottile/musl-cross/musl-cross podman
 
 check:
-	CC_LINUX=$(CC_LINUX) $(CARGO) check
+	bun run check
 
 test:
-	CC_LINUX=$(CC_LINUX) $(CARGO) test
+	bun run test
 
-test-system: build
-	LNX_BIN=$(BIN) scripts/system-test.sh
+test-system:
+	bun run test:system
+
+test-checkpoint:
+	bun run test:checkpoint
+
+test-fork-fanout:
+	bun run test:fork-fanout
+
+test-snapshot-compat:
+	bun run test:snapshot-compat
+
+test-dirty-fs:
+	bun run test:dirty-fs
+
+test-broker-recovery:
+	bun run test:broker-recovery
+
+test-client-chaos:
+	bun run test:client-chaos
+
+test-pty-resume:
+	bun run test:pty-resume
+
+test-browser:
+	bun run test:browser
+
+test-privileged-ingress:
+	bun run test:privileged-ingress
+
+test-stress:
+	bun run test:stress
+
+test-stock:
+	bun run test:stock
+
+test-ingress:
+	bun run test:ingress
+
+test-longevity:
+	bun run test:longevity
+
+test-full:
+	bun run test:full
 
 rootfs:
 	docker buildx build --platform linux/arm64 -f Dockerfile.rootfs -t lnx-rootfs --load .
@@ -56,7 +87,7 @@ rootfs:
 	scripts/prepare-rootfs-image.sh rootfs.ext4
 
 fmt:
-	$(CARGO) fmt
+	bun run fmt
 
 clean:
-	$(CARGO) clean
+	bun run clean
