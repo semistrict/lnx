@@ -60,10 +60,16 @@ static KRUN_NITRO_DEBUG: Mutex<bool> = Mutex::new(false);
 // Path to the init binary to be executed inside the VM.
 const INIT_PATH: &str = "/init.krun";
 
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(all(
+    feature = "init-blob",
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
 const DEFAULT_INIT_PAYLOAD: &[u8] = init_blob::INIT_BINARY;
 
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(all(
+    feature = "init-blob",
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
 fn init_virtual_entry() -> VirtualDirEntry {
     VirtualDirEntry {
         name: CString::new("init.krun").unwrap(),
@@ -355,10 +361,16 @@ impl VmBuilder {
             None
         };
 
-        let mut virtual_entries = Vec::new();
-        if fs.tag == "/dev/root" {
-            virtual_entries.push(init_virtual_entry());
-        }
+        #[cfg(feature = "init-blob")]
+        let virtual_entries = if fs.tag == "/dev/root" {
+            let mut entries = Vec::new();
+            entries.push(init_virtual_entry());
+            entries
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(feature = "init-blob"))]
+        let virtual_entries = Vec::new();
 
         self.cfg.vmr.add_fs_device(FsDeviceConfig {
             fs_id: fs.tag,
