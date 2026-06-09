@@ -24,6 +24,9 @@ jobs:
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
+      - name: Install Linux musl cross compiler
+        run: brew install FiloSottile/musl-cross/musl-cross
+
       - name: Build release binary
         run: CC_LINUX=/opt/homebrew/bin/aarch64-linux-musl-gcc depot cargo build --release
 
