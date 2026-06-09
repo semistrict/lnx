@@ -1,0 +1,46 @@
+name: Build lnx binary
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: depot-macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Depot CLI
+        uses: depot/setup-action@v1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Build release binary
+        run: depot cargo build --release
+
+      - name: Codesign release binary
+        run: codesign --entitlements entitlements.plist --force -s - target/release/lnx
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          cp target/release/lnx dist/lnx
+          tar -C dist -czf lnx-macos-arm64.tar.gz lnx
+          shasum -a 256 lnx-macos-arm64.tar.gz > lnx-macos-arm64.tar.gz.sha256
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lnx-macos-arm64
+          path: |
+            lnx-macos-arm64.tar.gz
+            lnx-macos-arm64.tar.gz.sha256
