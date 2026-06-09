@@ -1,41 +1,31 @@
+FROM ubuntu:26.04 AS rootfs
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    git curl wget build-essential ca-certificates openssh-client \
+    vim less file strace gdb \
+    iproute2 iputils-ping dnsutils net-tools tcpdump \
+    procps sysstat iptables nftables isc-dhcp-client \
+    e2fsprogs \
+    linux-tools-common \
+    podman buildah skopeo uidmap slirp4netns fuse-overlayfs && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN printf '%s\n' \
+    'deb http://ports.ubuntu.com/ubuntu-ports resolute main universe' \
+    'deb http://ports.ubuntu.com/ubuntu-ports resolute-updates main universe' \
+    > /etc/apt/sources.list
+
 FROM ubuntu:26.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    debootstrap e2fsprogs \
+    e2fsprogs \
     && rm -rf /var/lib/apt/lists/*
 
-# Layer 1: base debootstrap (slow, cached)
-RUN debootstrap --arch=arm64 resolute /rootfs http://ports.ubuntu.com/ubuntu-ports
+COPY --from=rootfs / /rootfs
 
-# Layer 2: enable universe
-RUN echo 'deb http://ports.ubuntu.com/ubuntu-ports resolute main universe' > /rootfs/etc/apt/sources.list && \
-    echo 'deb http://ports.ubuntu.com/ubuntu-ports resolute-updates main universe' >> /rootfs/etc/apt/sources.list
-
-# Layer 3: apt update (separate so package install can change without re-updating)
-RUN chroot /rootfs apt-get update
-
-# Layer 4: dev tools
-RUN chroot /rootfs apt-get install -y --no-install-recommends \
-    git curl wget build-essential ca-certificates openssh-client \
-    vim less file strace gdb
-
-# Layer 5: system / network tools
-RUN chroot /rootfs apt-get install -y --no-install-recommends \
-    iproute2 iputils-ping dnsutils net-tools tcpdump \
-    procps sysstat iptables nftables isc-dhcp-client \
-    e2fsprogs
-
-# Layer 6: perf
-RUN chroot /rootfs apt-get install -y --no-install-recommends \
-    linux-tools-common
-
-# Layer 7: containers
-RUN chroot /rootfs apt-get install -y --no-install-recommends \
-    podman buildah skopeo uidmap slirp4netns fuse-overlayfs
-
-# Layer 8: cleanup
-RUN chroot /rootfs apt-get clean && rm -rf /rootfs/var/lib/apt/lists/*
-
-# Layer 9: build ext4
 RUN truncate -s 4G /rootfs.ext4 && \
     mke2fs -F -t ext4 -b 16384 -d /rootfs -L lnx /rootfs.ext4
