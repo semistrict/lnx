@@ -140,7 +140,7 @@ fn download_kernel(dest: &Path) -> Result<()> {
     }
 
     let mut errors = Vec::new();
-    for asset in ["kernel.Image", "vmlinuz.gz"] {
+    for asset in ["vmlinuz.gz", "kernel.Image"] {
         match download_release(dest, asset) {
             Ok(()) => return Ok(()),
             Err(e) => errors.push(format!("{asset}: {e:#}")),
@@ -196,12 +196,12 @@ fn download_release(dest: &Path, asset: &str) -> Result<()> {
                 Command::new("zstd")
                     .arg("-d")
                     .arg("--force")
-                    .arg("--stdout")
+                    .arg("--sparse")
+                    .arg("--progress")
+                    .arg("-o")
+                    .arg(&output_tmp)
                     .arg(&download_tmp)
-                    .stdout(Stdio::from(
-                        fs::File::create(&output_tmp)
-                            .with_context(|| format!("create {}", output_tmp.display()))?,
-                    )),
+                    .stdout(Stdio::inherit()),
                 "zstd",
             )?;
             eprintln!("init: sparsify {}", output_tmp.display());
