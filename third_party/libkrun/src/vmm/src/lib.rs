@@ -420,9 +420,10 @@ impl Vmm {
         host_addr: u64,
         guest_addr: u64,
         len: u64,
+        protection: u64,
     ) {
         self.vm
-            .add_mapping(reply_sender, host_addr, guest_addr, len);
+            .add_mapping(reply_sender, host_addr, guest_addr, len, protection);
     }
 
     #[cfg(target_os = "macos")]

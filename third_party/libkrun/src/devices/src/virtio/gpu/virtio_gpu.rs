@@ -924,6 +924,7 @@ impl VirtioGpu {
                         map_ptr,
                         guest_addr,
                         resource.size,
+                        1 | 2 | 4,
                     ))
                     .unwrap();
                 if !reply_receiver.recv().unwrap() {

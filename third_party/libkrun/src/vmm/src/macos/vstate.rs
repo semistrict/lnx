@@ -108,8 +108,18 @@ impl Vm {
     }
 
     /// Initializes the guest memory.
-    pub fn memory_init(&mut self, guest_mem: &GuestMemoryMmap) -> Result<()> {
+    pub fn memory_init(
+        &mut self,
+        guest_mem: &GuestMemoryMmap,
+        excluded_ranges: &[(GuestAddress, usize)],
+    ) -> Result<()> {
         for region in guest_mem.iter() {
+            if excluded_ranges
+                .iter()
+                .any(|(addr, size)| *addr == region.start_addr() && *size as u64 == region.len())
+            {
+                continue;
+            }
             // It's safe to unwrap because the guest address is valid.
             let host_addr = guest_mem.get_host_address(region.start_addr()).unwrap();
             debug!(
@@ -136,13 +146,19 @@ impl Vm {
         host_addr: u64,
         guest_addr: u64,
         len: u64,
+        protection: u64,
     ) {
-        debug!("add_mapping: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
+        debug!(
+            "add_mapping: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}, protection={protection}"
+        );
         if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
             error!("Error removing memory map: {e:?}");
         }
 
-        if let Err(e) = self.hvf_vm.map_memory(host_addr, guest_addr, len) {
+        if let Err(e) = self
+            .hvf_vm
+            .map_memory_with_protection(host_addr, guest_addr, len, protection)
+        {
             error!("Error adding memory map: {e:?}");
             reply_sender.send(false).unwrap();
         } else {

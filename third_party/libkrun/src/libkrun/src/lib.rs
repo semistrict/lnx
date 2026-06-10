@@ -3247,7 +3247,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     }
 
     #[cfg(target_os = "macos")]
-    if ctx_cfg.gpu_virgl_flags.is_some() {
+    if ctx_cfg.gpu_virgl_flags.is_some() || ctx_cfg.vmr.fs.iter().any(|fs| fs.shm_size.is_some()) {
         vmm::worker::start_worker_thread(_vmm.clone(), _receiver).unwrap();
     }
 

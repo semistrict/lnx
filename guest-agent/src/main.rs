@@ -206,7 +206,8 @@ fn mount_virtiofs(tag: &str, guest_path: &str, read_only: bool) {
     let target = CString::new(target).unwrap();
     let fstype = cstr(b"virtiofs\0");
     let flags = if read_only { MS_RDONLY } else { 0 };
-    if unsafe { mount(tag.as_ptr(), target.as_ptr(), fstype, flags, ptr::null()) } < 0 {
+    let data = cstr(b"dax\0");
+    if unsafe { mount(tag.as_ptr(), target.as_ptr(), fstype, flags, data.cast()) } < 0 {
         die("mount virtiofs");
     }
 }

@@ -604,6 +604,8 @@ pub fn build_microvm(
         guest_memory = restore_pages_img(snap_path, &meta.ram)
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("pages.img: {e}")))?;
         crate::timing_event("build_microvm.snapshot.ram.mapped");
+        guest_memory = insert_shm_regions_for_guest(guest_memory, &_shm_manager)?;
+        crate::timing_event("build_microvm.snapshot.shm.mapped");
         for region in build_pmem_regions_for_guest(
             vm_resources,
             &arch_memory_info,
@@ -651,9 +653,16 @@ pub fn build_microvm(
         kernel_cmdline.insert_str(cmdline).unwrap();
     }
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(not(feature = "tee"), not(target_os = "macos")))]
     #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
+    #[cfg(all(not(feature = "tee"), target_os = "macos"))]
+    #[allow(unused_mut)]
+    let mut vm = setup_vm(
+        &guest_memory,
+        vm_resources.nested_enabled,
+        &_shm_manager.regions(),
+    )?;
     crate::timing_event("build_microvm.vm.created");
 
     #[cfg(feature = "tee")]
@@ -1817,13 +1826,15 @@ pub fn create_guest_memory(
     #[cfg(not(all(feature = "vhost-user", target_os = "linux")))]
     let use_vhost_user = false;
 
-    // Add SHM regions before creating guest memory
-    arch_mem_regions.extend(shm_manager.regions());
-
     let ram_ranges = arch_mem_regions
         .iter()
         .map(|(addr, size)| (addr.raw_value(), *size as u64))
         .collect::<Vec<_>>();
+
+    // Add SHM regions before creating guest memory. These are device windows,
+    // not RAM: keep them out of ram_ranges so snapshots and dirty tracking do
+    // not scale with the virtio-fs DAX window size.
+    arch_mem_regions.extend(shm_manager.regions());
 
     let mut guest_mem = if use_vhost_user {
         #[cfg(all(feature = "vhost-user", target_os = "linux"))]
@@ -1948,6 +1959,20 @@ fn build_pmem_regions_for_guest(
     .map_err(StartMicrovmError::GuestMemoryMmap)
 }
 
+fn insert_shm_regions_for_guest(
+    mut guest_mem: GuestMemoryMmap,
+    shm_manager: &ShmManager,
+) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
+    for (addr, size) in shm_manager.regions() {
+        let region = vm_memory::GuestRegionMmap::from_range(addr, size, None)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
+        guest_mem = guest_mem
+            .insert_region(Arc::new(region))
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
+    }
+    Ok(guest_mem)
+}
+
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
 fn load_cmdline(vmm: &Vmm) -> std::result::Result<(), StartMicrovmError> {
     kernel::loader::load_cmdline(
@@ -2000,11 +2025,12 @@ pub(crate) fn setup_vm(
 pub(crate) fn setup_vm(
     guest_memory: &GuestMemoryMmap,
     nested_enabled: bool,
+    excluded_ranges: &[(GuestAddress, usize)],
 ) -> std::result::Result<Vm, StartMicrovmError> {
     let mut vm = Vm::new(nested_enabled)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
-    vm.memory_init(guest_memory)
+    vm.memory_init(guest_memory, excluded_ranges)
         .map_err(Error::Vm)
         .map_err(StartMicrovmError::Internal)?;
     Ok(vm)

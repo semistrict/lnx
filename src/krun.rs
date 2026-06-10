@@ -6,7 +6,7 @@ pub const KRUN_KERNEL_FORMAT_RAW: u32 = 0;
 const COMPAT_NET_FEATURES: u32 = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1 << 11) | (1 << 14);
 const NET_FLAG_VFKIT: u32 = 1 << 0;
 const NET_FLAG_DHCP_CLIENT: u32 = 1 << 1;
-const VIRTIOFS_DAX_WINDOW_BYTES: u64 = 1 << 30;
+const VIRTIOFS_DAX_WINDOW_BYTES: u64 = 8 << 30;
 
 pub struct Context {
     pub(crate) id: u32,

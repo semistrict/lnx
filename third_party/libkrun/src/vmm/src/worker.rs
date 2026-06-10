@@ -44,7 +44,7 @@ impl super::Vmm {
     fn match_worker_message(&self, msg: WorkerMessage) {
         match msg {
             #[cfg(target_os = "macos")]
-            WorkerMessage::GpuAddMapping(s, h, g, l) => self.add_mapping(s, h, g, l),
+            WorkerMessage::GpuAddMapping(s, h, g, l, p) => self.add_mapping(s, h, g, l, p),
             #[cfg(target_os = "macos")]
             WorkerMessage::GpuRemoveMapping(s, g, l) => self.remove_mapping(s, g, l),
             #[cfg(target_arch = "x86_64")]

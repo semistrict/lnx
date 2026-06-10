@@ -37,6 +37,7 @@ use super::super::multikey::MultikeyBTreeMap;
 const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
 const SECURITY_CAPABILITY: &[u8] = b"security.capability\0";
 
+const DAX_MAPPING_ALIGNMENT: usize = 2 * 1024 * 1024;
 const UID_MAX: u32 = u32::MAX - 1;
 
 type Inode = u64;
@@ -3054,17 +3055,23 @@ impl FileSystem for PassthroughFs {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
 
-        let open_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
+        let writable_mapping = (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0;
+        let open_flags = if writable_mapping {
             libc::O_RDWR
         } else {
             libc::O_RDONLY
         };
 
-        let prot_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
-            libc::PROT_READ | libc::PROT_WRITE
+        // HVF rejects read-only file mappings as guest memory. For FUSE
+        // read-only mappings, use a private writable host mapping while the
+        // guest still gets the access mode requested by the kernel.
+        let prot_flags = libc::PROT_READ | libc::PROT_WRITE;
+        let mmap_flags = if writable_mapping {
+            libc::MAP_SHARED
         } else {
-            libc::PROT_READ
+            libc::MAP_PRIVATE
         };
+        let hv_protection = if writable_mapping { 1 | 2 } else { 1 | 2 | 4 };
 
         if (moffset + len) > shm_size {
             return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
@@ -3078,11 +3085,11 @@ impl FileSystem for PassthroughFs {
         let fd = file.as_raw_fd();
 
         let host_addr = unsafe {
-            libc::mmap(
-                null_mut(),
+            mmap_dax_aligned(
                 len as usize,
+                DAX_MAPPING_ALIGNMENT,
                 prot_flags,
-                libc::MAP_SHARED,
+                mmap_flags,
                 fd,
                 foffset as libc::off_t,
             )
@@ -3102,6 +3109,7 @@ impl FileSystem for PassthroughFs {
                 host_addr as u64,
                 guest_addr,
                 len,
+                hv_protection,
             ))
             .unwrap();
         if !reply_receiver.recv().unwrap() {
@@ -3167,4 +3175,70 @@ impl FileSystem for PassthroughFs {
 
         Ok(())
     }
+}
+
+unsafe fn mmap_dax_aligned(
+    len: usize,
+    alignment: usize,
+    prot: libc::c_int,
+    flags: libc::c_int,
+    fd: libc::c_int,
+    offset: libc::off_t,
+) -> *mut libc::c_void {
+    // HVF accepts the virtio-fs DAX windows only when the host VA has the same
+    // hugepage-scale alignment as the guest window requested by Linux.
+    let reserve_len = match len.checked_add(alignment) {
+        Some(size) => size,
+        None => return libc::MAP_FAILED,
+    };
+    let reservation = unsafe {
+        libc::mmap(
+            null_mut(),
+            reserve_len,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if reservation == libc::MAP_FAILED {
+        return libc::MAP_FAILED;
+    }
+
+    let base = reservation as usize;
+    let aligned = (base + alignment - 1) & !(alignment - 1);
+    let prefix_len = aligned - base;
+    if prefix_len != 0 {
+        unsafe {
+            libc::munmap(reservation, prefix_len);
+        }
+    }
+
+    let suffix_start = aligned + len;
+    let reservation_end = base + reserve_len;
+    if suffix_start < reservation_end {
+        unsafe {
+            libc::munmap(
+                suffix_start as *mut libc::c_void,
+                reservation_end - suffix_start,
+            );
+        }
+    }
+
+    let mapped = unsafe {
+        libc::mmap(
+            aligned as *mut libc::c_void,
+            len,
+            prot,
+            flags | libc::MAP_FIXED,
+            fd,
+            offset,
+        )
+    };
+    if mapped == libc::MAP_FAILED && len != 0 {
+        unsafe {
+            libc::munmap(aligned as *mut libc::c_void, len);
+        }
+    }
+    mapped
 }
