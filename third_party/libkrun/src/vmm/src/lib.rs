@@ -41,6 +41,7 @@ use std::io;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -359,6 +360,23 @@ impl Vmm {
     /// Returns a reference to the inner `GuestMemoryMmap` object if present, or `None` otherwise.
     pub fn guest_memory(&self) -> &GuestMemoryMmap {
         &self.guest_memory
+    }
+
+    pub fn set_virtiofs_write_allowlist(&mut self, tag: &str, paths: Vec<PathBuf>) -> bool {
+        for (_, transport) in self.mmio_device_manager.virtio_transports() {
+            let device = transport.lock().unwrap().device();
+            let mut device = device.lock().unwrap();
+            let Some(fs) = device
+                .as_mut_any()
+                .downcast_mut::<devices::virtio::fs::Fs>()
+            else {
+                continue;
+            };
+            if fs.tag() == tag {
+                return fs.set_write_allowlist(paths);
+            }
+        }
+        false
     }
 
     /// Injects CTRL+ALT+DEL keystroke combo in the i8042 device.

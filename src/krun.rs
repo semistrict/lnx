@@ -6,6 +6,7 @@ pub const KRUN_KERNEL_FORMAT_RAW: u32 = 0;
 const COMPAT_NET_FEATURES: u32 = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1 << 11) | (1 << 14);
 const NET_FLAG_VFKIT: u32 = 1 << 0;
 const NET_FLAG_DHCP_CLIENT: u32 = 1 << 1;
+const VIRTIOFS_DAX_WINDOW_BYTES: u64 = 1 << 30;
 
 pub struct Context {
     pub(crate) id: u32,
@@ -70,6 +71,52 @@ impl Context {
         call(
             unsafe { libkrun::krun_add_pmem(self.id, pmem_id.as_ptr(), rootfs.as_ptr(), false) },
             "krun_add_pmem(rootfs)",
+        )
+    }
+
+    pub fn add_virtiofs(&self, tag: &str, path: &Path, read_only: bool) -> Result<()> {
+        let tag = CString::new(tag)?;
+        let path = cstring_path(path)?;
+        call(
+            unsafe {
+                libkrun::krun_add_virtiofs3(
+                    self.id,
+                    tag.as_ptr(),
+                    path.as_ptr(),
+                    VIRTIOFS_DAX_WINDOW_BYTES,
+                    read_only,
+                )
+            },
+            "krun_add_virtiofs3",
+        )
+    }
+
+    pub fn add_policy_virtiofs(&self, tag: &str, path: &Path) -> Result<()> {
+        let tag = CString::new(tag)?;
+        let path = cstring_path(path)?;
+        call(
+            unsafe {
+                libkrun::krun_add_virtiofs4(
+                    self.id,
+                    tag.as_ptr(),
+                    path.as_ptr(),
+                    VIRTIOFS_DAX_WINDOW_BYTES,
+                    false,
+                    true,
+                )
+            },
+            "krun_add_virtiofs4",
+        )
+    }
+
+    pub fn set_virtiofs_write_allowlist(&self, tag: &str, paths: &[String]) -> Result<()> {
+        let tag = CString::new(tag)?;
+        let paths = CString::new(paths.join("\n"))?;
+        call(
+            unsafe {
+                libkrun::krun_set_virtiofs_write_allowlist(self.id, tag.as_ptr(), paths.as_ptr())
+            },
+            "krun_set_virtiofs_write_allowlist",
         )
     }
 

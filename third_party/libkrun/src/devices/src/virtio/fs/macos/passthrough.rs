@@ -10,6 +10,7 @@ use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::path::PathBuf;
 use std::ptr::null_mut;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -148,6 +149,199 @@ impl DirStream {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::ffi::CString;
+    use std::fs::{self, File};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, RwLock};
+
+    use super::{Config, Context, Extensions, FileSystem, FsOptions, PassthroughFs, fuse};
+    use crate::virtio::fs::bindings;
+    use crate::virtio::fs::inode_alloc::InodeAllocator;
+
+    struct TempRoot {
+        path: PathBuf,
+    }
+
+    impl TempRoot {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("libkrun-virtiofs-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn test_ctx() -> Context {
+        Context {
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            pid: std::process::id() as libc::pid_t,
+        }
+    }
+
+    fn cstr(value: &str) -> CString {
+        CString::new(value).unwrap()
+    }
+
+    fn new_fs(root: &Path, allowlist: Vec<PathBuf>) -> PassthroughFs {
+        let fs = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                write_allowlist: Some(Arc::new(RwLock::new(allowlist))),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        fs
+    }
+
+    #[test]
+    fn write_allowlist_rejects_sibling_creates() {
+        let temp = TempRoot::new("policy");
+        fs::create_dir(temp.path().join("allowed")).unwrap();
+        fs::create_dir(temp.path().join("denied")).unwrap();
+        let fs = new_fs(temp.path(), vec![PathBuf::from("allowed")]);
+        let ctx = test_ctx();
+
+        let allowed = fs.lookup(ctx, fuse::ROOT_ID, &cstr("allowed")).unwrap();
+        fs.create(
+            ctx,
+            allowed.inode,
+            &cstr("ok.txt"),
+            0o644,
+            false,
+            libc::O_WRONLY as u32,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+        assert!(temp.path().join("allowed/ok.txt").exists());
+
+        let denied = fs.lookup(ctx, fuse::ROOT_ID, &cstr("denied")).unwrap();
+        let err = match fs.create(
+            ctx,
+            denied.inode,
+            &cstr("no.txt"),
+            0o644,
+            false,
+            libc::O_WRONLY as u32,
+            0,
+            Extensions::default(),
+        ) {
+            Ok(_) => panic!("denied create unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::EROFS));
+        assert!(!temp.path().join("denied/no.txt").exists());
+    }
+
+    #[test]
+    fn apfs_copyfilerange_preserves_holes_and_fallocate_punches_holes() {
+        let temp = TempRoot::new("copy-range");
+        let fs = new_fs(temp.path(), vec![PathBuf::from(".")]);
+        let ctx = test_ctx();
+
+        let src_path = temp.path().join("sparse-src.bin");
+        let mut src = File::create(&src_path).unwrap();
+        src.write_all(b"head").unwrap();
+        src.seek(SeekFrom::Start(2 * 1024 * 1024)).unwrap();
+        src.write_all(b"tail").unwrap();
+        drop(src);
+
+        let src_entry = fs
+            .lookup(ctx, fuse::ROOT_ID, &cstr("sparse-src.bin"))
+            .unwrap();
+        let (src_handle, _) = fs
+            .open(ctx, src_entry.inode, false, libc::O_RDONLY as u32)
+            .unwrap();
+        let src_handle = src_handle.unwrap();
+        let (dst_entry, dst_handle, _) = fs
+            .create(
+                ctx,
+                fuse::ROOT_ID,
+                &cstr("sparse-dst.bin"),
+                0o644,
+                false,
+                libc::O_WRONLY as u32,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        let dst_handle = dst_handle.unwrap();
+
+        let copied = fs
+            .copyfilerange(
+                ctx,
+                src_entry.inode,
+                src_handle,
+                0,
+                dst_entry.inode,
+                dst_handle,
+                0,
+                2 * 1024 * 1024 + 4,
+                0,
+            )
+            .unwrap();
+        assert_eq!(copied, 2 * 1024 * 1024 + 4);
+
+        let dst_path = temp.path().join("sparse-dst.bin");
+        let mut dst = File::open(&dst_path).unwrap();
+        let mut buf = [0u8; 4];
+        dst.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"head");
+        dst.seek(SeekFrom::Start(2 * 1024 * 1024)).unwrap();
+        dst.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"tail");
+
+        dst.seek(SeekFrom::Start(1024 * 1024)).unwrap();
+        let mut hole = [1u8; 4096];
+        dst.read_exact(&mut hole).unwrap();
+        assert_eq!(hole, [0u8; 4096]);
+
+        let punch_path = temp.path().join("punch.bin");
+        let mut punch = File::create(&punch_path).unwrap();
+        punch.write_all(&vec![b'A'; 3 * 1024 * 1024]).unwrap();
+        drop(punch);
+
+        let punch_entry = fs.lookup(ctx, fuse::ROOT_ID, &cstr("punch.bin")).unwrap();
+        let (punch_handle, _) = fs
+            .open(ctx, punch_entry.inode, false, libc::O_RDWR as u32)
+            .unwrap();
+        fs.fallocate(
+            ctx,
+            punch_entry.inode,
+            punch_handle.unwrap(),
+            bindings::LINUX_FALLOC_FL_KEEP_SIZE as u32
+                | bindings::LINUX_FALLOC_FL_PUNCH_HOLE as u32,
+            1024 * 1024,
+            1024 * 1024,
+        )
+        .unwrap();
+
+        let mut punch = File::open(&punch_path).unwrap();
+        punch.seek(SeekFrom::Start(1024 * 1024)).unwrap();
+        let mut zeros = [1u8; 4096];
+        punch.read_exact(&mut zeros).unwrap();
+        assert_eq!(zeros, [0u8; 4096]);
+    }
+}
+
 struct HandleData {
     inode: Inode,
     file: RwLock<File>,
@@ -157,11 +351,25 @@ struct HandleData {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PassthroughFsSnapshot {
     inodes: Vec<InodeDataSnapshot>,
+    #[serde(default)]
+    inode_paths: Vec<InodePathSnapshot>,
     next_inode: u64,
     handles: Vec<HandleDataSnapshot>,
     next_handle: u64,
     writeback: bool,
     announce_submounts: bool,
+}
+
+impl PassthroughFsSnapshot {
+    pub(crate) fn inode_paths(&self) -> &[InodePathSnapshot] {
+        &self.inode_paths
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct InodePathSnapshot {
+    pub(crate) inode: Inode,
+    pub(crate) path: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -434,6 +642,24 @@ fn fstat(fd: RawFd, host: bool) -> io::Result<bindings::stat64> {
     }
 }
 
+fn punch_hole(fd: RawFd, offset: u64, length: u64) -> io::Result<()> {
+    if length == 0 {
+        return Ok(());
+    }
+
+    let mut hole = libc::fpunchhole_t {
+        fp_offset: offset as i64,
+        fp_flags: 0,
+        reserved: 0,
+        fp_length: length as i64,
+    };
+    let res = unsafe { libc::fcntl(fd, libc::F_PUNCHHOLE, &mut hole as *mut _) };
+    if res < 0 {
+        return Err(linux_error(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 fn lstat(c_path: &CString, host: bool) -> io::Result<bindings::stat64> {
     let mut st = MaybeUninit::<bindings::stat64>::zeroed();
 
@@ -555,6 +781,7 @@ pub struct Config {
     pub export_fsid: u64,
     /// Table of exported FDs to share with other subsystems. Not supported for macos.
     pub export_table: Option<ExportTable>,
+    pub write_allowlist: Option<Arc<RwLock<Vec<PathBuf>>>>,
 }
 
 impl Default for Config {
@@ -569,6 +796,7 @@ impl Default for Config {
             proc_sfd_rawfd: None,
             export_fsid: 0,
             export_table: None,
+            write_allowlist: None,
         }
     }
 }
@@ -583,6 +811,7 @@ pub struct PassthroughFs {
     inode_alloc: Arc<InodeAllocator>,
 
     handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
+    inode_paths: RwLock<BTreeMap<Inode, PathBuf>>,
     next_handle: AtomicU64,
 
     map_windows: Mutex<HashMap<u64, u64>>,
@@ -617,6 +846,7 @@ impl PassthroughFs {
             inode_alloc,
 
             handles: RwLock::new(BTreeMap::new()),
+            inode_paths: RwLock::new(BTreeMap::new()),
             next_handle: AtomicU64::new(1),
 
             map_windows: Mutex::new(HashMap::new()),
@@ -625,6 +855,165 @@ impl PassthroughFs {
             announce_submounts: AtomicBool::new(false),
             cfg,
         })
+    }
+
+    fn rel_child_path(&self, parent: Inode, name: &CStr) -> io::Result<PathBuf> {
+        let parent_path = self
+            .inode_paths
+            .read()
+            .unwrap()
+            .get(&parent)
+            .cloned()
+            .ok_or_else(ebadf)?;
+        let name = name.to_str().map_err(|_| einval())?;
+        if name.contains('/') || name == "." || name == ".." {
+            return Err(einval());
+        }
+        Ok(parent_path.join(name))
+    }
+
+    fn remember_inode_path(&self, inode: Inode, path: PathBuf) {
+        self.inode_paths.write().unwrap().insert(inode, path);
+    }
+
+    fn inode_path(&self, inode: Inode) -> io::Result<PathBuf> {
+        self.inode_paths
+            .read()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .ok_or_else(ebadf)
+    }
+
+    fn write_allowed_path(&self, path: &PathBuf) -> bool {
+        let Some(allowlist) = &self.cfg.write_allowlist else {
+            return true;
+        };
+        allowlist.read().unwrap().iter().any(|allowed| {
+            allowed.as_os_str() == "." || path == allowed || path.starts_with(allowed)
+        })
+    }
+
+    fn check_write_path(&self, path: &PathBuf) -> io::Result<()> {
+        if self.write_allowed_path(path) {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(libc::EROFS))
+        }
+    }
+
+    fn check_write_inode(&self, inode: Inode) -> io::Result<()> {
+        self.check_write_path(&self.inode_path(inode)?)
+    }
+
+    fn check_write_child(&self, parent: Inode, name: &CStr) -> io::Result<PathBuf> {
+        let path = self.rel_child_path(parent, name)?;
+        self.check_write_path(&path)?;
+        Ok(path)
+    }
+
+    fn copy_sparse_range(
+        &self,
+        fd_in: RawFd,
+        offset_in: u64,
+        fd_out: RawFd,
+        offset_out: u64,
+        len: u64,
+    ) -> io::Result<usize> {
+        let src_size = fstat(fd_in, true)?.st_size.max(0) as u64;
+        if offset_in >= src_size || len == 0 {
+            return Ok(0);
+        }
+
+        let end = offset_in.saturating_add(len).min(src_size);
+        let dst_end = offset_out + (end - offset_in);
+        if (fstat(fd_out, true)?.st_size.max(0) as u64) < dst_end {
+            let res = unsafe { libc::ftruncate(fd_out, dst_end as libc::off_t) };
+            if res < 0 {
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+        }
+
+        let mut pos = offset_in;
+        let mut copied = 0usize;
+        let mut buf = vec![0u8; 1024 * 1024];
+
+        while pos < end {
+            let data = unsafe { libc::lseek(fd_in, pos as libc::off_t, libc::SEEK_DATA) };
+            if data < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ENXIO) {
+                    break;
+                }
+                return Err(linux_error(err));
+            }
+
+            let data = data as u64;
+            if data >= end {
+                break;
+            }
+
+            if data > pos {
+                punch_hole(fd_out, offset_out + (pos - offset_in), data - pos)?;
+            }
+
+            let hole = unsafe { libc::lseek(fd_in, data as libc::off_t, libc::SEEK_HOLE) };
+            if hole < 0 {
+                return Err(linux_error(io::Error::last_os_error()));
+            }
+
+            let mut data_pos = data;
+            let data_end = (hole as u64).min(end);
+            while data_pos < data_end {
+                let chunk = (data_end - data_pos).min(buf.len() as u64) as usize;
+                let read = unsafe {
+                    libc::pread(
+                        fd_in,
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        chunk,
+                        data_pos as libc::off_t,
+                    )
+                };
+                if read < 0 {
+                    return Err(linux_error(io::Error::last_os_error()));
+                }
+                if read == 0 {
+                    break;
+                }
+
+                let read = read as usize;
+                let mut written = 0usize;
+                while written < read {
+                    let out_pos = offset_out + (data_pos - offset_in) + written as u64;
+                    let wrote = unsafe {
+                        libc::pwrite(
+                            fd_out,
+                            buf[written..read].as_ptr() as *const libc::c_void,
+                            read - written,
+                            out_pos as libc::off_t,
+                        )
+                    };
+                    if wrote < 0 {
+                        return Err(linux_error(io::Error::last_os_error()));
+                    }
+                    if wrote == 0 {
+                        return Err(linux_error(io::Error::from_raw_os_error(libc::EIO)));
+                    }
+                    written += wrote as usize;
+                }
+
+                data_pos += read as u64;
+                copied = copied.saturating_add(read);
+            }
+
+            pos = data_end;
+        }
+
+        if pos < end {
+            punch_hole(fd_out, offset_out + (pos - offset_in), end - pos)?;
+        }
+
+        Ok((end - offset_in).try_into().unwrap_or(copied))
     }
 
     pub(crate) fn snapshot_state(&self) -> io::Result<PassthroughFsSnapshot> {
@@ -678,9 +1067,20 @@ impl PassthroughFs {
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
+        let inode_paths = self
+            .inode_paths
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(&inode, path)| InodePathSnapshot {
+                inode,
+                path: path.to_string_lossy().into_owned(),
+            })
+            .collect();
 
         Ok(PassthroughFsSnapshot {
             inodes,
+            inode_paths,
             next_inode: self.inode_alloc.snapshot_next(),
             handles,
             next_handle: self.next_handle.load(Ordering::Acquire),
@@ -713,6 +1113,11 @@ impl PassthroughFs {
             let mut current = self.inodes.write().unwrap();
             *current = inodes;
         }
+        *self.inode_paths.write().unwrap() = snap
+            .inode_paths
+            .iter()
+            .map(|path| (path.inode, PathBuf::from(&path.path)))
+            .collect();
         for handle in &snap.handles {
             let flags = handle.flags & !libc::O_EXLOCK;
             let backing = self
@@ -1298,6 +1703,7 @@ impl FileSystem for PassthroughFs {
                 unlinked_fd: AtomicI64::new(-1),
             }),
         );
+        self.remember_inode_path(fuse::ROOT_ID, PathBuf::new());
 
         let mut opts = FsOptions::empty();
         if self.cfg.writeback && capable.contains(FsOptions::WRITEBACK_CACHE) {
@@ -1316,6 +1722,7 @@ impl FileSystem for PassthroughFs {
     fn destroy(&self) {
         self.handles.write().unwrap().clear();
         self.inodes.write().unwrap().clear();
+        self.inode_paths.write().unwrap().clear();
     }
 
     fn statfs(&self, _ctx: Context, inode: Inode) -> io::Result<bindings::statvfs64> {
@@ -1336,6 +1743,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        let rel_path = self.rel_child_path(parent, name)?;
         let parent_data = self
             .inodes
             .read()
@@ -1394,6 +1802,7 @@ impl FileSystem for PassthroughFs {
 
             inode
         };
+        self.remember_inode_path(inode, rel_path);
 
         Ok(Entry {
             inode,
@@ -1408,7 +1817,10 @@ impl FileSystem for PassthroughFs {
     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
         let mut inodes = self.inodes.write().unwrap();
 
-        forget_one(&mut inodes, inode, count)
+        forget_one(&mut inodes, inode, count);
+        if inodes.get(&inode).is_none() {
+            self.inode_paths.write().unwrap().remove(&inode);
+        }
     }
 
     fn batch_forget(&self, _ctx: Context, requests: Vec<(Inode, u64)>) {
@@ -1447,6 +1859,7 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
+        let rel_path = self.check_write_child(parent, name)?;
         let c_path = self.name_to_path(parent, name)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
@@ -1464,13 +1877,16 @@ impl FileSystem for PassthroughFs {
                 Some((ctx.uid, ctx.gid)),
                 Some(mode & !umask),
             )?;
-            self.lookup(ctx, parent, name)
+            let entry = self.lookup(ctx, parent, name)?;
+            self.remember_inode_path(entry.inode, rel_path);
+            Ok(entry)
         } else {
             Err(linux_error(io::Error::last_os_error()))
         }
     }
 
     fn rmdir(&self, ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+        self.check_write_child(parent, name)?;
         self.do_unlink(ctx, parent, name, libc::AT_REMOVEDIR)
     }
 
@@ -1522,6 +1938,10 @@ impl FileSystem for PassthroughFs {
         kill_priv: bool,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        let f = flags as i32;
+        if f & libc::O_ACCMODE != libc::O_RDONLY || f & libc::O_TRUNC != 0 {
+            self.check_write_inode(inode)?;
+        }
         self.do_open(inode, kill_priv, flags)
     }
 
@@ -1549,6 +1969,7 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
+        let rel_path = self.check_write_child(parent, name)?;
         let c_path = self.name_to_path(parent, name)?;
 
         let flags = self.parse_open_flags(flags as i32);
@@ -1599,6 +2020,7 @@ impl FileSystem for PassthroughFs {
         let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
 
         let entry = self.lookup(ctx, parent, name)?;
+        self.remember_inode_path(entry.inode, rel_path);
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let data = HandleData {
@@ -1620,6 +2042,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn unlink(&self, ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
+        self.check_write_child(parent, name)?;
         self.do_unlink(ctx, parent, name, 0)
     }
 
@@ -1663,6 +2086,7 @@ impl FileSystem for PassthroughFs {
         kill_priv: bool,
         _flags: u32,
     ) -> io::Result<usize> {
+        self.check_write_inode(inode)?;
         let data = self
             .handles
             .read()
@@ -1715,6 +2139,9 @@ impl FileSystem for PassthroughFs {
         handle: Option<Handle>,
         valid: SetattrValid,
     ) -> io::Result<(bindings::stat64, Duration)> {
+        if !valid.is_empty() {
+            self.check_write_inode(inode)?;
+        }
         // If we have a handle then use it otherwise get a new fd from the inode.
         let ihandle = if let Some(handle) = handle {
             let hd = self
@@ -1856,6 +2283,8 @@ impl FileSystem for PassthroughFs {
         newname: &CStr,
         flags: u32,
     ) -> io::Result<()> {
+        let old_rel_path = self.check_write_child(olddir, oldname)?;
+        let new_rel_path = self.check_write_child(newdir, newname)?;
         let mut mflags: u32 = 0;
         if ((flags as i32) & bindings::LINUX_RENAME_NOREPLACE) != 0 {
             mflags |= libc::RENAME_EXCL;
@@ -1948,7 +2377,12 @@ impl FileSystem for PassthroughFs {
             }
 
             let entry = self.lookup(ctx, newdir, newname)?;
+            self.remember_inode_path(entry.inode, new_rel_path);
             self.forget(ctx, entry.inode, 1);
+            self.inode_paths
+                .write()
+                .unwrap()
+                .retain(|_, path| path != &old_rel_path);
 
             Ok(())
         } else {
@@ -1970,6 +2404,7 @@ impl FileSystem for PassthroughFs {
         umask: u32,
         extensions: Extensions,
     ) -> io::Result<Entry> {
+        let rel_path = self.check_write_child(parent, name)?;
         let c_path = self.name_to_path(parent, name)?;
 
         let fd = unsafe {
@@ -2000,7 +2435,9 @@ impl FileSystem for PassthroughFs {
             }
 
             unsafe { libc::close(fd) };
-            self.lookup(ctx, parent, name)
+            let entry = self.lookup(ctx, parent, name)?;
+            self.remember_inode_path(entry.inode, rel_path);
+            Ok(entry)
         }
     }
 
@@ -2011,6 +2448,7 @@ impl FileSystem for PassthroughFs {
         newparent: Inode,
         newname: &CStr,
     ) -> io::Result<Entry> {
+        let rel_path = self.check_write_child(newparent, newname)?;
         let orig_c_path = match self.inode_to_handle(inode, false)? {
             InodeHandle::Path(c_path) => c_path,
             InodeHandle::Fd(_) => return Err(ebadf()),
@@ -2020,7 +2458,9 @@ impl FileSystem for PassthroughFs {
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::link(orig_c_path.as_ptr(), link_c_path.as_ptr()) };
         if res == 0 {
-            self.lookup(ctx, newparent, newname)
+            let entry = self.lookup(ctx, newparent, newname)?;
+            self.remember_inode_path(entry.inode, rel_path);
+            Ok(entry)
         } else {
             Err(linux_error(io::Error::last_os_error()))
         }
@@ -2034,6 +2474,7 @@ impl FileSystem for PassthroughFs {
         name: &CStr,
         extensions: Extensions,
     ) -> io::Result<Entry> {
+        let rel_path = self.check_write_child(parent, name)?;
         let c_path = self.name_to_path(parent, name)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
@@ -2052,6 +2493,7 @@ impl FileSystem for PassthroughFs {
             entry.attr.st_uid = ctx.uid;
             entry.attr.st_gid = ctx.gid;
             entry.attr.st_mode = mode;
+            self.remember_inode_path(entry.inode, rel_path);
             Ok(entry)
         } else {
             Err(linux_error(io::Error::last_os_error()))
@@ -2153,6 +2595,9 @@ impl FileSystem for PassthroughFs {
     }
 
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
+        if (mask as i32 & libc::W_OK) != 0 {
+            self.check_write_inode(inode)?;
+        }
         let st = match self.inode_to_handle(inode, true)? {
             InodeHandle::Path(c_path) => lstat(&c_path, false)?,
             InodeHandle::Fd(fd) => fstat(fd, false)?,
@@ -2212,6 +2657,7 @@ impl FileSystem for PassthroughFs {
         value: &[u8],
         flags: u32,
     ) -> io::Result<()> {
+        self.check_write_inode(inode)?;
         debug!("setxattr: inode={inode} name={name:?} value={value:?}");
 
         if !self.cfg.xattr {
@@ -2397,6 +2843,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn removexattr(&self, _ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
+        self.check_write_inode(inode)?;
         if !self.cfg.xattr {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
@@ -2430,6 +2877,7 @@ impl FileSystem for PassthroughFs {
         offset: u64,
         length: u64,
     ) -> io::Result<()> {
+        self.check_write_inode(inode)?;
         let data = self
             .handles
             .read()
@@ -2498,17 +2946,7 @@ impl FileSystem for PassthroughFs {
                     return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
                 }
 
-                let mut hole = libc::fpunchhole_t {
-                    fp_offset: offset as i64,
-                    fp_flags: 0,
-                    reserved: 0,
-                    fp_length: length as i64,
-                };
-
-                let res = unsafe { libc::fcntl(fd, libc::F_PUNCHHOLE, &mut hole as *mut _) };
-                if res < 0 {
-                    return Err(linux_error(io::Error::last_os_error()));
-                }
+                punch_hole(fd, offset, length)?;
             }
             _ => unreachable!(),
         }
@@ -2556,6 +2994,46 @@ impl FileSystem for PassthroughFs {
         }
     }
 
+    fn copyfilerange(
+        &self,
+        _ctx: Context,
+        inode_in: Inode,
+        handle_in: Handle,
+        offset_in: u64,
+        inode_out: Inode,
+        handle_out: Handle,
+        offset_out: u64,
+        len: u64,
+        flags: u64,
+    ) -> io::Result<usize> {
+        if flags != 0 {
+            return Err(einval());
+        }
+        self.check_write_inode(inode_out)?;
+
+        let data_in = self
+            .handles
+            .read()
+            .unwrap()
+            .get(&handle_in)
+            .filter(|hd| hd.inode == inode_in)
+            .cloned()
+            .ok_or_else(ebadf)?;
+        let fd_in = data_in.file.read().unwrap().as_raw_fd();
+
+        let data_out = self
+            .handles
+            .read()
+            .unwrap()
+            .get(&handle_out)
+            .filter(|hd| hd.inode == inode_out)
+            .cloned()
+            .ok_or_else(ebadf)?;
+        let fd_out = data_out.file.read().unwrap().as_raw_fd();
+
+        self.copy_sparse_range(fd_in, offset_in, fd_out, offset_out, len)
+    }
+
     fn setupmapping(
         &self,
         _ctx: Context,
@@ -2569,6 +3047,9 @@ impl FileSystem for PassthroughFs {
         shm_size: u64,
         map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
+        if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
+            self.check_write_inode(inode)?;
+        }
         if map_sender.is_none() {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
         }

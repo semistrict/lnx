@@ -2,6 +2,7 @@
 use crossbeam_channel::Sender;
 use std::cmp;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -78,6 +79,7 @@ impl Fs {
 
         let fs_cfg = shared_dir.map(|root_dir| passthrough::Config {
             root_dir,
+            write_allowlist: None,
             ..Default::default()
         });
 
@@ -101,6 +103,40 @@ impl Fs {
 
     pub fn id(&self) -> &str {
         defs::FS_DEV_ID
+    }
+
+    pub fn tag(&self) -> String {
+        let end = self
+            .config
+            .tag
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(self.config.tag.len());
+        String::from_utf8_lossy(&self.config.tag[..end]).into_owned()
+    }
+
+    pub fn set_write_allowlist(&mut self, paths: Vec<PathBuf>) -> bool {
+        let Some(cfg) = self.passthrough_cfg.as_mut() else {
+            return false;
+        };
+        let Some(allowlist) = &cfg.write_allowlist else {
+            return false;
+        };
+        *allowlist.write().unwrap() = paths;
+        true
+    }
+
+    pub fn enable_write_allowlist(
+        &mut self,
+        allowlist: Arc<std::sync::RwLock<Vec<PathBuf>>>,
+    ) -> bool {
+        let Some(cfg) = self.passthrough_cfg.as_mut() else {
+            return false;
+        };
+        cfg.write_allowlist = Some(allowlist);
+        cfg.cache_policy = passthrough::CachePolicy::Always;
+        cfg.writeback = true;
+        true
     }
 
     pub fn set_shm_region(&mut self, shm_region: VirtioShmRegion) {

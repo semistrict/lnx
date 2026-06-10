@@ -208,6 +208,15 @@ pub fn run(config: RunConfig) -> Result<i32> {
         .unwrap_or_else(|| config.layout.rootfs.clone());
     log_file_summary(&run_log, "rootfs.selected", &rootfs);
     ctx.add_root_pmem(&rootfs)?;
+    let host_home = dirs::home_dir().context("host home directory")?;
+    let guest_home = guest_home(&host_home);
+    let guest_cwd = guest_cwd(&config.cwd, &host_home);
+    ctx.add_policy_virtiofs("home", &host_home)?;
+    ctx.set_virtiofs_write_allowlist("home", &home_write_allowlist(&config.cwd, &host_home))?;
+    let outside_home_cwd = (!config.cwd.starts_with(&host_home)).then(|| config.cwd.clone());
+    if let Some(cwd) = &outside_home_cwd {
+        ctx.add_virtiofs("cwd", cwd, false)?;
+    }
     ctx.set_kernel(
         &config.layout.kernel,
         Some(&initrd),
@@ -240,6 +249,11 @@ pub fn run(config: RunConfig) -> Result<i32> {
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
             "container=lnx".to_string(),
             format!("LNX_HOST_UNIX_SECS={now}"),
+            format!("LNX_VIRTIOFS_HOME={guest_home}"),
+            outside_home_cwd
+                .as_ref()
+                .map(|_| format!("LNX_VIRTIOFS_CWD={guest_cwd}"))
+                .unwrap_or_else(|| "LNX_VIRTIOFS_CWD=".to_string()),
         ],
     )?;
     timings.event("krun.exec.configured");
@@ -283,6 +297,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
         initramfs_stamp,
         restore_snapshot,
         config.forwards.clone(),
+        host_home,
         Arc::clone(&timings),
         Arc::clone(&run_log),
         vm_error_rx,
@@ -1058,6 +1073,7 @@ pub(crate) fn connect_broker(socket: &Path) -> Result<UnixStream> {
 fn run_broker_session(mut stream: UnixStream, command: &[String], cwd: &Path) -> Result<i32> {
     INTERRUPTED.store(false, Ordering::SeqCst);
     let channel_id = new_request_id()?;
+    let host_home = dirs::home_dir().context("host home directory")?;
     let use_pty = should_request_pty();
     let raw_mode = if use_pty { RawTerminal::enter() } else { None };
     let (term, colorterm, rows, cols) = if use_pty {
@@ -1078,7 +1094,7 @@ fn run_broker_session(mut stream: UnixStream, command: &[String], cwd: &Path) ->
         &Message::OpenExec {
             channel_id,
             argv: command.to_vec(),
-            cwd: guest_cwd(cwd),
+            cwd: guest_cwd(cwd, &host_home),
             pty: use_pty,
             term,
             colorterm,
@@ -1277,6 +1293,7 @@ fn run_broker_owner(
     initramfs_stamp: PathBuf,
     restore_snapshot: Option<PathBuf>,
     forwards: Vec<PortForward>,
+    host_home: PathBuf,
     timings: Arc<TimingLog>,
     run_log: Arc<RunLog>,
     vm_error_rx: mpsc::Receiver<i32>,
@@ -1416,10 +1433,19 @@ fn run_broker_owner(
                     let seen = Arc::clone(&seen_active);
                     let checkpoint_tx = checkpoint_tx.clone();
                     let client_log = Arc::clone(&owner_log);
+                    let client_ctx = Arc::clone(&ctx);
+                    let client_host_home = host_home.clone();
                     thread::spawn(move || {
-                        if let Err(e) =
-                            handle_broker_client(client, tx, checkpoint_tx, clients, active, seen)
-                        {
+                        if let Err(e) = handle_broker_client(
+                            client,
+                            tx,
+                            checkpoint_tx,
+                            clients,
+                            active,
+                            seen,
+                            client_ctx,
+                            client_host_home,
+                        ) {
                             client_log.line(format!("broker.client.error {e:#}"));
                         }
                     });
@@ -1549,6 +1575,8 @@ fn handle_broker_client(
     clients: Arc<Mutex<HashMap<u64, BrokerChannel>>>,
     active: Arc<AtomicUsize>,
     seen_active: Arc<AtomicBool>,
+    ctx: Arc<KrunContext>,
+    host_home: PathBuf,
 ) -> Result<()> {
     client
         .set_nonblocking(false)
@@ -1588,6 +1616,12 @@ fn handle_broker_client(
         Message::OpenExec { channel_id, .. } | Message::OpenTcp { channel_id, .. } => *channel_id,
         _ => bail!("client did not open a channel"),
     };
+    if let Message::OpenExec { cwd, .. } = &first {
+        ctx.set_virtiofs_write_allowlist(
+            "home",
+            &home_write_allowlist(Path::new(cwd), &host_home),
+        )?;
+    }
     let mut active_reservation = ActiveReservation::new(Arc::clone(&active));
     seen_active.store(true, Ordering::SeqCst);
     let (to_client_tx, to_client_rx) = mpsc::channel::<Message>();
@@ -1984,12 +2018,26 @@ impl Drop for RawTerminal {
     }
 }
 
-fn guest_cwd(cwd: &Path) -> String {
-    let cwd = cwd.to_string_lossy();
-    if cwd.starts_with("/Users/") {
-        "/".to_string()
+fn guest_home(host_home: &Path) -> String {
+    host_home.to_string_lossy().into_owned()
+}
+
+fn guest_cwd(cwd: &Path, host_home: &Path) -> String {
+    if cwd.starts_with(host_home) {
+        cwd.to_string_lossy().into_owned()
     } else {
-        cwd.into_owned()
+        cwd.to_string_lossy().into_owned()
+    }
+}
+
+fn home_write_allowlist(cwd: &Path, host_home: &Path) -> Vec<String> {
+    let Ok(relative) = cwd.strip_prefix(host_home) else {
+        return Vec::new();
+    };
+    if relative.as_os_str().is_empty() {
+        vec![".".to_string()]
+    } else {
+        vec![relative.to_string_lossy().into_owned()]
     }
 }
 
@@ -2353,6 +2401,45 @@ mod tests {
         assert_eq!(
             broker_idle_ttl_from_env(Some("30000")),
             Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn guest_cwd_uses_host_path_under_home() {
+        assert_eq!(
+            guest_cwd(Path::new("/Users/ramon/src/lnx"), Path::new("/Users/ramon")),
+            "/Users/ramon/src/lnx"
+        );
+    }
+
+    #[test]
+    fn guest_cwd_uses_host_path_outside_home() {
+        assert_eq!(
+            guest_cwd(Path::new("/tmp/build"), Path::new("/Users/ramon")),
+            "/tmp/build"
+        );
+    }
+
+    #[test]
+    fn home_write_allowlist_is_relative_under_home() {
+        assert_eq!(
+            home_write_allowlist(Path::new("/Users/ramon/src/lnx"), Path::new("/Users/ramon")),
+            vec!["src/lnx".to_string()]
+        );
+    }
+
+    #[test]
+    fn home_write_allowlist_uses_dot_for_home_root() {
+        assert_eq!(
+            home_write_allowlist(Path::new("/Users/ramon"), Path::new("/Users/ramon")),
+            vec![".".to_string()]
+        );
+    }
+
+    #[test]
+    fn home_write_allowlist_is_empty_outside_home() {
+        assert!(
+            home_write_allowlist(Path::new("/tmp/build"), Path::new("/Users/ramon")).is_empty()
         );
     }
 }

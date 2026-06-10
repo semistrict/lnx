@@ -35,6 +35,7 @@ const WNOHANG: c_int = 1;
 const TIOCSCTTY: c_ulong = 0x540e;
 const TIOCSWINSZ: c_ulong = 0x5414;
 const CLOCK_REALTIME: c_int = 0;
+const MS_RDONLY: c_ulong = 1;
 const MS_BIND: c_ulong = 4096;
 const MS_REC: c_ulong = 16384;
 const MS_PRIVATE: c_ulong = 262144;
@@ -193,6 +194,32 @@ fn mount_fs(
     }
 }
 
+fn mount_virtiofs(tag: &str, guest_path: &str, read_only: bool) {
+    if tag.is_empty() || guest_path.is_empty() || !guest_path.starts_with('/') {
+        return;
+    }
+    let target = format!("/newroot{guest_path}");
+    if fs::metadata(&target).is_err() {
+        ensure_dir(&target);
+    }
+    let tag = CString::new(tag).unwrap();
+    let target = CString::new(target).unwrap();
+    let fstype = cstr(b"virtiofs\0");
+    let flags = if read_only { MS_RDONLY } else { 0 };
+    if unsafe { mount(tag.as_ptr(), target.as_ptr(), fstype, flags, ptr::null()) } < 0 {
+        die("mount virtiofs");
+    }
+}
+
+fn mount_host_shares() {
+    if let Ok(home) = env::var("LNX_VIRTIOFS_HOME") {
+        mount_virtiofs("home", &home, false);
+    }
+    if let Ok(cwd) = env::var("LNX_VIRTIOFS_CWD") {
+        mount_virtiofs("cwd", &cwd, false);
+    }
+}
+
 fn wait_for_path(path: &str) -> bool {
     for _ in 0..100 {
         if fs::metadata(path).is_ok() {
@@ -327,6 +354,7 @@ fn init_mode() -> ! {
         0,
         b"errors=continue,dax\0",
     );
+    mount_host_shares();
 
     ensure_dir("/newroot/usr/local/lib/lnx");
     ensure_dir("/newroot/usr/local/bin");

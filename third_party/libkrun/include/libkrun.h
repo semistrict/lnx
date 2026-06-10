@@ -368,6 +368,17 @@ int32_t krun_add_virtiofs3(uint32_t ctx_id,
                            uint64_t shm_size,
                            bool read_only);
 
+int32_t krun_add_virtiofs4(uint32_t ctx_id,
+                           const char *c_tag,
+                           const char *c_path,
+                           uint64_t shm_size,
+                           bool read_only,
+                           bool write_allowlist);
+
+int32_t krun_set_virtiofs_write_allowlist(uint32_t ctx_id,
+                                          const char *c_tag,
+                                          const char *c_paths);
+
 /* Send the VFKIT magic after establishing the connection,
    as required by gvproxy in vfkit mode. */
 #define NET_FLAG_VFKIT (1 << 0)

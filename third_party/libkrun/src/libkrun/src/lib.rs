@@ -32,9 +32,8 @@ use std::os::fd::AsRawFd;
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::slice;
-use std::sync::LazyLock;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use utils::eventfd::EventFd;
 use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
@@ -637,6 +636,7 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
                     // Default to a conservative 512 MB window.
                     shm_size: Some(1 << 29),
                     read_only: false,
+                    write_allowlist: None,
                     virtual_entries: {
                         let mut v = Vec::new();
                         if !cfg.disable_implicit_init {
@@ -686,6 +686,20 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
     shm_size: u64,
     read_only: bool,
 ) -> i32 {
+    unsafe { krun_add_virtiofs4(ctx_id, c_tag, c_path, shm_size, read_only, false) }
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub unsafe extern "C" fn krun_add_virtiofs4(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_path: *const c_char,
+    shm_size: u64,
+    read_only: bool,
+    write_allowlist: bool,
+) -> i32 {
     unsafe {
         if c_tag.is_null() {
             return -libc::EINVAL;
@@ -727,8 +741,60 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
                     shared_dir: path.map(|p| p.to_string()),
                     shm_size: shm,
                     read_only,
+                    write_allowlist: write_allowlist.then(|| Arc::new(RwLock::new(Vec::new()))),
                     virtual_entries,
                 });
+            }
+            Entry::Vacant(_) => return -libc::ENOENT,
+        }
+
+        KRUN_SUCCESS
+    }
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub unsafe extern "C" fn krun_set_virtiofs_write_allowlist(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_paths: *const c_char,
+) -> i32 {
+    unsafe {
+        if c_tag.is_null() || c_paths.is_null() {
+            return -libc::EINVAL;
+        }
+        let tag = match CStr::from_ptr(c_tag).to_str() {
+            Ok(tag) => tag,
+            Err(_) => return -libc::EINVAL,
+        };
+        let paths = match CStr::from_ptr(c_paths).to_str() {
+            Ok(paths) => paths
+                .split('\n')
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>(),
+            Err(_) => return -libc::EINVAL,
+        };
+
+        if let Some(vmm) = RUNNING_VMMS.lock().unwrap().get(&ctx_id).cloned() {
+            return if vmm.lock().unwrap().set_virtiofs_write_allowlist(tag, paths) {
+                KRUN_SUCCESS
+            } else {
+                -libc::ENOENT
+            };
+        }
+
+        match CTX_MAP.lock().unwrap().entry(ctx_id) {
+            Entry::Occupied(mut ctx_cfg) => {
+                let cfg = ctx_cfg.get_mut();
+                let Some(fs) = cfg.vmr.fs.iter_mut().find(|fs| fs.fs_id == tag) else {
+                    return -libc::ENOENT;
+                };
+                let Some(allowlist) = &fs.write_allowlist else {
+                    return -libc::EINVAL;
+                };
+                *allowlist.write().unwrap() = paths;
             }
             Entry::Vacant(_) => return -libc::ENOENT,
         }
@@ -2551,6 +2617,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                     // Default to a conservative 512 MB window.
                     shm_size: Some(1 << 29),
                     read_only: false,
+                    write_allowlist: None,
                     virtual_entries,
                 });
 

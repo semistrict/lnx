@@ -47,6 +47,10 @@ impl ShmManager {
         regions
     }
 
+    pub fn next_guest_addr(&self) -> u64 {
+        self.next_guest_addr
+    }
+
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     pub fn fs_region(&self, index: usize) -> Option<&ShmRegion> {
         self.fs_regions.get(&index)

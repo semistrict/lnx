@@ -1,5 +1,7 @@
 #[cfg(not(feature = "aws-nitro"))]
 use devices::virtio::fs::virtual_entry::VirtualDirEntry;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Debug)]
 pub struct FsDeviceConfig {
@@ -9,6 +11,7 @@ pub struct FsDeviceConfig {
     pub shared_dir: Option<String>,
     pub shm_size: Option<usize>,
     pub read_only: bool,
+    pub write_allowlist: Option<Arc<RwLock<Vec<PathBuf>>>>,
     #[cfg(not(feature = "aws-nitro"))]
     pub virtual_entries: Vec<VirtualDirEntry>,
 }

@@ -7,6 +7,7 @@ mod inode_alloc;
 #[allow(dead_code)]
 mod multikey;
 mod null_fs;
+mod policy_fs;
 mod read_only;
 mod server;
 pub mod virtual_entry;
