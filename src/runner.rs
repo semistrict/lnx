@@ -28,9 +28,9 @@ const AGENT_PORT: u32 = 10240;
 const SNAPSHOT_PORT: u32 = 10241;
 const CONTROL_PORT: u32 = 10242;
 const FRAME_SNAPSHOT: u8 = b'K';
-const BROKER_HELLO_TIMEOUT: Duration = Duration::from_millis(500);
 const INTERRUPT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const DEFAULT_BROKER_IDLE_TTL: Duration = Duration::ZERO;
+const DEFAULT_AGENT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(90);
 
 static SIGNAL_INIT: Once = Once::new();
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -1037,34 +1037,19 @@ fn run_existing_broker_client(
 pub(crate) fn connect_broker(socket: &Path) -> Result<UnixStream> {
     let mut stream =
         UnixStream::connect(socket).with_context(|| format!("connect {}", socket.display()))?;
+    stream
+        .set_nonblocking(false)
+        .context("set broker stream blocking")?;
     write_message(
         &mut stream,
         &Message::Hello {
             version: PROTOCOL_VERSION,
         },
     )?;
-    stream
-        .set_read_timeout(Some(BROKER_HELLO_TIMEOUT))
-        .context("set broker hello timeout")?;
-    let deadline = Instant::now() + BROKER_HELLO_TIMEOUT;
-    loop {
-        match read_message(&mut stream) {
-            Ok(Message::Hello { version }) if version == PROTOCOL_VERSION => break,
-            Ok(other) => bail!("bad broker hello: {other:?}"),
-            Err(e)
-                if matches!(
-                    e.downcast_ref::<std::io::Error>().map(|e| e.kind()),
-                    Some(ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted)
-                ) && Instant::now() < deadline =>
-            {
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(e) => return Err(e).context("read broker hello"),
-        }
+    match read_message(&mut stream).context("read broker hello")? {
+        Message::Hello { version } if version == PROTOCOL_VERSION => {}
+        other => bail!("bad broker hello: {other:?}"),
     }
-    stream
-        .set_read_timeout(None)
-        .context("clear broker hello timeout")?;
     Ok(stream)
 }
 
@@ -1297,11 +1282,7 @@ fn run_broker_owner(
     listener
         .set_nonblocking(true)
         .context("set lnx-agent listener nonblocking")?;
-    let agent_timeout = if restore_snapshot.is_some() {
-        Duration::from_secs(10)
-    } else {
-        Duration::from_secs(90)
-    };
+    let agent_timeout = agent_accept_timeout_from_env(std::env::var("LNX_AGENT_TIMEOUT_MS").ok());
     timings.event("agent.accept.begin");
     run_log.line(format!(
         "agent.accept.begin timeout_ms={} restore={}",
@@ -1311,28 +1292,15 @@ fn run_broker_owner(
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "false".to_string())
     ));
-    let mut agent_stream = match accept_unix_with_progress(
-        &listener,
-        agent_timeout,
-        Some((&timings, "agent.accept.waiting")),
-        Some(&vm_error_rx),
-    ) {
-        Ok(stream) => stream,
-        Err(e) => {
-            run_log.line(format!("agent.accept.error {e:#}"));
-            log_console_tail(&run_log, &console_log);
-            return Err(e).with_context(|| console_hint(&console_log));
-        }
-    };
-    timings.event("agent.accepted");
-    run_log.line("agent.accepted");
-    agent_stream
-        .set_nonblocking(false)
-        .context("set lnx-agent stream blocking")?;
-    match read_message(&mut agent_stream)? {
-        Message::Hello { version } if version == PROTOCOL_VERSION => {}
-        other => bail!("bad lnx-agent hello: {other:?}"),
-    }
+    let mut agent_stream =
+        match accept_agent_hello(&listener, agent_timeout, &timings, &run_log, &vm_error_rx) {
+            Ok(stream) => stream,
+            Err(e) => {
+                run_log.line(format!("agent.accept.error {e:#}"));
+                log_console_tail(&run_log, &console_log);
+                return Err(e).with_context(|| console_hint(&console_log));
+            }
+        };
     write_message(
         &mut agent_stream,
         &Message::Hello {
@@ -1563,6 +1531,13 @@ fn broker_idle_ttl_from_env(value: Option<&str>) -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_BROKER_IDLE_TTL)
+}
+
+fn agent_accept_timeout_from_env(value: Option<String>) -> Duration {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_AGENT_ACCEPT_TIMEOUT)
 }
 
 fn handle_broker_client(
@@ -1818,6 +1793,42 @@ fn handle_forward_connection(
 
 fn accept_unix(listener: &UnixListener, timeout: Duration) -> Result<UnixStream> {
     accept_unix_with_progress(listener, timeout, None, None)
+}
+
+fn accept_agent_hello(
+    listener: &UnixListener,
+    timeout: Duration,
+    timings: &TimingLog,
+    run_log: &RunLog,
+    vm_error_rx: &mpsc::Receiver<i32>,
+) -> Result<UnixStream> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let mut stream = accept_unix_with_progress(
+            listener,
+            remaining,
+            Some((timings, "agent.accept.waiting")),
+            Some(vm_error_rx),
+        )?;
+        stream
+            .set_nonblocking(false)
+            .context("set lnx-agent stream blocking")?;
+        match read_message(&mut stream) {
+            Ok(Message::Hello { version }) if version == PROTOCOL_VERSION => {
+                timings.event("agent.accepted");
+                run_log.line("agent.accepted");
+                return Ok(stream);
+            }
+            Ok(other) => {
+                run_log.line(format!("agent.accept.bad_hello {other:?}"));
+            }
+            Err(e) => {
+                run_log.line(format!("agent.accept.bad_hello_error {e:#}"));
+            }
+        }
+    }
+    bail!("timed out waiting for lnx-agent");
 }
 
 fn accept_unix_with_progress(

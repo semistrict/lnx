@@ -65,6 +65,9 @@ enum Command {
     #[command(hide = true)]
     #[command(name = "_ingress")]
     HiddenIngress(HiddenIngressArgs),
+    #[command(hide = true)]
+    #[command(name = "_vm-init")]
+    HiddenVmInit,
 }
 
 #[derive(Debug, Args)]
@@ -222,6 +225,7 @@ impl Cli {
                     config,
                 )
             }
+            Some(Command::HiddenVmInit) => initialize_vm_instance(layout, cpus, memory_mib),
             None => run_guest(
                 layout,
                 guest_command,
@@ -443,7 +447,7 @@ fn ensure_vm_initialized(
     layout: &Layout,
     cpus: u8,
     memory_mib: u32,
-    forwards: Vec<runner::PortForward>,
+    _forwards: Vec<runner::PortForward>,
     no_snapshot_restore: bool,
     explicit_snapshot: bool,
 ) -> Result<()> {
@@ -455,6 +459,24 @@ fn ensure_vm_initialized(
         return Ok(());
     }
     eprintln!("first run: initializing VM instance {}", layout.instance);
+    let cpus = cpus.to_string();
+    let memory_mib = memory_mib.to_string();
+    run_lnx_child(
+        layout,
+        Some(&layout.kernel),
+        Some(&layout.rootfs),
+        &["--cpus", &cpus, "--memory-mib", &memory_mib, "_vm-init"],
+        None,
+        false,
+    )
+    .context("initialize VM instance")?;
+    Ok(())
+}
+
+fn initialize_vm_instance(layout: Layout, cpus: u8, memory_mib: u32) -> Result<()> {
+    if layout.vm_initialized.exists() {
+        return Ok(());
+    }
     let cwd = std::env::current_dir().context("current directory")?;
     let status = runner::run(runner::RunConfig {
         layout: layout.clone(),
@@ -463,14 +485,14 @@ fn ensure_vm_initialized(
         cpus,
         memory_mib,
         restore_snapshot: None,
-        forwards,
+        forwards: Vec::new(),
         snapshot_output: Some(layout.snapshot_dir.join("latest")),
     })
     .context("initialize VM instance")?;
     if status != 0 {
         bail!("VM initialization exited with status {status}");
     }
-    mark_vm_initialized(layout)
+    mark_vm_initialized(&layout)
 }
 
 fn mark_vm_initialized(layout: &Layout) -> Result<()> {

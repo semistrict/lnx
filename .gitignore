@@ -12,6 +12,7 @@
 
 # Test artifacts
 /tmp/
+/results/**/*.json
 
 # Nested build artifacts
 /guest-agent/target/

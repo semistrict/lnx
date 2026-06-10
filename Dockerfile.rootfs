@@ -5,6 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     git curl wget build-essential ca-certificates openssh-client \
+    python3-minimal \
     sudo \
     vim less file strace gdb \
     iproute2 iputils-ping dnsutils net-tools tcpdump \

@@ -22,8 +22,13 @@ impl Layout {
         kernel: Option<PathBuf>,
         rootfs: Option<PathBuf>,
     ) -> Result<Self> {
-        let home = dirs::home_dir().context("could not resolve home directory")?;
-        let base = home.join(".lnx");
+        let base = match std::env::var_os("LNX_BASE") {
+            Some(path) => PathBuf::from(path),
+            None => {
+                let home = dirs::home_dir().context("could not resolve home directory")?;
+                home.join(".lnx")
+            }
+        };
         let image_dir = base.join("images").join(instance);
         let instance_dir = base.join("instances").join(instance);
         let snapshot_dir = image_dir.join("memory-snapshots");
@@ -107,5 +112,28 @@ mod tests {
         assert_eq!(layout.kernel, kernel);
         assert_eq!(layout.rootfs, rootfs);
         assert_eq!(layout.instance, "custom");
+    }
+
+    #[test]
+    fn resolve_honors_lnx_base_env() {
+        let base = std::env::temp_dir().join(format!("lnx-base-test-{}", std::process::id()));
+        unsafe {
+            std::env::set_var("LNX_BASE", &base);
+        }
+        let layout = Layout::resolve("envbase", None, None).expect("layout");
+        unsafe {
+            std::env::remove_var("LNX_BASE");
+        }
+
+        assert_eq!(layout.base, base);
+        assert_eq!(layout.kernel, layout.base.join("vmlinuz"));
+        assert_eq!(
+            layout.rootfs,
+            layout
+                .base
+                .join("images")
+                .join("envbase")
+                .join("rootfs.ext4")
+        );
     }
 }

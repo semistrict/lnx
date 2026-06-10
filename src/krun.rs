@@ -1,4 +1,4 @@
-use std::{ffi::CString, path::Path};
+use std::{ffi::CString, path::Path, sync::OnceLock};
 
 use anyhow::{Result, bail};
 
@@ -21,6 +21,10 @@ impl Context {
     }
 
     pub fn set_log_level(level: u32) -> Result<()> {
+        static LOG_LEVEL: OnceLock<u32> = OnceLock::new();
+        if LOG_LEVEL.set(level).is_err() {
+            return Ok(());
+        }
         call(libkrun::krun_set_log_level(level), "krun_set_log_level")
     }
 
