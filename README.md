@@ -73,3 +73,34 @@ dirty tracking and APFS clones to patch only changed RAM and disk blocks.
 Per-run timings are appended to `~/.lnx/instances/<instance>/timings.log`.
 Incremental snapshots skip `fsync` by default for speed; set
 `KRUN_SNAPSHOT_SYNC=1` to make snapshot files crash-durable before returning.
+
+Nested KVM testing:
+
+```sh
+bun run test:nested-kvm
+```
+
+The nested test compiles `lnx` for `aarch64-unknown-linux-musl`, boots an outer
+`lnx --nested-kvm` guest, verifies that an inner `lnx` VM can boot after the
+outer VM has gone through `lnxctl snapshot-exit`, then runs the Linux-host
+compatible part of the integration suite inside the nested-capable guest.
+
+Current caveats:
+
+- Inner nested `lnx` runs use `LNX_ROOTFS_BACKEND=block`; pmem/DAX rootfs inside
+  the nested Linux host still hits KVM mapping limitations.
+- Linux libkrun snapshot APIs return `ENOSYS`, so tests whose purpose is
+  checkpoint, fork, snapshot capture, or snapshot restore semantics remain
+  excluded from the inner Linux-host suite.
+- `system` and `stress` have nested-safe coverage for their non-snapshot
+  behavior; their snapshot-specific assertions remain excluded for the same
+  Linux libkrun snapshot reason.
+- Linux virtiofs write allowlist enforcement is not active today, so the
+  policy-specific virtiofs restore/fork checks do not run inside the nested
+  Linux host.
+- `stock-ubuntu` remains excluded: `snapd` panics while parsing the nested guest
+  kernel command line under nested KVM, and a stock boot/apt probe hung instead
+  of producing bounded signal.
+- Browser snapshot coverage remains opt-in and snapshot/fork-dependent.
+- Ingress and privileged ingress tests are macOS host tests because they depend
+  on launchd, `/etc/resolver`, keychain/sudo setup, and privileged host ports.
