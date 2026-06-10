@@ -43,12 +43,14 @@ const outerVmArgs = [
   "4096",
 ];
 const nestedSuite = [
+  "scripts/test/nested-system.ts",
   "scripts/test/cp.ts",
   "scripts/test/broker-recovery.ts",
   "scripts/test/client-chaos.ts",
+  "scripts/test/nested-stress.ts",
 ];
 const nestedCaveats = [
-  ["scripts/test/system.test.ts", "contains post-command snapshot and explicit snapshot restore checks; Linux libkrun snapshot APIs return ENOSYS"],
+  ["scripts/test/system.test.ts", "non-snapshot paths/exec/guest-shape/network coverage runs via scripts/test/nested-system.ts; post-command snapshot and explicit snapshot restore checks remain excluded because Linux libkrun snapshot APIs return ENOSYS"],
   ["scripts/test/virtiofs-policy.test.ts", "contains checkpoint/fork restore checks; Linux libkrun snapshot APIs return ENOSYS; Linux virtiofs write allowlist is not enforced today"],
   ["scripts/test/page-cache.test.ts", "asserts idle snapshot completion and rootfs DAX page-cache behavior; nested Linux inner runs use block rootfs"],
   ["scripts/test/rapid-fire.test.ts", "asserts snapshot-exit and idle snapshot behavior; Linux libkrun snapshot APIs return ENOSYS"],
@@ -59,7 +61,7 @@ const nestedCaveats = [
   ["scripts/test/snapshot-compat.test.ts", "directly validates snapshot restore compatibility; Linux libkrun snapshot APIs return ENOSYS"],
   ["scripts/test/virtiofs-resume.test.ts", "open fd/mmap survival is specifically snapshot/fork restore behavior; Linux libkrun snapshot APIs return ENOSYS"],
   ["scripts/test/dirty-fs.test.ts", "depends on checkpoint/fork rootfs snapshots; Linux libkrun snapshot APIs return ENOSYS"],
-  ["scripts/test/stress.test.ts", "last step asserts snapshot waits for active channels; Linux libkrun snapshot APIs return ENOSYS"],
+  ["scripts/test/stress.test.ts", "parallel channel coverage runs via scripts/test/nested-stress.ts; the snapshot-waits-for-active-channels step remains excluded because Linux libkrun snapshot APIs return ENOSYS"],
   ["scripts/test/stock-ubuntu.test.ts", "snapd panics while parsing the nested guest kernel command line under nested KVM"],
   ["scripts/test/ingress.test.ts", "host-side ingress lifecycle uses macOS launchd/resolver assumptions"],
   ["scripts/test/privileged-ingress.test.ts", "privileged host ingress uses sudo, /etc/resolver, launchd, and privileged ports"],
@@ -85,10 +87,12 @@ const fullSuite = [
   "scripts/test/privileged-ingress.test.ts",
 ];
 const nestedSuiteTestFiles = nestedSuite.map((script) => script.replace(/\.ts$/, ".test.ts"));
+const partiallyCoveredTestFiles = new Set(["scripts/test/system.test.ts", "scripts/test/stress.test.ts"]);
 const caveatedTestFiles = nestedCaveats.map(([testFile]) => testFile);
 const missingNestedDisposition = fullSuite.filter((testFile) =>
   testFile !== "scripts/test/nested-kvm.test.ts"
   && !nestedSuiteTestFiles.includes(testFile)
+  && !partiallyCoveredTestFiles.has(testFile)
   && !caveatedTestFiles.includes(testFile)
 );
 if (missingNestedDisposition.length > 0) {
