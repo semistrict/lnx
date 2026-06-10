@@ -42,30 +42,6 @@ const outerVmArgs = [
   "--memory-mib",
   "4096",
 ];
-const nestedSuite = [
-  "scripts/test/nested-system.ts",
-  "scripts/test/cp.ts",
-  "scripts/test/broker-recovery.ts",
-  "scripts/test/client-chaos.ts",
-  "scripts/test/nested-stress.ts",
-];
-const nestedCaveats = [
-  ["scripts/test/system.test.ts", "non-snapshot paths/exec/guest-shape/network coverage runs via scripts/test/nested-system.ts; post-command snapshot and explicit snapshot restore checks remain excluded because Linux libkrun snapshot APIs return ENOSYS"],
-  ["scripts/test/virtiofs-policy.test.ts", "contains checkpoint/fork restore checks; Linux libkrun snapshot APIs return ENOSYS; Linux virtiofs write allowlist is not enforced today"],
-  ["scripts/test/page-cache.test.ts", "asserts idle snapshot completion and rootfs DAX page-cache behavior; nested Linux inner runs use block rootfs"],
-  ["scripts/test/rapid-fire.test.ts", "asserts snapshot-exit and idle snapshot behavior; Linux libkrun snapshot APIs return ENOSYS"],
-  ["scripts/test/pty-resume.test.ts", "asserts pty survives snapshot-exit; Linux libkrun snapshot APIs return ENOSYS"],
-  ["scripts/test/browser-snapshot.test.ts", "creates checkpoints/forks and is opt-in because it installs browser/compositor packages"],
-  ["scripts/test/checkpoint-fork.test.ts", "checkpoint/fork requires snapshot capture/restore; Linux libkrun snapshot APIs return ENOSYS"],
-  ["scripts/test/fork-fanout.test.ts", "checkpoint fanout requires snapshot capture/restore; Linux libkrun snapshot APIs return ENOSYS"],
-  ["scripts/test/snapshot-compat.test.ts", "directly validates snapshot restore compatibility; Linux libkrun snapshot APIs return ENOSYS"],
-  ["scripts/test/virtiofs-resume.test.ts", "open fd/mmap survival is specifically snapshot/fork restore behavior; Linux libkrun snapshot APIs return ENOSYS"],
-  ["scripts/test/dirty-fs.test.ts", "depends on checkpoint/fork rootfs snapshots; Linux libkrun snapshot APIs return ENOSYS"],
-  ["scripts/test/stress.test.ts", "parallel channel coverage runs via scripts/test/nested-stress.ts; the snapshot-waits-for-active-channels step remains excluded because Linux libkrun snapshot APIs return ENOSYS"],
-  ["scripts/test/stock-ubuntu.test.ts", "snapd panics while parsing the nested guest kernel command line under nested KVM; a nested stock boot/apt probe also hung instead of producing bounded signal"],
-  ["scripts/test/ingress.test.ts", "host-side ingress lifecycle uses macOS launchd/resolver assumptions"],
-  ["scripts/test/privileged-ingress.test.ts", "privileged host ingress uses sudo, /etc/resolver, launchd, and privileged ports"],
-];
 const fullSuite = [
   "scripts/test/system.test.ts",
   "scripts/test/cp.test.ts",
@@ -86,20 +62,126 @@ const fullSuite = [
   "scripts/test/browser-snapshot.test.ts",
   "scripts/test/privileged-ingress.test.ts",
 ];
-const nestedSuiteTestFiles = nestedSuite.map((script) => script.replace(/\.ts$/, ".test.ts"));
-const partiallyCoveredTestFiles = new Set([
-  "scripts/test/system.test.ts",
-  "scripts/test/stress.test.ts",
-]);
-const caveatedTestFiles = nestedCaveats.map(([testFile]) => testFile);
-const missingNestedDisposition = fullSuite.filter((testFile) =>
-  testFile !== "scripts/test/nested-kvm.test.ts"
-  && !nestedSuiteTestFiles.includes(testFile)
-  && !partiallyCoveredTestFiles.has(testFile)
-  && !caveatedTestFiles.includes(testFile)
+
+type NestedDisposition =
+  | { kind: "run"; testFile: string; script: string }
+  | { kind: "partial"; testFile: string; script: string; caveat: string }
+  | { kind: "caveat"; testFile: string; caveat: string }
+  | { kind: "excluded"; testFile: string; caveat: string };
+
+const nestedDispositions: NestedDisposition[] = [
+  {
+    kind: "partial",
+    testFile: "scripts/test/system.test.ts",
+    script: "scripts/test/nested-system.ts",
+    caveat: "non-snapshot paths/exec/guest-shape/network coverage runs via scripts/test/nested-system.ts; post-command snapshot and explicit snapshot restore checks remain excluded because Linux libkrun snapshot APIs return ENOSYS",
+  },
+  { kind: "run", testFile: "scripts/test/cp.test.ts", script: "scripts/test/cp.ts" },
+  {
+    kind: "caveat",
+    testFile: "scripts/test/checkpoint-fork.test.ts",
+    caveat: "checkpoint/fork requires snapshot capture/restore; Linux libkrun snapshot APIs return ENOSYS",
+  },
+  {
+    kind: "caveat",
+    testFile: "scripts/test/fork-fanout.test.ts",
+    caveat: "checkpoint fanout requires snapshot capture/restore; Linux libkrun snapshot APIs return ENOSYS",
+  },
+  {
+    kind: "caveat",
+    testFile: "scripts/test/snapshot-compat.test.ts",
+    caveat: "directly validates snapshot restore compatibility; Linux libkrun snapshot APIs return ENOSYS",
+  },
+  {
+    kind: "caveat",
+    testFile: "scripts/test/virtiofs-policy.test.ts",
+    caveat: "contains checkpoint/fork restore checks; Linux libkrun snapshot APIs return ENOSYS; Linux virtiofs write allowlist is not enforced today",
+  },
+  {
+    kind: "caveat",
+    testFile: "scripts/test/page-cache.test.ts",
+    caveat: "asserts idle snapshot completion and rootfs DAX page-cache behavior; nested Linux inner runs use block rootfs",
+  },
+  {
+    kind: "caveat",
+    testFile: "scripts/test/virtiofs-resume.test.ts",
+    caveat: "open fd/mmap survival is specifically snapshot/fork restore behavior; Linux libkrun snapshot APIs return ENOSYS",
+  },
+  {
+    kind: "excluded",
+    testFile: "scripts/test/nested-kvm.test.ts",
+    caveat: "excluded intentionally to avoid double-nested KVM",
+  },
+  {
+    kind: "caveat",
+    testFile: "scripts/test/dirty-fs.test.ts",
+    caveat: "depends on checkpoint/fork rootfs snapshots; Linux libkrun snapshot APIs return ENOSYS",
+  },
+  { kind: "run", testFile: "scripts/test/broker-recovery.test.ts", script: "scripts/test/broker-recovery.ts" },
+  { kind: "run", testFile: "scripts/test/client-chaos.test.ts", script: "scripts/test/client-chaos.ts" },
+  {
+    kind: "caveat",
+    testFile: "scripts/test/pty-resume.test.ts",
+    caveat: "asserts pty survives snapshot-exit; Linux libkrun snapshot APIs return ENOSYS",
+  },
+  {
+    kind: "partial",
+    testFile: "scripts/test/stress.test.ts",
+    script: "scripts/test/nested-stress.ts",
+    caveat: "parallel channel coverage runs via scripts/test/nested-stress.ts; the snapshot-waits-for-active-channels step remains excluded because Linux libkrun snapshot APIs return ENOSYS",
+  },
+  {
+    kind: "caveat",
+    testFile: "scripts/test/stock-ubuntu.test.ts",
+    caveat: "snapd panics while parsing the nested guest kernel command line under nested KVM; a nested stock boot/apt probe also hung instead of producing bounded signal",
+  },
+  {
+    kind: "caveat",
+    testFile: "scripts/test/ingress.test.ts",
+    caveat: "host-side ingress lifecycle uses macOS launchd/resolver assumptions",
+  },
+  {
+    kind: "caveat",
+    testFile: "scripts/test/browser-snapshot.test.ts",
+    caveat: "creates checkpoints/forks and is opt-in because it installs browser/compositor packages",
+  },
+  {
+    kind: "caveat",
+    testFile: "scripts/test/privileged-ingress.test.ts",
+    caveat: "privileged host ingress uses sudo, /etc/resolver, launchd, and privileged ports",
+  },
+];
+const nestedSuite = nestedDispositions.flatMap((entry) =>
+  entry.kind === "run" || entry.kind === "partial" ? [entry.script] : []
 );
-if (missingNestedDisposition.length > 0) {
-  throw new Error(`nested-kvm is missing suite dispositions: ${missingNestedDisposition.join(", ")}`);
+const nestedCaveats = nestedDispositions.flatMap((entry) =>
+  entry.kind === "partial" || entry.kind === "caveat" || entry.kind === "excluded"
+    ? [[entry.testFile, entry.caveat]]
+    : []
+);
+const dispositionCounts = new Map<string, number>();
+for (const entry of nestedDispositions) {
+  dispositionCounts.set(entry.testFile, (dispositionCounts.get(entry.testFile) ?? 0) + 1);
+}
+const missingNestedDisposition = fullSuite.filter((testFile) => !dispositionCounts.has(testFile));
+const duplicateNestedDisposition = [...dispositionCounts]
+  .filter(([, count]) => count !== 1)
+  .map(([testFile]) => testFile);
+const unknownNestedDisposition = [...dispositionCounts]
+  .map(([testFile]) => testFile)
+  .filter((testFile) => !fullSuite.includes(testFile));
+if (
+  missingNestedDisposition.length > 0
+  || duplicateNestedDisposition.length > 0
+  || unknownNestedDisposition.length > 0
+) {
+  throw new Error(
+    [
+      `missing: ${missingNestedDisposition.join(", ") || "none"}`,
+      `duplicate: ${duplicateNestedDisposition.join(", ") || "none"}`,
+      `unknown: ${unknownNestedDisposition.join(", ") || "none"}`,
+    ].join("; "),
+  );
 }
 const outerInstances: string[] = [];
 
