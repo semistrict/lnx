@@ -2,17 +2,16 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
 };
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
-pub fn write_from_agent(agent_path: &Path, dir: PathBuf) -> Result<(PathBuf, bool)> {
+pub fn write_from_agent(agent: &[u8], dir: PathBuf) -> Result<(PathBuf, bool)> {
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join("initramfs.cpio");
     let stamp_path = dir.join("initramfs.stamp");
-    let stamp = stamp(agent_path)?;
+    let stamp = stamp(agent);
 
     if path.exists() && stamp_path.exists() {
         if fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str()) {
@@ -20,8 +19,7 @@ pub fn write_from_agent(agent_path: &Path, dir: PathBuf) -> Result<(PathBuf, boo
         }
     }
 
-    let agent = fs::read(agent_path).with_context(|| format!("read {}", agent_path.display()))?;
-    write_agent(&agent, &path)?;
+    write_agent(agent, &path)?;
     fs::write(&stamp_path, stamp).with_context(|| format!("write {}", stamp_path.display()))?;
     Ok((path, true))
 }
@@ -39,21 +37,8 @@ fn write_agent(agent: &[u8], path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn stamp(agent_path: &Path) -> Result<String> {
-    let meta =
-        fs::metadata(agent_path).with_context(|| format!("stat {}", agent_path.display()))?;
-    let modified = meta.modified().unwrap_or(UNIX_EPOCH);
-    let modified = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
-    Ok(format!(
-        "path={}\nlen={}\nmtime_secs={}\nmtime_nanos={}\nsha256={:x}\n",
-        agent_path.display(),
-        meta.len(),
-        modified.as_secs(),
-        modified.subsec_nanos(),
-        Sha256::digest(
-            fs::read(agent_path).with_context(|| format!("read {}", agent_path.display()))?
-        )
-    ))
+fn stamp(agent: &[u8]) -> String {
+    format!("len={}\nsha256={:x}\n", agent.len(), Sha256::digest(agent))
 }
 
 fn entry(buf: &mut Vec<u8>, name: &str, data: &[u8], mode: u32) -> Result<()> {
@@ -126,11 +111,8 @@ mod tests {
     #[test]
     fn write_from_agent_creates_expected_initramfs_entries() {
         let temp = TempDir::new("initramfs-entries");
-        let agent = temp.path().join("agent");
-        fs::write(&agent, b"agent-bytes").expect("write agent");
-
         let (initrd, rebuilt) =
-            write_from_agent(&agent, temp.path().join("run")).expect("write initramfs");
+            write_from_agent(b"agent-bytes", temp.path().join("run")).expect("write initramfs");
 
         assert!(rebuilt);
         let bytes = fs::read(&initrd).expect("read initramfs");
@@ -146,20 +128,18 @@ mod tests {
     #[test]
     fn write_from_agent_reuses_cache_until_agent_changes() {
         let temp = TempDir::new("initramfs-cache");
-        let agent = temp.path().join("agent");
         let run_dir = temp.path().join("run");
-        fs::write(&agent, b"first-agent").expect("write agent");
 
-        let (initrd, rebuilt) = write_from_agent(&agent, run_dir.clone()).expect("first write");
+        let (initrd, rebuilt) =
+            write_from_agent(b"first-agent", run_dir.clone()).expect("first write");
         assert!(rebuilt);
         let first = fs::read(&initrd).expect("read first");
 
-        let (_, rebuilt) = write_from_agent(&agent, run_dir.clone()).expect("cached write");
+        let (_, rebuilt) = write_from_agent(b"first-agent", run_dir.clone()).expect("cached write");
         assert!(!rebuilt);
         assert_eq!(fs::read(&initrd).expect("read cached"), first);
 
-        fs::write(&agent, b"second-agent").expect("rewrite agent");
-        let (_, rebuilt) = write_from_agent(&agent, run_dir).expect("rewritten initramfs");
+        let (_, rebuilt) = write_from_agent(b"second-agent", run_dir).expect("rewritten initramfs");
         assert!(rebuilt);
         let second = fs::read(&initrd).expect("read second");
         assert_ne!(second, first);

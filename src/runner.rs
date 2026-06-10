@@ -125,8 +125,10 @@ pub fn run(config: RunConfig) -> Result<i32> {
     timings.install_for_libkrun();
     timings.event("dirs.ready");
 
-    let (initrd, rebuilt_initramfs) =
-        initramfs::write_from_agent(Path::new(env!("LNX_AGENT")), config.layout.run_dir.clone())?;
+    let (initrd, rebuilt_initramfs) = initramfs::write_from_agent(
+        include_bytes!(env!("LNX_AGENT")),
+        config.layout.run_dir.clone(),
+    )?;
     timings.event(if rebuilt_initramfs {
         "initramfs.rebuilt"
     } else {
