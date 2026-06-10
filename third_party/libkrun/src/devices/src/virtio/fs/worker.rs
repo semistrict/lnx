@@ -22,6 +22,7 @@ use super::null_fs::NullFs;
 #[cfg(target_os = "macos")]
 use super::passthrough::PassthroughFsSnapshot;
 use super::passthrough::{self, PassthroughFs};
+#[cfg(target_os = "macos")]
 use super::policy_fs::WritableAllowlistFs;
 use super::read_only::PassthroughFsRo;
 use super::server::Server;
@@ -29,7 +30,10 @@ use super::virtual_entry::VirtualDirEntry;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
 
 pub(crate) enum FsServer {
+    #[cfg(target_os = "macos")]
     ReadWrite(Server<AugmentFs<WritableAllowlistFs<PassthroughFs>>>),
+    #[cfg(not(target_os = "macos"))]
+    ReadWrite(Server<AugmentFs<PassthroughFs>>),
     ReadOnly(Server<AugmentFs<PassthroughFsRo>>),
     Null(Server<AugmentFs<NullFs>>),
 }
@@ -188,17 +192,30 @@ impl FsWorker {
                     virtual_entries,
                 )))
             }
-            Some(mut cfg) => {
-                let allowlist = cfg.write_allowlist.take().unwrap_or_else(|| {
-                    Arc::new(std::sync::RwLock::new(vec![std::path::PathBuf::from(".")]))
-                });
-                let inner = PassthroughFs::new(cfg, inode_alloc.clone())?;
-                let inner = WritableAllowlistFs::new(inner, allowlist);
-                FsServer::ReadWrite(Server::new(AugmentFs::new(
-                    inner,
-                    &inode_alloc,
-                    virtual_entries,
-                )))
+            Some(cfg) => {
+                #[cfg(target_os = "macos")]
+                {
+                    let mut cfg = cfg;
+                    let allowlist = cfg.write_allowlist.take().unwrap_or_else(|| {
+                        Arc::new(std::sync::RwLock::new(vec![std::path::PathBuf::from(".")]))
+                    });
+                    let inner = PassthroughFs::new(cfg, inode_alloc.clone())?;
+                    let inner = WritableAllowlistFs::new(inner, allowlist);
+                    FsServer::ReadWrite(Server::new(AugmentFs::new(
+                        inner,
+                        &inode_alloc,
+                        virtual_entries,
+                    )))
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let inner = PassthroughFs::new(cfg, inode_alloc.clone())?;
+                    FsServer::ReadWrite(Server::new(AugmentFs::new(
+                        inner,
+                        &inode_alloc,
+                        virtual_entries,
+                    )))
+                }
             }
             None => FsServer::Null(Server::new(AugmentFs::new(
                 NullFs,

@@ -44,6 +44,13 @@ impl Context {
         )
     }
 
+    pub fn set_nested_virt(&self, enabled: bool) -> Result<()> {
+        call(
+            unsafe { libkrun::krun_set_nested_virt(self.id, enabled) },
+            "krun_set_nested_virt",
+        )
+    }
+
     pub fn set_kernel(&self, kernel: &Path, initrd: Option<&Path>, cmdline: &str) -> Result<()> {
         let kernel = cstring_path(kernel)?;
         let initrd = initrd.map(cstring_path).transpose()?;
@@ -71,6 +78,14 @@ impl Context {
         call(
             unsafe { libkrun::krun_add_pmem(self.id, pmem_id.as_ptr(), rootfs.as_ptr(), false) },
             "krun_add_pmem(rootfs)",
+        )
+    }
+
+    pub fn set_root_disk(&self, rootfs: &Path) -> Result<()> {
+        let rootfs = cstring_path(rootfs)?;
+        call(
+            unsafe { libkrun::krun_set_root_disk(self.id, rootfs.as_ptr()) },
+            "krun_set_root_disk",
         )
     }
 

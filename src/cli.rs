@@ -38,6 +38,9 @@ pub struct Cli {
     #[arg(long)]
     no_snapshot_restore: bool,
 
+    #[arg(long, help = "Request nested KVM support for the guest")]
+    nested_kvm: bool,
+
     #[arg(
         long = "forward",
         value_parser = parse_port_forward,
@@ -68,6 +71,9 @@ enum Command {
     #[command(hide = true)]
     #[command(name = "_vm-init")]
     HiddenVmInit,
+    #[command(hide = true)]
+    #[command(name = "_vm-owner")]
+    HiddenVmOwner(HiddenVmOwnerArgs),
 }
 
 #[derive(Debug, Args)]
@@ -124,6 +130,15 @@ enum IngressCommand {
 }
 
 #[derive(Debug, Args)]
+struct HiddenVmOwnerArgs {
+    #[arg(long)]
+    cwd: PathBuf,
+
+    #[arg(long)]
+    restore: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct HiddenIngressArgs {
     #[arg(long)]
     spawn: bool,
@@ -148,6 +163,7 @@ impl Cli {
             memory_mib,
             snapshot: snapshot_path,
             no_snapshot_restore,
+            nested_kvm,
             forwards,
             command,
             guest_command,
@@ -167,6 +183,7 @@ impl Cli {
                 memory_mib,
                 snapshot_path,
                 no_snapshot_restore,
+                nested_kvm,
                 forwards,
                 explicit_kernel,
                 explicit_rootfs,
@@ -226,6 +243,17 @@ impl Cli {
                 )
             }
             Some(Command::HiddenVmInit) => initialize_vm_instance(layout, cpus, memory_mib),
+            Some(Command::HiddenVmOwner(args)) => runner::run_owner(runner::RunConfig {
+                layout,
+                command: Vec::new(),
+                cwd: args.cwd,
+                cpus,
+                memory_mib,
+                nested_kvm,
+                restore_snapshot: args.restore,
+                forwards,
+                snapshot_output: None,
+            }),
             None => run_guest(
                 layout,
                 guest_command,
@@ -233,6 +261,7 @@ impl Cli {
                 memory_mib,
                 snapshot_path,
                 no_snapshot_restore,
+                nested_kvm,
                 forwards,
                 explicit_kernel,
                 explicit_rootfs,
@@ -362,6 +391,7 @@ fn run_guest(
     memory_mib: u32,
     snapshot_path: Option<PathBuf>,
     no_snapshot_restore: bool,
+    nested_kvm: bool,
     forwards: Vec<runner::PortForward>,
     explicit_kernel: bool,
     explicit_rootfs: bool,
@@ -409,6 +439,7 @@ fn run_guest(
         cwd,
         cpus,
         memory_mib,
+        nested_kvm,
         restore_snapshot,
         forwards,
         snapshot_output: None,
@@ -484,6 +515,7 @@ fn initialize_vm_instance(layout: Layout, cpus: u8, memory_mib: u32) -> Result<(
         cwd,
         cpus,
         memory_mib,
+        nested_kvm: false,
         restore_snapshot: None,
         forwards: Vec::new(),
         snapshot_output: Some(layout.snapshot_dir.join("latest")),
@@ -762,6 +794,7 @@ fn create_checkpoint(
             cwd,
             cpus,
             memory_mib,
+            nested_kvm: false,
             restore_snapshot,
             forwards,
             snapshot_output: Some(path.clone()),
@@ -866,6 +899,7 @@ fn create_internal_fork_checkpoint(
             cwd,
             cpus,
             memory_mib,
+            nested_kvm: false,
             restore_snapshot,
             forwards,
             snapshot_output: Some(path.clone()),

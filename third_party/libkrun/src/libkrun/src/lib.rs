@@ -779,12 +779,15 @@ pub unsafe extern "C" fn krun_set_virtiofs_write_allowlist(
             Err(_) => return -libc::EINVAL,
         };
 
-        if let Some(vmm) = RUNNING_VMMS.lock().unwrap().get(&ctx_id).cloned() {
-            return if vmm.lock().unwrap().set_virtiofs_write_allowlist(tag, paths) {
-                KRUN_SUCCESS
-            } else {
-                -libc::ENOENT
-            };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if let Some(vmm) = RUNNING_VMMS.lock().unwrap().get(&ctx_id).cloned() {
+                return if vmm.lock().unwrap().set_virtiofs_write_allowlist(tag, paths) {
+                    KRUN_SUCCESS
+                } else {
+                    -libc::ENOENT
+                };
+            }
         }
 
         match CTX_MAP.lock().unwrap().entry(ctx_id) {

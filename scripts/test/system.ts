@@ -10,8 +10,13 @@ import {
   read,
   run,
   testStep,
+  waitForVmSuspend,
   write,
 } from "./lib";
+
+// Shorten the detached owner's idle grace period so suspend-dependent
+// assertions don't wait the full default between steps.
+Bun.env.LNX_BROKER_IDLE_TTL_MS ??= "500";
 
 const ctx = defaultContext("system");
 const copyInstance = `${ctx.instance}-copy`;
@@ -55,11 +60,13 @@ try {
     assertEq((await lnx(ctx, ["--no-snapshot-restore", "echo", "cold"])).stdout, "cold", "cold exec");
     assertFile(join(ctx.base, "vmlinuz"), "auto-init kernel");
     assertFile(join(ctx.imageDir, "rootfs.ext4"), "auto-init rootfs");
+    await waitForVmSuspend(ctx);
     assertFile(join(ctx.snapshotDir, "latest", "vmstate.bin"), "full snapshot vmstate");
     assertFile(join(ctx.snapshotDir, "latest", "pages.img"), "full snapshot pages");
     assertFile(join(ctx.snapshotDir, "latest", "rootfs.ext4"), "full snapshot rootfs");
     assertEq((await lnx(ctx, ["echo", "restored"])).stdout, "restored", "restored exec");
     assertEq((await lnx(ctx, ["run", "echo", "run-subcommand"])).stdout, "run-subcommand", "run subcommand exec");
+    await waitForVmSuspend(ctx);
     assertEq((await lnx(ctx, ["--snapshot", join(ctx.snapshotDir, "latest"), "echo", "explicit-snapshot"])).stdout, "explicit-snapshot", "explicit snapshot restore");
   });
 

@@ -2344,6 +2344,7 @@ fn attach_fs_devices(
             )
             .unwrap(),
         ));
+        #[cfg(target_os = "macos")]
         if let Some(allowlist) = &config.write_allowlist {
             fs.lock().unwrap().enable_write_allowlist(allowlist.clone());
         }

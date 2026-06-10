@@ -1,6 +1,8 @@
 import { cp, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { assertContains, assertEq, cleanupContext, defaultContext, lnx, prepareContext, run, testStep } from "./lib";
+import { assertContains, assertEq, cleanupContext, defaultContext, lnx, prepareContext, run, testStep, waitForVmSuspend } from "./lib";
+
+Bun.env.LNX_BROKER_IDLE_TTL_MS ??= "500";
 
 const ctx = defaultContext("snapshot-compat");
 const badSnapshot = join(ctx.tmpdir, "bad-memory-snapshot");
@@ -15,6 +17,7 @@ try {
       "-lc",
       "printf disk-from-snapshot | sudo tee /root/compat-disk >/dev/null; printf memory-from-snapshot | sudo tee /run/compat-memory >/dev/null",
     ]);
+    await waitForVmSuspend(ctx);
     const restored = await lnx(ctx, [
       "bash",
       "-lc",
@@ -24,6 +27,7 @@ try {
   });
 
   await testStep("mismatched snapshot header skips memory restore clearly", async () => {
+    await waitForVmSuspend(ctx);
     await cp(join(ctx.snapshotDir, "latest"), badSnapshot, { recursive: true });
     const vmstatePath = join(badSnapshot, "vmstate.bin");
     const header = Buffer.from(await readFile(vmstatePath));

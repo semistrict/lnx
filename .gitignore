@@ -13,6 +13,10 @@
 # Test artifacts
 /tmp/
 /results/**/*.json
+/.lnx-nested-debug/
+/.lnx-nested-kvm*/
+/.lnx-nk-*/
+/.lnx-snapshot-root-debug/
 
 # Nested build artifacts
 /guest-agent/target/

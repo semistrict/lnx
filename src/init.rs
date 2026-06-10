@@ -35,11 +35,13 @@ pub fn run(layout: &Layout, kernel: Option<&Path>, rootfs: Option<&Path>) -> Res
         download_kernel(&layout.kernel)?;
     }
 
-    if let Some(rootfs) = rootfs {
-        copy_if_needed(rootfs, &default_rootfs, "rootfs")?;
+    let initialized_rootfs = if let Some(rootfs) = rootfs {
+        copy_if_needed(rootfs, &layout.rootfs, "rootfs")?;
+        &layout.rootfs
     } else {
         download_release(&default_rootfs, "rootfs.ext4.zst")?;
-    }
+        &default_rootfs
+    };
 
     if rootfs.is_none() {
         ensure_rootfs_min_size(&default_rootfs, DEFAULT_ROOTFS_SIZE)?;
@@ -47,7 +49,7 @@ pub fn run(layout: &Layout, kernel: Option<&Path>, rootfs: Option<&Path>) -> Res
     }
 
     eprintln!("init: kernel {}", layout.kernel.display());
-    eprintln!("init: rootfs {}", default_rootfs.display());
+    eprintln!("init: rootfs {}", initialized_rootfs.display());
     eprintln!("init: complete");
     Ok(())
 }

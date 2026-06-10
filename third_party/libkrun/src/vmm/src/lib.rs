@@ -41,6 +41,7 @@ use std::io;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::sync::OnceLock;
@@ -362,6 +363,7 @@ impl Vmm {
         &self.guest_memory
     }
 
+    #[cfg(target_os = "macos")]
     pub fn set_virtiofs_write_allowlist(&mut self, tag: &str, paths: Vec<PathBuf>) -> bool {
         for (_, transport) in self.mmio_device_manager.virtio_transports() {
             let device = transport.lock().unwrap().device();

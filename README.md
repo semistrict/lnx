@@ -61,11 +61,14 @@ certificates are generated per `.lnx` host on first use and terminate at the
 host ingress before proxying plain HTTP/WebSocket traffic to the guest port.
 
 Memory snapshot restore defaults to `~/.lnx/images/<instance>/memory-snapshots/latest`
-and can be overridden with `--snapshot <dir>`. The guest agent asks the host to
-snapshot after each command, so the next exec restores systemd, the agent, and
-the rootfs from that point. A fresh boot writes a full memory snapshot; restored
-runs use libkrun dirty tracking and APFS clones to patch only changed RAM and
-disk blocks.
+and can be overridden with `--snapshot <dir>`. The VM runs in a detached
+`_vm-owner` process, so `lnx` exits as soon as the guest command's status
+arrives. The owner keeps the VM alive for an idle grace period (5s by default,
+`LNX_BROKER_IDLE_TTL_MS` to override) so rapid-fire commands reuse the live VM
+without a restore; once idle it asks the guest to quiesce, snapshots, and
+exits, so the next exec restores systemd, the agent, and the rootfs from that
+point. A fresh boot writes a full memory snapshot; restored runs use libkrun
+dirty tracking and APFS clones to patch only changed RAM and disk blocks.
 
 Per-run timings are appended to `~/.lnx/instances/<instance>/timings.log`.
 Incremental snapshots skip `fsync` by default for speed; set

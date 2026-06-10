@@ -43,9 +43,38 @@ export function defaultContext(name: string): TestContext {
 }
 
 export async function cleanupContext(ctx: TestContext): Promise<void> {
+  // A detached VM owner may still be in its idle grace period; wait for it so
+  // it cannot recreate directories after we remove them.
+  await waitForOwnerExit(ctx).catch(() => {});
   await rm(ctx.tmpdir, { recursive: true, force: true });
   await rm(ctx.imageDir, { recursive: true, force: true });
   await rm(ctx.runDir, { recursive: true, force: true });
+}
+
+export async function waitForOwnerExit(ctx: TestContext, timeoutMs = 30_000): Promise<void> {
+  const broker = join(ctx.runDir, "broker.sock");
+  const lock = join(ctx.runDir, "bootstrap.lock.d");
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!existsSync(broker) && !existsSync(lock)) {
+      return;
+    }
+    await sleep(100);
+  }
+  throw new Error(`timeout waiting for VM owner exit (broker.sock or bootstrap.lock.d remains)`);
+}
+
+export async function waitForVmSuspend(ctx: TestContext, timeoutMs = 60_000): Promise<void> {
+  const vmstate = join(ctx.snapshotDir, "latest", "vmstate.bin");
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(vmstate)) {
+      await waitForOwnerExit(ctx, deadline - Date.now());
+      return;
+    }
+    await sleep(100);
+  }
+  throw new Error(`timeout waiting for VM suspend (missing ${vmstate})`);
 }
 
 export async function cleanupInstance(ctx: TestContext, instance: string): Promise<void> {

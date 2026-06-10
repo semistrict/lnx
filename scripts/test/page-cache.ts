@@ -1,7 +1,9 @@
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { assertEq, cleanupContext, defaultContext, lnx, prepareContext, testStep } from "./lib";
+import { assertEq, cleanupContext, defaultContext, lnx, prepareContext, testStep, waitForVmSuspend } from "./lib";
+
+Bun.env.LNX_BROKER_IDLE_TTL_MS ??= "500";
 
 const ctx = defaultContext("page-cache");
 const cwd = join(ctx.repoRoot, ".lnx-page-cache");
@@ -99,6 +101,7 @@ PY
     }
     assertEq(result.stdout.includes("virtiofs_sum="), true, "virtiofs file was read");
     assertEq(result.stdout.includes("local_sum="), true, "local file was read");
+    await waitForVmSuspend(ctx);
     const log = await Bun.file(join(ctx.runDir, "lnx.log")).text();
     assertEq(log.includes("snapshot.error"), false, "exit snapshot succeeded");
     assertEq(log.includes("snapshot.done"), true, "exit snapshot completed");

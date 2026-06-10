@@ -173,17 +173,11 @@ fn log(msg: &str) {
     let _ = fs::write("/dev/kmsg", format!("lnx-agent: {msg}\n"));
 }
 
-fn cstr(bytes: &'static [u8]) -> *const c_char {
+fn cstr(bytes: &[u8]) -> *const c_char {
     bytes.as_ptr() as *const c_char
 }
 
-fn mount_fs(
-    source: &'static [u8],
-    target: &'static [u8],
-    fstype: &'static [u8],
-    flags: c_ulong,
-    data: &'static [u8],
-) {
+fn mount_fs(source: &[u8], target: &[u8], fstype: &[u8], flags: c_ulong, data: &[u8]) {
     let data_ptr = if data.is_empty() {
         ptr::null()
     } else {
@@ -345,15 +339,23 @@ fn init_mode() -> ! {
             ptr::null(),
         )
     };
-    if !wait_for_path("/dev/pmem0") {
-        log("timed out waiting for /dev/pmem0");
+    let root_device = env::var("LNX_ROOT_DEVICE").unwrap_or_else(|_| "/dev/pmem0".to_string());
+    if !wait_for_path(&root_device) {
+        log(&format!("timed out waiting for {root_device}"));
     }
+    let root_device =
+        CString::new(root_device).unwrap_or_else(|_| CString::new("/dev/pmem0").unwrap());
+    let root_options = if root_device.as_bytes() == b"/dev/pmem0" {
+        b"errors=continue,dax\0".as_slice()
+    } else {
+        b"errors=continue\0".as_slice()
+    };
     mount_fs(
-        b"/dev/pmem0\0",
+        root_device.as_bytes_with_nul(),
         b"/newroot\0",
         b"ext4\0",
         0,
-        b"errors=continue,dax\0",
+        root_options,
     );
     mount_host_shares();
 
@@ -914,6 +916,10 @@ fn drop_to_exec_user(uid: u32, gid: u32) {
     }
 }
 
+fn allow_nested_kvm_for_exec_user() {
+    let _ = fs::set_permissions("/dev/kvm", fs::Permissions::from_mode(0o666));
+}
+
 fn exec_failed(arg0: *const c_char) -> ! {
     unsafe {
         let msg = CStr::from_ptr(arg0).to_bytes();
@@ -1004,6 +1010,7 @@ fn run_channel_pty(
     rx: mpsc::Receiver<ChannelInput>,
 ) {
     ensure_exec_user(uid, gid);
+    allow_nested_kvm_for_exec_user();
     let mut pty_master = -1;
     let mut pty_slave = -1;
     let control_socket = channel_control_socket(channel_id);
@@ -1201,6 +1208,7 @@ fn run_channel_pipe(
     rx: mpsc::Receiver<ChannelInput>,
 ) {
     ensure_exec_user(uid, gid);
+    allow_nested_kvm_for_exec_user();
     let control_socket = channel_control_socket(channel_id);
     let mut stdin_pipe = [-1; 2];
     let mut stdout_pipe = [-1; 2];

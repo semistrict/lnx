@@ -18,6 +18,7 @@ use std::{
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
 use lnx_protocol::{MAX_MESSAGE_SIZE, Message, PROTOCOL_VERSION};
@@ -30,7 +31,14 @@ const CONTROL_PORT: u32 = 10242;
 const FRAME_SNAPSHOT: u8 = b'K';
 const INTERRUPT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const DEFAULT_BROKER_IDLE_TTL: Duration = Duration::ZERO;
+const DEFAULT_OWNER_IDLE_TTL: Duration = Duration::from_secs(5);
+// The detached owner counts idle time from broker start, so a TTL shorter than
+// the client's connect retry interval would suspend the VM before the client
+// that spawned it ever connects.
+const MIN_OWNER_IDLE_TTL: Duration = Duration::from_millis(250);
+const OWNER_BOOT_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_AGENT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(90);
+const ROOTFS_BACKEND_ENV: &str = "LNX_ROOTFS_BACKEND";
 
 static SIGNAL_INIT: Once = Once::new();
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -46,6 +54,7 @@ pub struct RunConfig {
     pub cwd: PathBuf,
     pub cpus: u8,
     pub memory_mib: u32,
+    pub nested_kvm: bool,
     pub restore_snapshot: Option<PathBuf>,
     pub forwards: Vec<PortForward>,
     pub snapshot_output: Option<PathBuf>,
@@ -90,9 +99,82 @@ pub fn run(config: RunConfig) -> Result<i32> {
     if let Some(status) =
         run_existing_broker_client(&broker_socket, &config.command, &config.cwd, Some(&run_log))?
     {
+        run_log.line(format!("run.done status={status}"));
         return Ok(status);
     }
+    if config.snapshot_output.is_some() {
+        // Checkpoint and vm-init runs need the snapshot written before they
+        // return, so they keep the VM in the foreground.
+        return run_foreground(config, run_log, broker_socket);
+    }
 
+    let mut owner = spawn_owner_process(&config, &run_log)?;
+    let status = match run_broker_client_awaiting_owner(
+        &broker_socket,
+        &config.command,
+        &config.cwd,
+        &mut owner,
+        &config.layout,
+        &run_log,
+    ) {
+        Ok(status) => status,
+        Err(e) => {
+            run_log.line(format!("client.error {e:#}"));
+            return Err(e);
+        }
+    };
+    run_log.line(format!("run.done status={status}"));
+    Ok(status)
+}
+
+pub fn run_owner(config: RunConfig) -> Result<()> {
+    fs::create_dir_all(&config.layout.run_dir)
+        .with_context(|| format!("create {}", config.layout.run_dir.display()))?;
+    fs::create_dir_all(&config.layout.snapshot_dir)
+        .with_context(|| format!("create {}", config.layout.snapshot_dir.display()))?;
+    let run_log = Arc::new(RunLog::open(&config.layout)?);
+    run_log.line(format!(
+        "owner.start pid={} instance={} cwd={} restore={}",
+        std::process::id(),
+        config.layout.instance,
+        config.cwd.display(),
+        config
+            .restore_snapshot
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "false".to_string())
+    ));
+    let broker_socket = config.layout.run_dir.join("broker.sock");
+    let Some(bootstrap_lock) = acquire_bootstrap_for_owner(
+        &config.layout.run_dir.join("bootstrap.lock.d"),
+        &broker_socket,
+        &run_log,
+    )?
+    else {
+        run_log.line("owner.exit reason=existing_broker");
+        return Ok(());
+    };
+    if broker_socket.exists() {
+        run_log.line(format!(
+            "broker.stale_socket.remove path={}",
+            broker_socket.display()
+        ));
+        let _ = fs::remove_file(&broker_socket);
+    }
+
+    let idle = IdlePolicy {
+        ttl: owner_idle_ttl(),
+        starts_idle: true,
+    };
+    let vm = start_vm(&config, &run_log, &broker_socket, idle)?;
+    let _ = vm.owner.join();
+    run_log.line("owner.done");
+    drop(vm.network);
+    drop(bootstrap_lock);
+    Ok(())
+}
+
+fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBuf) -> Result<i32> {
     let bootstrap_lock = match acquire_bootstrap_or_run_client(
         &config.layout.run_dir.join("bootstrap.lock.d"),
         &broker_socket,
@@ -117,6 +199,75 @@ pub fn run(config: RunConfig) -> Result<i32> {
         let _ = fs::remove_file(&broker_socket);
     }
 
+    let vm = start_vm(
+        &config,
+        &run_log,
+        &broker_socket,
+        IdlePolicy {
+            ttl: broker_idle_ttl(),
+            starts_idle: false,
+        },
+    )?;
+    let status = match run_broker_client_retry(
+        &broker_socket,
+        &config.command,
+        &config.cwd,
+        Duration::from_secs(5),
+    )
+    .with_context(|| console_hint(&config.layout.console_log))
+    {
+        Ok(status) => status,
+        Err(e) => {
+            vm.timings.event(&format!("restore.client.error {e:#}"));
+            run_log.line(format!("client.error {e:#}"));
+            log_console_tail(&run_log, &config.layout.console_log);
+            return Err(e);
+        }
+    };
+    let _ = vm.owner.join();
+    vm.timings.event(&format!("run.done status={status}"));
+    run_log.line(format!("run.done status={status}"));
+    drop(vm.network);
+    drop(bootstrap_lock);
+    Ok(status)
+}
+
+struct VmHandles {
+    owner: thread::JoinHandle<()>,
+    network: Gvproxy,
+    timings: Arc<TimingLog>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RootfsBackend {
+    Pmem,
+    Block,
+}
+
+impl RootfsBackend {
+    fn from_env(value: Option<String>) -> Result<Self> {
+        match value.as_deref() {
+            None | Some("") | Some("pmem") => Ok(Self::Pmem),
+            Some("block") => Ok(Self::Block),
+            Some(value) => {
+                bail!("{ROOTFS_BACKEND_ENV} must be either 'pmem' or 'block', got {value:?}")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct IdlePolicy {
+    ttl: Duration,
+    starts_idle: bool,
+}
+
+fn start_vm(
+    config: &RunConfig,
+    run_log: &Arc<RunLog>,
+    broker_socket: &Path,
+    idle: IdlePolicy,
+) -> Result<VmHandles> {
     let timings = Arc::new(TimingLog::open(
         &config.layout,
         &config.command,
@@ -201,27 +352,44 @@ pub fn run(config: RunConfig) -> Result<i32> {
     let ctx = Arc::new(KrunContext::create()?);
     ctx.set_console_output(&config.layout.console_log)?;
     ctx.set_vm_config(config.cpus, config.memory_mib)?;
+    if config.nested_kvm {
+        ctx.set_nested_virt(true)?;
+    }
     let rootfs = requested_restore_snapshot
         .as_ref()
         .map(|snapshot| snapshot.join("rootfs.ext4"))
         .filter(|path| path.exists())
         .unwrap_or_else(|| config.layout.rootfs.clone());
     log_file_summary(&run_log, "rootfs.selected", &rootfs);
-    ctx.add_root_pmem(&rootfs)?;
-    let host_home = dirs::home_dir().context("host home directory")?;
+    let rootfs_backend = RootfsBackend::from_env(std::env::var(ROOTFS_BACKEND_ENV).ok())?;
+    let root_device = match rootfs_backend {
+        RootfsBackend::Pmem => {
+            ctx.add_root_pmem(&rootfs)?;
+            "/dev/pmem0"
+        }
+        RootfsBackend::Block => {
+            ctx.set_root_disk(&rootfs)?;
+            "/dev/vda"
+        }
+    };
+    let host_home = host_home_for_cwd(&config.cwd)?;
     let guest_home = guest_home(&host_home);
     let guest_cwd = guest_cwd(&config.cwd, &host_home);
     ctx.add_policy_virtiofs("home", &host_home)?;
-    ctx.set_virtiofs_write_allowlist("home", &home_write_allowlist(&config.cwd, &host_home))?;
+    set_home_write_allowlist(ctx.as_ref(), &config.cwd, &host_home)?;
     let outside_home_cwd = (!config.cwd.starts_with(&host_home)).then(|| config.cwd.clone());
     if let Some(cwd) = &outside_home_cwd {
         ctx.add_virtiofs("cwd", cwd, false)?;
     }
-    ctx.set_kernel(
-        &config.layout.kernel,
-        Some(&initrd),
-        "console=hvc0 reboot=k panic=1 root=/dev/pmem0 rw rootfstype=ext4 rootflags=dax",
-    )?;
+    let mut kernel_cmdline =
+        format!("console=hvc0 reboot=k panic=1 root={root_device} rw rootfstype=ext4");
+    if matches!(rootfs_backend, RootfsBackend::Pmem) {
+        kernel_cmdline.push_str(" rootflags=dax");
+    }
+    if config.nested_kvm {
+        kernel_cmdline.push_str(" kvm.allow_unsafe_mappings=1");
+    }
+    ctx.set_kernel(&config.layout.kernel, Some(&initrd), &kernel_cmdline)?;
     ctx.add_vsock_connector(AGENT_PORT, &socket)?;
     ctx.add_vsock_connector(SNAPSHOT_PORT, &snapshot_socket)?;
     ctx.add_vsock_connector(CONTROL_PORT, &control_socket)?;
@@ -249,6 +417,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
             "container=lnx".to_string(),
             format!("LNX_HOST_UNIX_SECS={now}"),
+            format!("LNX_ROOT_DEVICE={root_device}"),
             format!("LNX_VIRTIOFS_HOME={guest_home}"),
             outside_home_cwd
                 .as_ref()
@@ -293,11 +462,12 @@ pub fn run(config: RunConfig) -> Result<i32> {
         snapshot_listener,
         control_listener,
         broker_listener,
-        broker_socket.clone(),
+        broker_socket.to_path_buf(),
         initramfs_stamp,
         restore_snapshot,
         config.forwards.clone(),
         host_home,
+        idle,
         Arc::clone(&timings),
         Arc::clone(&run_log),
         vm_error_rx,
@@ -310,42 +480,16 @@ pub fn run(config: RunConfig) -> Result<i32> {
             log_console_tail(&run_log, &config.layout.console_log);
             cleanup_runtime_sockets(
                 &run_log,
-                &[&broker_socket, &socket, &snapshot_socket, &control_socket],
+                &[broker_socket, &socket, &snapshot_socket, &control_socket],
             );
             return Err(e);
         }
     };
-    let status = match run_broker_client_retry(
-        &broker_socket,
-        &config.command,
-        &config.cwd,
-        Duration::from_secs(5),
-    )
-    .with_context(|| console_hint(&config.layout.console_log))
-    {
-        Ok(status) => status,
-        Err(e) => {
-            timings.event(&format!("restore.client.error {e:#}"));
-            run_log.line(format!("client.error {e:#}"));
-            log_console_tail(&run_log, &config.layout.console_log);
-            return Err(e);
-        }
-    };
-    let _ = owner.join();
-    let result = Ok(status);
-    match &result {
-        Ok(status) => {
-            timings.event(&format!("run.done status={status}"));
-            run_log.line(format!("run.done status={status}"));
-        }
-        Err(e) => {
-            timings.event(&format!("run.error {e:#}"));
-            run_log.line(format!("run.error {e:#}"));
-        }
-    }
-    drop(network);
-    drop(bootstrap_lock);
-    result
+    Ok(VmHandles {
+        owner,
+        network,
+        timings,
+    })
 }
 
 pub fn seed_checkpoint_from_base(
@@ -1073,7 +1217,7 @@ pub(crate) fn connect_broker(socket: &Path) -> Result<UnixStream> {
 fn run_broker_session(mut stream: UnixStream, command: &[String], cwd: &Path) -> Result<i32> {
     INTERRUPTED.store(false, Ordering::SeqCst);
     let channel_id = new_request_id()?;
-    let host_home = dirs::home_dir().context("host home directory")?;
+    let host_home = host_home_for_cwd(cwd)?;
     let use_pty = should_request_pty();
     let raw_mode = if use_pty { RawTerminal::enter() } else { None };
     let (term, colorterm, rows, cols) = if use_pty {
@@ -1294,6 +1438,7 @@ fn run_broker_owner(
     restore_snapshot: Option<PathBuf>,
     forwards: Vec<PortForward>,
     host_home: PathBuf,
+    idle: IdlePolicy,
     timings: Arc<TimingLog>,
     run_log: Arc<RunLog>,
     vm_error_rx: mpsc::Receiver<i32>,
@@ -1332,7 +1477,7 @@ fn run_broker_owner(
     let (snapshot_exit_tx, snapshot_exit_rx) = mpsc::channel::<u64>();
     let client_senders = Arc::new(Mutex::new(HashMap::<u64, BrokerChannel>::new()));
     let active = Arc::new(AtomicUsize::new(0));
-    let seen_active = Arc::new(AtomicBool::new(false));
+    let seen_active = Arc::new(AtomicBool::new(idle.starts_idle));
 
     let mut agent_writer = agent_stream
         .try_clone()
@@ -1404,7 +1549,7 @@ fn run_broker_owner(
     let owner_timings = Arc::clone(&timings);
     let owner_log = Arc::clone(&run_log);
     let force_full_snapshot = restore_snapshot.is_none();
-    let broker_idle_ttl = broker_idle_ttl();
+    let broker_idle_ttl = idle.ttl;
     for forward in forwards {
         start_forward_listener(
             forward,
@@ -1429,7 +1574,9 @@ fn run_broker_owner(
                     owner_log.line("broker.client.accepted");
                     let tx = agent_tx.clone();
                     let clients = Arc::clone(&client_senders);
-                    let active = Arc::clone(&active);
+                    // Reserve at accept time so the idle grace period cannot
+                    // expire between a client connecting and its first message.
+                    let reservation = ActiveReservation::new(Arc::clone(&active));
                     let seen = Arc::clone(&seen_active);
                     let checkpoint_tx = checkpoint_tx.clone();
                     let client_log = Arc::clone(&owner_log);
@@ -1441,7 +1588,7 @@ fn run_broker_owner(
                             tx,
                             checkpoint_tx,
                             clients,
-                            active,
+                            reservation,
                             seen,
                             client_ctx,
                             client_host_home,
@@ -1561,6 +1708,160 @@ fn broker_idle_ttl_from_env(value: Option<&str>) -> Duration {
         .unwrap_or(DEFAULT_BROKER_IDLE_TTL)
 }
 
+fn owner_idle_ttl() -> Duration {
+    owner_idle_ttl_from_env(std::env::var("LNX_BROKER_IDLE_TTL_MS").ok().as_deref())
+}
+
+fn owner_idle_ttl_from_env(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_OWNER_IDLE_TTL)
+        .max(MIN_OWNER_IDLE_TTL)
+}
+
+fn forward_spec(forward: &PortForward) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        forward.listen_host, forward.listen_port, forward.guest_host, forward.guest_port
+    )
+}
+
+fn spawn_owner_process(config: &RunConfig, run_log: &RunLog) -> Result<Child> {
+    let exe = std::env::current_exe().context("current executable")?;
+    let log_path = config.layout.run_dir.join("owner.log");
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open {}", log_path.display()))?;
+    let mut command = Command::new(exe);
+    command
+        .arg("--instance")
+        .arg(&config.layout.instance)
+        .arg("--kernel")
+        .arg(&config.layout.kernel)
+        .arg("--rootfs")
+        .arg(&config.layout.rootfs)
+        .arg("--cpus")
+        .arg(config.cpus.to_string())
+        .arg("--memory-mib")
+        .arg(config.memory_mib.to_string());
+    if config.nested_kvm {
+        command.arg("--nested-kvm");
+    }
+    for forward in &config.forwards {
+        command.arg("--forward").arg(forward_spec(forward));
+    }
+    command.arg("_vm-owner").arg("--cwd").arg(&config.cwd);
+    if let Some(snapshot) = &config.restore_snapshot {
+        command.arg("--restore").arg(snapshot);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().context("clone owner log handle")?)
+        .stderr(log)
+        .process_group(0);
+    let child = command.spawn().context("spawn lnx _vm-owner")?;
+    run_log.line(format!("owner.spawned pid={}", child.id()));
+    Ok(child)
+}
+
+fn run_broker_client_awaiting_owner(
+    socket: &Path,
+    command: &[String],
+    cwd: &Path,
+    owner: &mut Child,
+    layout: &Layout,
+    run_log: &RunLog,
+) -> Result<i32> {
+    let deadline = Instant::now() + OWNER_BOOT_TIMEOUT;
+    let mut last = None;
+    while Instant::now() < deadline {
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            return Ok(130);
+        }
+        match connect_broker(socket) {
+            Ok(stream) => return run_broker_session(stream, command, cwd),
+            Err(e) => last = Some(e),
+        }
+        if let Some(status) = owner.try_wait().context("check lnx _vm-owner")? {
+            // An owner that exits zero lost the bootstrap race to another
+            // owner, so keep retrying until that one's broker comes up.
+            if !status.success() {
+                run_log.line(format!("owner.exited.early status={status}"));
+                bail!(
+                    "lnx VM owner exited with {status} before the broker came up{}{}",
+                    owner_log_hint(layout),
+                    console_hint(&layout.console_log)
+                );
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    match last {
+        Some(e) => Err(e).with_context(|| {
+            format!(
+                "timed out waiting for the lnx VM owner broker{}",
+                console_hint(&layout.console_log)
+            )
+        }),
+        None => bail!("timed out waiting for the lnx VM owner broker"),
+    }
+}
+
+fn acquire_bootstrap_for_owner(
+    lock_path: &Path,
+    broker_socket: &Path,
+    run_log: &RunLog,
+) -> Result<Option<BootstrapLock>> {
+    let start = Instant::now();
+    let mut logged_wait = false;
+    loop {
+        if let Some(lock) = BootstrapLock::try_acquire(lock_path)? {
+            run_log.line(format!(
+                "owner.bootstrap.lock.acquired path={}",
+                lock_path.display()
+            ));
+            return Ok(Some(lock));
+        }
+        if !logged_wait {
+            run_log.line(format!(
+                "owner.bootstrap.lock.busy path={}",
+                lock_path.display()
+            ));
+            logged_wait = true;
+        }
+        if connect_broker(broker_socket).is_ok() {
+            return Ok(None);
+        }
+        if start.elapsed() > Duration::from_secs(120) {
+            run_log.line(format!(
+                "owner.bootstrap.lock.timeout path={}",
+                lock_path.display()
+            ));
+            bail!("timed out waiting for {}", lock_path.display());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn owner_log_hint(layout: &Layout) -> String {
+    let path = layout.run_dir.join("owner.log");
+    let Ok(bytes) = fs::read(&path) else {
+        return String::new();
+    };
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let start = bytes.len().saturating_sub(2048);
+    format!(
+        "\n\nVM owner log ({}):\n{}",
+        path.display(),
+        String::from_utf8_lossy(&bytes[start..]).trim_end()
+    )
+}
+
 fn agent_accept_timeout_from_env(value: Option<String>) -> Duration {
     value
         .and_then(|value| value.parse::<u64>().ok())
@@ -1573,7 +1874,7 @@ fn handle_broker_client(
     agent_tx: mpsc::Sender<Message>,
     checkpoint_tx: mpsc::Sender<CheckpointRequest>,
     clients: Arc<Mutex<HashMap<u64, BrokerChannel>>>,
-    active: Arc<AtomicUsize>,
+    mut active_reservation: ActiveReservation,
     seen_active: Arc<AtomicBool>,
     ctx: Arc<KrunContext>,
     host_home: PathBuf,
@@ -1617,12 +1918,8 @@ fn handle_broker_client(
         _ => bail!("client did not open a channel"),
     };
     if let Message::OpenExec { cwd, .. } = &first {
-        ctx.set_virtiofs_write_allowlist(
-            "home",
-            &home_write_allowlist(Path::new(cwd), &host_home),
-        )?;
+        set_home_write_allowlist(ctx.as_ref(), Path::new(cwd), &host_home)?;
     }
-    let mut active_reservation = ActiveReservation::new(Arc::clone(&active));
     seen_active.store(true, Ordering::SeqCst);
     let (to_client_tx, to_client_rx) = mpsc::channel::<Message>();
     clients
@@ -1949,14 +2246,13 @@ fn terminal_size() -> (u16, u16) {
         ws_ypixel: u16,
     }
 
-    const TIOCGWINSZ: libc::c_ulong = 0x40087468;
     let mut size = Winsize {
         ws_row: 0,
         ws_col: 0,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    let rc = unsafe { libc::ioctl(std::io::stdin().as_raw_fd(), TIOCGWINSZ, &mut size) };
+    let rc = unsafe { libc::ioctl(std::io::stdin().as_raw_fd(), libc::TIOCGWINSZ, &mut size) };
     let rows = if rc == 0 && size.ws_row > 0 {
         size.ws_row
     } else {
@@ -2022,6 +2318,21 @@ fn guest_home(host_home: &Path) -> String {
     host_home.to_string_lossy().into_owned()
 }
 
+fn host_home_for_cwd(cwd: &Path) -> Result<PathBuf> {
+    let mut components = cwd.components();
+    if matches!(components.next(), Some(std::path::Component::RootDir))
+        && matches!(
+            components.next().and_then(|c| c.as_os_str().to_str()),
+            Some("Users")
+        )
+    {
+        if let Some(user) = components.next() {
+            return Ok(PathBuf::from("/Users").join(user.as_os_str()));
+        }
+    }
+    dirs::home_dir().context("host home directory")
+}
+
 fn guest_cwd(cwd: &Path, host_home: &Path) -> String {
     if cwd.starts_with(host_home) {
         cwd.to_string_lossy().into_owned()
@@ -2039,6 +2350,16 @@ fn home_write_allowlist(cwd: &Path, host_home: &Path) -> Vec<String> {
     } else {
         vec![relative.to_string_lossy().into_owned()]
     }
+}
+
+#[cfg(target_os = "macos")]
+fn set_home_write_allowlist(ctx: &KrunContext, cwd: &Path, host_home: &Path) -> Result<()> {
+    ctx.set_virtiofs_write_allowlist("home", &home_write_allowlist(cwd, host_home))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_home_write_allowlist(_ctx: &KrunContext, _cwd: &Path, _host_home: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn serve_snapshot(
@@ -2405,6 +2726,60 @@ mod tests {
     }
 
     #[test]
+    fn owner_idle_ttl_defaults_to_five_second_grace() {
+        assert_eq!(owner_idle_ttl_from_env(None), Duration::from_secs(5));
+        assert_eq!(
+            owner_idle_ttl_from_env(Some("nope")),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn owner_idle_ttl_reads_env_but_clamps_to_minimum() {
+        assert_eq!(
+            owner_idle_ttl_from_env(Some("30000")),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            owner_idle_ttl_from_env(Some("0")),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn rootfs_backend_defaults_to_pmem() {
+        assert_eq!(RootfsBackend::from_env(None).unwrap(), RootfsBackend::Pmem);
+        assert_eq!(
+            RootfsBackend::from_env(Some(String::new())).unwrap(),
+            RootfsBackend::Pmem
+        );
+    }
+
+    #[test]
+    fn rootfs_backend_accepts_block() {
+        assert_eq!(
+            RootfsBackend::from_env(Some("block".to_string())).unwrap(),
+            RootfsBackend::Block
+        );
+    }
+
+    #[test]
+    fn rootfs_backend_rejects_unknown_values() {
+        assert!(RootfsBackend::from_env(Some("virtiofs".to_string())).is_err());
+    }
+
+    #[test]
+    fn forward_spec_round_trips_the_cli_format() {
+        let forward = PortForward {
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: 16081,
+            guest_host: "localhost".to_string(),
+            guest_port: 6080,
+        };
+        assert_eq!(forward_spec(&forward), "127.0.0.1:16081:localhost:6080");
+    }
+
+    #[test]
     fn guest_cwd_uses_host_path_under_home() {
         assert_eq!(
             guest_cwd(Path::new("/Users/ramon/src/lnx"), Path::new("/Users/ramon")),
@@ -2417,6 +2792,14 @@ mod tests {
         assert_eq!(
             guest_cwd(Path::new("/tmp/build"), Path::new("/Users/ramon")),
             "/tmp/build"
+        );
+    }
+
+    #[test]
+    fn host_home_for_cwd_uses_mounted_macos_home() {
+        assert_eq!(
+            host_home_for_cwd(Path::new("/Users/ramon/src/lnx")).unwrap(),
+            PathBuf::from("/Users/ramon")
         );
     }
 

@@ -2,6 +2,7 @@
 use crossbeam_channel::Sender;
 use std::cmp;
 use std::io::Write;
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -79,6 +80,7 @@ impl Fs {
 
         let fs_cfg = shared_dir.map(|root_dir| passthrough::Config {
             root_dir,
+            #[cfg(target_os = "macos")]
             write_allowlist: None,
             ..Default::default()
         });
@@ -115,6 +117,7 @@ impl Fs {
         String::from_utf8_lossy(&self.config.tag[..end]).into_owned()
     }
 
+    #[cfg(target_os = "macos")]
     pub fn set_write_allowlist(&mut self, paths: Vec<PathBuf>) -> bool {
         let Some(cfg) = self.passthrough_cfg.as_mut() else {
             return false;
@@ -126,6 +129,7 @@ impl Fs {
         true
     }
 
+    #[cfg(target_os = "macos")]
     pub fn enable_write_allowlist(
         &mut self,
         allowlist: Arc<std::sync::RwLock<Vec<PathBuf>>>,
