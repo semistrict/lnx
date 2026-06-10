@@ -26,6 +26,8 @@ use std::thread;
 #[cfg(target_arch = "x86_64")]
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 
 #[cfg(feature = "amd-sev")]
@@ -57,6 +59,12 @@ use kvm_bindings::{
 use kvm_bindings::{KVM_CAP_EXIT_HYPERCALL, KVM_MEMORY_EXIT_FLAG_PRIVATE, kvm_enable_cap};
 #[cfg(not(target_arch = "riscv64"))]
 use kvm_bindings::{KVM_MEMORY_ATTRIBUTE_PRIVATE, kvm_memory_attributes};
+#[cfg(target_arch = "aarch64")]
+use kvm_bindings::{
+    KVM_REG_SIZE_MASK, KVM_REG_SIZE_U8, KVM_REG_SIZE_U16, KVM_REG_SIZE_U32, KVM_REG_SIZE_U64,
+    KVM_REG_SIZE_U128, KVM_REG_SIZE_U256, KVM_REG_SIZE_U512, KVM_REG_SIZE_U1024,
+    KVM_REG_SIZE_U2048, RegList,
+};
 use kvm_ioctls::{Cap::*, *};
 use utils::eventfd::EventFd;
 use utils::signal::{Killable, register_signal_handler, sigrtmin};
@@ -895,6 +903,7 @@ impl Vm {
 #[allow(unused)]
 #[cfg(target_arch = "x86_64")]
 /// Structure holding VM kvm state.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VmState {
     pitstate: kvm_pit_state2,
     clock: kvm_clock_data,
@@ -1425,6 +1434,39 @@ impl Vcpu {
         Ok(())
     }
 
+    #[allow(unused)]
+    #[cfg(target_arch = "aarch64")]
+    fn save_state(&self) -> Result<VcpuState> {
+        let mut reg_list = RegList::new(1).map_err(|_| Error::VcpuUnhandledKvmExit)?;
+        let _ = self.fd.get_reg_list(&mut reg_list);
+        let count = unsafe { reg_list.as_mut_fam_struct() }.n as usize;
+        let mut reg_list = RegList::new(count).map_err(|_| Error::VcpuUnhandledKvmExit)?;
+        self.fd.get_reg_list(&mut reg_list).map_err(Error::VcpuFd)?;
+
+        let mut regs = Vec::with_capacity(count);
+        for reg_id in reg_list.as_slice() {
+            let size = one_reg_size(*reg_id)?;
+            let mut value = vec![0; size];
+            self.fd
+                .get_one_reg(*reg_id, &mut value)
+                .map_err(Error::VcpuFd)?;
+            regs.push(Aarch64OneReg { id: *reg_id, value });
+        }
+        regs.sort_by_key(|reg| reg.id);
+        Ok(VcpuState { regs })
+    }
+
+    #[allow(unused)]
+    #[cfg(target_arch = "aarch64")]
+    fn restore_state(&self, state: VcpuState) -> Result<()> {
+        for reg in state.regs {
+            self.fd
+                .set_one_reg(reg.id, &reg.value)
+                .map_err(Error::VcpuFd)?;
+        }
+        Ok(())
+    }
+
     /// Runs the vCPU in KVM context and handles the kvm exit reason.
     ///
     /// Returns error or enum specifying whether emulation was handled or interrupted.
@@ -1610,10 +1652,18 @@ impl Vcpu {
         match self.event_receiver.try_recv() {
             // Running ---- Pause ----> Paused
             Ok(VcpuEvent::Pause) => {
-                // Nothing special to do.
-                self.response_sender
-                    .send(VcpuResponse::Paused)
-                    .expect("failed to send pause status");
+                match self.save_state().and_then(|state| {
+                    bincode::serialize(&state).map_err(|_| Error::VcpuUnhandledKvmExit)
+                }) {
+                    Ok(bytes) => self
+                        .response_sender
+                        .send(VcpuResponse::Paused(bytes))
+                        .expect("failed to send pause status"),
+                    Err(e) => self
+                        .response_sender
+                        .send(VcpuResponse::Error(format!("save vcpu state: {e}")))
+                        .expect("failed to send pause error"),
+                }
 
                 // TODO: we should call `KVM_KVMCLOCK_CTRL` here to make sure
                 // TODO continued: the guest soft lockup watchdog does not panic on Resume.
@@ -1625,6 +1675,11 @@ impl Vcpu {
                 self.response_sender
                     .send(VcpuResponse::Resumed)
                     .expect("failed to send resume status");
+            }
+            Ok(VcpuEvent::RestoreState(_)) => {
+                self.response_sender
+                    .send(VcpuResponse::Error("not paused".into()))
+                    .expect("failed to send restore error");
             }
             // Unhandled exit of the other end.
             Err(TryRecvError::Disconnected) => {
@@ -1649,6 +1704,22 @@ impl Vcpu {
                     .expect("failed to send resume status");
                 // Move to 'running' state.
                 StateMachine::next(Self::running)
+            }
+            Ok(VcpuEvent::RestoreState(bytes)) => {
+                let result = bincode::deserialize::<VcpuState>(&bytes)
+                    .map_err(|_| Error::VcpuUnhandledKvmExit)
+                    .and_then(|state| self.restore_state(state));
+                match result {
+                    Ok(()) => self
+                        .response_sender
+                        .send(VcpuResponse::Restored)
+                        .expect("failed to send restore status"),
+                    Err(e) => self
+                        .response_sender
+                        .send(VcpuResponse::Error(format!("restore vcpu state: {e}")))
+                        .expect("failed to send restore error"),
+                }
+                StateMachine::next(Self::paused)
             }
             // All other events have no effect on current 'paused' state.
             Ok(_) => StateMachine::next(Self::paused),
@@ -1710,6 +1781,7 @@ impl Drop for Vcpu {
 
 #[cfg(target_arch = "x86_64")]
 /// Structure holding VCPU kvm state.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VcpuState {
     cpuid: CpuId,
     msrs: Msrs,
@@ -1723,6 +1795,35 @@ pub struct VcpuState {
     xsave: kvm_xsave,
 }
 
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Aarch64OneReg {
+    id: u64,
+    value: Vec<u8>,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VcpuState {
+    regs: Vec<Aarch64OneReg>,
+}
+
+#[cfg(target_arch = "aarch64")]
+fn one_reg_size(reg_id: u64) -> Result<usize> {
+    match reg_id & KVM_REG_SIZE_MASK {
+        value if value == u64::from(KVM_REG_SIZE_U8) => Ok(1),
+        KVM_REG_SIZE_U16 => Ok(2),
+        KVM_REG_SIZE_U32 => Ok(4),
+        KVM_REG_SIZE_U64 => Ok(8),
+        KVM_REG_SIZE_U128 => Ok(16),
+        KVM_REG_SIZE_U256 => Ok(32),
+        KVM_REG_SIZE_U512 => Ok(64),
+        KVM_REG_SIZE_U1024 => Ok(128),
+        KVM_REG_SIZE_U2048 => Ok(256),
+        _ => Err(Error::VcpuUnhandledKvmExit),
+    }
+}
+
 // Allow currently unused Pause and Exit events. These will be used by the vmm later on.
 #[allow(unused)]
 #[derive(Debug)]
@@ -1732,18 +1833,23 @@ pub enum VcpuEvent {
     Pause,
     /// Event that should resume the Vcpu.
     Resume,
-    // Serialize and Deserialize to follow after we get the support from kvm-ioctls.
+    /// Restore serialized vCPU state while paused.
+    RestoreState(Vec<u8>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
 /// List of responses that the Vcpu reports.
 pub enum VcpuResponse {
     /// Vcpu is paused.
-    Paused,
+    Paused(Vec<u8>),
     /// Vcpu is resumed.
     Resumed,
+    /// Serialized vCPU state was restored.
+    Restored,
     /// Vcpu is stopped.
     Exited(u8),
+    /// vCPU operation failed.
+    Error(String),
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
