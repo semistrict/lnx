@@ -62,7 +62,7 @@ const nestedCaveats = [
   ["scripts/test/virtiofs-resume.test.ts", "open fd/mmap survival is specifically snapshot/fork restore behavior; Linux libkrun snapshot APIs return ENOSYS"],
   ["scripts/test/dirty-fs.test.ts", "depends on checkpoint/fork rootfs snapshots; Linux libkrun snapshot APIs return ENOSYS"],
   ["scripts/test/stress.test.ts", "parallel channel coverage runs via scripts/test/nested-stress.ts; the snapshot-waits-for-active-channels step remains excluded because Linux libkrun snapshot APIs return ENOSYS"],
-  ["scripts/test/stock-ubuntu.test.ts", "snapd panics while parsing the nested guest kernel command line under nested KVM"],
+  ["scripts/test/stock-ubuntu.test.ts", "snapd panics while parsing the nested guest kernel command line under nested KVM; a nested stock boot/apt probe also hung instead of producing bounded signal"],
   ["scripts/test/ingress.test.ts", "host-side ingress lifecycle uses macOS launchd/resolver assumptions"],
   ["scripts/test/privileged-ingress.test.ts", "privileged host ingress uses sudo, /etc/resolver, launchd, and privileged ports"],
 ];
@@ -87,7 +87,10 @@ const fullSuite = [
   "scripts/test/privileged-ingress.test.ts",
 ];
 const nestedSuiteTestFiles = nestedSuite.map((script) => script.replace(/\.ts$/, ".test.ts"));
-const partiallyCoveredTestFiles = new Set(["scripts/test/system.test.ts", "scripts/test/stress.test.ts"]);
+const partiallyCoveredTestFiles = new Set([
+  "scripts/test/system.test.ts",
+  "scripts/test/stress.test.ts",
+]);
 const caveatedTestFiles = nestedCaveats.map(([testFile]) => testFile);
 const missingNestedDisposition = fullSuite.filter((testFile) =>
   testFile !== "scripts/test/nested-kvm.test.ts"
@@ -284,10 +287,12 @@ try {
       `export GVPROXY_PATH=${quoteShell(linuxGvproxy)}`,
       "export LNX_ROOTFS_BACKEND=block",
       "export LNX_BROKER_IDLE_TTL_MS=250",
+      "export LNX_SKIP_TEST_CLEANUP=1",
       `suite_log=${quoteShell(suiteLog)}`,
       ": > \"$suite_log\"",
       "run_logged() {",
       "  echo \"+ $*\" >> \"$suite_log\"",
+      "  echo \"nested-run: $*\" >&2",
       "  \"$@\" >> \"$suite_log\" 2>&1 || {",
       "    status=$?",
       "    tail -200 \"$suite_log\" >&2 || true",
@@ -303,7 +308,7 @@ try {
         `  ${quoteShell(testFile)}${index === nestedSuite.length - 1 ? "" : " \\"}`
       ),
       "do",
-      "  run_logged timeout 240s bun \"$test_file\"",
+      "  run_logged timeout --kill-after=5s 240s bun \"$test_file\"",
       "done",
       "echo NESTED_SUITE_OK",
     ].join("\n");

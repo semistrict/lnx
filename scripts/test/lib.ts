@@ -43,6 +43,9 @@ export function defaultContext(name: string): TestContext {
 }
 
 export async function cleanupContext(ctx: TestContext): Promise<void> {
+  if (Bun.env.LNX_SKIP_TEST_CLEANUP === "1") {
+    return;
+  }
   // A detached VM owner may still be in its idle grace period; wait for it so
   // it cannot recreate directories after we remove them.
   await waitForOwnerExit(ctx).catch(() => {});
