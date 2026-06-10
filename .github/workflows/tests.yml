@@ -1,0 +1,46 @@
+name: Test lnx
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: depot-macos-latest
+    timeout-minutes: 180
+    env:
+      CC_LINUX: /opt/homebrew/bin/aarch64-linux-musl-gcc
+      LNX_BASE: ${{ runner.temp }}/lnx-state
+      LNX_RUN_BROWSER_TEST: "1"
+      LNX_RUN_PRIVILEGED_INGRESS_TEST: "1"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Depot CLI
+        uses: depot/setup-action@v1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install host dependencies
+        run: |
+          brew install FiloSottile/musl-cross/musl-cross
+          brew install e2fsprogs zstd
+
+      - name: Rust formatting
+        run: cargo fmt --check
+
+      - name: Rust tests
+        run: cargo test
+
+      - name: Full system tests
+        run: bun run test:full
+

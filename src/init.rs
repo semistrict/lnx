@@ -22,10 +22,9 @@ const ZERO_SCAN_BLOCK: usize = 16 * 1024 * 1024;
 pub fn run(layout: &Layout, kernel: Option<&Path>, rootfs: Option<&Path>) -> Result<()> {
     eprintln!("init: base {}", layout.base.display());
     create_dir(&layout.base)?;
-    create_dir(&layout.instance_dir)?;
+    let default_rootfs = default_rootfs(layout);
     create_dir(
-        layout
-            .rootfs
+        default_rootfs
             .parent()
             .context("rootfs path has no parent directory")?,
     )?;
@@ -37,26 +36,54 @@ pub fn run(layout: &Layout, kernel: Option<&Path>, rootfs: Option<&Path>) -> Res
     }
 
     if let Some(rootfs) = rootfs {
-        copy_if_needed(rootfs, &layout.rootfs, "rootfs")?;
-    } else if clone_default_rootfs(layout)? {
+        copy_if_needed(rootfs, &default_rootfs, "rootfs")?;
     } else {
-        download_release(&layout.rootfs, "rootfs.ext4.zst")?;
+        download_release(&default_rootfs, "rootfs.ext4.zst")?;
     }
 
     if rootfs.is_none() {
-        ensure_rootfs_min_size(&layout.rootfs, DEFAULT_ROOTFS_SIZE)?;
-        validate_managed_rootfs(&layout.rootfs, DEFAULT_ROOTFS_SIZE)?;
+        ensure_rootfs_min_size(&default_rootfs, DEFAULT_ROOTFS_SIZE)?;
+        validate_managed_rootfs(&default_rootfs, DEFAULT_ROOTFS_SIZE)?;
     }
 
     eprintln!("init: kernel {}", layout.kernel.display());
-    eprintln!("init: rootfs {}", layout.rootfs.display());
+    eprintln!("init: rootfs {}", default_rootfs.display());
     eprintln!("init: complete");
     Ok(())
 }
 
+pub fn ensure_instance(layout: &Layout) -> Result<()> {
+    create_dir(&layout.instance_dir)?;
+    create_dir(
+        layout
+            .rootfs
+            .parent()
+            .context("rootfs path has no parent directory")?,
+    )?;
+    if layout.rootfs.exists() {
+        return Ok(());
+    }
+    if layout.instance == "default" {
+        bail!("missing rootfs: {}", layout.rootfs.display());
+    }
+    let default_rootfs = default_rootfs(layout);
+    if !default_rootfs.exists() {
+        bail!("missing default rootfs: {}", default_rootfs.display());
+    }
+    eprintln!(
+        "init: clone rootfs {} -> {}",
+        default_rootfs.display(),
+        layout.rootfs.display()
+    );
+    clone_or_copy(&default_rootfs, &layout.rootfs)
+}
+
+pub fn ensure_kernel(layout: &Layout) -> Result<()> {
+    download_kernel(&layout.kernel)
+}
+
 fn create_dir(path: &Path) -> Result<()> {
     if path.exists() {
-        eprintln!("init: directory exists {}", path.display());
         return Ok(());
     }
     eprintln!("init: create directory {}", path.display());
@@ -76,25 +103,12 @@ fn copy_if_needed(src: &Path, dest: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn clone_default_rootfs(layout: &Layout) -> Result<bool> {
-    if layout.rootfs.exists() || layout.instance == "default" {
-        return Ok(false);
-    }
-    let default_rootfs = layout
+fn default_rootfs(layout: &Layout) -> PathBuf {
+    layout
         .base
         .join("images")
         .join("default")
-        .join("rootfs.ext4");
-    if !default_rootfs.exists() {
-        return Ok(false);
-    }
-    eprintln!(
-        "init: clone rootfs {} -> {}",
-        default_rootfs.display(),
-        layout.rootfs.display()
-    );
-    clone_or_copy(&default_rootfs, &layout.rootfs)?;
-    Ok(true)
+        .join("rootfs.ext4")
 }
 
 fn clone_or_copy(src: &Path, dest: &Path) -> Result<()> {

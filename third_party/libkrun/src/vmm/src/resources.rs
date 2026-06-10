@@ -441,6 +441,7 @@ mod tests {
             block: Default::default(),
             #[cfg(feature = "net")]
             net: Default::default(),
+            pmem: Default::default(),
             gpu_virgl_flags: None,
             gpu_shm_size: None,
             #[cfg(feature = "gpu")]

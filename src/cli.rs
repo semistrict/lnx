@@ -1,4 +1,6 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
     io::Write,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
@@ -59,6 +61,7 @@ enum Command {
     Checkpoints,
     Fork(ForkArgs),
     Ingress(IngressArgs),
+    Instances(InstancesArgs),
     #[command(hide = true)]
     #[command(name = "_ingress")]
     HiddenIngress(HiddenIngressArgs),
@@ -97,6 +100,17 @@ struct ForkArgs {
 struct IngressArgs {
     #[command(subcommand)]
     command: IngressCommand,
+}
+
+#[derive(Debug, Args)]
+struct InstancesArgs {
+    #[command(subcommand)]
+    command: InstancesCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum InstancesCommand {
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -195,6 +209,9 @@ impl Cli {
                     IngressCommand::Status => ingress::print_status(&config),
                 }
             }
+            Some(Command::Instances(args)) => match args.command {
+                InstancesCommand::List => list_instances(&layout.base),
+            },
             Some(Command::HiddenIngress(args)) => {
                 let config = ingress::load_config()?;
                 ingress::run_hidden(
@@ -220,6 +237,120 @@ impl Cli {
     }
 }
 
+fn list_instances(base: &Path) -> Result<()> {
+    let mut names = BTreeSet::new();
+    collect_child_dir_names(&base.join("images"), &mut names)?;
+    collect_child_dir_names(&base.join("instances"), &mut names)?;
+
+    let mut instances = names
+        .into_iter()
+        .map(|name| {
+            let layout = Layout::resolve(&name, None, None)?;
+            let state = instance_state(&layout);
+            let pids = instance_pids(&layout).join(",");
+            Ok(InstanceRow { name, state, pids })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    instances.sort_by_key(|row| (instance_state_rank(row.state), row.name.clone()));
+
+    println!("{:<36} {:<12} {}", "NAME", "STATE", "PIDS");
+    for row in instances {
+        println!("{:<36} {:<12} {}", row.name, row.state, row.pids);
+    }
+    Ok(())
+}
+
+struct InstanceRow {
+    name: String,
+    state: &'static str,
+    pids: String,
+}
+
+fn instance_state_rank(state: &str) -> u8 {
+    match state {
+        "running" => 0,
+        "starting" => 1,
+        "stopped" => 2,
+        _ => 3,
+    }
+}
+
+fn collect_child_dir_names(parent: &Path, names: &mut BTreeSet<String>) -> Result<()> {
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", parent.display())),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            names.insert(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(())
+}
+
+fn instance_state(layout: &Layout) -> &'static str {
+    let broker = layout.run_dir.join("broker.sock");
+    if broker.exists() && runner::connect_broker(&broker).is_ok() {
+        "running"
+    } else if alive_owner_pid(&layout.run_dir.join("bootstrap.lock.d")).is_some() {
+        "starting"
+    } else if layout.rootfs.exists() {
+        "stopped"
+    } else {
+        "partial"
+    }
+}
+
+fn instance_pids(layout: &Layout) -> Vec<String> {
+    let mut pids = BTreeMap::new();
+    if let Some(pid) = alive_owner_pid(&layout.run_dir.join("bootstrap.lock.d")) {
+        pids.insert(pid, ());
+    }
+    for pid in host_pids_for_instance(&layout.instance) {
+        pids.insert(pid, ());
+    }
+    pids.keys().map(ToString::to_string).collect()
+}
+
+fn alive_owner_pid(lock_dir: &Path) -> Option<i32> {
+    let pid = fs::read_to_string(lock_dir.join("owner.pid"))
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()?;
+    process_alive(pid).then_some(pid)
+}
+
+fn host_pids_for_instance(instance: &str) -> Vec<i32> {
+    let output = ProcessCommand::new("pgrep")
+        .arg("-f")
+        .arg(format!("--instance[= ]{instance}"))
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<i32>().ok())
+        .filter(|pid| *pid != std::process::id() as i32 && process_alive(*pid))
+        .collect()
+}
+
+fn process_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    unsafe {
+        libc::kill(pid, 0) == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
 fn run_guest(
     layout: Layout,
     command: Vec<String>,
@@ -231,20 +362,15 @@ fn run_guest(
     explicit_kernel: bool,
     explicit_rootfs: bool,
 ) -> Result<()> {
-    if !layout.kernel.exists() {
-        if explicit_kernel {
-            bail!("missing kernel: {}", layout.kernel.display());
-        }
-        eprintln!("first run: kernel missing, initializing lnx image files");
-        init::run(&layout, None, None).context("auto-init")?;
-    }
-    if !layout.rootfs.exists() {
-        if explicit_rootfs {
-            bail!("missing rootfs: {}", layout.rootfs.display());
-        }
-        eprintln!("first run: rootfs missing, initializing lnx image files");
-        init::run(&layout, None, None).context("auto-init")?;
-    }
+    ensure_image_and_instance(&layout, explicit_kernel, explicit_rootfs)?;
+    ensure_vm_initialized(
+        &layout,
+        cpus,
+        memory_mib,
+        forwards.clone(),
+        no_snapshot_restore,
+        snapshot_path.is_some(),
+    )?;
 
     let command = if command.is_empty() {
         vec!["bash".to_string(), "-l".to_string()]
@@ -286,6 +412,74 @@ fn run_guest(
 
     let status = runner::run(config)?;
     std::process::exit(status);
+}
+
+fn ensure_image_and_instance(
+    layout: &Layout,
+    explicit_kernel: bool,
+    explicit_rootfs: bool,
+) -> Result<()> {
+    if !layout.kernel.exists() {
+        if explicit_kernel {
+            bail!("missing kernel: {}", layout.kernel.display());
+        }
+        eprintln!("first run: kernel missing, initializing lnx image files");
+        init::ensure_kernel(layout).context("auto-init kernel")?;
+    }
+    if !layout.rootfs.exists() {
+        if explicit_rootfs {
+            bail!("missing rootfs: {}", layout.rootfs.display());
+        }
+        eprintln!("first run: instance rootfs missing, initializing lnx instance files");
+        init::run(layout, None, None).context("auto-init")?;
+        init::ensure_instance(layout).context("auto-init instance")?;
+    } else {
+        init::ensure_instance(layout).context("auto-init instance")?;
+    }
+    Ok(())
+}
+
+fn ensure_vm_initialized(
+    layout: &Layout,
+    cpus: u8,
+    memory_mib: u32,
+    forwards: Vec<runner::PortForward>,
+    no_snapshot_restore: bool,
+    explicit_snapshot: bool,
+) -> Result<()> {
+    if layout.vm_initialized.exists() || no_snapshot_restore || explicit_snapshot {
+        return Ok(());
+    }
+    if layout.snapshot_dir.join("latest").exists() {
+        mark_vm_initialized(layout)?;
+        return Ok(());
+    }
+    eprintln!("first run: initializing VM instance {}", layout.instance);
+    let cwd = std::env::current_dir().context("current directory")?;
+    let status = runner::run(runner::RunConfig {
+        layout: layout.clone(),
+        command: vec!["true".to_string()],
+        cwd,
+        cpus,
+        memory_mib,
+        restore_snapshot: None,
+        forwards,
+        snapshot_output: Some(layout.snapshot_dir.join("latest")),
+    })
+    .context("initialize VM instance")?;
+    if status != 0 {
+        bail!("VM initialization exited with status {status}");
+    }
+    mark_vm_initialized(layout)
+}
+
+fn mark_vm_initialized(layout: &Layout) -> Result<()> {
+    if let Some(parent) = layout.vm_initialized.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::write(&layout.vm_initialized, b"1\n")
+        .with_context(|| format!("write {}", layout.vm_initialized.display()))?;
+    Ok(())
 }
 
 fn copy_between_host_and_guest(
@@ -516,20 +710,7 @@ fn create_checkpoint(
     explicit_kernel: bool,
     explicit_rootfs: bool,
 ) -> Result<()> {
-    if !layout.kernel.exists() {
-        if explicit_kernel {
-            bail!("missing kernel: {}", layout.kernel.display());
-        }
-        eprintln!("first run: kernel missing, initializing lnx image files");
-        init::run(&layout, None, None).context("auto-init")?;
-    }
-    if !layout.rootfs.exists() {
-        if explicit_rootfs {
-            bail!("missing rootfs: {}", layout.rootfs.display());
-        }
-        eprintln!("first run: rootfs missing, initializing lnx image files");
-        init::run(&layout, None, None).context("auto-init")?;
-    }
+    ensure_image_and_instance(&layout, explicit_kernel, explicit_rootfs)?;
 
     std::fs::create_dir_all(&layout.checkpoint_dir)
         .with_context(|| format!("create {}", layout.checkpoint_dir.display()))?;
@@ -633,20 +814,7 @@ fn create_internal_fork_checkpoint(
     explicit_kernel: bool,
     explicit_rootfs: bool,
 ) -> Result<checkpoints::Checkpoint> {
-    if !layout.kernel.exists() {
-        if explicit_kernel {
-            bail!("missing kernel: {}", layout.kernel.display());
-        }
-        eprintln!("first run: kernel missing, initializing lnx image files");
-        init::run(layout, None, None).context("auto-init")?;
-    }
-    if !layout.rootfs.exists() {
-        if explicit_rootfs {
-            bail!("missing rootfs: {}", layout.rootfs.display());
-        }
-        eprintln!("first run: rootfs missing, initializing lnx image files");
-        init::run(layout, None, None).context("auto-init")?;
-    }
+    ensure_image_and_instance(layout, explicit_kernel, explicit_rootfs)?;
 
     std::fs::create_dir_all(&layout.checkpoint_dir)
         .with_context(|| format!("create {}", layout.checkpoint_dir.display()))?;

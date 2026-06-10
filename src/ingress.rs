@@ -1,8 +1,10 @@
 use std::{
+    ffi::CString,
     fs,
     io::{BufReader, ErrorKind, Read, Write},
     net::{TcpListener, TcpStream, UdpSocket},
     os::unix::{
+        ffi::OsStrExt,
         net::{UnixListener, UnixStream},
         process::CommandExt,
     },
@@ -32,6 +34,7 @@ const DEFAULT_DOMAIN: &str = "lnx";
 const DEFAULT_DNS_ADDR: &str = "127.0.0.1:5354";
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:80";
 const DEFAULT_HTTPS_ADDR: &str = "127.0.0.1:443";
+const AUTOSTART_IDLE_TTL_MS: &str = "30000";
 const CA_COMMON_NAME: &str = "lnx local ingress CA";
 const SERVICE_LABEL: &str = "com.semistrict.lnx.ingress";
 const LAUNCH_DAEMON_PATH: &str = "/Library/LaunchDaemons/com.semistrict.lnx.ingress.plist";
@@ -76,6 +79,8 @@ pub fn enable(config: &Config) -> Result<()> {
         println!("ingress enabled for .{}", config.domain);
         return Ok(());
     }
+    ensure_ca(config)?;
+    ensure_wildcard_cert(config)?;
     println!("writing {}", config.resolver_path().display());
     println!("starting dns on {}", config.dns_addr);
     println!("starting http on {}", config.http_addr);
@@ -246,6 +251,54 @@ fn is_privileged_addr(addr: &str) -> bool {
         .unwrap_or(true)
 }
 
+fn ingress_user_ids() -> Option<(u32, u32)> {
+    if unsafe { libc::geteuid() } != 0 {
+        return None;
+    }
+    if let (Ok(uid), Ok(gid)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
+        if let (Ok(uid), Ok(gid)) = (uid.parse::<u32>(), gid.parse::<u32>()) {
+            return Some((uid, gid));
+        }
+    }
+    let user = std::env::var("LNX_INGRESS_USER")
+        .or_else(|_| std::env::var("SUDO_USER"))
+        .ok()?;
+    let user = CString::new(user).ok()?;
+    unsafe {
+        let passwd = libc::getpwnam(user.as_ptr());
+        if passwd.is_null() {
+            None
+        } else {
+            Some(((*passwd).pw_uid, (*passwd).pw_gid))
+        }
+    }
+}
+
+fn chown_to_ingress_user(path: &Path) {
+    let Some((uid, gid)) = ingress_user_ids() else {
+        return;
+    };
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return;
+    };
+    unsafe {
+        libc::chown(path.as_ptr(), uid, gid);
+    }
+}
+
+fn ensure_user_owned_lnx_dirs(config: &Config) {
+    chown_to_ingress_user(&config.state_dir);
+    if let Some(base) = config.state_dir.parent() {
+        chown_to_ingress_user(base);
+        for name in ["instances", "images"] {
+            let path = base.join(name);
+            if fs::create_dir_all(&path).is_ok() {
+                chown_to_ingress_user(&path);
+            }
+        }
+    }
+}
+
 fn start_helper(config: &Config, args: &[&str]) -> Result<()> {
     let exe = std::env::current_exe().context("current executable")?;
     let mut command = if config.needs_privileges() {
@@ -280,6 +333,7 @@ fn start_helper(config: &Config, args: &[&str]) -> Result<()> {
 fn install_service(config: &Config) -> Result<()> {
     fs::create_dir_all(&config.state_dir)
         .with_context(|| format!("create {}", config.state_dir.display()))?;
+    ensure_user_owned_lnx_dirs(config);
     ensure_ca(config)?;
     if config.requires_privileged_service() {
         trust_ca(config)?;
@@ -359,7 +413,6 @@ fn launchd_plist(config: &Config) -> Result<String> {
         .or_else(|_| std::env::var("SUDO_USER"))
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_default();
-    let log_path = config.log_path().display().to_string();
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -395,10 +448,6 @@ fn launchd_plist(config: &Config) -> Result<String> {
   <true/>
   <key>KeepAlive</key>
   <true/>
-  <key>StandardOutPath</key>
-  <string>{log_path}</string>
-  <key>StandardErrorPath</key>
-  <string>{log_path}</string>
 </dict>
 </plist>
 "#,
@@ -412,7 +461,6 @@ fn launchd_plist(config: &Config) -> Result<String> {
         resolver_dir = xml_escape(&config.resolver_dir.display().to_string()),
         state_dir = xml_escape(&config.state_dir.display().to_string()),
         user = xml_escape(&user),
-        log_path = xml_escape(&log_path),
     ))
 }
 
@@ -428,11 +476,13 @@ fn xml_escape(value: &str) -> String {
 fn spawn_daemon(config: &Config) -> Result<()> {
     fs::create_dir_all(&config.state_dir)
         .with_context(|| format!("create {}", config.state_dir.display()))?;
+    ensure_user_owned_lnx_dirs(config);
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(config.log_path())
         .context("open ingress log")?;
+    chown_to_ingress_user(&config.log_path());
     let err = log.try_clone().context("clone ingress log")?;
     let mut command = Command::new(std::env::current_exe().context("current executable")?);
     command
@@ -453,6 +503,7 @@ fn spawn_daemon(config: &Config) -> Result<()> {
 fn run_daemon(config: Config) -> Result<()> {
     fs::create_dir_all(&config.state_dir)
         .with_context(|| format!("create {}", config.state_dir.display()))?;
+    ensure_user_owned_lnx_dirs(&config);
     install_resolver(&config)?;
 
     let http_listener = TcpListener::bind(&config.http_addr)
@@ -524,7 +575,8 @@ fn install_resolver(config: &Config) -> Result<()> {
     fs::create_dir_all(&config.resolver_dir)
         .with_context(|| format!("create {}", config.resolver_dir.display()))?;
     fs::write(config.resolver_path(), config.resolver_contents()?)
-        .with_context(|| format!("write {}", config.resolver_path().display()))
+        .with_context(|| format!("write {}", config.resolver_path().display()))?;
+    Ok(())
 }
 
 fn listen_admin(path: &PathBuf) -> Result<UnixListener> {
@@ -534,6 +586,7 @@ fn listen_admin(path: &PathBuf) -> Result<UnixListener> {
     let _ = fs::remove_file(path);
     let listener =
         UnixListener::bind(path).with_context(|| format!("listen {}", path.display()))?;
+    chown_to_ingress_user(path);
     let _ = fs::set_permissions(
         path,
         <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o666),
@@ -621,6 +674,7 @@ fn json_field(body: &str, field: &str) -> Option<String> {
 fn ensure_ca(config: &Config) -> Result<()> {
     fs::create_dir_all(config.ca_dir())
         .with_context(|| format!("create {}", config.ca_dir().display()))?;
+    chown_to_ingress_user(&config.ca_dir());
     if config.ca_cert_path().exists() && config.ca_key_path().exists() {
         return Ok(());
     }
@@ -651,6 +705,8 @@ fn ensure_ca(config: &Config) -> Result<()> {
             .arg(&cert),
     )
     .context("generate ingress CA certificate")?;
+    chown_to_ingress_user(&config.ca_key_path());
+    chown_to_ingress_user(&config.ca_cert_path());
     Ok(())
 }
 
@@ -713,31 +769,26 @@ impl ResolvesServerCert for IngressCertResolver {
         if parse_host(&host, &self.config.domain).is_err() {
             return None;
         }
-        ensure_host_cert(&self.config, &host)
+        ensure_wildcard_cert(&self.config)
             .and_then(|(cert, key)| load_certified_key(&cert, &key))
             .ok()
             .map(Arc::new)
     }
 }
 
-fn ensure_host_cert(config: &Config, host: &str) -> Result<(PathBuf, PathBuf)> {
+fn ensure_wildcard_cert(config: &Config) -> Result<(PathBuf, PathBuf)> {
     fs::create_dir_all(config.cert_dir())
         .with_context(|| format!("create {}", config.cert_dir().display()))?;
-    let safe = host
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '.' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
+    chown_to_ingress_user(&config.cert_dir());
+    let domain = config.domain.to_ascii_lowercase();
+    let host = format!("*.{domain}");
+    let safe = format!("wildcard.{domain}");
     let key = config.cert_dir().join(format!("{safe}.key"));
     let csr = config.cert_dir().join(format!("{safe}.csr"));
     let cert = config.cert_dir().join(format!("{safe}.crt"));
     let ext = config.cert_dir().join(format!("{safe}.ext"));
-    if cert.exists() && key.exists() {
+    let serial = config.ca_dir().join("lnx-ca.srl");
+    if file_nonempty(&cert) && file_nonempty(&key) {
         return Ok((cert, key));
     }
     fs::write(
@@ -776,6 +827,8 @@ fn ensure_host_cert(config: &Config, host: &str) -> Result<(PathBuf, PathBuf)> {
             .arg("-CAkey")
             .arg(config.ca_key_path())
             .arg("-CAcreateserial")
+            .arg("-CAserial")
+            .arg(&serial)
             .arg("-out")
             .arg(&cert)
             .arg("-days")
@@ -786,7 +839,15 @@ fn ensure_host_cert(config: &Config, host: &str) -> Result<(PathBuf, PathBuf)> {
     )
     .context("sign ingress host certificate")?;
     let _ = fs::remove_file(csr);
+    chown_to_ingress_user(&key);
+    chown_to_ingress_user(&cert);
+    chown_to_ingress_user(&ext);
+    chown_to_ingress_user(&serial);
     Ok((cert, key))
+}
+
+fn file_nonempty(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0)
 }
 
 fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey> {
@@ -848,6 +909,11 @@ fn handle_https(
             return Ok(());
         }
     };
+
+    if maybe_fork_and_redirect(&mut conn.writer(), &request, &host, &config)? {
+        flush_tls(&mut conn, &mut stream)?;
+        return Ok(());
+    }
 
     let Some((broker_socket, route)) = route_http_host(&mut conn.writer(), &host, &config)? else {
         flush_tls(&mut conn, &mut stream)?;
@@ -1019,10 +1085,38 @@ fn handle_http(mut stream: TcpStream, config: Config) -> Result<()> {
             return Ok(());
         }
     };
+    if maybe_fork_and_redirect(&mut stream, &request, &host, &config)? {
+        return Ok(());
+    }
+
     let Some((broker_socket, route)) = route_http_host(&mut stream, &host, &config)? else {
         return Ok(());
     };
     runner::proxy_stream_to_guest(&broker_socket, stream, request, "127.0.0.1", route.port)
+}
+
+fn maybe_fork_and_redirect(
+    response: &mut impl Write,
+    request: &[u8],
+    host: &str,
+    config: &Config,
+) -> Result<bool> {
+    let Some(request_target) = request_target(request) else {
+        return Ok(false);
+    };
+    let Some(source_instance) = fork_source_from_request_target(request_target) else {
+        return Ok(false);
+    };
+    let route = match parse_host(host, &config.domain) {
+        Ok(route) => route,
+        Err(_) => return Ok(false),
+    };
+    let dest = Layout::resolve(&route.instance, None, None)?;
+    if !dest.rootfs.exists() {
+        fork_instance(&source_instance, &route.instance, config)?;
+    }
+    write_redirect_response(response, &clean_fork_request_target(request_target))?;
+    Ok(true)
 }
 
 fn route_http_host(
@@ -1088,10 +1182,10 @@ fn start_instance(instance: &str, config: &Config) -> Result<()> {
         command = Command::new(exe);
     }
     command
+        .env("LNX_BROKER_IDLE_TTL_MS", AUTOSTART_IDLE_TTL_MS)
         .arg("--instance")
         .arg(instance)
-        .arg("sleep")
-        .arg("infinity")
+        .arg("true")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(
@@ -1099,6 +1193,7 @@ fn start_instance(instance: &str, config: &Config) -> Result<()> {
                 .create(true)
                 .append(true)
                 .open(config.log_path())
+                .inspect(|_| chown_to_ingress_user(&config.log_path()))
                 .unwrap_or_else(|_| fs::File::create("/dev/null").expect("open /dev/null")),
         );
     unsafe {
@@ -1110,6 +1205,53 @@ fn start_instance(instance: &str, config: &Config) -> Result<()> {
     let _child = command
         .spawn()
         .with_context(|| format!("auto-start lnx instance {instance}"))?;
+    Ok(())
+}
+
+fn fork_instance(source: &str, dest: &str, config: &Config) -> Result<()> {
+    let exe = std::env::current_exe().context("current executable")?;
+    let mut command;
+    if unsafe { libc::geteuid() } == 0 {
+        if let Ok(user) = std::env::var("LNX_INGRESS_USER").or_else(|_| std::env::var("SUDO_USER"))
+        {
+            command = Command::new("sudo");
+            command.arg("-u").arg(user);
+            command.arg(format!(
+                "HOME={}",
+                std::env::var("HOME").unwrap_or_default()
+            ));
+            command.arg(exe);
+        } else {
+            command = Command::new(exe);
+        }
+    } else {
+        command = Command::new(exe);
+    }
+    let output = command
+        .arg("--instance")
+        .arg(source)
+        .arg("fork")
+        .arg(dest)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("fork lnx instance {dest} from {source}"))?;
+    if !output.status.success() {
+        bail!(
+            "fork lnx instance {dest} from {source} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(config.log_path())
+        .ok();
+    if log.is_some() {
+        chown_to_ingress_user(&config.log_path());
+    }
+    if let Some(log) = &mut log {
+        let _ = writeln!(log, "forked instance {dest} from {source}");
+    }
     Ok(())
 }
 
@@ -1128,6 +1270,72 @@ fn write_http_response(
     Ok(())
 }
 
+fn write_redirect_response(stream: &mut impl Write, location: &str) -> Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )?;
+    Ok(())
+}
+
+fn request_target(request: &[u8]) -> Option<&str> {
+    let line = request.split(|byte| *byte == b'\n').next()?;
+    let line = std::str::from_utf8(line).ok()?.trim_end_matches('\r');
+    let mut parts = line.split_whitespace();
+    let _method = parts.next()?;
+    parts.next()
+}
+
+fn fork_source_from_request_target(target: &str) -> Option<String> {
+    let query = target.split_once('?')?.1;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == "lnx:fork" && !value.is_empty() {
+            return Some(percent_decode(value));
+        }
+    }
+    None
+}
+
+fn clean_fork_request_target(target: &str) -> String {
+    let Some((path, query)) = target.split_once('?') else {
+        return target.to_string();
+    };
+    let kept = query
+        .split('&')
+        .filter(|pair| {
+            let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(*pair);
+            key != "lnx:fork"
+        })
+        .filter(|pair| !pair.is_empty())
+        .collect::<Vec<_>>();
+    if kept.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{}", kept.join("&"))
+    }
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub fn parse_host(host: &str, domain: &str) -> Result<Route> {
     let host = strip_optional_port(host)
         .trim_end_matches('.')
@@ -1137,20 +1345,21 @@ pub fn parse_host(host: &str, domain: &str) -> Result<Route> {
         bail!("host {host:?} is not under .{domain}");
     }
     let name = host.trim_end_matches(&suffix);
-    let labels = name.split('.').collect::<Vec<_>>();
-    if labels.len() < 2 {
-        bail!("host {host:?} must look like p<port>.<instance>.{domain}");
+    if name.contains('.') {
+        bail!("host {host:?} must look like p<port>-<instance>.{domain}");
     }
-    let port_label = labels[0];
+    let Some((port_label, instance)) = name.split_once('-') else {
+        bail!("host {host:?} must look like p<port>-<instance>.{domain}");
+    };
     let Some(port) = port_label.strip_prefix('p') else {
-        bail!("host {host:?} must start with p<port>");
+        bail!("host {host:?} must start with p<port>-");
     };
     let port = port.parse::<u16>().context("invalid ingress port")?;
-    if port == 0 {
+    if port == 0 || instance.is_empty() {
         bail!("invalid ingress port");
     }
     Ok(Route {
-        instance: labels[1..].join("."),
+        instance: instance.to_string(),
         port,
     })
 }
@@ -1229,16 +1438,52 @@ mod tests {
 
     #[test]
     fn parses_ingress_hosts() {
-        let route = parse_host("p8080.dev.lnx", "lnx").expect("parse");
+        let route = parse_host("p8080-dev.lnx", "lnx").expect("parse");
         assert_eq!(route.instance, "dev");
         assert_eq!(route.port, 8080);
 
-        let route = parse_host("p3000.parent.child.lnx:80", "lnx").expect("parse");
-        assert_eq!(route.instance, "parent.child");
+        let route = parse_host("p3000-parent-child.lnx:80", "lnx").expect("parse");
+        assert_eq!(route.instance, "parent-child");
         assert_eq!(route.port, 3000);
 
-        assert!(parse_host("p0.dev.lnx", "lnx").is_err());
-        assert!(parse_host("8080.dev.lnx", "lnx").is_err());
+        assert!(parse_host("p0-dev.lnx", "lnx").is_err());
+        assert!(parse_host("8080-dev.lnx", "lnx").is_err());
         assert!(parse_host("p8080.lnx", "lnx").is_err());
+        assert!(parse_host("p8080.dev.lnx", "lnx").is_err());
+    }
+
+    #[test]
+    fn parses_fork_query_from_request_target() {
+        assert_eq!(
+            fork_source_from_request_target("/vnc.html?lnx:fork=foo"),
+            Some("foo".to_string())
+        );
+        assert_eq!(
+            fork_source_from_request_target("/vnc.html?a=1&lnx:fork=source%2Evm&b=2"),
+            Some("source.vm".to_string())
+        );
+        assert_eq!(fork_source_from_request_target("/vnc.html?a=1"), None);
+        assert_eq!(fork_source_from_request_target("/vnc.html?lnx:fork="), None);
+    }
+
+    #[test]
+    fn removes_only_fork_query_param_for_redirect() {
+        assert_eq!(clean_fork_request_target("/?lnx:fork=foo"), "/");
+        assert_eq!(
+            clean_fork_request_target("/vnc.html?a=1&lnx:fork=foo&b=2"),
+            "/vnc.html?a=1&b=2"
+        );
+        assert_eq!(
+            clean_fork_request_target("/vnc.html?autoconnect=true"),
+            "/vnc.html?autoconnect=true"
+        );
+    }
+
+    #[test]
+    fn extracts_request_target() {
+        assert_eq!(
+            request_target(b"GET /vnc.html?lnx:fork=foo HTTP/1.1\r\nHost: p6080.bar.lnx\r\n\r\n"),
+            Some("/vnc.html?lnx:fork=foo")
+        );
     }
 }

@@ -115,10 +115,19 @@ pub fn fork(source: &Layout, checkpoint: &Checkpoint, dest: &Layout) -> Result<(
     .with_context(|| format!("create {}", dest.rootfs.parent().unwrap().display()))?;
     clone_or_copy(&checkpoint.path.join("rootfs.ext4"), &dest.rootfs)?;
     clone_snapshot_dir(&checkpoint.path, &dest.snapshot_dir.join("latest"))?;
+    mark_vm_initialized(dest)?;
     if source.kernel.exists() && !dest.kernel.exists() {
         clone_or_copy(&source.kernel, &dest.kernel)?;
     }
     Ok(())
+}
+
+fn mark_vm_initialized(layout: &Layout) -> Result<()> {
+    if let Some(parent) = layout.vm_initialized.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::write(&layout.vm_initialized, b"1\n")
+        .with_context(|| format!("write {}", layout.vm_initialized.display()))
 }
 
 pub fn display_time(created_unix: u64) -> String {
@@ -266,6 +275,7 @@ mod tests {
             instance_dir: base.join("instances/test"),
             snapshot_dir: base.join("images/test/memory-snapshots"),
             checkpoint_dir: base.join("images/test/checkpoints"),
+            vm_initialized: base.join("images/test/vm-initialized"),
             run_dir: base.join("instances/test"),
             console_log: base.join("instances/test/console.log"),
         }
@@ -320,6 +330,7 @@ mod tests {
             instance_dir: temp.path.join("dest/instances/forked"),
             snapshot_dir: temp.path.join("dest/images/forked/memory-snapshots"),
             checkpoint_dir: temp.path.join("dest/images/forked/checkpoints"),
+            vm_initialized: temp.path.join("dest/images/forked/vm-initialized"),
             run_dir: temp.path.join("dest/instances/forked"),
             console_log: temp.path.join("dest/instances/forked/console.log"),
         };
@@ -355,6 +366,10 @@ mod tests {
             b"stamp"
         );
         assert!(dest.snapshot_dir.join("latest/checkpoint.meta").exists());
+        assert_eq!(
+            fs::read(&dest.vm_initialized).expect("read initialized marker"),
+            b"1\n"
+        );
     }
 
     #[test]

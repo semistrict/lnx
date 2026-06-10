@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::{env, fs, thread};
 
 use lnx_protocol::{MAX_MESSAGE_SIZE, Message, PROTOCOL_VERSION};
+mod user;
+use user::{EXEC_HOME, EXEC_USER, ensure_exec_user};
 
 const AF_VSOCK: c_int = 40;
 const AF_UNIX: c_int = 1;
@@ -15,7 +17,6 @@ const SOCK_STREAM: c_int = 1;
 const VMADDR_CID_HOST: u32 = 2;
 const AGENT_PORT: u32 = 10240;
 const SNAPSHOT_PORT: u32 = 10241;
-const CONTROL_PORT: u32 = 10242;
 const EINTR: c_int = 4;
 const EAGAIN: c_int = 11;
 const ECHILD: c_int = 10;
@@ -39,19 +40,10 @@ const MS_REC: c_ulong = 16384;
 const MS_PRIVATE: c_ulong = 262144;
 const MNT_DETACH: c_int = 2;
 const SYS_PIVOT_ROOT: isize = 41;
-const POLLOUT: i16 = 0x0004;
-
-const FRAME_OUTPUT: u8 = b'O';
-const FRAME_STDERR: u8 = b'E';
-const FRAME_INPUT: u8 = b'I';
-const FRAME_STATUS: u8 = b'S';
 const FRAME_SNAPSHOT: u8 = b'K';
 const FRAME_CONTROL_SNAPSHOT_EXIT: u8 = b'X';
 const FRAME_CONTROL_OK: u8 = b'x';
-const REQUEST_FLAG_PTY: u8 = 1;
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin";
-const EXEC_USER: &str = "lnxuser";
-const EXEC_HOME: &str = "/home/lnxuser";
 const AGENT_PATH: &str = "/run/lnx/lnx-agent";
 const LNXCTL_PATH: &str = "/run/lnx/lnxctl";
 const OLD_AGENT_PATH: &str = "/usr/local/lib/lnx/lnx-agent";
@@ -122,8 +114,6 @@ unsafe extern "C" {
     fn accept(fd: c_int, addr: *mut Sockaddr, len: *mut c_uint) -> c_int;
     fn bind(fd: c_int, addr: *const Sockaddr, len: c_uint) -> c_int;
     fn chdir(path: *const c_char) -> c_int;
-    fn chmod(path: *const c_char, mode: c_uint) -> c_int;
-    fn chown(path: *const c_char, owner: c_uint, group: c_uint) -> c_int;
     fn clock_settime(clockid: c_int, tp: *const Timespec) -> c_int;
     fn close(fd: c_int) -> c_int;
     fn connect(fd: c_int, addr: *const Sockaddr, len: c_uint) -> c_int;
@@ -569,13 +559,6 @@ fn write_frame(fd: c_int, frame_type: u8, payload: &[u8]) -> bool {
         && write_all(fd, payload)
 }
 
-fn write_command_frame(fd: c_int, frame_type: u8, request_id: u64, payload: &[u8]) -> bool {
-    write_all(fd, &[frame_type])
-        && write_all(fd, &((payload.len() + 8) as u32).to_be_bytes())
-        && write_all(fd, &request_id.to_be_bytes())
-        && write_all(fd, payload)
-}
-
 fn request_snapshot(fd: c_int) {
     write_frame(fd, FRAME_SNAPSHOT, &[]);
 }
@@ -740,18 +723,6 @@ fn read_u32(fd: c_int) -> u32 {
     u32::from_be_bytes(buf)
 }
 
-fn read_u8(fd: c_int) -> u8 {
-    let mut buf = [0u8; 1];
-    read_exact(fd, &mut buf);
-    buf[0]
-}
-
-fn read_u16(fd: c_int) -> u16 {
-    let mut buf = [0u8; 2];
-    read_exact(fd, &mut buf);
-    u16::from_be_bytes(buf)
-}
-
 fn read_message(fd: c_int) -> Option<Message> {
     let mut len = [0u8; 4];
     if !try_read_exact(fd, &mut len) {
@@ -786,18 +757,6 @@ fn write_message_locked(agent_fd: &Arc<Mutex<c_int>>, message: &Message) -> bool
     write_message(*fd, message)
 }
 
-fn read_string(fd: c_int, max_len: usize, label: &str) -> String {
-    let len = read_u32(fd) as usize;
-    if len > max_len {
-        die(label);
-    }
-    let mut bytes = vec![0u8; len];
-    if len > 0 {
-        read_exact(fd, &mut bytes);
-    }
-    String::from_utf8(bytes).unwrap_or_default()
-}
-
 fn set_nonblocking(fd: c_int) {
     let flags = unsafe { fcntl(fd, F_GETFL) };
     if flags >= 0 {
@@ -815,179 +774,6 @@ fn vsock_addr(port: u32) -> SockaddrVm {
         svm_cid: VMADDR_CID_HOST,
         svm_flags: 0,
         svm_zero: [0; 3],
-    }
-}
-
-fn reconnect_agent_fd(agent_fd: &mut c_int) {
-    if *agent_fd >= 0 {
-        unsafe {
-            close(*agent_fd);
-        }
-    }
-    *agent_fd = reconnect_after_snapshot_point();
-}
-
-fn write_command_frame_reconnect(
-    agent_fd: &mut c_int,
-    frame_type: u8,
-    request_id: u64,
-    payload: &[u8],
-) {
-    if write_command_frame(*agent_fd, frame_type, request_id, payload) {
-        return;
-    }
-    reconnect_agent_fd(agent_fd);
-    let _ = write_command_frame(*agent_fd, frame_type, request_id, payload);
-}
-
-fn drain_output(
-    output_fd: c_int,
-    agent_fd: &mut c_int,
-    frame_type: u8,
-    request_id: u64,
-    buf: &mut [u8],
-) -> bool {
-    let mut saw_eof = false;
-    loop {
-        let n = unsafe { read(output_fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
-        if n > 0 {
-            write_command_frame_reconnect(agent_fd, frame_type, request_id, &buf[..n as usize]);
-            continue;
-        }
-        if n < 0 && errno() == EINTR {
-            continue;
-        }
-        if n < 0 && errno() == EAGAIN {
-            break;
-        }
-        if n < 0 && errno() == EIO {
-            saw_eof = true;
-            break;
-        }
-        saw_eof = true;
-        break;
-    }
-    saw_eof
-}
-
-enum InputFrame {
-    Data(Vec<u8>),
-    Eof,
-    Stale,
-}
-
-fn read_input_frame(agent_fd: c_int, request_id: u64) -> Option<InputFrame> {
-    let mut frame_type = [0u8; 1];
-    if !try_read_exact(agent_fd, &mut frame_type) {
-        return None;
-    }
-    let mut len_buf = [0u8; 4];
-    if !try_read_exact(agent_fd, &mut len_buf) {
-        return None;
-    }
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if frame_type[0] != FRAME_INPUT || len < 8 {
-        die("bad input frame");
-    }
-    let mut frame_request_id = [0u8; 8];
-    if !try_read_exact(agent_fd, &mut frame_request_id) {
-        return None;
-    }
-    let frame_request_id = u64::from_be_bytes(frame_request_id);
-    let payload_len = len - 8;
-    let mut payload = vec![0u8; payload_len];
-    if payload_len > 0 && !try_read_exact(agent_fd, &mut payload) {
-        return None;
-    }
-    if frame_request_id != request_id {
-        return Some(InputFrame::Stale);
-    }
-    if payload_len > 0 {
-        Some(InputFrame::Data(payload))
-    } else {
-        Some(InputFrame::Eof)
-    }
-}
-
-fn drain_pty_input(agent_fd: c_int, pty_fd: c_int, request_id: u64) -> bool {
-    match read_input_frame(agent_fd, request_id) {
-        Some(InputFrame::Data(payload)) => {
-            write_all(pty_fd, &payload);
-            true
-        }
-        Some(InputFrame::Eof) => {
-            write_all(pty_fd, &[0x04]);
-            true
-        }
-        Some(InputFrame::Stale) => true,
-        None => false,
-    }
-}
-
-fn drain_pipe_input(agent_fd: c_int, stdin_fd: &mut c_int, request_id: u64) -> bool {
-    match read_input_frame(agent_fd, request_id) {
-        Some(InputFrame::Data(payload)) => {
-            if *stdin_fd >= 0 && !write_all(*stdin_fd, &payload) {
-                unsafe {
-                    close(*stdin_fd);
-                }
-                *stdin_fd = -1;
-            }
-            true
-        }
-        Some(InputFrame::Eof) => {
-            if *stdin_fd >= 0 {
-                unsafe {
-                    close(*stdin_fd);
-                }
-                *stdin_fd = -1;
-            }
-            true
-        }
-        Some(InputFrame::Stale) => true,
-        None => false,
-    }
-}
-
-fn handle_local_control(listener_fd: c_int, agent_fd: &mut c_int, request_id: u64) {
-    let client_fd = unsafe { accept(listener_fd, ptr::null_mut(), ptr::null_mut()) };
-    if client_fd < 0 {
-        return;
-    }
-    let mut frame_type = [0u8; 1];
-    let mut len = [0u8; 4];
-    if !try_read_exact(client_fd, &mut frame_type) || !try_read_exact(client_fd, &mut len) {
-        unsafe {
-            close(client_fd);
-        }
-        return;
-    }
-    let len = u32::from_be_bytes(len);
-    if frame_type[0] != FRAME_CONTROL_SNAPSHOT_EXIT || len != 0 {
-        unsafe {
-            close(client_fd);
-        }
-        return;
-    }
-
-    unsafe {
-        sync();
-        close(*agent_fd);
-    }
-    *agent_fd = -1;
-    let snapshot_fd = connect_vsock(CONTROL_PORT);
-    let _ = write_frame(
-        snapshot_fd,
-        FRAME_CONTROL_SNAPSHOT_EXIT,
-        &request_id.to_be_bytes(),
-    );
-    unsafe {
-        close(snapshot_fd);
-    }
-    reconnect_agent_fd(agent_fd);
-    let _ = write_frame(client_fd, FRAME_CONTROL_OK, &[]);
-    unsafe {
-        close(client_fd);
     }
 }
 
@@ -1015,13 +801,6 @@ fn accept_channel_control(listener_fd: c_int) -> Option<c_int> {
     }
 }
 
-fn close_channel_control(fd: c_int) {
-    unsafe {
-        close(fd);
-    }
-    let _ = fs::remove_file(CONTROL_SOCKET);
-}
-
 fn channel_control_socket(channel_id: u64) -> String {
     format!("/run/lnx-agent-{channel_id:016x}.sock")
 }
@@ -1039,361 +818,6 @@ fn set_lnx_control_socket(path: &str) {
             setenv(name.as_ptr(), value.as_ptr(), 1);
         }
     }
-}
-
-fn run_command(fd: &mut c_int) -> (u64, c_int) {
-    let mut request_id = [0u8; 8];
-    read_exact(*fd, &mut request_id);
-    let request_id = u64::from_be_bytes(request_id);
-
-    let cwd_len = read_u32(*fd) as usize;
-    if cwd_len > 1024 * 1024 {
-        die("bad cwd len");
-    }
-    let mut cwd = vec![0u8; cwd_len + 1];
-    read_exact(*fd, &mut cwd[..cwd_len]);
-    if cwd_len > 0 {
-        unsafe {
-            chdir(cwd.as_ptr() as *const c_char);
-        }
-    }
-
-    let flags = read_u8(*fd);
-    if flags & !REQUEST_FLAG_PTY != 0 {
-        die("bad request flags");
-    }
-    let use_pty = flags & REQUEST_FLAG_PTY != 0;
-    let (term, colorterm, rows, cols) = if use_pty {
-        (
-            read_string(*fd, 1024, "bad TERM len"),
-            read_string(*fd, 1024, "bad COLORTERM len"),
-            read_u16(*fd).max(1),
-            read_u16(*fd).max(1),
-        )
-    } else {
-        (String::new(), String::new(), 1, 1)
-    };
-
-    let argc = read_u32(*fd);
-    if argc == 0 || argc > 4096 {
-        die("bad argc");
-    }
-
-    let mut storage = Vec::with_capacity(argc as usize);
-    let mut argv = Vec::with_capacity(argc as usize + 1);
-    for _ in 0..argc {
-        let len = read_u32(*fd) as usize;
-        if len > 1024 * 1024 {
-            die("bad argv len");
-        }
-        let mut bytes = vec![0u8; len + 1];
-        read_exact(*fd, &mut bytes[..len]);
-        storage.push(bytes);
-    }
-    for bytes in &storage {
-        argv.push(bytes.as_ptr() as *const c_char);
-    }
-    argv.push(ptr::null());
-
-    let status = if use_pty {
-        run_pty_command(fd, request_id, &argv, &term, &colorterm, rows, cols)
-    } else {
-        run_pipe_command(fd, request_id, &argv)
-    };
-
-    (request_id, exit_status(status))
-}
-
-fn run_pty_command(
-    fd: &mut c_int,
-    request_id: u64,
-    argv: &[*const c_char],
-    term: &str,
-    colorterm: &str,
-    rows: u16,
-    cols: u16,
-) -> c_int {
-    let mut pty_master = -1;
-    let mut pty_slave = -1;
-    if unsafe {
-        openpty(
-            &mut pty_master,
-            &mut pty_slave,
-            ptr::null_mut(),
-            ptr::null(),
-            ptr::null(),
-        )
-    } < 0
-    {
-        die("openpty");
-    }
-    let winsize = Winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    unsafe {
-        ioctl(pty_master, TIOCSWINSZ, &winsize as *const Winsize);
-    }
-
-    let pid = unsafe { fork() };
-    if pid < 0 {
-        die("fork");
-    }
-    if pid == 0 {
-        unsafe {
-            close(pty_master);
-            close(*fd);
-            setsid();
-            ioctl(pty_slave, TIOCSCTTY, 0);
-            dup2(pty_slave, STDIN_FILENO);
-            dup2(pty_slave, STDOUT_FILENO);
-            dup2(pty_slave, STDERR_FILENO);
-            if pty_slave > STDERR_FILENO {
-                close(pty_slave);
-            }
-            if let Ok(name) = CString::new("TERM") {
-                if let Ok(value) = CString::new(term) {
-                    setenv(name.as_ptr(), value.as_ptr(), 1);
-                }
-            }
-            if !colorterm.is_empty() {
-                if let Ok(name) = CString::new("COLORTERM") {
-                    if let Ok(value) = CString::new(colorterm) {
-                        setenv(name.as_ptr(), value.as_ptr(), 1);
-                    }
-                }
-            }
-            set_default_exec_environment();
-            set_lnx_request_id(request_id);
-            execvp(argv[0], argv.as_ptr());
-            exec_failed(argv[0]);
-        }
-    }
-    unsafe {
-        close(pty_slave);
-    }
-    set_nonblocking(pty_master);
-    set_nonblocking(*fd);
-    let control_fd = listen_unix(CONTROL_SOCKET);
-
-    let mut buf = [0u8; 8192];
-    let mut status = 0;
-    let mut child_exited = false;
-    let mut pty_eof = false;
-    loop {
-        let mut pollfds = [
-            PollFd {
-                fd: pty_master,
-                events: POLLIN,
-                revents: 0,
-            },
-            PollFd {
-                fd: *fd,
-                events: POLLIN,
-                revents: 0,
-            },
-            PollFd {
-                fd: control_fd,
-                events: POLLIN,
-                revents: 0,
-            },
-        ];
-        let n = unsafe { poll(pollfds.as_mut_ptr(), 3, 100) };
-        if n < 0 && errno() == EINTR {
-            continue;
-        }
-        if n > 0 && pollfds[0].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
-            pty_eof |= drain_output(pty_master, fd, FRAME_OUTPUT, request_id, &mut buf);
-        }
-        if n > 0 && pollfds[1].revents & (POLLHUP | POLLERR) != 0 {
-            reconnect_agent_fd(fd);
-        }
-        if n > 0 && pollfds[1].revents & POLLIN != 0 {
-            if !drain_pty_input(*fd, pty_master, request_id) {
-                reconnect_agent_fd(fd);
-            }
-        }
-        if n > 0 && pollfds[2].revents & POLLIN != 0 {
-            handle_local_control(control_fd, fd, request_id);
-        }
-        if !child_exited {
-            let waited = unsafe { waitpid(pid, &mut status, WNOHANG) };
-            if waited == pid {
-                child_exited = true;
-            } else if waited < 0 {
-                let err = errno();
-                if err == ECHILD {
-                    status = 0;
-                    child_exited = true;
-                } else {
-                    status = 127 << 8;
-                    child_exited = true;
-                }
-            }
-        }
-        if child_exited {
-            pty_eof |= drain_output(pty_master, fd, FRAME_OUTPUT, request_id, &mut buf);
-        }
-        if child_exited && pty_eof {
-            break;
-        }
-    }
-    unsafe {
-        close(pty_master);
-        close(control_fd);
-    }
-    let _ = fs::remove_file(CONTROL_SOCKET);
-
-    status
-}
-
-fn run_pipe_command(fd: &mut c_int, request_id: u64, argv: &[*const c_char]) -> c_int {
-    let mut stdin_pipe = [-1; 2];
-    let mut stdout_pipe = [-1; 2];
-    let mut stderr_pipe = [-1; 2];
-    if unsafe { pipe(stdin_pipe.as_mut_ptr()) } < 0 {
-        die("pipe stdin");
-    }
-    if unsafe { pipe(stdout_pipe.as_mut_ptr()) } < 0 {
-        die("pipe stdout");
-    }
-    if unsafe { pipe(stderr_pipe.as_mut_ptr()) } < 0 {
-        die("pipe stderr");
-    }
-
-    let pid = unsafe { fork() };
-    if pid < 0 {
-        die("fork");
-    }
-    if pid == 0 {
-        unsafe {
-            close(stdin_pipe[1]);
-            close(stdout_pipe[0]);
-            close(stderr_pipe[0]);
-            close(*fd);
-            dup2(stdin_pipe[0], STDIN_FILENO);
-            dup2(stdout_pipe[1], STDOUT_FILENO);
-            dup2(stderr_pipe[1], STDERR_FILENO);
-            if stdin_pipe[0] > STDERR_FILENO {
-                close(stdin_pipe[0]);
-            }
-            if stdout_pipe[1] > STDERR_FILENO {
-                close(stdout_pipe[1]);
-            }
-            if stderr_pipe[1] > STDERR_FILENO {
-                close(stderr_pipe[1]);
-            }
-            set_default_exec_environment();
-            set_lnx_request_id(request_id);
-            execvp(argv[0], argv.as_ptr());
-            exec_failed(argv[0]);
-        }
-    }
-
-    unsafe {
-        close(stdin_pipe[0]);
-        close(stdout_pipe[1]);
-        close(stderr_pipe[1]);
-    }
-    let mut stdin_write = stdin_pipe[1];
-    let stdout_read = stdout_pipe[0];
-    let stderr_read = stderr_pipe[0];
-    set_nonblocking(stdout_read);
-    set_nonblocking(stderr_read);
-    set_nonblocking(*fd);
-    let control_fd = listen_unix(CONTROL_SOCKET);
-
-    let mut buf = [0u8; 8192];
-    let mut status = 0;
-    let mut child_exited = false;
-    let mut stdout_eof = false;
-    let mut stderr_eof = false;
-    loop {
-        let mut pollfds = [
-            PollFd {
-                fd: stdout_read,
-                events: POLLIN,
-                revents: 0,
-            },
-            PollFd {
-                fd: stderr_read,
-                events: POLLIN,
-                revents: 0,
-            },
-            PollFd {
-                fd: *fd,
-                events: POLLIN,
-                revents: 0,
-            },
-            PollFd {
-                fd: control_fd,
-                events: POLLIN,
-                revents: 0,
-            },
-        ];
-        let n = unsafe { poll(pollfds.as_mut_ptr(), 4, 100) };
-        if n < 0 && errno() == EINTR {
-            continue;
-        }
-        if n > 0 && pollfds[0].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
-            stdout_eof |= drain_output(stdout_read, fd, FRAME_OUTPUT, request_id, &mut buf);
-        }
-        if n > 0 && pollfds[1].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
-            stderr_eof |= drain_output(stderr_read, fd, FRAME_STDERR, request_id, &mut buf);
-        }
-        if n > 0 && pollfds[2].revents & (POLLHUP | POLLERR) != 0 {
-            reconnect_agent_fd(fd);
-        }
-        if n > 0 && pollfds[2].revents & POLLIN != 0 {
-            if !drain_pipe_input(*fd, &mut stdin_write, request_id) {
-                reconnect_agent_fd(fd);
-            }
-        }
-        if n > 0 && pollfds[3].revents & POLLIN != 0 {
-            handle_local_control(control_fd, fd, request_id);
-        }
-        if !child_exited {
-            let waited = unsafe { waitpid(pid, &mut status, WNOHANG) };
-            if waited == pid {
-                child_exited = true;
-            } else if waited < 0 {
-                let err = errno();
-                if err == ECHILD {
-                    status = 0;
-                    child_exited = true;
-                } else {
-                    status = 127 << 8;
-                    child_exited = true;
-                }
-            }
-        }
-        if child_exited {
-            if stdin_write >= 0 {
-                unsafe {
-                    close(stdin_write);
-                }
-                stdin_write = -1;
-            }
-            stdout_eof |= drain_output(stdout_read, fd, FRAME_OUTPUT, request_id, &mut buf);
-            stderr_eof |= drain_output(stderr_read, fd, FRAME_STDERR, request_id, &mut buf);
-        }
-        if child_exited && stdout_eof && stderr_eof {
-            break;
-        }
-    }
-    unsafe {
-        if stdin_write >= 0 {
-            close(stdin_write);
-        }
-        close(stdout_read);
-        close(stderr_read);
-        close(control_fd);
-    }
-    let _ = fs::remove_file(CONTROL_SOCKET);
-
-    status
 }
 
 fn set_lnx_request_id(request_id: u64) {
@@ -1417,54 +841,34 @@ fn set_default_exec_environment() {
     set_env("LOGNAME", EXEC_USER);
 }
 
+fn set_forwarded_environment(env: &[(String, String)]) {
+    for (name, value) in env {
+        if allowed_forwarded_env(name) {
+            set_env(name, value);
+        }
+    }
+}
+
+fn allowed_forwarded_env(name: &str) -> bool {
+    matches!(
+        name,
+        "TERM"
+            | "COLORTERM"
+            | "LANG"
+            | "LANGUAGE"
+            | "TZ"
+            | "NO_COLOR"
+            | "CLICOLOR"
+            | "CLICOLOR_FORCE"
+    ) || name.starts_with("LC_")
+}
+
 fn set_env(name: &str, value: &str) {
     if let (Ok(name), Ok(value)) = (CString::new(name), CString::new(value)) {
         unsafe {
             setenv(name.as_ptr(), value.as_ptr(), 1);
         }
     }
-}
-
-fn append_file(path: &str, line: &str) {
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = file.write_all(line.as_bytes());
-    }
-}
-
-fn file_contains_line_prefix(path: &str, prefix: &str) -> bool {
-    fs::read_to_string(path)
-        .map(|contents| contents.lines().any(|line| line.starts_with(prefix)))
-        .unwrap_or(false)
-}
-
-fn ensure_exec_user(uid: u32, gid: u32) {
-    if uid == 0 {
-        return;
-    }
-    if !file_contains_line_prefix("/etc/passwd", "lnxuser:") {
-        append_file(
-            "/etc/passwd",
-            &format!("{EXEC_USER}:x:{uid}:{gid}::/home/{EXEC_USER}:/bin/bash\n"),
-        );
-    }
-    if !file_contains_line_prefix("/etc/shadow", "lnxuser:") {
-        append_file("/etc/shadow", &format!("{EXEC_USER}:!::0:99999:7:::\n"));
-    }
-    if !file_contains_line_prefix("/etc/group", "lnxuser:") {
-        append_file("/etc/group", &format!("{EXEC_USER}:x:{gid}:\n"));
-    }
-    let _ = fs::create_dir_all(EXEC_HOME);
-    if let Ok(home) = CString::new(EXEC_HOME) {
-        unsafe {
-            chown(home.as_ptr(), uid, gid);
-        }
-    }
-    let _ = fs::create_dir_all("/etc/sudoers.d");
-    let _ = fs::write(
-        "/etc/sudoers.d/lnx",
-        format!("{EXEC_USER} ALL=(ALL) NOPASSWD: ALL\n"),
-    );
-    let _ = fs::set_permissions("/etc/sudoers.d/lnx", fs::Permissions::from_mode(0o440));
 }
 
 fn drop_to_exec_user(uid: u32, gid: u32) {
@@ -1561,6 +965,7 @@ fn run_channel_pty(
     channel_id: u64,
     argv: Vec<String>,
     cwd: String,
+    env: Vec<(String, String)>,
     term: String,
     colorterm: String,
     rows: u16,
@@ -1640,6 +1045,7 @@ fn run_channel_pty(
             }
         }
         set_default_exec_environment();
+        set_forwarded_environment(&env);
         set_lnx_request_id(channel_id);
         set_lnx_control_socket(&control_socket);
         drop_to_exec_user(uid, gid);
@@ -1760,6 +1166,7 @@ fn run_channel_pipe(
     channel_id: u64,
     argv: Vec<String>,
     cwd: String,
+    env: Vec<(String, String)>,
     uid: u32,
     gid: u32,
     rx: mpsc::Receiver<ChannelInput>,
@@ -1807,6 +1214,7 @@ fn run_channel_pipe(
             }
         }
         set_default_exec_environment();
+        set_forwarded_environment(&env);
         set_lnx_request_id(channel_id);
         set_lnx_control_socket(&control_socket);
         drop_to_exec_user(uid, gid);
@@ -2090,6 +1498,7 @@ fn agent_loop() {
                 cols,
                 uid,
                 gid,
+                env,
             } => {
                 let (tx, rx) = mpsc::channel();
                 channels.push((channel_id, tx));
@@ -2097,13 +1506,13 @@ fn agent_loop() {
                 if pty {
                     thread::spawn(move || {
                         run_channel_pty(
-                            writer, channel_id, argv, cwd, term, colorterm, rows, cols, uid, gid,
-                            rx,
+                            writer, channel_id, argv, cwd, env, term, colorterm, rows, cols, uid,
+                            gid, rx,
                         )
                     });
                 } else {
                     thread::spawn(move || {
-                        run_channel_pipe(writer, channel_id, argv, cwd, uid, gid, rx)
+                        run_channel_pipe(writer, channel_id, argv, cwd, env, uid, gid, rx)
                     });
                 }
             }

@@ -30,6 +30,7 @@ const CONTROL_PORT: u32 = 10242;
 const FRAME_SNAPSHOT: u8 = b'K';
 const BROKER_HELLO_TIMEOUT: Duration = Duration::from_millis(500);
 const INTERRUPT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
+const DEFAULT_BROKER_IDLE_TTL: Duration = Duration::ZERO;
 
 static SIGNAL_INIT: Once = Once::new();
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -1098,6 +1099,7 @@ fn run_broker_session(mut stream: UnixStream, command: &[String], cwd: &Path) ->
             cols,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
+            env: forwarded_exec_env(),
         },
     )?;
 
@@ -1223,6 +1225,33 @@ fn run_broker_session(mut stream: UnixStream, command: &[String], cwd: &Path) ->
             _ => {}
         }
     }
+}
+
+fn forwarded_exec_env() -> Vec<(String, String)> {
+    const EXACT: &[&str] = &[
+        "TERM",
+        "COLORTERM",
+        "LANG",
+        "LANGUAGE",
+        "TZ",
+        "NO_COLOR",
+        "CLICOLOR",
+        "CLICOLOR_FORCE",
+    ];
+    let mut env = Vec::new();
+    for key in EXACT {
+        if let Ok(value) = std::env::var(key) {
+            if !value.is_empty() {
+                env.push(((*key).to_string(), value));
+            }
+        }
+    }
+    for (key, value) in std::env::vars() {
+        if key.starts_with("LC_") && !value.is_empty() && !env.iter().any(|(k, _)| k == &key) {
+            env.push((key, value));
+        }
+    }
+    env
 }
 
 fn run_broker_client_retry(
@@ -1388,6 +1417,7 @@ fn run_broker_owner(
     let owner_timings = Arc::clone(&timings);
     let owner_log = Arc::clone(&run_log);
     let force_full_snapshot = restore_snapshot.is_none();
+    let broker_idle_ttl = broker_idle_ttl();
     for forward in forwards {
         start_forward_listener(
             forward,
@@ -1400,7 +1430,12 @@ fn run_broker_owner(
     }
     Ok(thread::spawn(move || {
         owner_timings.event("broker.ready");
-        owner_log.line(format!("broker.ready socket={}", broker_socket.display()));
+        owner_log.line(format!(
+            "broker.ready socket={} idle_ttl_ms={}",
+            broker_socket.display(),
+            broker_idle_ttl.as_millis()
+        ));
+        let mut idle_deadline: Option<Instant> = None;
         loop {
             match broker_listener.accept() {
                 Ok((client, _)) => {
@@ -1476,8 +1511,17 @@ fn run_broker_owner(
                             }
                         }
                     }
-                    if seen_active.load(Ordering::SeqCst) && active.load(Ordering::SeqCst) == 0 {
-                        break;
+                    if active.load(Ordering::SeqCst) > 0 {
+                        idle_deadline = None;
+                    } else if seen_active.load(Ordering::SeqCst) {
+                        if broker_idle_ttl.is_zero() {
+                            break;
+                        }
+                        let deadline =
+                            idle_deadline.get_or_insert_with(|| Instant::now() + broker_idle_ttl);
+                        if Instant::now() >= *deadline {
+                            break;
+                        }
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
@@ -1508,6 +1552,17 @@ fn run_broker_owner(
             Err(e) => owner_log.line(format!("snapshot.error {e:#}")),
         }
     }))
+}
+
+fn broker_idle_ttl() -> Duration {
+    broker_idle_ttl_from_env(std::env::var("LNX_BROKER_IDLE_TTL_MS").ok().as_deref())
+}
+
+fn broker_idle_ttl_from_env(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_BROKER_IDLE_TTL)
 }
 
 fn handle_broker_client(
@@ -2272,6 +2327,20 @@ mod tests {
         left.write_all(&(MAX_MESSAGE_SIZE + 1).to_be_bytes())
             .expect("write oversized length");
         assert!(read_message(&mut right).is_err());
+    }
+
+    #[test]
+    fn broker_idle_ttl_defaults_to_immediate_shutdown() {
+        assert_eq!(broker_idle_ttl_from_env(None), Duration::ZERO);
+        assert_eq!(broker_idle_ttl_from_env(Some("nope")), Duration::ZERO);
+    }
+
+    #[test]
+    fn broker_idle_ttl_reads_milliseconds_from_env() {
+        assert_eq!(
+            broker_idle_ttl_from_env(Some("30000")),
+            Duration::from_secs(30)
+        );
     }
 }
 

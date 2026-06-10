@@ -114,8 +114,6 @@ where
     F: FnOnce(&Path) -> Result<()>,
 {
     crate::timing_event("snapshot.capture.begin");
-    let prepatch_dir =
-        stop_prepatch_workers_for_capture(dir, inputs.guest_memory, inputs.ram_ranges)?;
     // 1. Quiesce: pause all vCPUs and collect their state.
     let vcpu_states = match pause_vcpus(inputs.vcpu_handles, inputs.vcpu_ids) {
         Ok(states) => states,
@@ -125,6 +123,15 @@ where
         }
     };
     crate::timing_event("snapshot.capture.vcpus.paused");
+
+    let prepatch_dir =
+        match stop_prepatch_workers_for_capture(dir, inputs.guest_memory, inputs.ram_ranges) {
+            Ok(prepatch_dir) => prepatch_dir,
+            Err(e) => {
+                let _ = resume_vcpus(inputs.vcpu_handles);
+                return Err(e);
+            }
+        };
 
     let result = capture_paused(
         &inputs,

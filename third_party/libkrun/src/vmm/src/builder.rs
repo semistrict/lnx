@@ -2811,7 +2811,13 @@ pub mod tests {
     fn default_guest_memory(
         mem_size_mib: usize,
     ) -> std::result::Result<
-        (GuestMemoryMmap, ArchMemoryInfo, ShmManager, PayloadConfig),
+        (
+            GuestMemoryMmap,
+            ArchMemoryInfo,
+            ShmManager,
+            PayloadConfig,
+            Vec<PmemRegionConfig>,
+        ),
         StartMicrovmError,
     > {
         let mut vm_resources = VmResources::default();
@@ -2837,7 +2843,7 @@ pub mod tests {
             nested_enabled: false,
         };
 
-        let (guest_memory, _arch_memory_info, _shm_manager, _payload_config) =
+        let (guest_memory, _arch_memory_info, _shm_manager, _payload_config, _pmem_regions) =
             default_guest_memory(128).unwrap();
         let vm = setup_vm(&guest_memory, false).unwrap();
         let _kvmioapic = KvmIoapic::new(vm.fd()).unwrap();
@@ -2862,7 +2868,7 @@ pub mod tests {
     #[test]
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     fn test_create_vcpus_aarch64() {
-        let (guest_memory, arch_memory_info, _shm_manager, _payload_config) =
+        let (guest_memory, arch_memory_info, _shm_manager, _payload_config, _pmem_regions) =
             default_guest_memory(128).unwrap();
         let vm = setup_vm(&guest_memory, false).unwrap();
         let vcpu_count = 2;

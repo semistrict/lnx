@@ -19,6 +19,7 @@ pub enum Message {
         cols: u16,
         uid: u32,
         gid: u32,
+        env: Vec<(String, String)>,
     },
     OpenTcp {
         channel_id: u64,
@@ -82,6 +83,10 @@ mod tests {
             cols: 160,
             uid: 501,
             gid: 20,
+            env: vec![
+                ("LANG".into(), "en_US.UTF-8".into()),
+                ("COLORTERM".into(), "truecolor".into()),
+            ],
         };
 
         let encoded = postcard::to_allocvec(&message).expect("encode");
