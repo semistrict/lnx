@@ -354,6 +354,8 @@ pub(crate) struct PassthroughFsSnapshot {
     inodes: Vec<InodeDataSnapshot>,
     #[serde(default)]
     inode_paths: Vec<InodePathSnapshot>,
+    #[serde(default)]
+    dax_mappings: Vec<DaxMappingSnapshot>,
     next_inode: u64,
     handles: Vec<HandleDataSnapshot>,
     next_handle: u64,
@@ -400,6 +402,21 @@ struct CachedDirEntrySnapshot {
     ino: bindings::ino64_t,
     name: Vec<u8>,
     type_: u8,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DaxMappingSnapshot {
+    guest_addr: u64,
+    inode: Inode,
+    foffset: u64,
+    len: u64,
+    writable: bool,
+}
+
+#[derive(Clone, Debug)]
+struct DaxMapping {
+    host_addr: u64,
+    snapshot: DaxMappingSnapshot,
 }
 
 fn ebadf() -> io::Error {
@@ -815,7 +832,8 @@ pub struct PassthroughFs {
     inode_paths: RwLock<BTreeMap<Inode, PathBuf>>,
     next_handle: AtomicU64,
 
-    map_windows: Mutex<HashMap<u64, u64>>,
+    map_windows: Mutex<HashMap<u64, DaxMapping>>,
+    pending_dax_mappings: Mutex<Vec<DaxMappingSnapshot>>,
 
     // Whether writeback caching is enabled for this directory. This will only be true when
     // `cfg.writeback` is true and `init` was called with `FsOptions::WRITEBACK_CACHE`.
@@ -851,6 +869,7 @@ impl PassthroughFs {
             next_handle: AtomicU64::new(1),
 
             map_windows: Mutex::new(HashMap::new()),
+            pending_dax_mappings: Mutex::new(Vec::new()),
 
             writeback: AtomicBool::new(false),
             announce_submounts: AtomicBool::new(false),
@@ -1017,6 +1036,77 @@ impl PassthroughFs {
         Ok((end - offset_in).try_into().unwrap_or(copied))
     }
 
+    fn install_dax_mapping(
+        &self,
+        mapping: DaxMappingSnapshot,
+        map_sender: &Option<Sender<WorkerMessage>>,
+    ) -> io::Result<()> {
+        if map_sender.is_none() {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
+
+        let open_flags = if mapping.writable {
+            libc::O_RDWR
+        } else {
+            libc::O_RDONLY
+        };
+        // HVF rejects read-only file mappings as guest memory. For FUSE
+        // read-only mappings, use a private writable host mapping while the
+        // guest still gets the access mode requested by the kernel.
+        let prot_flags = libc::PROT_READ | libc::PROT_WRITE;
+        let mmap_flags = if mapping.writable {
+            libc::MAP_SHARED
+        } else {
+            libc::MAP_PRIVATE
+        };
+        let hv_protection = if mapping.writable { 1 | 2 } else { 1 | 2 | 4 };
+
+        let file = self.open_inode(mapping.inode, open_flags)?;
+        let fd = file.as_raw_fd();
+        let host_addr = unsafe {
+            mmap_dax_aligned(
+                mapping.len as usize,
+                DAX_MAPPING_ALIGNMENT,
+                prot_flags,
+                mmap_flags,
+                fd,
+                mapping.foffset as libc::off_t,
+            )
+        };
+        if host_addr == libc::MAP_FAILED {
+            return Err(linux_error(io::Error::last_os_error()));
+        }
+
+        drop(file);
+
+        let sender = map_sender.as_ref().unwrap();
+        let (reply_sender, reply_receiver) = unbounded();
+        sender
+            .send(WorkerMessage::GpuAddMapping(
+                reply_sender,
+                host_addr as u64,
+                mapping.guest_addr,
+                mapping.len,
+                hv_protection,
+            ))
+            .unwrap();
+        if !reply_receiver.recv().unwrap() {
+            error!("Error requesting HVF the addition of a DAX window");
+            unsafe { libc::munmap(host_addr, mapping.len as usize) };
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+        }
+
+        self.map_windows.lock().unwrap().insert(
+            mapping.guest_addr,
+            DaxMapping {
+                host_addr: host_addr as u64,
+                snapshot: mapping,
+            },
+        );
+
+        Ok(())
+    }
+
     pub(crate) fn snapshot_state(&self) -> io::Result<PassthroughFsSnapshot> {
         let inodes = self
             .inodes
@@ -1078,10 +1168,18 @@ impl PassthroughFs {
                 path: path.to_string_lossy().into_owned(),
             })
             .collect();
+        let dax_mappings = self
+            .map_windows
+            .lock()
+            .unwrap()
+            .values()
+            .map(|mapping| mapping.snapshot.clone())
+            .collect();
 
         Ok(PassthroughFsSnapshot {
             inodes,
             inode_paths,
+            dax_mappings,
             next_inode: self.inode_alloc.snapshot_next(),
             handles,
             next_handle: self.next_handle.load(Ordering::Acquire),
@@ -1119,6 +1217,8 @@ impl PassthroughFs {
             .iter()
             .map(|path| (path.inode, PathBuf::from(&path.path)))
             .collect();
+        *self.map_windows.lock().unwrap() = HashMap::new();
+        *self.pending_dax_mappings.lock().unwrap() = snap.dax_mappings.clone();
         for handle in &snap.handles {
             let flags = handle.flags & !libc::O_EXLOCK;
             let backing = self
@@ -1166,6 +1266,24 @@ impl PassthroughFs {
         self.writeback.store(snap.writeback, Ordering::Release);
         self.announce_submounts
             .store(snap.announce_submounts, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn replay_dax_mappings(
+        &self,
+        map_sender: &Option<Sender<WorkerMessage>>,
+    ) -> io::Result<()> {
+        let mappings = {
+            let mut pending = self.pending_dax_mappings.lock().unwrap();
+            if pending.is_empty() {
+                return Ok(());
+            }
+            std::mem::take(&mut *pending)
+        };
+
+        for mapping in mappings {
+            self.install_dax_mapping(mapping, map_sender)?;
+        }
         Ok(())
     }
 
@@ -3055,24 +3173,6 @@ impl FileSystem for PassthroughFs {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
 
-        let writable_mapping = (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0;
-        let open_flags = if writable_mapping {
-            libc::O_RDWR
-        } else {
-            libc::O_RDONLY
-        };
-
-        // HVF rejects read-only file mappings as guest memory. For FUSE
-        // read-only mappings, use a private writable host mapping while the
-        // guest still gets the access mode requested by the kernel.
-        let prot_flags = libc::PROT_READ | libc::PROT_WRITE;
-        let mmap_flags = if writable_mapping {
-            libc::MAP_SHARED
-        } else {
-            libc::MAP_PRIVATE
-        };
-        let hv_protection = if writable_mapping { 1 | 2 } else { 1 | 2 | 4 };
-
         if (moffset + len) > shm_size {
             return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
         }
@@ -3080,50 +3180,16 @@ impl FileSystem for PassthroughFs {
         let guest_addr = guest_shm_base + moffset;
 
         debug!("setupmapping: ino {inode:?} guest_addr={guest_addr:x} len={len}");
-
-        let file = self.open_inode(inode, open_flags)?;
-        let fd = file.as_raw_fd();
-
-        let host_addr = unsafe {
-            mmap_dax_aligned(
-                len as usize,
-                DAX_MAPPING_ALIGNMENT,
-                prot_flags,
-                mmap_flags,
-                fd,
-                foffset as libc::off_t,
-            )
-        };
-        if host_addr == libc::MAP_FAILED {
-            return Err(linux_error(io::Error::last_os_error()));
-        }
-
-        drop(file);
-
-        // We've checked that map_sender is something above.
-        let sender = map_sender.as_ref().unwrap();
-        let (reply_sender, reply_receiver) = unbounded();
-        sender
-            .send(WorkerMessage::GpuAddMapping(
-                reply_sender,
-                host_addr as u64,
+        self.install_dax_mapping(
+            DaxMappingSnapshot {
                 guest_addr,
+                inode,
+                foffset,
                 len,
-                hv_protection,
-            ))
-            .unwrap();
-        if !reply_receiver.recv().unwrap() {
-            error!("Error requesting HVF the addition of a DAX window");
-            unsafe { libc::munmap(host_addr, len as usize) };
-            return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
-        }
-
-        self.map_windows
-            .lock()
-            .unwrap()
-            .insert(guest_addr, host_addr as u64);
-
-        Ok(())
+                writable: (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0,
+            },
+            map_sender,
+        )
     }
 
     fn removemapping(
@@ -3143,7 +3209,7 @@ impl FileSystem for PassthroughFs {
             if (req.moffset + req.len) > shm_size {
                 return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
             }
-            let host_addr = match self.map_windows.lock().unwrap().remove(&guest_addr) {
+            let mapping = match self.map_windows.lock().unwrap().remove(&guest_addr) {
                 Some(a) => a,
                 None => return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL))),
             };
@@ -3166,7 +3232,12 @@ impl FileSystem for PassthroughFs {
                 return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
             }
 
-            let ret = unsafe { libc::munmap(host_addr as *mut libc::c_void, req.len as usize) };
+            let ret = unsafe {
+                libc::munmap(
+                    mapping.host_addr as *mut libc::c_void,
+                    mapping.snapshot.len as usize,
+                )
+            };
             if ret == -1 {
                 error!("Error unmapping DAX window");
                 return Err(linux_error(io::Error::last_os_error()));

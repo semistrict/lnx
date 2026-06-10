@@ -107,6 +107,13 @@ impl WritableAllowlistFs<PassthroughFs> {
             .collect();
         Ok(())
     }
+
+    pub(crate) fn replay_dax_mappings(
+        &self,
+        map_sender: &Option<Sender<WorkerMessage>>,
+    ) -> io::Result<()> {
+        self.inner.replay_dax_mappings(map_sender)
+    }
 }
 
 impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for WritableAllowlistFs<T> {

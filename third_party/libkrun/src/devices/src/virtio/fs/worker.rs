@@ -98,6 +98,15 @@ impl FsServer {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn replay_dax_mappings(&self, map_sender: &Option<Sender<WorkerMessage>>) -> io::Result<()> {
+        match self {
+            FsServer::ReadWrite(s) => s.fs().inner().replay_dax_mappings(map_sender),
+            FsServer::ReadOnly(s) => s.fs().inner().replay_dax_mappings(map_sender),
+            FsServer::Null(_) => Ok(()),
+        }
+    }
+
     fn handle_message(
         &self,
         r: Reader,
@@ -245,6 +254,13 @@ impl FsWorker {
     }
 
     fn work(mut self) -> FsWorkerStopResult {
+        #[cfg(target_os = "macos")]
+        if let Err(e) = self.server.replay_dax_mappings(&self.map_sender) {
+            error!("failed to replay virtio-fs DAX mappings: {e:?}");
+            self.exit_code
+                .store(libc::EINVAL, std::sync::atomic::Ordering::Release);
+        }
+
         let virtq_hpq_ev_fd = self.queue_evts[HPQ_INDEX].as_raw_fd();
         let virtq_req_ev_fd = self.queue_evts[REQ_INDEX].as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();

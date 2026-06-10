@@ -74,6 +74,14 @@ impl PassthroughFsRo {
     pub(crate) fn restore_state(&self, snap: &PassthroughFsSnapshot) -> io::Result<()> {
         self.inner.restore_state(snap)
     }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn replay_dax_mappings(
+        &self,
+        map_sender: &Option<Sender<WorkerMessage>>,
+    ) -> io::Result<()> {
+        self.inner.replay_dax_mappings(map_sender)
+    }
 }
 
 impl FileSystem for PassthroughFsRo {

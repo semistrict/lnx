@@ -35,6 +35,8 @@ use std::slice;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use utils::eventfd::EventFd;
+#[cfg(target_os = "macos")]
+use utils::worker_message::WorkerMessage;
 use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
     VmResources, VsockConfig,
@@ -3199,6 +3201,8 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     }
 
     let (sender, _receiver) = unbounded();
+    #[cfg(target_os = "macos")]
+    let worker_sender = sender.clone();
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
@@ -3226,8 +3230,36 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     }
     vmm::timing_event("start_enter.running_vmm.registered");
 
+    #[cfg(target_os = "macos")]
+    let macos_worker_needed =
+        ctx_cfg.gpu_virgl_flags.is_some() || ctx_cfg.vmr.fs.iter().any(|fs| fs.shm_size.is_some());
+
+    #[cfg(target_os = "macos")]
+    if macos_worker_needed {
+        vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
+        vmm::timing_event("start_enter.vmm_worker.started");
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if ctx_cfg.snapshot_restore_path.is_some() {
+        if macos_worker_needed {
+            let (reply_sender, reply_receiver) = unbounded();
+            if let Err(e) = worker_sender.send(WorkerMessage::Barrier(reply_sender)) {
+                error!("Error sending restore worker barrier: {e:?}");
+                return -libc::EINVAL;
+            }
+            match reply_receiver.recv() {
+                Ok(true) => vmm::timing_event("start_enter.restore.worker_barrier"),
+                Ok(false) => {
+                    error!("restore worker barrier failed");
+                    return -libc::EINVAL;
+                }
+                Err(e) => {
+                    error!("Error waiting for restore worker barrier: {e:?}");
+                    return -libc::EINVAL;
+                }
+            }
+        }
         match event_manager.run_with_timeout(0) {
             Ok(count) => {
                 vmm::timing_event(&format!(
@@ -3244,11 +3276,6 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             return -libc::EINVAL;
         }
         vmm::timing_event("start_enter.restore.resumed");
-    }
-
-    #[cfg(target_os = "macos")]
-    if ctx_cfg.gpu_virgl_flags.is_some() || ctx_cfg.vmr.fs.iter().any(|fs| fs.shm_size.is_some()) {
-        vmm::worker::start_worker_thread(_vmm.clone(), _receiver).unwrap();
     }
 
     #[cfg(target_arch = "x86_64")]
