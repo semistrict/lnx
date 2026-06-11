@@ -227,6 +227,20 @@ pub trait VirtioDevice: AsAny + Send {
         ))
     }
 
+    /// Resume device backends while a snapshot restore is still rebuilding the
+    /// rest of machine state. Devices that need to publish guest-visible
+    /// events after interrupt-controller restore can keep those events pending
+    /// here and emit them from `post_restore`.
+    fn resume_after_restore(&mut self) -> Result<(), DeviceSnapshotError> {
+        self.resume()
+    }
+
+    /// Finalize restore after all devices, irqchip, and vCPUs have had their
+    /// captured state applied.
+    fn post_restore(&mut self) -> Result<(), DeviceSnapshotError> {
+        Ok(())
+    }
+
     /// Serialize the device's snapshot. Must be called while the device is paused.
     fn serialize_state(&self) -> Result<DeviceSnapshot, DeviceSnapshotError> {
         Err(DeviceSnapshotError::Unsupported(

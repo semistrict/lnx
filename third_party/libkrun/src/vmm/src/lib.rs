@@ -69,7 +69,9 @@ use kernel::cmdline::Cmdline as KernelCmdline;
 use polly::event_manager::{self, EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::EventFd;
-use vm_memory::{Address, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::GuestMemoryMmap;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use vm_memory::{Address, GuestMemory, GuestMemoryRegion};
 
 /// Success exit code.
 pub const FC_EXIT_CODE_OK: u8 = 0;
@@ -217,9 +219,13 @@ pub struct Vmm {
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
 
-    // Snapshot/restore support (macOS arm64 / HVF only).
+    // Snapshot/restore support.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     snapshot_ctx: Option<crate::macos::vstate::SnapshotCtx>,
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    snapshot_irqchip: Option<IrqChip>,
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    snapshot_nested_enabled: bool,
 }
 
 impl Vmm {
@@ -253,21 +259,52 @@ impl Vmm {
         Ok(())
     }
 
+    /// Starts vCPU threads and leaves them in their initial paused state.
+    #[cfg(target_os = "linux")]
+    pub fn start_vcpus_paused(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
+        let vcpu_count = vcpus.len();
+
+        Vcpu::register_kick_signal_handler();
+
+        self.vcpus_handles.reserve(vcpu_count);
+
+        for mut vcpu in vcpus.drain(..) {
+            vcpu.set_mmio_bus(self.mmio_device_manager.bus.clone());
+
+            self.vcpus_handles
+                .push(vcpu.start_threaded().map_err(Error::VcpuHandle)?);
+        }
+
+        Ok(())
+    }
+
     /// Sends a resume command to the vcpus.
     #[cfg(target_os = "linux")]
     pub fn resume_vcpus(&mut self) -> Result<()> {
-        for handle in self.vcpus_handles.iter() {
-            handle
-                .send_event(VcpuEvent::Resume)
-                .map_err(Error::VcpuEvent)?;
+        for (index, handle) in self.vcpus_handles.iter().enumerate() {
+            handle.send_event(VcpuEvent::Resume).map_err(|e| {
+                error!("resume vcpu {index}: send failed: {e:?}");
+                Error::VcpuEvent(e)
+            })?;
         }
-        for handle in self.vcpus_handles.iter() {
+        for (index, handle) in self.vcpus_handles.iter().enumerate() {
             match handle
                 .response_receiver()
-                .recv_timeout(Duration::from_millis(1000))
+                .recv_timeout(Duration::from_millis(5000))
             {
                 Ok(VcpuResponse::Resumed) => (),
-                _ => return Err(Error::VcpuResume),
+                Ok(VcpuResponse::Error(e)) => {
+                    error!("resume vcpu {index}: {e}");
+                    return Err(Error::VcpuResume);
+                }
+                Ok(other) => {
+                    error!("resume vcpu {index}: unexpected response {other:?}");
+                    return Err(Error::VcpuResume);
+                }
+                Err(e) => {
+                    error!("resume vcpu {index}: timed out waiting for response: {e}");
+                    return Err(Error::VcpuResume);
+                }
             }
         }
         Ok(())
@@ -555,11 +592,69 @@ impl Vmm {
         crate::macos::snapshot::restore(&inputs, &reader).map_err(|e| e.to_string())
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub fn snapshot(&mut self, path: &std::path::Path) -> std::result::Result<(), String> {
+        let inputs = crate::linux::snapshot::CaptureInputs {
+            guest_memory: &self.guest_memory,
+            ram_ranges: &self.ram_ranges,
+            vcpu_handles: &self.vcpus_handles,
+            irqchip: self.snapshot_irqchip.as_ref(),
+            virtio_transports: self.mmio_device_manager.virtio_transports(),
+            nested_enabled: self.snapshot_nested_enabled,
+        };
+        crate::linux::snapshot::capture(inputs, path).map_err(|e| e.to_string())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub fn snapshot_with_file_copy(
+        &mut self,
+        path: &std::path::Path,
+        copy_src: &std::path::Path,
+        copy_dst_name: &std::path::Path,
+    ) -> std::result::Result<(), String> {
+        let inputs = crate::linux::snapshot::CaptureInputs {
+            guest_memory: &self.guest_memory,
+            ram_ranges: &self.ram_ranges,
+            vcpu_handles: &self.vcpus_handles,
+            irqchip: self.snapshot_irqchip.as_ref(),
+            virtio_transports: self.mmio_device_manager.virtio_transports(),
+            nested_enabled: self.snapshot_nested_enabled,
+        };
+        crate::linux::snapshot::capture_with_paused_hook(inputs, path, |stage_dir| {
+            let dst = stage_dir.join(copy_dst_name);
+            clone_or_copy_file(copy_src, &dst).map_err(crate::linux::snapshot::SnapshotError::Io)
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub fn restore_from(&mut self, path: &std::path::Path) -> std::result::Result<(), String> {
+        let reader =
+            crate::linux::snapshot::SnapshotReader::open(path).map_err(|e| e.to_string())?;
+        let inputs = crate::linux::snapshot::CaptureInputs {
+            guest_memory: &self.guest_memory,
+            ram_ranges: &self.ram_ranges,
+            vcpu_handles: &self.vcpus_handles,
+            irqchip: self.snapshot_irqchip.as_ref(),
+            virtio_transports: self.mmio_device_manager.virtio_transports(),
+            nested_enabled: self.snapshot_nested_enabled,
+        };
+        crate::linux::snapshot::restore(&inputs, &reader).map_err(|e| e.to_string())
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn resume_after_restore(&mut self) -> std::result::Result<(), String> {
         crate::timing_event("snapshot.restore.resume_vcpus.begin");
         crate::macos::snapshot::orchestrator::resume_vcpus(&self.vcpus_handles)
             .map_err(|e| e.to_string())?;
+        crate::timing_event("snapshot.restore.resume_vcpus.done");
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub fn resume_after_restore(&mut self) -> std::result::Result<(), String> {
+        crate::timing_event("snapshot.restore.resume_vcpus.begin");
+        self.resume_vcpus().map_err(|e| format!("{e:?}"))?;
         crate::timing_event("snapshot.restore.resume_vcpus.done");
         Ok(())
     }
@@ -577,6 +672,125 @@ fn clone_or_copy_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::
         return Ok(());
     }
     std::fs::copy(src, dst).map(|_| ())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn clone_or_copy_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
+
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut src_file = std::fs::File::open(src)?;
+    let mut dst_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(dst)?;
+
+    const FICLONE: libc::Ioctl = 0x4004_9409;
+    if unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0 {
+        return Ok(());
+    }
+
+    let len = src_file.metadata()?.len();
+    dst_file.set_len(len)?;
+
+    // A whole-file copy_file_range is deliberately avoided: on filesystems
+    // without reflink support it materializes source holes as allocated
+    // zeros. Instead walk SEEK_DATA/SEEK_HOLE extents and copy_file_range
+    // each data extent — on virtiofs the whole file is one extent but
+    // FUSE_COPY_FILE_RANGE is serviced server-side instead of streaming
+    // bytes through the guest.
+    if sparse_copy_extents(&mut src_file, &mut dst_file, len).is_ok() {
+        return Ok(());
+    }
+
+    // SEEK_DATA may be unsupported; restart with a dense scan.
+    dst_file.set_len(0)?;
+    dst_file.set_len(len)?;
+    src_file.seek(SeekFrom::Start(0))?;
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    let mut offset = 0u64;
+    while offset < len {
+        let want = std::cmp::min(buf.len() as u64, len - offset) as usize;
+        src_file.read_exact(&mut buf[..want])?;
+        if buf[..want].iter().any(|byte| *byte != 0) {
+            dst_file.seek(SeekFrom::Start(offset))?;
+            dst_file.write_all(&buf[..want])?;
+        }
+        offset += want as u64;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn sparse_copy_extents(
+    src_file: &mut std::fs::File,
+    dst_file: &mut std::fs::File,
+    len: u64,
+) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
+
+    let mut offset = 0u64;
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    while offset < len {
+        let data =
+            unsafe { libc::lseek(src_file.as_raw_fd(), offset as libc::off_t, libc::SEEK_DATA) };
+        if data < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENXIO) {
+                return Ok(());
+            }
+            return Err(err);
+        }
+
+        let data = data as u64;
+        let hole =
+            unsafe { libc::lseek(src_file.as_raw_fd(), data as libc::off_t, libc::SEEK_HOLE) };
+        if hole < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut copied = data;
+        let end = std::cmp::min(hole as u64, len);
+        while copied < end {
+            let want = std::cmp::min(end - copied, 128 * 1024 * 1024) as libc::size_t;
+            let mut off_in = copied as libc::loff_t;
+            let mut off_out = copied as libc::loff_t;
+            let n = unsafe {
+                libc::copy_file_range(
+                    src_file.as_raw_fd(),
+                    &mut off_in,
+                    dst_file.as_raw_fd(),
+                    &mut off_out,
+                    want,
+                    0,
+                )
+            };
+            if n > 0 {
+                copied += n as u64;
+                continue;
+            }
+            // copy_file_range unsupported here; stream the rest of this
+            // extent through userspace, skipping all-zero chunks.
+            while copied < end {
+                let want = std::cmp::min(buf.len() as u64, end - copied) as usize;
+                src_file.seek(SeekFrom::Start(copied))?;
+                src_file.read_exact(&mut buf[..want])?;
+                if buf[..want].iter().any(|byte| *byte != 0) {
+                    dst_file.seek(SeekFrom::Start(copied))?;
+                    dst_file.write_all(&buf[..want])?;
+                }
+                copied += want as u64;
+            }
+        }
+        offset = end;
+    }
+    Ok(())
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

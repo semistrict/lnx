@@ -89,6 +89,9 @@ pub struct MMIODeviceManager {
     irq: u32,
     last_irq: u32,
     id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
+    /// Parallel handle table for virtio MMIO transports, indexed by MMIO base
+    /// address. Used by snapshot orchestration to enumerate devices.
+    virtio_transports: Vec<(u64, Arc<Mutex<devices::virtio::MmioTransport>>)>,
 }
 
 impl MMIODeviceManager {
@@ -103,7 +106,13 @@ impl MMIODeviceManager {
             last_irq: irq_interval.1,
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
+            virtio_transports: Vec::new(),
         }
+    }
+
+    /// Stable, ordered view of every virtio-mmio transport, keyed by MMIO base.
+    pub fn virtio_transports(&self) -> &[(u64, Arc<Mutex<devices::virtio::MmioTransport>>)] {
+        &self.virtio_transports
     }
 
     /// Register a MMIO IOAPIC device.
@@ -149,8 +158,10 @@ impl MMIODeviceManager {
 
         mmio_device.set_irq_line(self.irq);
 
+        let arc = Arc::new(Mutex::new(mmio_device));
+        self.virtio_transports.push((self.mmio_base, arc.clone()));
         self.bus
-            .insert(Arc::new(Mutex::new(mmio_device)), self.mmio_base, MMIO_LEN)
+            .insert(arc, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
         let ret = (self.mmio_base, self.irq);
         self.id_to_dev_info.insert(

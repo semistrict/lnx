@@ -799,7 +799,7 @@ mod tests {
             0x20_0000, // 2 MB
         )])
         .unwrap();
-        vm.memory_init(&gm).expect("memory_init failed");
+        vm.memory_init(&gm, &[]).expect("memory_init failed");
     }
 
     #[test]

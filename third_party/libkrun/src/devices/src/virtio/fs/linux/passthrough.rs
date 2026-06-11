@@ -58,6 +58,37 @@ struct HandleData {
     exported: AtomicBool,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct InodeDataSnapshot {
+    inode: Inode,
+    ino: libc::ino64_t,
+    dev: libc::dev_t,
+    mnt_id: u64,
+    refcount: u64,
+    // Backing path recovered from /proc/self/fd at capture time; inodes are
+    // reopened by path on restore, so unlinked-but-open files cannot be
+    // snapshotted.
+    path: Vec<u8>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HandleDataSnapshot {
+    handle: Handle,
+    inode: Inode,
+    flags: i32,
+    exported: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PassthroughFsSnapshot {
+    inodes: Vec<InodeDataSnapshot>,
+    handles: Vec<HandleDataSnapshot>,
+    next_inode: u64,
+    next_handle: u64,
+    writeback: bool,
+    announce_submounts: bool,
+}
+
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Default)]
 struct LinuxDirent64 {
@@ -504,6 +535,169 @@ impl PassthroughFs {
 
         // Safe because we just opened this fd.
         Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// Resolve the backing path of an O_PATH fd via /proc/self/fd.
+    fn fd_path(&self, file: &File) -> io::Result<Vec<u8>> {
+        let pathname = CString::new(format!("{}", file.as_raw_fd()))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        let len = unsafe {
+            libc::readlinkat(
+                self.proc_self_fd.as_raw_fd(),
+                pathname.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        if len < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        buf.truncate(len as usize);
+        Ok(buf)
+    }
+
+    pub(crate) fn snapshot_state(&self) -> io::Result<PassthroughFsSnapshot> {
+        let inodes = self
+            .inodes
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(_, data)| {
+                let st = stat(&data.file)?;
+                let path = self.fd_path(&data.file)?;
+                if st.st_nlink == 0 {
+                    // Reopening by path on restore cannot reach an unlinked
+                    // file.
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!(
+                            "inode {} ({}) is unlinked but still open; cannot snapshot",
+                            data.inode,
+                            String::from_utf8_lossy(&path)
+                        ),
+                    ));
+                }
+                Ok(InodeDataSnapshot {
+                    inode: data.inode,
+                    ino: st.st_ino,
+                    dev: data.dev,
+                    mnt_id: data.mnt_id,
+                    refcount: data.refcount.load(Ordering::Acquire),
+                    path,
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+
+        let handles = self
+            .handles
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(&handle, data)| {
+                let file = data.file.read().unwrap();
+                let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+                if flags < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(HandleDataSnapshot {
+                    handle,
+                    inode: data.inode,
+                    flags,
+                    exported: data.exported.load(Ordering::Acquire),
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+
+        Ok(PassthroughFsSnapshot {
+            inodes,
+            handles,
+            next_inode: self.inode_alloc.snapshot_next(),
+            next_handle: self.next_handle.load(Ordering::Acquire),
+            writeback: self.writeback.load(Ordering::Acquire),
+            announce_submounts: self.announce_submounts.load(Ordering::Acquire),
+        })
+    }
+
+    pub(crate) fn restore_state(&self, snap: &PassthroughFsSnapshot) -> io::Result<()> {
+        let mut inodes = MultikeyBTreeMap::new();
+        for inode in &snap.inodes {
+            let path = String::from_utf8_lossy(&inode.path).into_owned();
+            let c_path = CString::new(inode.path.clone())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let e = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("reopen restored inode {} path {path}: {e}", inode.inode),
+                ));
+            }
+            let file = unsafe { File::from_raw_fd(fd) };
+            let st = stat(&file)?;
+            if st.st_ino != inode.ino || st.st_dev != inode.dev {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "restored inode {} changed identity at {path}: ino {} -> {}, dev {} -> {}",
+                        inode.inode, inode.ino, st.st_ino, inode.dev, st.st_dev
+                    ),
+                ));
+            }
+            inodes.insert(
+                inode.inode,
+                InodeAltKey {
+                    ino: inode.ino,
+                    dev: inode.dev,
+                    mnt_id: inode.mnt_id,
+                },
+                Arc::new(InodeData {
+                    inode: inode.inode,
+                    file,
+                    dev: inode.dev,
+                    mnt_id: inode.mnt_id,
+                    refcount: AtomicU64::new(inode.refcount),
+                }),
+            );
+        }
+        *self.inodes.write().unwrap() = inodes;
+
+        let mut handles = BTreeMap::new();
+        for handle in &snap.handles {
+            // F_GETFL does not report creation flags, but never reopen with
+            // anything that could mutate the file.
+            let flags = handle.flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC);
+            let file = self.open_inode(handle.inode, flags).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "open restored handle {} inode {} flags {:#x}: {e}",
+                        handle.handle, handle.inode, flags
+                    ),
+                )
+            })?;
+            handles.insert(
+                handle.handle,
+                Arc::new(HandleData {
+                    inode: handle.inode,
+                    file: RwLock::new(file),
+                    exported: AtomicBool::new(handle.exported),
+                }),
+            );
+        }
+        *self.handles.write().unwrap() = handles;
+
+        self.inode_alloc.restore_next(snap.next_inode);
+        self.next_handle.store(snap.next_handle, Ordering::Release);
+        self.writeback.store(snap.writeback, Ordering::Release);
+        self.announce_submounts
+            .store(snap.announce_submounts, Ordering::Release);
+        Ok(())
     }
 
     fn open_inode_or_path(&self, inode: Inode, flags: i32) -> io::Result<FileOrLink> {

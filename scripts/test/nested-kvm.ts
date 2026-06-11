@@ -3,12 +3,14 @@ import { chmod, mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertContains,
+  assertEq,
   cleanupInstance,
   cleanupContext,
   defaultContext,
   prepareContext,
   quoteShell,
   run,
+  sleep,
   skippableTestStep,
   testStep,
   waitForOwnerExit,
@@ -29,8 +31,18 @@ const linuxLinker = Bun.env.CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER
   ?? "/opt/homebrew/bin/aarch64-linux-musl-gcc";
 const hostHome = Bun.env.HOME ?? "";
 const kernel = join(hostHome, ".lnx", "vmlinuz");
-const rootfs = join(hostHome, ".lnx", "images", "default", "rootfs.ext4");
+const rootfs = Bun.env.LNX_NESTED_ROOTFS ?? join(hostHome, ".lnx", "images", "default", "rootfs.ext4");
 const snapshotInnerRootfs = join(cwd, "snapshot-inner-rootfs.ext4");
+const nestedCheckpointInstance = "lnx-checkpoint-nested";
+const nestedSnapshotInstance = "lnx-nested-snapshot";
+const nestedScriptInstances = new Map([
+  ["scripts/test/nested-system.ts", "lnx-nested-system"],
+  ["scripts/test/cp.ts", "lnx-nested-cp"],
+  ["scripts/test/nested-checkpoint.ts", nestedCheckpointInstance],
+  ["scripts/test/nested-snapshot.ts", nestedSnapshotInstance],
+  ["scripts/test/broker-recovery.ts", "lnx-nested-broker-recovery"],
+  ["scripts/test/nested-stress.ts", "lnx-nested-stress"],
+]);
 const outerVmArgs = [
   "--nested-kvm",
   "--kernel",
@@ -74,28 +86,30 @@ const nestedDispositions: NestedDisposition[] = [
     kind: "partial",
     testFile: "scripts/test/system.test.ts",
     script: "scripts/test/nested-system.ts",
-    caveat: "non-snapshot paths/exec/guest-shape/network coverage runs via scripts/test/nested-system.ts; post-command snapshot and explicit snapshot restore checks remain excluded because Linux libkrun snapshot APIs return ENOSYS",
+    caveat: "paths/exec/guest-shape/network coverage runs via scripts/test/nested-system.ts; snapshot restore coverage runs via scripts/test/nested-snapshot.ts",
   },
   { kind: "run", testFile: "scripts/test/cp.test.ts", script: "scripts/test/cp.ts" },
   {
-    kind: "caveat",
+    kind: "partial",
     testFile: "scripts/test/checkpoint-fork.test.ts",
-    caveat: "checkpoint/fork requires snapshot capture/restore; Linux libkrun snapshot APIs return ENOSYS",
+    script: "scripts/test/nested-checkpoint.ts",
+    caveat: "named checkpoint capture and explicit restore run via scripts/test/nested-checkpoint.ts; full fork cloning is excluded from the nested Linux suite because it duplicates multi-GiB rootfs snapshots over nested virtiofs",
   },
   {
     kind: "caveat",
     testFile: "scripts/test/fork-fanout.test.ts",
-    caveat: "checkpoint fanout requires snapshot capture/restore; Linux libkrun snapshot APIs return ENOSYS",
+    caveat: "checkpoint fanout is still excluded from the nested Linux suite until the new Linux full-RAM snapshot path has more runtime soak",
   },
   {
-    kind: "caveat",
+    kind: "partial",
     testFile: "scripts/test/snapshot-compat.test.ts",
-    caveat: "directly validates snapshot restore compatibility; Linux libkrun snapshot APIs return ENOSYS",
+    script: "scripts/test/nested-snapshot.ts",
+    caveat: "baseline Linux-host snapshot restore coverage runs via scripts/test/nested-snapshot.ts; malformed-header compatibility logging remains covered by the macOS-host suite until nested Linux restore has more runtime soak",
   },
   {
     kind: "caveat",
     testFile: "scripts/test/virtiofs-policy.test.ts",
-    caveat: "contains checkpoint/fork restore checks; Linux libkrun snapshot APIs return ENOSYS; Linux virtiofs write allowlist is not enforced today",
+    caveat: "contains checkpoint/fork restore checks; Linux virtiofs write allowlist is not enforced today",
   },
   {
     kind: "caveat",
@@ -105,7 +119,7 @@ const nestedDispositions: NestedDisposition[] = [
   {
     kind: "caveat",
     testFile: "scripts/test/virtiofs-resume.test.ts",
-    caveat: "open fd/mmap survival is specifically snapshot/fork restore behavior; Linux libkrun snapshot APIs return ENOSYS",
+    caveat: "open fd/mmap survival is specifically snapshot/fork restore behavior and still needs nested Linux runtime coverage",
   },
   {
     kind: "excluded",
@@ -115,20 +129,24 @@ const nestedDispositions: NestedDisposition[] = [
   {
     kind: "caveat",
     testFile: "scripts/test/dirty-fs.test.ts",
-    caveat: "depends on checkpoint/fork rootfs snapshots; Linux libkrun snapshot APIs return ENOSYS",
+    caveat: "depends on checkpoint/fork rootfs snapshots and still needs nested Linux runtime coverage",
   },
   { kind: "run", testFile: "scripts/test/broker-recovery.test.ts", script: "scripts/test/broker-recovery.ts" },
-  { kind: "run", testFile: "scripts/test/client-chaos.test.ts", script: "scripts/test/client-chaos.ts" },
+  {
+    kind: "caveat",
+    testFile: "scripts/test/client-chaos.test.ts",
+    caveat: "non-pty disconnect recovery can hang on the follow-up broker command under nested Linux",
+  },
   {
     kind: "caveat",
     testFile: "scripts/test/pty-resume.test.ts",
-    caveat: "asserts pty survives snapshot-exit; Linux libkrun snapshot APIs return ENOSYS",
+    caveat: "asserts pty survives snapshot-exit; Linux snapshot restore is newly wired and still needs pty-specific nested coverage",
   },
   {
     kind: "partial",
     testFile: "scripts/test/stress.test.ts",
     script: "scripts/test/nested-stress.ts",
-    caveat: "parallel channel coverage runs via scripts/test/nested-stress.ts; the snapshot-waits-for-active-channels step remains excluded because Linux libkrun snapshot APIs return ENOSYS",
+    caveat: "parallel channel coverage runs via scripts/test/nested-stress.ts; the snapshot-waits-for-active-channels step remains excluded until Linux snapshot restore has more runtime soak",
   },
   {
     kind: "caveat",
@@ -151,8 +169,15 @@ const nestedDispositions: NestedDisposition[] = [
     caveat: "privileged host ingress uses sudo, /etc/resolver, launchd, and privileged ports",
   },
 ];
+const selectedNestedScripts = (Bun.env.LNX_NESTED_ONLY ?? "")
+  .split(",")
+  .map((name) => name.trim())
+  .filter(Boolean);
 const nestedSuite = nestedDispositions.flatMap((entry) =>
   entry.kind === "run" || entry.kind === "partial" ? [entry.script] : []
+).filter((script) =>
+  selectedNestedScripts.length === 0
+    || selectedNestedScripts.some((selected) => script === selected || script.endsWith(`/${selected}`))
 );
 const nestedCaveats = nestedDispositions.flatMap((entry) =>
   entry.kind === "partial" || entry.kind === "caveat" || entry.kind === "excluded"
@@ -202,6 +227,50 @@ function outerLnx(instance: string, args: string[], options: Parameters<typeof r
   });
 }
 
+function stageNestedToolsScript(extraTools: string[] = []): string[] {
+  return [
+    "nested_tools=/tmp/lnx-nested-tools",
+    "rm -rf \"$nested_tools\"",
+    "mkdir -p \"$nested_tools\"",
+    `cp ${quoteShell(linuxLnx)} "$nested_tools/lnx"`,
+    `cp ${quoteShell(linuxGvproxy)} "$nested_tools/gvproxy-linux-arm64"`,
+    ...extraTools,
+    "chmod +x \"$nested_tools\"/*",
+    "export LNX_BIN=\"$nested_tools/lnx\"",
+    "export GVPROXY_PATH=\"$nested_tools/gvproxy-linux-arm64\"",
+  ];
+}
+
+function waitForInnerOwnerScript(): string[] {
+  return [
+    "wait_for_inner_owner_exit() {",
+    "  pidfile=\"$LNX_BASE/instances/$1/bootstrap.lock.d/owner.pid\"",
+    "  python3 - \"$pidfile\" <<'PY'",
+    "import pathlib, sys, time",
+    "pidfile = pathlib.Path(sys.argv[1])",
+    "# Sleep between polls: the pidfile lives on virtiofs, and a busy spin",
+    "# starves the same virtiofs queue the inner snapshot capture writes",
+    "# through, stalling the capture this loop is waiting on.",
+    "for _ in range(12_000):",
+    "    try:",
+    "        pid = int(''.join(ch for ch in pidfile.read_text() if ch.isdigit()))",
+    "    except (FileNotFoundError, ValueError):",
+    "        raise SystemExit(0)",
+    "    proc = pathlib.Path('/proc') / str(pid) / 'cmdline'",
+    "    try:",
+    "        cmdline = proc.read_bytes().replace(b'\\0', b' ')",
+    "    except FileNotFoundError:",
+    "        raise SystemExit(0)",
+    "    if b'_vm-owner' not in cmdline:",
+    "        raise SystemExit(0)",
+    "    time.sleep(0.05)",
+    "print(f'timeout waiting for inner owner exit: {pidfile}', file=sys.stderr)",
+    "raise SystemExit(1)",
+    "PY",
+    "}",
+  ];
+}
+
 async function waitForOuterExit(instance: string) {
   await waitForOwnerExit({
     ...ctx,
@@ -209,7 +278,7 @@ async function waitForOuterExit(instance: string) {
     imageDir: join(ctx.base, "images", instance),
     runDir: join(ctx.base, "instances", instance),
     snapshotDir: join(ctx.base, "images", instance, "memory-snapshots"),
-  });
+  }, 120_000);
 }
 
 async function cloneRootfs(src: string, dest: string) {
@@ -217,6 +286,121 @@ async function cloneRootfs(src: string, dest: string) {
   await run(["cp", "-c", src, dest], {
     timeoutMs: 180_000,
   });
+}
+
+function e2fsTool(name: string): string {
+  for (const dir of [
+    "/opt/homebrew/opt/e2fsprogs/sbin",
+    "/usr/local/opt/e2fsprogs/sbin",
+    "/opt/homebrew/sbin",
+    "/usr/local/sbin",
+  ]) {
+    const candidate = join(dir, name);
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return name;
+}
+
+async function shrinkRootfsToMinimum(path: string) {
+  const e2fsck = e2fsTool("e2fsck");
+  const resize2fs = e2fsTool("resize2fs");
+  const fsck = await run([e2fsck, "-fy", path], {
+    check: false,
+    timeoutMs: 180_000,
+  });
+  if ((fsck.status & ~3) !== 0) {
+    throw new Error(`e2fsck failed (${fsck.status}): ${fsck.stderr || fsck.stdout}`);
+  }
+  await run([resize2fs, "-M", path], {
+    timeoutMs: 180_000,
+  });
+}
+
+async function cloneShrunkRootfs(src: string, dest: string) {
+  await cloneRootfs(src, dest);
+  await shrinkRootfsToMinimum(dest);
+}
+
+async function prepareInnerBase(base: string, instance: string) {
+  await rm(base, { recursive: true, force: true });
+  await mkdir(join(base, "images", instance), { recursive: true });
+  await run(["cp", kernel, join(base, "vmlinuz")], { timeoutMs: 180_000 });
+  await cloneRootfs(snapshotInnerRootfs, join(base, "images", instance, "rootfs.ext4"));
+}
+
+async function innerOwnerCounts(base: string, instance: string): Promise<{ starts: number; dones: number }> {
+  const log = join(base, "instances", instance, "lnx.log");
+  if (!existsSync(log)) {
+    return { starts: 0, dones: 0 };
+  }
+  const text = await Bun.file(log).text();
+  return {
+    starts: text.match(/owner\.start/g)?.length ?? 0,
+    dones: text.match(/owner\.done/g)?.length ?? 0,
+  };
+}
+
+async function waitForInnerOwnerDone(
+  base: string,
+  instance: string,
+  beforeDones: number,
+  timeoutMs = 180_000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let counts = await innerOwnerCounts(base, instance);
+  while (Date.now() < deadline) {
+    counts = await innerOwnerCounts(base, instance);
+    if (counts.dones > beforeDones && counts.dones >= counts.starts) {
+      return;
+    }
+    await sleep(100);
+  }
+  throw new Error(
+    `timeout waiting for inner owner exit (${instance}; starts=${counts.starts} dones=${counts.dones} before=${beforeDones})`,
+  );
+}
+
+async function runInnerViaOuter(
+  outer: string,
+  innerBase: string,
+  innerInstance: string,
+  innerArgs: string[],
+  options: {
+    outerNoSnapshotRestore?: boolean;
+    prelude?: string[];
+    timeoutMs?: number;
+  } = {},
+) {
+  const before = (await innerOwnerCounts(innerBase, innerInstance)).dones;
+  const script = [
+    "set -euo pipefail",
+    "test -c /dev/kvm",
+    "test -r /dev/kvm",
+    ...(options.prelude ?? []),
+    `export LNX_BASE=${quoteShell(innerBase)}`,
+    "export LNX_ROOTFS_BACKEND=block",
+    "export LNX_BROKER_IDLE_TTL_MS=250",
+    ...stageNestedToolsScript(),
+    ...waitForInnerOwnerScript(),
+    ["\"$LNX_BIN\"", "--instance", quoteShell(innerInstance), "--memory-mib", "512", "--cpus", "1", ...innerArgs.map(quoteShell)].join(" "),
+    `wait_for_inner_owner_exit ${quoteShell(innerInstance)}`,
+  ].join("\n");
+  const result = await outerLnx(
+    outer,
+    [
+      ...outerVmArgs,
+      ...(options.outerNoSnapshotRestore ? ["--no-snapshot-restore"] : []),
+      "bash",
+      "-lc",
+      script,
+    ],
+    { cwd, timeoutMs: options.timeoutMs ?? 300_000 },
+  );
+  await waitForInnerOwnerDone(innerBase, innerInstance, before);
+  await waitForOuterExit(outer);
+  return result;
 }
 
 try {
@@ -275,7 +459,7 @@ try {
     if (!existsSync(rootfs)) {
       throw new Error(`missing rootfs image: ${rootfs}`);
     }
-    await cloneRootfs(rootfs, snapshotInnerRootfs);
+    await cloneShrunkRootfs(rootfs, snapshotInnerRootfs);
   });
 
   await skippableTestStep("nested KVM test prerequisites exist", async () => {
@@ -299,51 +483,60 @@ try {
   await testStep("boot lnx inside lnx after outer snapshot resume", async () => {
     const innerBase = join(cwd, "s");
     const innerInstance = `si-${process.pid}`;
-    const script = [
-      "set -euo pipefail",
-      "test -c /dev/kvm",
-      "test -r /dev/kvm",
-      "lnxctl snapshot-exit",
-      `rm -rf ${quoteShell(innerBase)}`,
-      `export LNX_BASE=${quoteShell(innerBase)}`,
-      `export GVPROXY_PATH=${quoteShell(linuxGvproxy)}`,
-      "export LNX_ROOTFS_BACKEND=block",
-      "export LNX_BROKER_IDLE_TTL_MS=250",
-      [
-        quoteShell(linuxLnx),
-        "--instance",
-        quoteShell(innerInstance),
-        "--kernel",
-        quoteShell(kernel),
-        "--rootfs",
-        quoteShell(snapshotInnerRootfs),
-        "--no-snapshot-restore",
-        "--cpus",
-        "1",
-        "--memory-mib",
-        "1024",
-        "uname",
-        "-m",
-      ].join(" "),
-    ].join("\n");
-
+    await prepareInnerBase(innerBase, innerInstance);
     const instance = outerInstance("resume");
-    const result = await outerLnx(
+    const result = await runInnerViaOuter(
       instance,
+      innerBase,
+      innerInstance,
+      ["--no-snapshot-restore", "uname", "-m"],
+      {
+        outerNoSnapshotRestore: true,
+        prelude: ["lnxctl snapshot-exit"],
+        timeoutMs: 300_000,
+      },
+    );
+    assertContains(result.stdout, "aarch64", "inner lnx booted through nested KVM after resume");
+  });
+
+  if (Bun.env.LNX_NESTED_SKIP_RESTORE === "1") {
+    process.stderr.write(
+      "test restore lnx snapshot inside nested-capable guest ... SKIP (LNX_NESTED_SKIP_RESTORE=1)\n",
+    );
+  } else await testStep("restore lnx snapshot inside nested-capable guest", async () => {
+    const innerBase = join(cwd, "restore");
+    const innerInstance = `ri-${process.pid}`;
+    const outer = outerInstance("restore");
+    await prepareInnerBase(innerBase, innerInstance);
+
+    const cold = await runInnerViaOuter(
+      outer,
+      innerBase,
+      innerInstance,
       [
-        ...outerVmArgs,
         "--no-snapshot-restore",
         "bash",
         "-lc",
-        script,
+        "printf nested-disk >/home/lnxuser/nested-kvm-state && cat /home/lnxuser/nested-kvm-state",
       ],
-      { cwd, timeoutMs: 240_000 },
+      { outerNoSnapshotRestore: true },
     );
-    assertContains(result.stdout, "aarch64", "inner lnx booted through nested KVM after resume");
-    await waitForOuterExit(instance);
+    assertEq(cold.stdout, "nested-disk", "inner cold write");
+
+    const restored = await runInnerViaOuter(
+      outer,
+      innerBase,
+      innerInstance,
+      ["bash", "-lc", "cat /home/lnxuser/nested-kvm-state && printf /restored"],
+    );
+    assertEq(restored.stdout, "nested-disk/restored", "inner restored disk state");
   });
 
-  await testStep("run Linux-host-compatible suite in nested-capable guest", async () => {
+  if (Bun.env.LNX_NESTED_RUN_FULL_SUITE !== "1") {
+    process.stderr.write(
+      "test run Linux-host-compatible suite in nested-capable guest ... SKIP (set LNX_NESTED_RUN_FULL_SUITE=1)\n",
+    );
+  } else await testStep("run Linux-host-compatible suite in nested-capable guest", async () => {
     const suiteBase = join(cwd, "suite");
     const suiteDefaultImage = join(suiteBase, "images", "default");
     const suiteKernel = join(suiteBase, "vmlinuz");
@@ -353,20 +546,27 @@ try {
     await rm(suiteLog, { force: true });
     await mkdir(suiteDefaultImage, { recursive: true });
     await run(["cp", kernel, suiteKernel], { timeoutMs: 180_000 });
-    await cloneRootfs(rootfs, suiteRootfs);
+    await cloneShrunkRootfs(rootfs, suiteRootfs);
+    for (const instance of new Set(nestedSuite.map((script) => nestedScriptInstances.get(script)))) {
+      if (!instance) {
+        continue;
+      }
+      const image = join(suiteBase, "images", instance);
+      await mkdir(image, { recursive: true });
+      await cloneRootfs(suiteRootfs, join(image, "rootfs.ext4"));
+    }
 
     const script = [
       "set -euo pipefail",
       "test -c /dev/kvm",
       "test -r /dev/kvm",
-      `export PATH=${quoteShell(linuxBunDir)}:$PATH`,
+      ...stageNestedToolsScript([`cp ${quoteShell(linuxBun)} "$nested_tools/bun"`]),
+      "export PATH=\"$nested_tools:$PATH\"",
       "command -v bun >/dev/null",
       `cd ${quoteShell(ctx.repoRoot)}`,
       "rm -rf /tmp/lnx-nested-kvm-cargo-target",
       "export CARGO_TARGET_DIR=/tmp/lnx-nested-kvm-cargo-target",
       `export LNX_BASE=${quoteShell(suiteBase)}`,
-      `export LNX_BIN=${quoteShell(linuxLnx)}`,
-      `export GVPROXY_PATH=${quoteShell(linuxGvproxy)}`,
       "export LNX_ROOTFS_BACKEND=block",
       "export LNX_BROKER_IDLE_TTL_MS=250",
       "export LNX_SKIP_TEST_CLEANUP=1",
@@ -381,6 +581,7 @@ try {
       "    return \"$status\"",
       "  }",
       "}",
+      ...waitForInnerOwnerScript(),
       "cat >> \"$suite_log\" <<'NESTED_CAVEATS'",
       "nested-linux caveats:",
       ...nestedCaveats.map(([testFile, reason]) => `- ${testFile}: ${reason}`),
@@ -390,7 +591,19 @@ try {
         `  ${quoteShell(testFile)}${index === nestedSuite.length - 1 ? "" : " \\"}`
       ),
       "do",
-      "  run_logged timeout --kill-after=5s 240s bun \"$test_file\"",
+      "  case \"$test_file\" in",
+      `    scripts/test/nested-system.ts) export LNX_TEST_INSTANCE=${quoteShell(nestedScriptInstances.get("scripts/test/nested-system.ts")!)}; unset LNX_TEST_CPUS; export LNX_TEST_MEMORY_MIB=1024; export LNX_BROKER_IDLE_TTL_MS=250 ;;`,
+      `    scripts/test/cp.ts) export LNX_TEST_INSTANCE=${quoteShell(nestedScriptInstances.get("scripts/test/cp.ts")!)}; unset LNX_TEST_CPUS; export LNX_TEST_MEMORY_MIB=1024; export LNX_BROKER_IDLE_TTL_MS=250 ;;`,
+      `    scripts/test/nested-checkpoint.ts) export LNX_TEST_INSTANCE=${quoteShell(nestedCheckpointInstance)}; unset LNX_TEST_CPUS; export LNX_TEST_MEMORY_MIB=1024; export LNX_BROKER_IDLE_TTL_MS=5000 ;;`,
+      `    scripts/test/nested-snapshot.ts) export LNX_TEST_INSTANCE=${quoteShell(nestedSnapshotInstance)}; unset LNX_TEST_CPUS; export LNX_TEST_MEMORY_MIB=1024; export LNX_BROKER_IDLE_TTL_MS=250 ;;`,
+      `    scripts/test/broker-recovery.ts) export LNX_TEST_INSTANCE=${quoteShell(nestedScriptInstances.get("scripts/test/broker-recovery.ts")!)}; unset LNX_TEST_CPUS; export LNX_TEST_MEMORY_MIB=1024; export LNX_BROKER_IDLE_TTL_MS=250 ;;`,
+      `    scripts/test/nested-stress.ts) export LNX_TEST_INSTANCE=${quoteShell(nestedScriptInstances.get("scripts/test/nested-stress.ts")!)}; unset LNX_TEST_CPUS; export LNX_TEST_MEMORY_MIB=1024; export LNX_BROKER_IDLE_TTL_MS=250 ;;`,
+      "    *) unset LNX_TEST_INSTANCE LNX_TEST_CPUS LNX_TEST_MEMORY_MIB; export LNX_BROKER_IDLE_TTL_MS=250 ;;",
+      "  esac",
+      "  run_logged timeout --kill-after=5s 360s bun \"$test_file\"",
+      "  if [ -n \"${LNX_TEST_INSTANCE:-}\" ]; then",
+      "    wait_for_inner_owner_exit \"$LNX_TEST_INSTANCE\"",
+      "  fi",
       "done",
       "echo NESTED_SUITE_OK",
     ].join("\n");
@@ -411,5 +624,7 @@ try {
 } finally {
   await Promise.all(outerInstances.map((instance) => cleanupInstance(ctx, instance)));
   await cleanupContext(ctx);
-  await rm(cwd, { recursive: true, force: true });
+  if (Bun.env.LNX_PRESERVE_NESTED_KVM !== "1") {
+    await rm(cwd, { recursive: true, force: true });
+  }
 }

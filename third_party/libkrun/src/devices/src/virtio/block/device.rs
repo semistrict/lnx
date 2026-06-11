@@ -143,25 +143,24 @@ impl DiskProperties {
     pub fn cache_type(&self) -> CacheType {
         self.cache_type
     }
+
+    pub(crate) fn flush(&self) -> io::Result<()> {
+        match self.cache_type {
+            CacheType::Writeback => {
+                let diskfile = self.file.lock().unwrap();
+                diskfile.flush()?;
+                diskfile.sync()
+            }
+            CacheType::Unsafe => Ok(()),
+        }
+    }
 }
 
 impl Drop for DiskProperties {
     fn drop(&mut self) {
-        match self.cache_type {
-            CacheType::Writeback => {
-                // flush() first to force any cached data out.
-                if self.file.lock().unwrap().flush().is_err() {
-                    error!("Failed to flush block data on drop.");
-                }
-                // Sync data out to physical media on host.
-                if self.file.lock().unwrap().sync().is_err() {
-                    error!("Failed to sync block data on drop.")
-                }
-            }
-            CacheType::Unsafe => {
-                // This is a noop.
-            }
-        };
+        if self.flush().is_err() {
+            error!("Failed to flush block data on drop.");
+        }
     }
 }
 
@@ -465,6 +464,8 @@ impl VirtioDevice for Block {
         let (dq, disk) = worker
             .join()
             .map_err(|e| DeviceSnapshotError::Invalid(format!("block worker join: {e:?}")))?;
+        disk.flush()
+            .map_err(|e| DeviceSnapshotError::Invalid(format!("block flush before pause: {e}")))?;
         self.paused = Some((dq, disk));
         Ok(())
     }

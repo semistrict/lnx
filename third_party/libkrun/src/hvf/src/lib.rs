@@ -301,6 +301,9 @@ impl HvfVm {
         let ret = unsafe { hv_vm_create(config) };
 
         if ret != HV_SUCCESS {
+            error!(
+                "hv_vm_create failed ret={ret:?} nested_enabled={nested_enabled} max_ipa_size={max_ipa_size}"
+            );
             Err(Error::VmCreate)
         } else {
             Ok(Self {})

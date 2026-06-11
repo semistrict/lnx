@@ -61,9 +61,13 @@ use kvm_bindings::{KVM_CAP_EXIT_HYPERCALL, KVM_MEMORY_EXIT_FLAG_PRIVATE, kvm_ena
 use kvm_bindings::{KVM_MEMORY_ATTRIBUTE_PRIVATE, kvm_memory_attributes};
 #[cfg(target_arch = "aarch64")]
 use kvm_bindings::{
+    KVM_REG_ARM64, KVM_REG_ARM64_SYSREG, KVM_REG_ARM64_SYSREG_CRM_MASK,
+    KVM_REG_ARM64_SYSREG_CRM_SHIFT, KVM_REG_ARM64_SYSREG_CRN_MASK, KVM_REG_ARM64_SYSREG_CRN_SHIFT,
+    KVM_REG_ARM64_SYSREG_OP0_MASK, KVM_REG_ARM64_SYSREG_OP0_SHIFT, KVM_REG_ARM64_SYSREG_OP1_MASK,
+    KVM_REG_ARM64_SYSREG_OP1_SHIFT, KVM_REG_ARM64_SYSREG_OP2_MASK, KVM_REG_ARM64_SYSREG_OP2_SHIFT,
     KVM_REG_SIZE_MASK, KVM_REG_SIZE_U8, KVM_REG_SIZE_U16, KVM_REG_SIZE_U32, KVM_REG_SIZE_U64,
     KVM_REG_SIZE_U128, KVM_REG_SIZE_U256, KVM_REG_SIZE_U512, KVM_REG_SIZE_U1024,
-    KVM_REG_SIZE_U2048, RegList,
+    KVM_REG_SIZE_U2048, RegList, kvm_mp_state, kvm_vcpu_events,
 };
 use kvm_ioctls::{Cap::*, *};
 use utils::eventfd::EventFd;
@@ -177,7 +181,7 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     /// Failed to get KVM vcpu lapic.
     VcpuGetLapic(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     /// Failed to get KVM vcpu mp state.
     VcpuGetMpState(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
@@ -189,7 +193,7 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     /// Failed to get KVM vcpu sregs.
     VcpuGetSregs(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     /// Failed to get KVM vcpu event.
     VcpuGetVcpuEvents(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
@@ -209,7 +213,7 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu lapic.
     VcpuSetLapic(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     /// Failed to set KVM vcpu mp state.
     VcpuSetMpState(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
@@ -221,7 +225,7 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu sregs.
     VcpuSetSregs(kvm_ioctls::Error),
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     /// Failed to set KVM vcpu event.
     VcpuSetVcpuEvents(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
@@ -367,7 +371,7 @@ impl Display for Error {
             VcpuGetDebugRegs(e) => write!(f, "Failed to get KVM vcpu debug regs: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuGetLapic(e) => write!(f, "Failed to get KVM vcpu lapic: {e}"),
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             VcpuGetMpState(e) => write!(f, "Failed to get KVM vcpu mp state: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuGetMsrs(e) => write!(f, "Failed to get KVM vcpu msrs: {e}"),
@@ -375,7 +379,7 @@ impl Display for Error {
             VcpuGetRegs(e) => write!(f, "Failed to get KVM vcpu regs: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuGetSregs(e) => write!(f, "Failed to get KVM vcpu sregs: {e}"),
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             VcpuGetVcpuEvents(e) => write!(f, "Failed to get KVM vcpu event: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuGetXcrs(e) => write!(f, "Failed to get KVM vcpu xcrs: {e}"),
@@ -387,7 +391,7 @@ impl Display for Error {
             VcpuSetDebugRegs(e) => write!(f, "Failed to set KVM vcpu debug regs: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetLapic(e) => write!(f, "Failed to set KVM vcpu lapic: {e}"),
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             VcpuSetMpState(e) => write!(f, "Failed to set KVM vcpu mp state: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetMsrs(e) => write!(f, "Failed to set KVM vcpu msrs: {e}"),
@@ -395,7 +399,7 @@ impl Display for Error {
             VcpuSetRegs(e) => write!(f, "Failed to set KVM vcpu regs: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetSregs(e) => write!(f, "Failed to set KVM vcpu sregs: {e}"),
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             VcpuSetVcpuEvents(e) => write!(f, "Failed to set KVM vcpu event: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetXcrs(e) => write!(f, "Failed to set KVM vcpu xcrs: {e}"),
@@ -1453,7 +1457,19 @@ impl Vcpu {
             regs.push(Aarch64OneReg { id: *reg_id, value });
         }
         regs.sort_by_key(|reg| reg.id);
-        Ok(VcpuState { regs })
+        let mp_state = self.fd.get_mp_state().ok();
+        let vcpu_events = self.fd.get_vcpu_events().ok().map(|events| unsafe {
+            std::slice::from_raw_parts(
+                &events as *const kvm_vcpu_events as *const u8,
+                std::mem::size_of::<kvm_vcpu_events>(),
+            )
+            .to_vec()
+        });
+        Ok(VcpuState {
+            regs,
+            mp_state,
+            vcpu_events,
+        })
     }
 
     #[allow(unused)]
@@ -1464,6 +1480,90 @@ impl Vcpu {
                 .set_one_reg(reg.id, &reg.value)
                 .map_err(Error::VcpuFd)?;
         }
+        if let Some(vcpu_events) = state.vcpu_events {
+            if vcpu_events.len() != std::mem::size_of::<kvm_vcpu_events>() {
+                return Err(Error::VcpuUnhandledKvmExit);
+            }
+            let mut events = std::mem::MaybeUninit::<kvm_vcpu_events>::zeroed();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    vcpu_events.as_ptr(),
+                    events.as_mut_ptr() as *mut u8,
+                    vcpu_events.len(),
+                );
+            }
+            let vcpu_events = unsafe { events.assume_init() };
+            self.fd
+                .set_vcpu_events(&vcpu_events)
+                .map_err(Error::VcpuSetVcpuEvents)?;
+        }
+        if let Some(mp_state) = state.mp_state {
+            self.fd
+                .set_mp_state(mp_state)
+                .map_err(Error::VcpuSetMpState)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn get_one_reg_u64(&self, reg_id: u64) -> Option<u64> {
+        let mut bytes = [0u8; 8];
+        self.fd.get_one_reg(reg_id, &mut bytes).ok()?;
+        Some(u64::from_le_bytes(bytes))
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn set_one_reg_u64(&self, reg_id: u64, value: u64) -> Result<()> {
+        self.fd
+            .set_one_reg(reg_id, &value.to_le_bytes())
+            .map(|_| ())
+            .map_err(Error::VcpuFd)
+    }
+
+    /// Re-arm deadlines that are measured against the host-advancing physical
+    /// counter. The virtual timer needs no rebase: KVM_REG_ARM_TIMER_CNT is
+    /// restored from the saved register list, which freezes guest virtual
+    /// time across the suspension and keeps CNTV_CVAL valid as captured.
+    ///
+    /// Assumes guest CNTPCT tracks the host counter (no
+    /// KVM_ARM_VM_COUNTER_OFFSET in use); revisit the physical-timer delta if
+    /// that ever changes.
+    ///
+    /// NOTE: KVM_REG_ARM_TIMER_CVAL and KVM_REG_ARM_TIMER_CNT have
+    /// historically swapped sysreg encodings — (3,3,14,0,2) is the virtual
+    /// CVAL and (3,3,14,3,2) is the virtual counter. Do not address the
+    /// virtual timer by its architectural encodings.
+    #[cfg(target_arch = "aarch64")]
+    fn rebase_timer(&self, delta_ticks: u64) -> Result<()> {
+        for (cval_reg, ctl_reg) in [
+            // CNTP_CVAL_EL0 / CNTP_CTL_EL0
+            (
+                arm64_sys_reg_id(3, 3, 14, 2, 2),
+                arm64_sys_reg_id(3, 3, 14, 2, 1),
+            ),
+            // CNTHP_CVAL_EL2 / CNTHP_CTL_EL2 (present only with nested virt)
+            (
+                arm64_sys_reg_id(3, 4, 14, 2, 2),
+                arm64_sys_reg_id(3, 4, 14, 2, 1),
+            ),
+        ] {
+            if let Some(cval) = self.get_one_reg_u64(cval_reg) {
+                self.set_one_reg_u64(cval_reg, cval.wrapping_add(delta_ticks))?;
+            }
+            if let Some(ctl) = self.get_one_reg_u64(ctl_reg) {
+                let ctl = if (ctl & TMR_CTL_ENABLE) == 0 {
+                    ctl & !TMR_CTL_ISTATUS
+                } else {
+                    ctl
+                };
+                self.set_one_reg_u64(ctl_reg, ctl)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    fn rebase_timer(&self, _delta_ticks: u64) -> Result<()> {
         Ok(())
     }
 
@@ -1681,6 +1781,11 @@ impl Vcpu {
                     .send(VcpuResponse::Error("not paused".into()))
                     .expect("failed to send restore error");
             }
+            Ok(VcpuEvent::RebaseTimer(_)) => {
+                self.response_sender
+                    .send(VcpuResponse::Error("not paused".into()))
+                    .expect("failed to send timer rebase error");
+            }
             // Unhandled exit of the other end.
             Err(TryRecvError::Disconnected) => {
                 // Move to 'exited' state.
@@ -1718,6 +1823,19 @@ impl Vcpu {
                         .response_sender
                         .send(VcpuResponse::Error(format!("restore vcpu state: {e}")))
                         .expect("failed to send restore error"),
+                }
+                StateMachine::next(Self::paused)
+            }
+            Ok(VcpuEvent::RebaseTimer(delta_ticks)) => {
+                match self.rebase_timer(delta_ticks) {
+                    Ok(()) => self
+                        .response_sender
+                        .send(VcpuResponse::TimerRebased)
+                        .expect("failed to send timer rebase status"),
+                    Err(e) => self
+                        .response_sender
+                        .send(VcpuResponse::Error(format!("rebase timer: {e}")))
+                        .expect("failed to send timer rebase error"),
                 }
                 StateMachine::next(Self::paused)
             }
@@ -1806,6 +1924,10 @@ pub struct Aarch64OneReg {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VcpuState {
     regs: Vec<Aarch64OneReg>,
+    #[serde(default)]
+    mp_state: Option<kvm_mp_state>,
+    #[serde(default)]
+    vcpu_events: Option<Vec<u8>>,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1824,6 +1946,23 @@ fn one_reg_size(reg_id: u64) -> Result<usize> {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+const TMR_CTL_ENABLE: u64 = 1;
+#[cfg(target_arch = "aarch64")]
+const TMR_CTL_ISTATUS: u64 = 1 << 2;
+
+#[cfg(target_arch = "aarch64")]
+fn arm64_sys_reg_id(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
+    KVM_REG_ARM64 as u64
+        | KVM_REG_SIZE_U64 as u64
+        | KVM_REG_ARM64_SYSREG as u64
+        | ((op0 << KVM_REG_ARM64_SYSREG_OP0_SHIFT) & KVM_REG_ARM64_SYSREG_OP0_MASK as u64)
+        | ((op1 << KVM_REG_ARM64_SYSREG_OP1_SHIFT) & KVM_REG_ARM64_SYSREG_OP1_MASK as u64)
+        | ((crn << KVM_REG_ARM64_SYSREG_CRN_SHIFT) & KVM_REG_ARM64_SYSREG_CRN_MASK as u64)
+        | ((crm << KVM_REG_ARM64_SYSREG_CRM_SHIFT) & KVM_REG_ARM64_SYSREG_CRM_MASK as u64)
+        | ((op2 << KVM_REG_ARM64_SYSREG_OP2_SHIFT) & KVM_REG_ARM64_SYSREG_OP2_MASK as u64)
+}
+
 // Allow currently unused Pause and Exit events. These will be used by the vmm later on.
 #[allow(unused)]
 #[derive(Debug)]
@@ -1835,6 +1974,8 @@ pub enum VcpuEvent {
     Resume,
     /// Restore serialized vCPU state while paused.
     RestoreState(Vec<u8>),
+    /// Re-arm virtual timer state after snapshot restore while paused.
+    RebaseTimer(u64),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1846,6 +1987,8 @@ pub enum VcpuResponse {
     Resumed,
     /// Serialized vCPU state was restored.
     Restored,
+    /// Virtual timer state was re-armed.
+    TimerRebased,
     /// Vcpu is stopped.
     Exited(u8),
     /// vCPU operation failed.
@@ -2041,7 +2184,7 @@ mod tests {
     fn test_configure_vcpu() {
         let kvm = KvmContext::new().unwrap();
         let vm_resources = VmResources::default();
-        let (guest_memory, arch_memory_info, _shm_manager, _payload_config) =
+        let (guest_memory, arch_memory_info, _shm_manager, _payload_config, _pmem_regions) =
             create_guest_memory(128, &vm_resources, &Payload::Empty).unwrap();
         let mut vm = Vm::new(kvm.fd()).expect("new vm failed");
         assert!(vm.memory_init(&guest_memory, kvm.max_memslots()).is_ok());

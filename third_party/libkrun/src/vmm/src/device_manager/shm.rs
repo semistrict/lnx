@@ -47,6 +47,21 @@ impl ShmManager {
         regions
     }
 
+    pub fn guest_memory_regions(&self) -> Vec<(GuestAddress, usize)> {
+        let mut regions: Vec<(GuestAddress, usize)> = Vec::new();
+
+        #[cfg(not(target_os = "macos"))]
+        for region in self.fs_regions.iter() {
+            regions.push((region.1.guest_addr, region.1.size));
+        }
+
+        if let Some(region) = &self.gpu_region {
+            regions.push((region.guest_addr, region.size));
+        }
+
+        regions
+    }
+
     pub fn next_guest_addr(&self) -> u64 {
         self.next_guest_addr
     }

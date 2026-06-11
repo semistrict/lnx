@@ -26,7 +26,6 @@ use super::filesystem::{
 };
 use super::fuse;
 use super::inode_alloc::InodeAllocator;
-#[cfg(target_os = "macos")]
 use super::passthrough::PassthroughFsSnapshot;
 use super::passthrough::{self, PassthroughFs};
 use crate::virtio::bindings;
@@ -65,12 +64,10 @@ impl PassthroughFsRo {
         })
     }
 
-    #[cfg(target_os = "macos")]
     pub(crate) fn snapshot_state(&self) -> io::Result<PassthroughFsSnapshot> {
         self.inner.snapshot_state()
     }
 
-    #[cfg(target_os = "macos")]
     pub(crate) fn restore_state(&self, snap: &PassthroughFsSnapshot) -> io::Result<()> {
         self.inner.restore_state(snap)
     }

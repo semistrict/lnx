@@ -1,12 +1,20 @@
 import { assertEq, cleanupContext, defaultContext, lnx, prepareContext, testStep } from "./lib";
 
 const ctx = defaultContext("nested-stress");
+const vmArgs = [
+  ...(Bun.env.LNX_TEST_CPUS ? ["--cpus", Bun.env.LNX_TEST_CPUS] : []),
+  ...(Bun.env.LNX_TEST_MEMORY_MIB ? ["--memory-mib", Bun.env.LNX_TEST_MEMORY_MIB] : []),
+];
+
+function lnxVm(args: string[], options: Parameters<typeof lnx>[1] = {}) {
+  return lnx(ctx, [...vmArgs, ...args], options);
+}
 
 try {
   await prepareContext(ctx);
 
   await testStep("warm nested-host VM", async () => {
-    assertEq((await lnx(ctx, ["--no-snapshot-restore", "echo", "warm"])).stdout, "warm", "warm exec");
+    assertEq((await lnxVm(["--no-snapshot-restore", "echo", "warm"])).stdout, "warm", "warm exec");
   });
 
   await testStep("parallel non-pty channels on a Linux host", async () => {
@@ -19,7 +27,7 @@ try {
         const id = pending.shift();
         if (id === undefined) return;
         const delay = id % 7;
-        const result = await lnx(ctx, ["bash", "-lc", `echo start-${id}; sleep 0.${delay}; echo end-${id}`]);
+        const result = await lnxVm(["bash", "-lc", `echo start-${id}; sleep 0.${delay}; echo end-${id}`]);
         results[id] = result.stdout;
       }
     }
@@ -31,9 +39,9 @@ try {
 
   await testStep("mixed stdin and exit status on a Linux host", async () => {
     const [cat, fail, slow] = await Promise.all([
-      lnx(ctx, ["cat"], { stdin: "pipe-ok" }),
-      lnx(ctx, ["bash", "-lc", "exit 33"], { check: false }),
-      lnx(ctx, ["bash", "-lc", "sleep 1; echo slow-ok"]),
+      lnxVm(["cat"], { stdin: "pipe-ok" }),
+      lnxVm(["bash", "-lc", "exit 33"], { check: false }),
+      lnxVm(["bash", "-lc", "sleep 1; echo slow-ok"]),
     ]);
     assertEq(cat.stdout, "pipe-ok", "parallel stdin");
     assertEq(fail.status, 33, "parallel failing status");

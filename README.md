@@ -89,12 +89,14 @@ Current caveats:
 
 - Inner nested `lnx` runs use `LNX_ROOTFS_BACKEND=block`; pmem/DAX rootfs inside
   the nested Linux host still hits KVM mapping limitations.
-- Linux libkrun snapshot APIs return `ENOSYS`, so tests whose purpose is
-  checkpoint, fork, snapshot capture, or snapshot restore semantics remain
-  excluded from the inner Linux-host suite.
+- Linux libkrun snapshot APIs are wired for a full-RAM KVM/aarch64 capture and
+  restore path. Incremental dirty-log snapshots are not implemented yet, so the
+  Linux path is expected to be correct but heavier than the macOS/HVF path until
+  it grows KVM dirty-log support.
 - `system` and `stress` have nested-safe coverage for their non-snapshot
-  behavior; their snapshot-specific assertions remain excluded for the same
-  Linux libkrun snapshot reason.
+  behavior; their snapshot-specific assertions should move into the nested
+  Linux suite after the Linux full-RAM restore path has end-to-end runtime
+  coverage.
 - Linux virtiofs write allowlist enforcement is not active today, so the
   policy-specific virtiofs restore/fork checks do not run inside the nested
   Linux host.

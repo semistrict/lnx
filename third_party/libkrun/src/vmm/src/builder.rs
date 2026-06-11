@@ -96,7 +96,7 @@ use vm_memory::Address;
 use vm_memory::Bytes;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
 use vm_memory::FileOffset;
-#[cfg(not(feature = "aws-nitro"))]
+#[cfg(not(target_os = "macos"))]
 use vm_memory::GuestMemory;
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
 use vm_memory::GuestRegionMmap;
@@ -620,6 +620,38 @@ pub fn build_microvm(
         crate::timing_event("build_microvm.snapshot.pmem.mapped");
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    if let Some(snap_path) = &vm_resources.snapshot_restore_path {
+        use crate::linux::snapshot::{
+            SectionId, SnapshotReader, orchestrator::MetaSection, ram::restore_pages_img,
+        };
+        crate::timing_event("build_microvm.snapshot.reader.open.begin");
+        let reader = SnapshotReader::open(snap_path)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("snapshot open: {e}")))?;
+        crate::timing_event("build_microvm.snapshot.reader.open.done");
+        let meta: MetaSection = reader
+            .get_bincode(SectionId::Meta, 0)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("snapshot meta: {e}")))?;
+        crate::timing_event("build_microvm.snapshot.meta.loaded");
+        guest_memory = restore_pages_img(snap_path, &meta.ram)
+            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("pages.img: {e}")))?;
+        crate::timing_event("build_microvm.snapshot.ram.mapped");
+        guest_memory = insert_shm_regions_for_guest(guest_memory, &_shm_manager)?;
+        crate::timing_event("build_microvm.snapshot.shm.mapped");
+        for region in build_pmem_regions_for_guest(
+            vm_resources,
+            &arch_memory_info,
+            _shm_manager.next_guest_addr(),
+        )?
+        .0
+        {
+            guest_memory = guest_memory
+                .insert_region(Arc::new(region))
+                .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
+        }
+        crate::timing_event("build_microvm.snapshot.pmem.mapped");
+    }
+
     let vcpu_config = vm_resources.vcpu_config();
     crate::timing_event("build_microvm.vcpu_config.ready");
 
@@ -854,6 +886,7 @@ pub fn build_microvm(
         Arc::new(VcpuList::new(cpu_count as u64))
     };
 
+    #[allow(unused_mut)]
     let mut vcpus;
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
@@ -1040,6 +1073,10 @@ pub fn build_microvm(
         pio_device_manager,
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         snapshot_ctx,
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        snapshot_irqchip: Some(intc.clone()),
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        snapshot_nested_enabled: vm_resources.nested_enabled,
     };
     crate::timing_event("build_microvm.vmm.struct.created");
 
@@ -1184,9 +1221,9 @@ pub fn build_microvm(
     #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
     load_cmdline(&vmm)?;
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
     let restoring_snapshot = vm_resources.snapshot_restore_path.is_some();
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(not(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64")))]
     let restoring_snapshot = false;
 
     if !restoring_snapshot {
@@ -1259,6 +1296,15 @@ pub fn build_microvm(
     }
 
     crate::timing_event("build_microvm.start_vcpus.begin");
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    if vm_resources.snapshot_restore_path.is_some() {
+        vmm.start_vcpus_paused(vcpus)
+            .map_err(StartMicrovmError::Internal)?;
+    } else {
+        vmm.start_vcpus(vcpus)
+            .map_err(StartMicrovmError::Internal)?;
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;
     crate::timing_event("build_microvm.start_vcpus.done");
@@ -1273,6 +1319,16 @@ pub fn build_microvm(
             StartMicrovmError::Internal(crate::Error::VcpuResume).tap(|_| {
                 error!("snapshot restore failed: {e}");
             })
+        })?;
+        crate::timing_event("build_microvm.restore_from.done");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    if let Some(snap_path) = vm_resources.snapshot_restore_path.clone() {
+        crate::timing_event("build_microvm.restore_from.begin");
+        vmm.restore_from(&snap_path).map_err(|e| {
+            error!("snapshot restore failed: {e}");
+            StartMicrovmError::Internal(crate::Error::VcpuResume)
         })?;
         crate::timing_event("build_microvm.restore_from.done");
     }
@@ -1834,7 +1890,7 @@ pub fn create_guest_memory(
     // Add SHM regions before creating guest memory. These are device windows,
     // not RAM: keep them out of ram_ranges so snapshots and dirty tracking do
     // not scale with the virtio-fs DAX window size.
-    arch_mem_regions.extend(shm_manager.regions());
+    arch_mem_regions.extend(shm_manager.guest_memory_regions());
 
     let mut guest_mem = if use_vhost_user {
         #[cfg(all(feature = "vhost-user", target_os = "linux"))]
@@ -1963,7 +2019,7 @@ fn insert_shm_regions_for_guest(
     mut guest_mem: GuestMemoryMmap,
     shm_manager: &ShmManager,
 ) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
-    for (addr, size) in shm_manager.regions() {
+    for (addr, size) in shm_manager.guest_memory_regions() {
         let region = vm_memory::GuestRegionMmap::from_range(addr, size, None)
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
         guest_mem = guest_mem
@@ -2352,11 +2408,16 @@ fn attach_fs_devices(
         let id = format!("{}{}", String::from(fs.lock().unwrap().id()), i);
 
         if let Some(shm_region) = shm_manager.fs_region(i) {
+            #[cfg(not(target_os = "macos"))]
+            let host_addr = vmm
+                .guest_memory
+                .get_host_address(shm_region.guest_addr)
+                .map_err(StartMicrovmError::ShmHostAddr)? as u64;
+            #[cfg(target_os = "macos")]
+            let host_addr = 0;
+
             fs.lock().unwrap().set_shm_region(VirtioShmRegion {
-                host_addr: vmm
-                    .guest_memory
-                    .get_host_address(shm_region.guest_addr)
-                    .map_err(StartMicrovmError::ShmHostAddr)? as u64,
+                host_addr,
                 guest_addr: shm_region.guest_addr.raw_value(),
                 size: shm_region.size,
             });

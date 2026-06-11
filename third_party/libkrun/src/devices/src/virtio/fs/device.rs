@@ -21,7 +21,6 @@ use super::super::{
 use super::ExportTable;
 use super::passthrough;
 use super::virtual_entry::VirtualDirEntry;
-#[cfg(target_os = "macos")]
 use super::worker::FsServerSnapshot;
 use super::worker::{FsWorker, FsWorkerStopResult};
 use super::{defs, defs::uapi};
@@ -337,7 +336,6 @@ impl VirtioDevice for Fs {
                 tag: self.config.tag.to_vec(),
                 num_request_queues: self.config.num_request_queues,
                 read_only: self.read_only,
-                #[cfg(target_os = "macos")]
                 server: Some(stop.server.snapshot_state().map_err(|e| {
                     DeviceSnapshotError::Invalid(format!("fs server snapshot: {e}"))
                 })?),
@@ -373,16 +371,13 @@ impl VirtioDevice for Fs {
         for (queue, state) in stop.queues.iter_mut().zip(&snap.queues) {
             queue.restore_state(state);
         }
-        #[cfg(target_os = "macos")]
-        {
-            let server = body
-                .server
-                .as_ref()
-                .ok_or_else(|| DeviceSnapshotError::Invalid("fs server snapshot missing".into()))?;
-            stop.server
-                .restore_state(server)
-                .map_err(|e| DeviceSnapshotError::Invalid(format!("fs server restore: {e}")))?;
-        }
+        let server = body
+            .server
+            .as_ref()
+            .ok_or_else(|| DeviceSnapshotError::Invalid("fs server snapshot missing".into()))?;
+        stop.server
+            .restore_state(server)
+            .map_err(|e| DeviceSnapshotError::Invalid(format!("fs server restore: {e}")))?;
         Ok(())
     }
 }
@@ -393,7 +388,6 @@ struct FsSnapshotBody {
     tag: Vec<u8>,
     num_request_queues: u32,
     read_only: bool,
-    #[cfg(target_os = "macos")]
     #[serde(default)]
     server: Option<FsServerSnapshot>,
 }

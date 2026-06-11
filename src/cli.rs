@@ -417,6 +417,11 @@ fn run_guest(
         copy_between_host_and_guest(
             &layout,
             &command[1..],
+            ChildVmConfig {
+                cpus,
+                memory_mib,
+                nested_kvm,
+            },
             explicit_kernel.then_some(layout.kernel.as_path()),
             explicit_rootfs.then_some(layout.rootfs.as_path()),
         )?;
@@ -496,6 +501,7 @@ fn ensure_vm_initialized(
         layout,
         Some(&layout.kernel),
         Some(&layout.rootfs),
+        None,
         &["--cpus", &cpus, "--memory-mib", &memory_mib, "_vm-init"],
         None,
         false,
@@ -539,6 +545,7 @@ fn mark_vm_initialized(layout: &Layout) -> Result<()> {
 fn copy_between_host_and_guest(
     layout: &Layout,
     args: &[String],
+    vm_config: ChildVmConfig,
     explicit_kernel: Option<&Path>,
     explicit_rootfs: Option<&Path>,
 ) -> Result<()> {
@@ -559,10 +566,20 @@ fn copy_between_host_and_guest(
         .all(|value| !*value);
 
     match (sources_are_host, dest_is_host, sources_are_guest) {
-        (true, false, _) => copy_host_to_guest(layout, &operands, explicit_kernel, explicit_rootfs),
-        (false, true, true) => {
-            copy_guest_to_host(layout, &operands, explicit_kernel, explicit_rootfs)
-        }
+        (true, false, _) => copy_host_to_guest(
+            layout,
+            &operands,
+            vm_config,
+            explicit_kernel,
+            explicit_rootfs,
+        ),
+        (false, true, true) => copy_guest_to_host(
+            layout,
+            &operands,
+            vm_config,
+            explicit_kernel,
+            explicit_rootfs,
+        ),
         _ => bail!(
             "host transfers must copy only host: sources to one guest destination, or only guest sources to one host: destination"
         ),
@@ -611,20 +628,11 @@ fn strip_host_prefix(value: &str) -> Result<&str> {
 fn copy_host_to_guest(
     layout: &Layout,
     args: &[String],
+    vm_config: ChildVmConfig,
     explicit_kernel: Option<&Path>,
     explicit_rootfs: Option<&Path>,
 ) -> Result<()> {
     let guest_dest = args.last().context("missing guest destination")?;
-    run_lnx_child(
-        layout,
-        explicit_kernel,
-        explicit_rootfs,
-        &["mkdir", "-p", guest_dest],
-        None,
-        false,
-    )
-    .context("create guest destination")?;
-
     let mut tar_args = vec!["-cf".to_string(), "-".to_string()];
     for source in &args[..args.len() - 1] {
         let source = PathBuf::from(strip_host_prefix(source)?);
@@ -649,7 +657,14 @@ fn copy_host_to_guest(
         layout,
         explicit_kernel,
         explicit_rootfs,
-        &["tar", "-C", guest_dest, "-xf", "-"],
+        Some(vm_config),
+        &[
+            "sh",
+            "-lc",
+            "mkdir -p \"$1\" && tar -C \"$1\" -xf -",
+            "lnx-cp",
+            guest_dest,
+        ],
         Some(&tar_output.stdout),
         false,
     )
@@ -660,6 +675,7 @@ fn copy_host_to_guest(
 fn copy_guest_to_host(
     layout: &Layout,
     args: &[String],
+    vm_config: ChildVmConfig,
     explicit_kernel: Option<&Path>,
     explicit_rootfs: Option<&Path>,
 ) -> Result<()> {
@@ -674,6 +690,7 @@ fn copy_guest_to_host(
         layout,
         explicit_kernel,
         explicit_rootfs,
+        Some(vm_config),
         &guest_tar_args
             .iter()
             .map(String::as_str)
@@ -694,6 +711,7 @@ fn copy_guest_to_host(
         .as_mut()
         .context("open host tar stdin")?
         .write_all(&archive)?;
+    drop(tar.stdin.take());
     let status = tar.wait().context("wait for host tar extract")?;
     if !status.success() {
         bail!("host tar extract failed with status {status}");
@@ -701,10 +719,18 @@ fn copy_guest_to_host(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct ChildVmConfig {
+    cpus: u8,
+    memory_mib: u32,
+    nested_kvm: bool,
+}
+
 fn run_lnx_child(
     layout: &Layout,
     explicit_kernel: Option<&Path>,
     explicit_rootfs: Option<&Path>,
+    vm_config: Option<ChildVmConfig>,
     command: &[&str],
     stdin: Option<&[u8]>,
     capture_stdout: bool,
@@ -717,6 +743,16 @@ fn run_lnx_child(
     }
     if let Some(rootfs) = explicit_rootfs {
         child.arg("--rootfs").arg(rootfs);
+    }
+    if let Some(config) = vm_config {
+        child
+            .arg("--cpus")
+            .arg(config.cpus.to_string())
+            .arg("--memory-mib")
+            .arg(config.memory_mib.to_string());
+        if config.nested_kvm {
+            child.arg("--nested-kvm");
+        }
     }
     child.args(command);
     child.stdin(if stdin.is_some() {
@@ -737,6 +773,7 @@ fn run_lnx_child(
             .as_mut()
             .context("open lnx child stdin")?
             .write_all(stdin)?;
+        drop(child.stdin.take());
     }
     if capture_stdout {
         let output = child.wait_with_output().context("wait for lnx child")?;

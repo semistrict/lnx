@@ -1,9 +1,11 @@
 use std::{
-    ffi::CString,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
 
 use anyhow::{Context, Result, bail};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -235,8 +237,7 @@ fn clone_file(src: &Path, dest: &Path) -> Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 fn clone_file(src: &Path, dest: &Path) -> Result<()> {
-    fs::copy(src, dest).with_context(|| format!("copy {} to {}", src.display(), dest.display()))?;
-    Ok(())
+    crate::sparse_copy::clone_or_copy_file(src, dest)
 }
 
 #[cfg(test)]

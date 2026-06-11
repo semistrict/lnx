@@ -290,6 +290,14 @@ impl MmioTransport {
         }
     }
 
+    pub fn replay_queue_notifications(&self) {
+        for (index, eventfd) in self.queue_evts.iter().enumerate() {
+            if let Err(e) = eventfd.write(1) {
+                warn!("failed to replay queue notification index={index}: {e}");
+            }
+        }
+    }
+
     pub fn restore_queues_and_activate(
         &mut self,
         st: &MmioTransportState,

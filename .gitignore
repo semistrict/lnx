@@ -16,6 +16,7 @@
 /.lnx-nested-debug/
 /.lnx-nested-kvm*/
 /.lnx-nk-*/
+/.lnx-probe-*/
 /.lnx-snapshot-root-debug/
 
 # Nested build artifacts

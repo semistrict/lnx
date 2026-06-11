@@ -6,6 +6,8 @@ mod initramfs;
 mod krun;
 mod paths;
 mod runner;
+#[cfg(not(target_os = "macos"))]
+mod sparse_copy;
 
 use anyhow::Result;
 use clap::Parser;

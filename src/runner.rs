@@ -30,6 +30,14 @@ const SNAPSHOT_PORT: u32 = 10241;
 const CONTROL_PORT: u32 = 10242;
 const FRAME_SNAPSHOT: u8 = b'K';
 const INTERRUPT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
+// Accepted vmstate.bin container version. The macOS and Linux snapshot
+// containers version independently; keep in sync with VERSION in
+// third_party/libkrun/src/vmm/src/{macos,linux}/snapshot/container.rs.
+#[cfg(target_os = "macos")]
+const SNAPSHOT_VMSTATE_VERSION: u32 = 1;
+#[cfg(not(target_os = "macos"))]
+const SNAPSHOT_VMSTATE_VERSION: u32 = 2;
+
 const DEFAULT_BROKER_IDLE_TTL: Duration = Duration::ZERO;
 const DEFAULT_OWNER_IDLE_TTL: Duration = Duration::from_secs(5);
 // The detached owner counts idle time from broker start, so a TTL shorter than
@@ -114,6 +122,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
         &config.command,
         &config.cwd,
         &mut owner,
+        &config,
         &config.layout,
         &run_log,
     ) {
@@ -933,7 +942,7 @@ fn snapshot_vm_config(snapshot: &Path) -> Result<Option<SnapshotVmConfig>> {
         bail!("bad snapshot magic in {}", path.display());
     }
     let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
-    if version != 1 {
+    if version != SNAPSHOT_VMSTATE_VERSION {
         bail!(
             "unsupported snapshot version {version} in {}",
             path.display()
@@ -1033,7 +1042,9 @@ fn start_gvproxy(run_dir: &Path) -> Result<Gvproxy> {
         .spawn()
         .with_context(|| format!("start {}", gvproxy.display()))?;
 
-    wait_for_path(&socket, Duration::from_secs(5))
+    // Generous: in a freshly restored nested guest, process startup and
+    // socket creation on virtiofs can take well over the usual instant.
+    wait_for_path(&socket, Duration::from_secs(30))
         .with_context(|| format!("gvproxy did not create {}", socket.display()))?;
     Ok(Gvproxy { socket, child })
 }
@@ -1082,12 +1093,14 @@ pub(crate) fn write_message(stream: &mut UnixStream, message: &Message) -> Resul
 }
 
 pub(crate) fn read_message(stream: &mut UnixStream) -> Result<Message> {
-    let len = read_u32(stream)?;
+    let len = read_u32(stream).context("read protocol length")?;
     if len > MAX_MESSAGE_SIZE {
         bail!("protocol message too large: {len}");
     }
     let mut bytes = vec![0u8; len as usize];
-    stream.read_exact(&mut bytes)?;
+    stream
+        .read_exact(&mut bytes)
+        .with_context(|| format!("read protocol body ({len} bytes)"))?;
     postcard::from_bytes(&bytes).context("decode protocol message")
 }
 
@@ -1494,8 +1507,13 @@ fn run_broker_owner(
     let reader_clients = Arc::clone(&client_senders);
     let reader_active = Arc::clone(&active);
     let reader_snapshot_exit_tx = snapshot_exit_tx.clone();
+    let reader_log = Arc::clone(&run_log);
     thread::spawn(move || {
-        while let Ok(message) = read_message(&mut agent_reader) {
+        let reader_err = loop {
+            let message = match read_message(&mut agent_reader) {
+                Ok(message) => message,
+                Err(e) => break e,
+            };
             let channel_id = match &message {
                 Message::Data { channel_id, .. }
                 | Message::Stderr { channel_id, .. }
@@ -1530,7 +1548,7 @@ fn run_broker_owner(
                     }
                 }
             }
-        }
+        };
         if let Ok(mut clients) = reader_clients.lock() {
             let dropped = clients
                 .values()
@@ -1540,6 +1558,9 @@ fn run_broker_owner(
             if dropped > 0 {
                 reader_active.fetch_sub(dropped, Ordering::SeqCst);
             }
+            reader_log.line(format!(
+                "broker.agent.reader_eof dropped_channels={dropped} error={reader_err:#}"
+            ));
         }
     });
 
@@ -1592,6 +1613,7 @@ fn run_broker_owner(
                             seen,
                             client_ctx,
                             client_host_home,
+                            Arc::clone(&client_log),
                         ) {
                             client_log.line(format!("broker.client.error {e:#}"));
                         }
@@ -1772,6 +1794,7 @@ fn run_broker_client_awaiting_owner(
     command: &[String],
     cwd: &Path,
     owner: &mut Child,
+    config: &RunConfig,
     layout: &Layout,
     run_log: &RunLog,
 ) -> Result<i32> {
@@ -1788,7 +1811,10 @@ fn run_broker_client_awaiting_owner(
         if let Some(status) = owner.try_wait().context("check lnx _vm-owner")? {
             // An owner that exits zero lost the bootstrap race to another
             // owner, so keep retrying until that one's broker comes up.
-            if !status.success() {
+            if status.success() {
+                run_log.line("owner.exited.early status=0 retry=spawn");
+                *owner = spawn_owner_process(config, run_log)?;
+            } else {
                 run_log.line(format!("owner.exited.early status={status}"));
                 bail!(
                     "lnx VM owner exited with {status} before the broker came up{}{}",
@@ -1878,6 +1904,7 @@ fn handle_broker_client(
     seen_active: Arc<AtomicBool>,
     ctx: Arc<KrunContext>,
     host_home: PathBuf,
+    run_log: Arc<RunLog>,
 ) -> Result<()> {
     client
         .set_nonblocking(false)
@@ -1917,6 +1944,7 @@ fn handle_broker_client(
         Message::OpenExec { channel_id, .. } | Message::OpenTcp { channel_id, .. } => *channel_id,
         _ => bail!("client did not open a channel"),
     };
+    run_log.line(format!("broker.client.open channel={channel_id:016x}"));
     if let Message::OpenExec { cwd, .. } = &first {
         set_home_write_allowlist(ctx.as_ref(), Path::new(cwd), &host_home)?;
     }
@@ -1950,11 +1978,36 @@ fn handle_broker_client(
     loop {
         match read_message(&mut client) {
             Ok(message) => {
-                agent_tx
-                    .send(message)
-                    .context("send client message to agent")?;
+                match &message {
+                    Message::Data { channel_id, bytes } => run_log.line(format!(
+                        "broker.client.data channel={channel_id:016x} bytes={}",
+                        bytes.len()
+                    )),
+                    Message::Eof { channel_id } => {
+                        run_log.line(format!("broker.client.eof channel={channel_id:016x}"))
+                    }
+                    Message::Close { channel_id } => {
+                        run_log.line(format!("broker.client.close channel={channel_id:016x}"))
+                    }
+                    _ => {}
+                }
+                if let Err(e) = agent_tx.send(message) {
+                    // The agent writer is gone; this channel can never
+                    // complete, so release its idle-accounting slot.
+                    let owned = clients
+                        .lock()
+                        .ok()
+                        .and_then(|mut clients| clients.remove(&channel_id))
+                        .map(|channel| channel.active_owned_by_reader)
+                        .unwrap_or(false);
+                    if owned {
+                        active_reservation.active.fetch_sub(1, Ordering::SeqCst);
+                    }
+                    return Err(e).context("send client message to agent");
+                }
             }
             Err(_) => {
+                run_log.line(format!("broker.client.read_eof channel={channel_id:016x}"));
                 let _ = agent_tx.send(Message::Eof { channel_id });
                 return Ok(());
             }
@@ -2489,11 +2542,7 @@ fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    fs::copy(src, dst).with_context(|| format!("copy {} to {}", src.display(), dst.display()))?;
-    Ok(())
+    crate::sparse_copy::clone_or_copy_file(src, dst)
 }
 
 fn copy_snapshot_stamp(snapshot_path: &Path, initramfs_stamp: &Path) -> Result<()> {
@@ -2596,7 +2645,7 @@ fn log_console_tail(run_log: &RunLog, path: &Path) {
 
 fn read_u32(stream: &mut UnixStream) -> Result<u32> {
     let mut buf = [0u8; 4];
-    stream.read_exact(&mut buf)?;
+    stream.read_exact(&mut buf).context("read u32")?;
     Ok(u32::from_be_bytes(buf))
 }
 
@@ -2636,7 +2685,7 @@ mod tests {
         fs::create_dir_all(snapshot).expect("create snapshot dir");
         let mut header = [0u8; 40];
         header[0..8].copy_from_slice(b"LKRNSS01");
-        header[8..12].copy_from_slice(&1u32.to_le_bytes());
+        header[8..12].copy_from_slice(&SNAPSHOT_VMSTATE_VERSION.to_le_bytes());
         header[16..24].copy_from_slice(&memory_bytes.to_le_bytes());
         header[32..36].copy_from_slice(&vcpu_count.to_le_bytes());
         fs::write(snapshot.join("vmstate.bin"), header).expect("write vmstate");
@@ -2678,7 +2727,7 @@ mod tests {
 
         let mut header = [0u8; 40];
         header[0..8].copy_from_slice(b"LKRNSS01");
-        header[8..12].copy_from_slice(&2u32.to_le_bytes());
+        header[8..12].copy_from_slice(&(SNAPSHOT_VMSTATE_VERSION + 1).to_le_bytes());
         fs::write(temp.path().join("vmstate.bin"), header).expect("write bad version");
         assert!(snapshot_vm_config(temp.path()).is_err());
     }

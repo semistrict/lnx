@@ -196,6 +196,12 @@ impl Vsock {
 
         let mut queue_ev = queue_ev.lock().unwrap();
         let Some(head) = queue_ev.pop(mem) else {
+            warn!(
+                "vsock.restore.transport_reset_pending_no_descriptor len={} next_avail={} next_used={}",
+                queue_ev.len(mem),
+                queue_ev.next_avail.0,
+                queue_ev.next_used.0
+            );
             return Ok(false);
         };
 
@@ -227,7 +233,10 @@ impl Vsock {
             )));
         }
 
-        info!("vsock.restore.transport_reset_event");
+        warn!(
+            "vsock.restore.transport_reset_event index={} next_avail={} next_used={}",
+            head.index, queue_ev.next_avail.0, queue_ev.next_used.0
+        );
         Ok(true)
     }
 
@@ -355,6 +364,25 @@ impl VirtioDevice for Vsock {
 
     fn resume(&mut self) -> Result<(), DeviceSnapshotError> {
         self.muxer.resume();
+        let mut raise_irq = self.process_transport_reset_event();
+        raise_irq |= self.process_stream_tx();
+        if self.muxer.has_pending_rx() {
+            raise_irq |= self.process_stream_rx();
+        }
+        if let DeviceState::Activated(_, ref interrupt) = self.device_state {
+            if raise_irq {
+                interrupt.signal_used_queue();
+            }
+        }
+        Ok(())
+    }
+
+    fn resume_after_restore(&mut self) -> Result<(), DeviceSnapshotError> {
+        self.muxer.resume();
+        Ok(())
+    }
+
+    fn post_restore(&mut self) -> Result<(), DeviceSnapshotError> {
         let mut raise_irq = self.process_transport_reset_event();
         raise_irq |= self.process_stream_tx();
         if self.muxer.has_pending_rx() {

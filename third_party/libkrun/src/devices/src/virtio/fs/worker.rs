@@ -19,7 +19,6 @@ use super::defs::{HPQ_INDEX, REQ_INDEX};
 use super::descriptor_utils::{Reader, Writer};
 use super::inode_alloc::InodeAllocator;
 use super::null_fs::NullFs;
-#[cfg(target_os = "macos")]
 use super::passthrough::PassthroughFsSnapshot;
 use super::passthrough::{self, PassthroughFs};
 #[cfg(target_os = "macos")]
@@ -38,7 +37,6 @@ pub(crate) enum FsServer {
     Null(Server<AugmentFs<NullFs>>),
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum FsServerSnapshot {
     ReadWrite {
@@ -52,7 +50,6 @@ pub(crate) enum FsServerSnapshot {
 }
 
 impl FsServer {
-    #[cfg(target_os = "macos")]
     pub(crate) fn snapshot_state(&self) -> io::Result<FsServerSnapshot> {
         match self {
             FsServer::ReadWrite(s) => Ok(FsServerSnapshot::ReadWrite {
@@ -70,7 +67,6 @@ impl FsServer {
         }
     }
 
-    #[cfg(target_os = "macos")]
     pub(crate) fn restore_state(&self, snap: &FsServerSnapshot) -> io::Result<()> {
         match (self, snap) {
             (

@@ -49,6 +49,16 @@ impl IrqChipDevice {
     pub fn restore_snapshot_state(&mut self, data: &[u8]) -> Result<(), DeviceError> {
         self.inner.restore_snapshot_state(data)
     }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub fn snapshot_state(&self) -> Result<Option<Vec<u8>>, DeviceError> {
+        self.inner.snapshot_state()
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub fn restore_snapshot_state(&mut self, data: &[u8]) -> Result<(), DeviceError> {
+        self.inner.restore_snapshot_state(data)
+    }
 }
 
 impl BusDevice for IrqChipDevice {
@@ -161,6 +171,16 @@ pub trait IrqChipT: BusDevice + GICDevice {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn restore_snapshot_state(&mut self, _data: &[u8]) -> Result<(), DeviceError> {
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn snapshot_state(&self) -> Result<Option<Vec<u8>>, DeviceError> {
+        Ok(None)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     fn restore_snapshot_state(&mut self, _data: &[u8]) -> Result<(), DeviceError> {
         Ok(())
     }
