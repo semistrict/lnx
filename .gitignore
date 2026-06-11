@@ -15,6 +15,7 @@
 /results/**/*.json
 /.lnx-nested-debug/
 /.lnx-nested-kvm*/
+/.lnx-chaos/
 /.lnx-nk-*/
 /.lnx-probe-*/
 /.lnx-snapshot-root-debug/

@@ -69,6 +69,7 @@ const fullSuite = [
   "scripts/test/client-chaos.test.ts",
   "scripts/test/pty-resume.test.ts",
   "scripts/test/stress.test.ts",
+  "scripts/test/snapshot-chaos.test.ts",
   "scripts/test/stock-ubuntu.test.ts",
   "scripts/test/ingress.test.ts",
   "scripts/test/browser-snapshot.test.ts",
@@ -147,6 +148,11 @@ const nestedDispositions: NestedDisposition[] = [
     testFile: "scripts/test/stress.test.ts",
     script: "scripts/test/nested-stress.ts",
     caveat: "parallel channel coverage runs via scripts/test/nested-stress.ts; the snapshot-waits-for-active-channels step remains excluded until Linux snapshot restore has more runtime soak",
+  },
+  {
+    kind: "caveat",
+    testFile: "scripts/test/snapshot-chaos.test.ts",
+    caveat: "drives randomized workloads across snapshot-exit cycles on the macOS/HVF path; enable for the nested Linux host once snapshot-exit with live channels is reliable there",
   },
   {
     kind: "caveat",
