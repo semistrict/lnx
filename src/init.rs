@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::paths::Layout;
 
-const DEFAULT_IMAGE_VERSION: &str = "images-v0.2.0";
+const DEFAULT_IMAGE_VERSION: &str = "images-v0.3.0";
 const RELEASE_BASE: &str = "https://github.com/semistrict/lnx/releases/download";
 const DEFAULT_ROOTFS_SIZE: u64 = 64 * 1024 * 1024 * 1024;
 const REQUIRED_EXT4_BLOCK_SIZE: u64 = 16 * 1024;

@@ -318,6 +318,30 @@ fn configure_network() {
         "/etc/resolv.conf",
         format!("nameserver {gateway}\nnameserver 1.1.1.1\n"),
     );
+    ensure_hosts();
+}
+
+/// Populate /etc/hosts so the local hostname resolves. Some base images ship
+/// an empty hosts file with the hostname set to localhost.localdomain, which
+/// makes getaddrinfo fail and tools like sudo warn "unable to resolve host".
+/// Only writes when the file is empty so an image's own hosts is preserved.
+fn ensure_hosts() {
+    if !fs::read_to_string("/etc/hosts").unwrap_or_default().trim().is_empty() {
+        return;
+    }
+    let mut names = String::from("localhost localhost.localdomain");
+    if let Some(hostname) = fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "localhost" && s != "localhost.localdomain")
+    {
+        names.push(' ');
+        names.push_str(&hostname);
+    }
+    let _ = fs::write(
+        "/etc/hosts",
+        format!("127.0.0.1\t{names}\n::1\tlocalhost ip6-localhost ip6-loopback\n"),
+    );
 }
 
 fn init_mode() -> ! {
