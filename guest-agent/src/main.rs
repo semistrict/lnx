@@ -568,6 +568,7 @@ WantedBy=multi-user.target\n";
     let _ = fs::remove_dir("/oldroot");
 
     configure_network();
+    relax_static_devices();
 
     match detect_image_init() {
         // systemd reads the unit installed above and supervises the agent.
@@ -1105,7 +1106,23 @@ fn drop_to_exec_user(uid: u32, gid: u32) {
     }
 }
 
-fn allow_nested_kvm_for_exec_user() {
+/// Relax the static device nodes that udev normally opens up on a desktop
+/// distro. The guest runs systemd but not systemd-udevd (udev isn't
+/// installed), so nothing applies the usual `KERNEL=="fuse", MODE="0666"`
+/// rules and these nodes keep the kernel's restrictive default (e.g.
+/// /dev/fuse is 0600), which blocks unprivileged FUSE and tun. They exist
+/// from boot, so relaxing them once in the initramfs init is enough — no
+/// udev ever resets them. Best-effort: missing nodes are skipped.
+fn relax_static_devices() {
+    for path in ["/dev/fuse", "/dev/net/tun"] {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o666));
+    }
+}
+
+/// Relax /dev/kvm so an unprivileged exec can run a nested VM. Unlike the
+/// static nodes, /dev/kvm only appears once nested virtualization is engaged,
+/// so it isn't present at boot — relax it right before each exec instead.
+fn relax_nested_kvm() {
     let _ = fs::set_permissions("/dev/kvm", fs::Permissions::from_mode(0o666));
 }
 
@@ -1377,7 +1394,7 @@ fn run_channel_pty(
     rx: mpsc::Receiver<ChannelInput>,
 ) {
     ensure_exec_user(uid, gid, &group);
-    allow_nested_kvm_for_exec_user();
+    relax_nested_kvm();
     let argv = resolve_login_shell(argv, uid);
     let mut pty_master = -1;
     let mut pty_slave = -1;
@@ -1592,7 +1609,7 @@ fn run_channel_pipe(
     rx: mpsc::Receiver<ChannelInput>,
 ) {
     ensure_exec_user(uid, gid, &group);
-    allow_nested_kvm_for_exec_user();
+    relax_nested_kvm();
     let argv = resolve_login_shell(argv, uid);
     let control_socket = channel_control_socket(channel_id);
     let child_exec = make_child_exec(&argv, &cwd, &env, channel_id, &control_socket);

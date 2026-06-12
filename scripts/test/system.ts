@@ -97,6 +97,14 @@ try {
     const rootMount = await lnx(ctx, ["findmnt", "-n", "-o", "FSTYPE,OPTIONS", "/"]);
     assertContains(rootMount.stdout, "ext4", "root is ext4");
     assertContains(rootMount.stdout, "dax=always", "root is dax mounted");
+    // The guest boots without udev/systemd-tmpfiles, so the agent relaxes the
+    // device nodes those normally open up; otherwise /dev/fuse stays 0600 and
+    // unprivileged FUSE (e.g. ArtifactFS) fails. Standard distros use 0666.
+    assertEq(
+      (await lnx(ctx, ["bash", "-lc", "stat -c %a /dev/fuse"])).stdout,
+      "666",
+      "/dev/fuse is world-rw for unprivileged FUSE",
+    );
   });
 
   await testStep("network and lnxctl", async () => {
