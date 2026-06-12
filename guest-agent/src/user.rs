@@ -11,10 +11,11 @@ unsafe extern "C" {
     fn chown(path: *const c_char, owner: c_uint, group: c_uint) -> c_int;
 }
 
-pub fn ensure_exec_user(uid: u32, gid: u32) {
+pub fn ensure_exec_user(uid: u32, gid: u32, group: &str) {
     if uid == 0 {
         return;
     }
+    ensure_exec_group(gid, group);
     if !file_contains_line_prefix("/etc/passwd", "lnxuser:") {
         if !create_exec_user_with_useradd(uid, gid) {
             append_file(
@@ -37,6 +38,81 @@ pub fn ensure_exec_user(uid: u32, gid: u32) {
         format!("{EXEC_USER} ALL=(ALL) NOPASSWD: ALL\n"),
     );
     let _ = fs::set_permissions("/etc/sudoers.d/lnx", fs::Permissions::from_mode(0o440));
+}
+
+/// Make the guest's group for `gid` carry the host's name for it, so shared
+/// files list the same owner group on both sides (e.g. gid 20 is `staff` on
+/// macOS but ships as `dialout` in the rootfs). Renames an existing group or
+/// creates a missing one; host names that are not portable Linux group names
+/// leave the guest untouched.
+fn ensure_exec_group(gid: u32, host_name: &str) {
+    if !is_portable_group_name(host_name) {
+        return;
+    }
+    match group_name_for_gid(gid) {
+        Some(name) if name == host_name => {}
+        Some(name) => {
+            let renamed = Command::new("/usr/sbin/groupmod")
+                .arg("-n")
+                .arg(host_name)
+                .arg(&name)
+                .status()
+                .is_ok_and(|status| status.success());
+            if !renamed {
+                rename_group_entry(&name, host_name);
+            }
+        }
+        None => {
+            let added = Command::new("/usr/sbin/groupadd")
+                .arg("-g")
+                .arg(gid.to_string())
+                .arg(host_name)
+                .status()
+                .is_ok_and(|status| status.success());
+            if !added {
+                append_file("/etc/group", &format!("{host_name}:x:{gid}:\n"));
+            }
+        }
+    }
+}
+
+fn is_portable_group_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    name.len() <= 32
+        && (first.is_ascii_lowercase() || first == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+fn group_name_for_gid(gid: u32) -> Option<String> {
+    let gid = gid.to_string();
+    fs::read_to_string("/etc/group").ok()?.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        let _password = fields.next()?;
+        (fields.next()? == gid).then(|| name.to_string())
+    })
+}
+
+fn rename_group_entry(old: &str, new: &str) {
+    let Ok(contents) = fs::read_to_string("/etc/group") else {
+        return;
+    };
+    let prefix = format!("{old}:");
+    let renamed = contents
+        .lines()
+        .map(|line| {
+            if let Some(rest) = line.strip_prefix(&prefix) {
+                format!("{new}:{rest}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = fs::write("/etc/group", renamed + "\n");
 }
 
 fn create_exec_user_with_useradd(uid: u32, gid: u32) -> bool {

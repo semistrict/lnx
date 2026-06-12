@@ -38,6 +38,8 @@ try {
 
     assertEq((await lnxVm(["id", "-un"])).stdout, "lnxuser", "exec runs as lnxuser");
     assertEq((await lnxVm(["bash", "-lc", 'printf "%s:%s:%s" "$USER" "$LOGNAME" "$HOME"'])).stdout, "lnxuser:lnxuser:/home/lnxuser", "exec user environment");
+    const hostGroup = (await run(["id", "-gn"])).stdout;
+    assertEq((await lnxVm(["id", "-gn"])).stdout, hostGroup, "exec primary group named like host");
     assertEq((await lnxVm(["getconf", "PAGESIZE"])).stdout, "16384", "guest page size");
     assertContains((await lnxVm(["bash", "-lc", "printf %s \"$PATH\""])).stdout, "/snap/bin", "exec PATH includes snap commands");
     const pid1 = await lnxVm(["bash", "-lc", "cat /proc/1/comm; sudo readlink /proc/1/root; test ! -e /newroot; test ! -e /oldroot; echo clean"]);

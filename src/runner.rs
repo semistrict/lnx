@@ -1259,6 +1259,7 @@ fn run_broker_session(mut stream: UnixStream, command: &[String], cwd: &Path) ->
             cols,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
+            group: host_group_name(),
             env: forwarded_exec_env(),
         },
     )?;
@@ -1385,6 +1386,31 @@ fn run_broker_session(mut stream: UnixStream, command: &[String], cwd: &Path) ->
             _ => {}
         }
     }
+}
+
+/// Name of the host's primary group, so the guest can label the matching gid
+/// the way the host does (e.g. gid 20 is `staff` on macOS, `dialout` on
+/// Ubuntu). Empty when the lookup fails; the guest then keeps its own name.
+fn host_group_name() -> String {
+    let gid = unsafe { libc::getgid() };
+    let mut buf = [0u8; 1024];
+    let mut grp: libc::group = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::group = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getgrgid_r(
+            gid,
+            &mut grp,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        return String::new();
+    }
+    unsafe { std::ffi::CStr::from_ptr(grp.gr_name) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn forwarded_exec_env() -> Vec<(String, String)> {

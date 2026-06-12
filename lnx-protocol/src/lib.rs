@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +19,7 @@ pub enum Message {
         cols: u16,
         uid: u32,
         gid: u32,
+        group: String,
         env: Vec<(String, String)>,
     },
     OpenTcp {
@@ -83,6 +84,7 @@ mod tests {
             cols: 160,
             uid: 501,
             gid: 20,
+            group: "staff".into(),
             env: vec![
                 ("LANG".into(), "en_US.UTF-8".into()),
                 ("COLORTERM".into(), "truecolor".into()),

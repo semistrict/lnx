@@ -1222,9 +1222,10 @@ fn run_channel_pty(
     cols: u16,
     uid: u32,
     gid: u32,
+    group: String,
     rx: mpsc::Receiver<ChannelInput>,
 ) {
-    ensure_exec_user(uid, gid);
+    ensure_exec_user(uid, gid, &group);
     allow_nested_kvm_for_exec_user();
     let mut pty_master = -1;
     let mut pty_slave = -1;
@@ -1434,10 +1435,11 @@ fn run_channel_pipe(
     env: Vec<(String, String)>,
     uid: u32,
     gid: u32,
+    group: String,
     eof_requested: Arc<AtomicBool>,
     rx: mpsc::Receiver<ChannelInput>,
 ) {
-    ensure_exec_user(uid, gid);
+    ensure_exec_user(uid, gid, &group);
     allow_nested_kvm_for_exec_user();
     let control_socket = channel_control_socket(channel_id);
     let child_exec = make_child_exec(&argv, &cwd, &env, channel_id, &control_socket);
@@ -1801,6 +1803,7 @@ fn agent_loop() {
                 cols,
                 uid,
                 gid,
+                group,
                 env,
             } => {
                 let (tx, rx) = mpsc::channel();
@@ -1817,7 +1820,7 @@ fn agent_loop() {
                     thread::spawn(move || {
                         run_channel_pty(
                             writer, channel_id, argv, cwd, env, term, colorterm, rows, cols, uid,
-                            gid, rx,
+                            gid, group, rx,
                         )
                     });
                 } else {
@@ -1830,6 +1833,7 @@ fn agent_loop() {
                             env,
                             uid,
                             gid,
+                            group,
                             eof_requested,
                             rx,
                         )
