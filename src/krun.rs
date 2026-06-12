@@ -6,9 +6,6 @@ pub const KRUN_KERNEL_FORMAT_RAW: u32 = 0;
 const COMPAT_NET_FEATURES: u32 = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1 << 11) | (1 << 14);
 const NET_FLAG_VFKIT: u32 = 1 << 0;
 const NET_FLAG_DHCP_CLIENT: u32 = 1 << 1;
-// VIRTIO_NET_F_MAC: the guest adopts the device-configured MAC.
-#[cfg(target_os = "macos")]
-const NET_FEATURE_MAC: u32 = 1 << 5;
 const VIRTIOFS_DAX_WINDOW_BYTES: u64 = 8 << 30;
 
 pub struct Context {
@@ -170,9 +167,9 @@ impl Context {
     ///
     /// Unlike the gvproxy path, the vmnet bridge forwards raw ≤MTU ethernet
     /// frames and does no segmentation or checksum fixups, so no offload
-    /// features are negotiated — only VIRTIO_NET_F_MAC, so the guest adopts
-    /// the stable per-instance address it needs for ARP on the shared
-    /// segment.
+    /// features are negotiated. The guest still adopts the configured
+    /// per-instance MAC: libkrun always advertises VIRTIO_NET_F_MAC, which is
+    /// not part of the configurable feature mask.
     #[cfg(target_os = "macos")]
     pub fn add_fd_network(&self, fd: std::os::fd::OwnedFd, mac: [u8; 6]) -> Result<()> {
         use std::os::fd::IntoRawFd;
@@ -185,7 +182,7 @@ impl Context {
                     std::ptr::null(),
                     fd.into_raw_fd(),
                     mac.as_mut_ptr(),
-                    NET_FEATURE_MAC,
+                    0,
                     0,
                 )
             },

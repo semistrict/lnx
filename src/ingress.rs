@@ -85,7 +85,6 @@ pub fn enable(config: &Config) -> Result<()> {
         return Ok(());
     }
     ensure_ca(config)?;
-    ensure_wildcard_cert(config)?;
     println!("writing {}", config.resolver_path().display());
     println!("starting dns on {}", config.dns_addr);
     println!("starting http on {}", config.http_addr);
@@ -326,6 +325,7 @@ fn start_helper(config: &Config, args: &[&str]) -> Result<()> {
             "LNX_INGRESS_RESOLVER_DIR",
             "LNX_INGRESS_STATE_DIR",
             "LNX_INGRESS_USER",
+            "LNX_VMNET_DEBUG",
         ] {
             if let Ok(value) = std::env::var(key) {
                 command.arg(format!("{key}={value}"));
@@ -374,7 +374,8 @@ fn uninstall_service(config: &Config) -> Result<()> {
     let _ = fs::remove_file(config.launchd_path());
     let _ = fs::remove_file(config.resolver_path());
     let _ = fs::remove_file(config.socket_path());
-    let _ = untrust_ca(config);
+    // Leave the CA trusted: re-trusting on the next enable would re-open the
+    // Security auth dialog. The local dev CA persists like mkcert's.
     Ok(())
 }
 
@@ -455,8 +456,12 @@ fn launchd_plist(config: &Config) -> Result<String> {
     <key>LNX_INGRESS_STATE_DIR</key>
     <string>{state_dir}</string>
     <key>LNX_INGRESS_USER</key>
-    <string>{user}</string>
+    <string>{user}</string>{debug_env}
   </dict>
+  <key>StandardErrorPath</key>
+  <string>{log}</string>
+  <key>StandardOutPath</key>
+  <string>{log}</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -472,6 +477,14 @@ fn launchd_plist(config: &Config) -> Result<String> {
         http_addr = xml_escape(&config.http_addr),
         https_addr = xml_escape(&config.https_addr),
         subnet = xml_escape(&config.subnet),
+        log = xml_escape(&config.log_path().display().to_string()),
+        debug_env = match std::env::var("LNX_VMNET_DEBUG") {
+            Ok(value) => format!(
+                "\n    <key>LNX_VMNET_DEBUG</key>\n    <string>{}</string>",
+                xml_escape(&value)
+            ),
+            Err(_) => String::new(),
+        },
         resolver_dir = xml_escape(&config.resolver_dir.display().to_string()),
         state_dir = xml_escape(&config.state_dir.display().to_string()),
         user = xml_escape(&user),
@@ -1244,6 +1257,12 @@ fn trust_ca(config: &Config) -> Result<()> {
     if !cfg!(target_os = "macos") {
         return Ok(());
     }
+    // Trusting the CA opens a Security auth dialog; skip it when the CA is
+    // already in the System keychain so repeated enable/disable cycles don't
+    // re-prompt. The CA is stable once generated, so present means trusted.
+    if ca_already_trusted() {
+        return Ok(());
+    }
     run_command(
         Command::new("security")
             .arg("add-trusted-cert")
@@ -1257,6 +1276,21 @@ fn trust_ca(config: &Config) -> Result<()> {
     .context("trust ingress CA")
 }
 
+fn ca_already_trusted() -> bool {
+    Command::new("security")
+        .arg("find-certificate")
+        .arg("-c")
+        .arg(CA_COMMON_NAME)
+        .arg("/Library/Keychains/System.keychain")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+// Retained for an explicit teardown; normal disable leaves the CA trusted.
+#[allow(dead_code)]
 fn untrust_ca(_config: &Config) -> Result<()> {
     if !cfg!(target_os = "macos") {
         return Ok(());
@@ -1299,20 +1333,22 @@ impl ResolvesServerCert for IngressCertResolver {
         if parse_host(&host, &self.config.domain).is_err() {
             return None;
         }
-        ensure_wildcard_cert(&self.config)
+        ensure_host_cert(&self.config, &host)
             .and_then(|(cert, key)| load_certified_key(&cert, &key))
             .ok()
             .map(Arc::new)
     }
 }
 
-fn ensure_wildcard_cert(config: &Config) -> Result<(PathBuf, PathBuf)> {
+// A wildcard cert `*.lnx` is a wildcard directly under what OpenSSL treats as
+// a TLD, which curl/OpenSSL refuse to match. Mint an exact-host leaf instead,
+// cached per host, so every requested name validates.
+fn ensure_host_cert(config: &Config, host: &str) -> Result<(PathBuf, PathBuf)> {
     fs::create_dir_all(config.cert_dir())
         .with_context(|| format!("create {}", config.cert_dir().display()))?;
     chown_to_ingress_user(&config.cert_dir());
-    let domain = config.domain.to_ascii_lowercase();
-    let host = format!("*.{domain}");
-    let safe = format!("wildcard.{domain}");
+    let host = host.to_ascii_lowercase();
+    let safe = host.replace(['*', '/', ':'], "_");
     let key = config.cert_dir().join(format!("{safe}.key"));
     let csr = config.cert_dir().join(format!("{safe}.csr"));
     let cert = config.cert_dir().join(format!("{safe}.crt"));

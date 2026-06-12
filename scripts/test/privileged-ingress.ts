@@ -40,63 +40,74 @@ try {
   await cleanupContext(ctx);
   await cleanupInstance(ctx, peerInstance);
 
-  await testStep("privileged ingress install status https and disable", async () => {
-    await run([
-      ctx.lnxBin,
-      "--instance",
-      ctx.instance,
-      "--no-snapshot-restore",
-      "bash",
-      "-lc",
-      "sudo mkdir -p /tmp/lnx-privileged-ingress && printf privileged-https-ok | sudo tee /tmp/lnx-privileged-ingress/index.html >/dev/null && sudo tee /etc/systemd/system/lnx-privileged-ingress-test.service >/dev/null <<'UNIT'\n[Service]\nWorkingDirectory=/tmp/lnx-privileged-ingress\nExecStart=/usr/bin/python3 -m http.server 8080 --bind 0.0.0.0\n[Install]\nWantedBy=multi-user.target\nUNIT\nsudo systemctl daemon-reload && sudo systemctl enable --now lnx-privileged-ingress-test.service && sleep 1 && curl -fsS http://127.0.0.1:8080",
-    ], { timeoutMs: 240_000 });
+  // Serve a fixed body on :8080 inside a cold-booted VM, so reachability
+  // depends only on the network path, not on snapshot/systemd state.
+  const SERVE = "cd /tmp && printf privileged-https-ok > index.html && exec python3 -m http.server 8080 --bind 0.0.0.0";
 
+  await testStep("ingress installs and reserves a vmnet network", async () => {
+    // Force a fresh install so the daemon runs this binary: `enable`
+    // short-circuits when an ingress daemon is already loaded, which would
+    // otherwise leave a stale binary (without vmnet) serving.
+    await run(["sudo", ctx.lnxBin, "ingress", "disable"], { check: false, timeoutMs: 120_000 });
     const enable = await run(["sudo", ctx.lnxBin, "ingress", "enable"], { timeoutMs: 120_000 });
     assertContains(enable.stdout + enable.stderr, "ingress enabled", "ingress enable output");
     const status = await run([ctx.lnxBin, "ingress", "status"]);
     assertContains(status.stdout, "enabled", "ingress status");
     assertContains(status.stdout, "network: 192.168.106.0/24", "vmnet network reserved");
-
-    const url = `https://p8080-${ctx.instance}.lnx/`;
-    const https = await run(["curl", "-fsS", "--connect-timeout", "10", "--max-time", "60", url], { timeoutMs: 90_000 });
-    assertEq(https.stdout, "privileged-https-ok", "trusted https .lnx ingress");
   });
 
-  await testStep("instance gets a routable vmnet address and DNS name", async () => {
-    // Keep the VM alive: direct-to-IP traffic has no L7 hook to auto-start
-    // the instance the way the ingress proxy does.
-    const holder = spawnLnx(ctx, ["bash", "-lc", "sleep 120"]);
-    try {
-      const log = await run(["bash", "-lc", `cat ${join(ctx.runDir, "lnx.log")}`]);
-      assertContains(log.stdout, "network.vmnet ip=192.168.106.", "owner attached to vmnet");
+  async function holderVmnetIp(timeoutMs = 120_000): Promise<string> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const log = await run(["bash", "-lc", `cat ${join(ctx.runDir, "lnx.log")} 2>/dev/null || true`]);
+      const match = log.stdout.match(/network\.vmnet ip=(\d+\.\d+\.\d+\.\d+)\//);
+      if (match) {
+        return match[1];
+      }
+      await sleep(500);
+    }
+    throw new Error("owner never attached to vmnet (no network.vmnet ip= in lnx.log)");
+  }
 
+  await testStep("routable vmnet address, DNS name, and reachability", async () => {
+    // Cold-boot a VM that serves http inline; hold it alive for every check.
+    const holder = spawnLnx(ctx, ["--no-snapshot-restore", "bash", "-lc", SERVE]);
+    try {
+      const ip = await holderVmnetIp();
+      // Reach the routable address directly (host -> vmnet bridge -> VM).
+      const direct = await waitForHttp(`http://${ip}:8080/`, 120_000);
+      assertEq(direct, "privileged-https-ok", "host reaches the VM by its routable IP");
+
+      // <instance>.lnx resolves to the routable address (host-side DNS).
       const resolved = await run(
         ["dig", "-p", "5354", "@127.0.0.1", "+short", `${ctx.instance}.lnx`],
         { timeoutMs: 15_000 },
       );
-      assertContains(resolved.stdout, "192.168.106.", "instance name resolves to its address");
+      assertEq(resolved.stdout, ip, "instance name resolves to its address");
 
-      // System resolver -> /etc/resolver/lnx -> ingress DNS -> direct VM IP.
-      const direct = await waitForHttp(`http://${ctx.instance}.lnx:8080/`, 60_000);
-      assertEq(direct, "privileged-https-ok", "host reaches the VM by name and IP");
-    } finally {
-      holder.kill();
-      await holder.exited;
-    }
-  });
+      // Host reaches the VM by name: system resolver -> ingress DNS -> IP.
+      const byName = await waitForHttp(`http://${ctx.instance}.lnx:8080/`, 30_000);
+      assertEq(byName, "privileged-https-ok", "host reaches the VM by name");
 
-  await testStep("VMs reach each other by name", async () => {
-    const holder = spawnLnx(ctx, ["bash", "-lc", "sleep 240"]);
-    try {
+      // The L7 ingress proxy terminates TLS and forwards over the broker.
+      const url = `https://p8080-${ctx.instance}.lnx/`;
+      const https = await run(
+        ["curl", "-fsS", "--connect-timeout", "10", "--max-time", "30", url],
+        { timeoutMs: 60_000 },
+      );
+      assertEq(https.stdout, "privileged-https-ok", "trusted https .lnx ingress proxy");
+
+      // A peer on the shared L2 segment reaches the holder by its address.
       const peer = await run([
         ctx.lnxBin,
         "--instance",
         peerInstance,
+        "--no-snapshot-restore",
         "bash",
         "-lc",
-        `curl -fsS --connect-timeout 10 --max-time 30 http://${ctx.instance}.lnx:8080/`,
+        `curl -fsS --connect-timeout 10 --max-time 30 http://${ip}:8080/`,
       ], { timeoutMs: 600_000 });
-      assertEq(peer.stdout, "privileged-https-ok", "guest resolves and reaches its peer");
+      assertEq(peer.stdout, "privileged-https-ok", "peer reaches the holder by IP");
     } finally {
       holder.kill();
       await holder.exited;

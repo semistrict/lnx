@@ -162,8 +162,12 @@ impl Network {
     /// the underlying objects are intentionally never released.
     pub fn create(subnet: Ipv4Addr, prefix: u8) -> Result<Network> {
         let mask = mask_for_prefix(prefix);
-        let subnet_addr = libc::in_addr {
-            s_addr: u32::from(subnet).to_be(),
+        // vmnet's set_ipv4_subnet takes the host (gateway) address, not the
+        // network address: it assigns this to the host-side bridge. Passing
+        // the network address (.0) would strand the guests, whose gateway is
+        // .1. (Matches Apple's container tool.)
+        let gateway_addr = libc::in_addr {
+            s_addr: u32::from(gateway_for_subnet(subnet)).to_be(),
         };
         let mask_addr = libc::in_addr {
             s_addr: u32::from(mask).to_be(),
@@ -174,7 +178,7 @@ impl Network {
             if config.is_null() {
                 return Err(vmnet_error("vmnet_network_configuration_create", status));
             }
-            let rc = vmnet_network_configuration_set_ipv4_subnet(config, &subnet_addr, &mask_addr);
+            let rc = vmnet_network_configuration_set_ipv4_subnet(config, &gateway_addr, &mask_addr);
             if rc != VMNET_SUCCESS {
                 return Err(vmnet_error(
                     "vmnet_network_configuration_set_ipv4_subnet",
@@ -266,6 +270,8 @@ impl Network {
             host_fd,
             stopped: AtomicBool::new(false),
             rx: Mutex::new(RxScratch::new(max_packet_size)),
+            rx_frames: std::sync::atomic::AtomicU64::new(0),
+            tx_frames: std::sync::atomic::AtomicU64::new(0),
         });
 
         // guest -> vmnet: a reader on the host end of the pair. The fd has a
@@ -414,10 +420,19 @@ struct AttachmentInner {
     host_fd: OwnedFd,
     stopped: AtomicBool,
     rx: Mutex<RxScratch>,
+    rx_frames: std::sync::atomic::AtomicU64,
+    tx_frames: std::sync::atomic::AtomicU64,
 }
 
 unsafe impl Send for AttachmentInner {}
 unsafe impl Sync for AttachmentInner {}
+
+/// Set LNX_VMNET_DEBUG to log the first frames in each direction — useful for
+/// diagnosing a guest that can't reach its gateway.
+fn vmnet_debug() -> bool {
+    std::env::var_os("LNX_VMNET_DEBUG").is_some()
+}
+
 
 impl AttachmentInner {
     fn forward_available_packets(&self) {
@@ -452,6 +467,12 @@ impl AttachmentInner {
                 return;
             }
             let sizes: Vec<usize> = descs.iter().take(count as usize).map(|d| d.vm_pkt_size).collect();
+            if vmnet_debug() {
+                let n = self.rx_frames.fetch_add(count as u64, Ordering::Relaxed);
+                if n < 16 {
+                    eprintln!("vmnet.rx frames+={count} total={} sizes={sizes:?}", n + count as u64);
+                }
+            }
             for (size, buffer) in sizes.iter().zip(&rx.buffers) {
                 let frame = &buffer[..*size];
                 // MSG_DONTWAIT: a full guest receive buffer drops the frame
@@ -520,7 +541,13 @@ impl AttachmentInner {
             };
             let mut count: c_int = 1;
             // A frame vmnet rejects (e.g. oversized) is dropped, not fatal.
-            let _ = unsafe { vmnet_write(self.interface.0, &mut desc, &mut count) };
+            let rc = unsafe { vmnet_write(self.interface.0, &mut desc, &mut count) };
+            if vmnet_debug() {
+                let n = self.tx_frames.fetch_add(1, Ordering::Relaxed);
+                if n < 16 {
+                    eprintln!("vmnet.tx frame={received} rc={rc} count={count}");
+                }
+            }
         }
     }
 
