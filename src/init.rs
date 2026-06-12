@@ -93,6 +93,11 @@ pub fn ensure_kernel(layout: &Layout) -> Result<()> {
     download_kernel(&layout.kernel)
 }
 
+/// Installs a caller-supplied kernel image instead of downloading one.
+pub fn install_kernel(layout: &Layout, kernel: &Path) -> Result<()> {
+    copy_if_needed(kernel, &layout.kernel, "kernel")
+}
+
 fn create_dir(path: &Path) -> Result<()> {
     if path.exists() {
         return Ok(());

@@ -15,7 +15,7 @@ use crate::{descriptor, init, paths::Layout};
 /// can preserve ownership, modes, and device nodes, and the guest kernel's
 /// 16 KiB pages match the 16 KiB-block ext4 the managed rootfs layout
 /// requires. The built image lands back on the host through the cwd share.
-pub fn import_image(layout: &Layout, reference: &str) -> Result<()> {
+pub fn import_image(layout: &Layout, reference: &str, kernel: Option<&Path>) -> Result<()> {
     if layout.rootfs.exists() {
         bail!(
             "instance {} already has a rootfs: {}",
@@ -26,7 +26,10 @@ pub fn import_image(layout: &Layout, reference: &str) -> Result<()> {
     if layout.instance == "default" {
         bail!("the default instance is the import builder; import into a named instance");
     }
-    init::ensure_kernel(layout)?;
+    match kernel {
+        Some(kernel) => init::install_kernel(layout, kernel)?,
+        None => init::ensure_kernel(layout)?,
+    }
 
     let image = ImageReference::parse(reference)?;
     let staging = layout.base.join(format!("oci-import-{}", std::process::id()));
@@ -89,25 +92,24 @@ impl ImageReference {
 fn pull_layers(image: &ImageReference, staging: &Path) -> Result<Vec<PathBuf>> {
     let token = fetch_token(image)?;
     let manifest = fetch_manifest(image, &token, &image.reference)?;
-    let manifest = match manifest["mediaType"].as_str() {
-        Some(
-            "application/vnd.oci.image.index.v1+json"
-            | "application/vnd.docker.distribution.manifest.list.v2+json",
-        ) => {
-            let digest = manifest["manifests"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|entry| {
-                    entry["platform"]["os"] == "linux"
-                        && entry["platform"]["architecture"] == "arm64"
-                })
-                .and_then(|entry| entry["digest"].as_str())
-                .with_context(|| format!("no linux/arm64 manifest for {}", image.repository))?
-                .to_string();
-            fetch_manifest(image, &token, &digest)?
-        }
-        _ => manifest,
+    // An image index / manifest list carries a `manifests` array; its
+    // top-level mediaType is only recommended by the OCI spec and some
+    // registries omit it, so detect the index by shape, not mediaType.
+    let manifest = if manifest["manifests"].is_array() {
+        let digest = manifest["manifests"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|entry| {
+                entry["platform"]["os"] == "linux"
+                    && entry["platform"]["architecture"] == "arm64"
+            })
+            .and_then(|entry| entry["digest"].as_str())
+            .with_context(|| format!("no linux/arm64 manifest for {}", image.repository))?
+            .to_string();
+        fetch_manifest(image, &token, &digest)?
+    } else {
+        manifest
     };
 
     let layers = manifest["layers"]
@@ -263,20 +265,25 @@ root=/var/tmp/lnx-oci-root
 rm -rf "$root"
 mkdir -p "$root"
 for layer in ./layer-*; do
+    # Apply whiteouts before extracting: a marker's basename starts with
+    # ".wh." (".wh..wh..opq" makes the directory opaque). Match on the
+    # basename so a real file merely containing ".wh." is left alone.
     tar -tf "$layer" | while IFS= read -r entry; do
-        case "$entry" in
-            *.wh..wh..opq)
-                dir="${entry%.wh..wh..opq}"
+        name="$(basename "$entry")"
+        case "$name" in
+            .wh..wh..opq)
+                dir="$(dirname "$entry")"
                 find "$root/$dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
                 ;;
-            *.wh.*)
-                name="$(basename "$entry")"
+            .wh.*)
                 dir="$(dirname "$entry")"
                 rm -rf "$root/$dir/${name#.wh.}"
                 ;;
         esac
     done
-    tar -xpf "$layer" -C "$root" --numeric-owner --exclude='*.wh.*'
+    tar -xpf "$layer" -C "$root" --numeric-owner
+    # Drop the extracted marker files themselves (basename starts with .wh.).
+    find "$root" -depth -name '.wh.*' -exec rm -rf {} + 2>/dev/null || true
 done
 rm -f ./rootfs.ext4
 truncate -s 64G ./rootfs.ext4

@@ -96,6 +96,9 @@ try {
     await mkdir(join(upper, "sub"), { recursive: true });
     await writeFile(join(lower, "keep.txt"), "keep");
     await writeFile(join(lower, "gone.txt"), "gone");
+    // A real file whose name merely contains ".wh." must survive: only
+    // basenames that start with ".wh." are whiteout markers.
+    await writeFile(join(lower, "archive.wh.bak"), "real");
     await writeFile(join(lower, "sub", "old.txt"), "old");
     await writeFile(join(upper, ".wh.gone.txt"), "");
     await writeFile(join(upper, "sub", ".wh..wh..opq"), "");
@@ -108,6 +111,7 @@ try {
 
     const image = join(staging, "rootfs.ext4");
     assertEq(await debugfsHas(image, "/keep.txt"), true, "lower file kept");
+    assertEq(await debugfsHas(image, "/archive.wh.bak"), true, "file containing .wh. kept");
     assertEq(await debugfsHas(image, "/top.txt"), true, "upper file added");
     assertEq(await debugfsHas(image, "/sub/new.txt"), true, "opaque dir repopulated");
     assertEq(await debugfsHas(image, "/gone.txt"), false, "whiteout removed file");

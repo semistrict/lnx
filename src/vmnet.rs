@@ -13,8 +13,8 @@
 use std::ffi::{c_char, c_int, c_void};
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -33,6 +33,11 @@ const VMNET_SHARED_MODE: u32 = 1001;
 const VMNET_INTERFACE_PACKETS_AVAILABLE: u32 = 1 << 0;
 
 const READ_BATCH: usize = 32;
+/// Largest frame the libkrun unixgram socket can carry (MAX_BUFFER_SIZE minus
+/// the virtio-net header it strips). Sizing reads to this avoids truncating a
+/// guest frame into a corrupt packet on the segment.
+const MAX_FRAME_SIZE: usize = 65550;
+const RECV_TIMEOUT_MS: i64 = 250;
 
 #[repr(C)]
 struct VmPktDesc {
@@ -226,6 +231,10 @@ impl Network {
             let _ = started_tx.send((status, max_packet_size));
         });
 
+        // Release the dispatch queue on any early return; success hands it to
+        // the Attachment, which releases it on Drop.
+        let queue_guard = QueueGuard(Some(queue));
+
         let interface = unsafe {
             let desc = xpc_dictionary_create(std::ptr::null(), std::ptr::null(), 0);
             xpc_dictionary_set_bool(desc, vmnet_allocate_mac_address_key, false);
@@ -235,57 +244,109 @@ impl Network {
             interface
         };
         if interface.is_null() {
-            unsafe { dispatch_release(queue) };
             bail!("vmnet_interface_start_with_network failed");
         }
+        let interface = SendPtr(interface);
+        // From here on the interface is started; tear it down on any error.
+        let started = StartedInterface {
+            interface,
+            queue: queue_guard,
+        };
         let (status, max_packet_size) = started_rx
             .recv_timeout(Duration::from_secs(10))
             .context("vmnet interface start timed out")?;
         if status != VMNET_SUCCESS {
-            unsafe { dispatch_release(queue) };
             return Err(vmnet_error("vmnet_interface_start_with_network", status));
         }
         let max_packet_size = usize::try_from(max_packet_size.max(1514)).expect("packet size");
 
         let inner = Arc::new(AttachmentInner {
-            interface: SendPtr(interface),
+            interface,
             queue: SendPtr(queue),
             host_fd,
             stopped: AtomicBool::new(false),
+            rx: Mutex::new(RxScratch::new(max_packet_size)),
         });
 
+        // guest -> vmnet: a reader on the host end of the pair. The fd has a
+        // recv timeout so the thread observes `stopped` even though a closed
+        // datagram peer delivers no EOF. Spawn it before arming the vmnet
+        // callback so this is the last fallible step.
+        let write_inner = Arc::clone(&inner);
+        let pump = thread::Builder::new()
+            .name(format!("vmnet-{label}"))
+            .spawn(move || write_inner.pump_guest_to_vmnet())
+            .context("spawn vmnet pump thread")?;
+
         // vmnet -> guest: drain available packets from the dispatch callback
-        // and forward each one as a single datagram. A full socket buffer
-        // drops the frame, like a real link would.
+        // and forward each one as a single datagram. A full guest receive
+        // buffer drops the frame (MSG_DONTWAIT), like a real link would.
         let read_inner = Arc::clone(&inner);
         let event_callback = RcBlock::new(move |_events: u32, _event: XpcObject| {
-            read_inner.forward_available_packets(max_packet_size);
+            read_inner.forward_available_packets();
         });
         let rc = unsafe {
             vmnet_interface_set_event_callback(
-                interface,
+                interface.0,
                 VMNET_INTERFACE_PACKETS_AVAILABLE,
                 queue,
                 &*event_callback as *const Block<dyn Fn(u32, XpcObject)> as *const c_void,
             )
         };
         if rc != VMNET_SUCCESS {
+            // Pump is already running; signal it and let `started` Drop stop
+            // the interface.
             inner.stop();
+            let _ = pump.join();
             return Err(vmnet_error("vmnet_interface_set_event_callback", rc));
         }
 
-        // guest -> vmnet: a blocking reader on the host end of the pair.
-        let write_inner = Arc::clone(&inner);
-        let pump = thread::Builder::new()
-            .name(format!("vmnet-{label}"))
-            .spawn(move || write_inner.pump_guest_to_vmnet(max_packet_size))
-            .context("spawn vmnet pump thread")?;
+        // vmnet copies the callback block, so our handle can drop here; the
+        // copy stays alive until the callback is disabled at teardown.
+        drop(event_callback);
 
+        // No fallible steps remain: take over teardown from the start guard.
+        started.into_owned();
         Ok(Attachment {
             guest_fd: Some(guest_fd),
             inner,
             pump: Some(pump),
         })
+    }
+}
+
+/// Releases a dispatch queue on Drop unless ownership is handed off.
+struct QueueGuard(Option<DispatchQueue>);
+
+impl Drop for QueueGuard {
+    fn drop(&mut self) {
+        if let Some(queue) = self.0.take() {
+            unsafe { dispatch_release(queue) };
+        }
+    }
+}
+
+unsafe impl Send for QueueGuard {}
+
+/// Stops and releases a started interface (and its queue) on Drop, until
+/// `into_owned` transfers that responsibility to the Attachment.
+struct StartedInterface {
+    interface: SendPtr,
+    queue: QueueGuard,
+}
+
+impl StartedInterface {
+    fn into_owned(mut self) {
+        // The Attachment now owns teardown; forget the queue so Drop is a
+        // no-op and leak nothing.
+        self.queue.0.take();
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for StartedInterface {
+    fn drop(&mut self) {
+        stop_interface(self.interface.0, self.queue.0.take());
     }
 }
 
@@ -309,7 +370,41 @@ impl Drop for Attachment {
         if let Some(pump) = self.pump.take() {
             let _ = pump.join();
         }
-        unsafe { dispatch_release(self.inner.queue.0) };
+        stop_interface(self.inner.interface.0, Some(self.inner.queue.0));
+    }
+}
+
+/// Disables the event callback and stops the interface, draining the
+/// completion handler so vmnet finishes teardown before the queue is freed.
+fn stop_interface(interface: *mut c_void, queue: Option<DispatchQueue>) {
+    unsafe {
+        vmnet_interface_set_event_callback(interface, 0, std::ptr::null_mut(), std::ptr::null());
+    }
+    let (stopped_tx, stopped_rx) = mpsc::channel::<u32>();
+    let handler = RcBlock::new(move |status: u32| {
+        let _ = stopped_tx.send(status);
+    });
+    if let Some(queue) = queue {
+        let rc = unsafe { vmnet_stop_interface(interface, queue, &handler) };
+        if rc == VMNET_SUCCESS {
+            let _ = stopped_rx.recv_timeout(Duration::from_secs(5));
+        }
+        unsafe { dispatch_release(queue) };
+    }
+}
+
+/// Reusable receive buffers for the vmnet -> guest path. The dispatch queue
+/// is serial, so a single scratch set behind a Mutex never contends; this
+/// keeps the RX hot path allocation-free.
+struct RxScratch {
+    buffers: Vec<Vec<u8>>,
+}
+
+impl RxScratch {
+    fn new(max_packet_size: usize) -> Self {
+        Self {
+            buffers: (0..READ_BATCH).map(|_| vec![0u8; max_packet_size]).collect(),
+        }
     }
 }
 
@@ -318,29 +413,34 @@ struct AttachmentInner {
     queue: SendPtr,
     host_fd: OwnedFd,
     stopped: AtomicBool,
+    rx: Mutex<RxScratch>,
 }
 
 unsafe impl Send for AttachmentInner {}
 unsafe impl Sync for AttachmentInner {}
 
 impl AttachmentInner {
-    fn forward_available_packets(&self, max_packet_size: usize) {
+    fn forward_available_packets(&self) {
         if self.stopped.load(Ordering::SeqCst) {
             return;
         }
-        let mut buffers = vec![vec![0u8; max_packet_size]; READ_BATCH];
-        let mut iovs: Vec<libc::iovec> = buffers
-            .iter_mut()
-            .map(|buffer| libc::iovec {
-                iov_base: buffer.as_mut_ptr().cast(),
-                iov_len: buffer.len(),
-            })
-            .collect();
+        let mut rx = self.rx.lock().unwrap();
+        let capacity = rx.buffers.first().map(|b| b.len()).unwrap_or(0);
         loop {
+            // vmnet_read mutates each descriptor's vm_pkt_size/iov_len, so
+            // rebuild the iovecs and descriptors at full capacity each pass.
+            let mut iovs: Vec<libc::iovec> = rx
+                .buffers
+                .iter_mut()
+                .map(|buffer| libc::iovec {
+                    iov_base: buffer.as_mut_ptr().cast(),
+                    iov_len: capacity,
+                })
+                .collect();
             let mut descs: Vec<VmPktDesc> = iovs
                 .iter_mut()
                 .map(|iov| VmPktDesc {
-                    vm_pkt_size: max_packet_size,
+                    vm_pkt_size: capacity,
                     vm_pkt_iov: iov,
                     vm_pkt_iovcnt: 1,
                     vm_flags: 0,
@@ -351,14 +451,18 @@ impl AttachmentInner {
             if rc != VMNET_SUCCESS || count <= 0 {
                 return;
             }
-            for (desc, buffer) in descs.iter().zip(&buffers).take(count as usize) {
-                let frame = &buffer[..desc.vm_pkt_size];
+            let sizes: Vec<usize> = descs.iter().take(count as usize).map(|d| d.vm_pkt_size).collect();
+            for (size, buffer) in sizes.iter().zip(&rx.buffers) {
+                let frame = &buffer[..*size];
+                // MSG_DONTWAIT: a full guest receive buffer drops the frame
+                // (EWOULDBLOCK / ENOBUFS on macOS) instead of stalling this
+                // serial dispatch queue.
                 let _ = unsafe {
                     libc::send(
                         self.host_fd.as_raw_fd(),
                         frame.as_ptr().cast(),
                         frame.len(),
-                        0,
+                        libc::MSG_DONTWAIT,
                     )
                 };
             }
@@ -368,8 +472,10 @@ impl AttachmentInner {
         }
     }
 
-    fn pump_guest_to_vmnet(&self, max_packet_size: usize) {
-        let mut buffer = vec![0u8; max_packet_size];
+    fn pump_guest_to_vmnet(&self) {
+        // Sized for the largest frame the unixgram socket can carry so a
+        // truncated read never injects a corrupt frame into the segment.
+        let mut buffer = vec![0u8; MAX_FRAME_SIZE];
         loop {
             let received = unsafe {
                 libc::recv(
@@ -379,12 +485,28 @@ impl AttachmentInner {
                     0,
                 )
             };
-            if received < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-            {
-                continue;
+            if received < 0 {
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    // Recv timeout / interrupted: re-check the stop flag and
+                    // keep going. The timeout is how the thread notices a
+                    // closed datagram peer, which delivers no EOF.
+                    Some(libc::EAGAIN) | Some(libc::EINTR) => {
+                        if self.stopped.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        continue;
+                    }
+                    _ => return,
+                }
             }
-            if received <= 0 {
-                return;
+            if received == 0 {
+                // A zero-length datagram is not EOF on SOCK_DGRAM; only stop
+                // when asked to.
+                if self.stopped.load(Ordering::SeqCst) {
+                    return;
+                }
+                continue;
             }
             let mut iov = libc::iovec {
                 iov_base: buffer.as_mut_ptr().cast(),
@@ -397,30 +519,17 @@ impl AttachmentInner {
                 vm_flags: 0,
             };
             let mut count: c_int = 1;
-            let rc = unsafe { vmnet_write(self.interface.0, &mut desc, &mut count) };
-            if rc != VMNET_SUCCESS {
-                return;
-            }
+            // A frame vmnet rejects (e.g. oversized) is dropped, not fatal.
+            let _ = unsafe { vmnet_write(self.interface.0, &mut desc, &mut count) };
         }
     }
 
+    /// Signals the pump to exit; the actual interface teardown happens in
+    /// `stop_interface` from the Attachment Drop.
     fn stop(&self) {
-        if self.stopped.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        // Wake the pump thread before tearing the interface down.
+        self.stopped.store(true, Ordering::SeqCst);
+        // Best-effort wake; the recv timeout guarantees progress regardless.
         unsafe { libc::shutdown(self.host_fd.as_raw_fd(), libc::SHUT_RDWR) };
-        unsafe {
-            vmnet_interface_set_event_callback(self.interface.0, 0, std::ptr::null_mut(), std::ptr::null());
-        }
-        let (stopped_tx, stopped_rx) = mpsc::channel::<u32>();
-        let handler = RcBlock::new(move |status: u32| {
-            let _ = stopped_tx.send(status);
-        });
-        let rc = unsafe { vmnet_stop_interface(self.interface.0, self.queue.0, &handler) };
-        if rc == VMNET_SUCCESS {
-            let _ = stopped_rx.recv_timeout(Duration::from_secs(5));
-        }
     }
 }
 
@@ -432,8 +541,9 @@ fn dgram_socketpair() -> Result<(OwnedFd, OwnedFd)> {
     }
     let host = unsafe { OwnedFd::from_raw_fd(fds[0]) };
     let guest = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    // Ethernet frames are dropped rather than blocked on a slow peer, so give
-    // both directions some headroom.
+    // On macOS the datagram send buffer sets the max frame size and gives no
+    // queuing; the receiver's buffer is what queues. Size both generously in
+    // both directions so frames are dropped on overflow, never blocked.
     for fd in [&host, &guest] {
         let size: c_int = 4 * 1024 * 1024;
         for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
@@ -447,6 +557,21 @@ fn dgram_socketpair() -> Result<(OwnedFd, OwnedFd)> {
                 );
             }
         }
+    }
+    // The pump reads the host end with a timeout so it can observe the stop
+    // flag; a closed datagram peer never delivers EOF to wake a blocking recv.
+    let timeout = libc::timeval {
+        tv_sec: RECV_TIMEOUT_MS / 1000,
+        tv_usec: ((RECV_TIMEOUT_MS % 1000) * 1000) as _,
+    };
+    unsafe {
+        libc::setsockopt(
+            host.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&raw const timeout).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
     }
     Ok((host, guest))
 }

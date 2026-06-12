@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -514,23 +514,39 @@ fn spawn_daemon(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Routable per-VM networking, mirroring Apple's container tool: one
-/// NAT-mode vmnet network with a dedicated subnet, DHCP disabled, and
-/// addresses allocated here per instance. Lives in the ingress daemon
-/// because creating vmnet interfaces requires root.
-#[cfg(target_os = "macos")]
-struct NetworkService {
-    network: Option<crate::vmnet::Network>,
-    state_path: PathBuf,
-    allocations: Mutex<HashMap<String, Ipv4Addr>>,
-    attachments: Mutex<HashMap<String, crate::vmnet::Attachment>>,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct AttachInfo {
     ip: Ipv4Addr,
     prefix: u8,
     gateway: Ipv4Addr,
+}
+
+/// Distinguishes a re-attach of the same instance so a stale keepalive
+/// thread's detach cannot remove a newer attachment.
+#[cfg(target_os = "macos")]
+static ATTACH_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Routable per-VM networking, mirroring Apple's container tool: one
+/// NAT-mode vmnet network with a dedicated subnet, DHCP disabled, and
+/// addresses allocated here per instance. Lives in the ingress daemon
+/// because creating vmnet interfaces requires root.
+#[cfg(target_os = "macos")]
+struct ActiveAttachment {
+    generation: u64,
+    ip: Ipv4Addr,
+    // Dropped (stopping the vmnet interface) when removed from `active`.
+    _attachment: crate::vmnet::Attachment,
+}
+
+#[cfg(target_os = "macos")]
+struct NetworkService {
+    network: Option<crate::vmnet::Network>,
+    state_path: PathBuf,
+    // Persisted per-instance address reservations (stable across restarts).
+    allocations: std::sync::Mutex<HashMap<String, Ipv4Addr>>,
+    // Live interfaces, keyed by instance. Removed when the owner exits, which
+    // stops the interface and frees its pump thread.
+    active: std::sync::Mutex<HashMap<String, ActiveAttachment>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -558,8 +574,8 @@ impl NetworkService {
         Arc::new(NetworkService {
             network,
             state_path,
-            allocations: Mutex::new(allocations),
-            attachments: Mutex::new(HashMap::new()),
+            allocations: std::sync::Mutex::new(allocations),
+            active: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -570,14 +586,18 @@ impl NetworkService {
         }
     }
 
+    /// Names resolve only for instances with a live attachment, so a stopped
+    /// or gvproxy-fallback VM returns NXDOMAIN rather than a black-hole IP.
     fn instance_ips(&self) -> HashMap<String, Ipv4Addr> {
-        if self.network.is_none() {
-            return HashMap::new();
-        }
-        self.allocations.lock().unwrap().clone()
+        self.active
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(instance, active)| (instance.clone(), active.ip))
+            .collect()
     }
 
-    fn attach(&self, instance: &str) -> Result<(OwnedFd, AttachInfo)> {
+    fn attach(&self, instance: &str) -> Result<(OwnedFd, AttachInfo, u64)> {
         let network = self
             .network
             .as_ref()
@@ -587,12 +607,17 @@ impl NetworkService {
         let fd = attachment
             .take_guest_fd()
             .context("vmnet attachment has no guest fd")?;
+        let generation = ATTACH_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Replacing an existing attachment stops the previous interface; the
         // bootstrap lock guarantees at most one live owner per instance.
-        self.attachments
-            .lock()
-            .unwrap()
-            .insert(instance.to_string(), attachment);
+        self.active.lock().unwrap().insert(
+            instance.to_string(),
+            ActiveAttachment {
+                generation,
+                ip,
+                _attachment: attachment,
+            },
+        );
         Ok((
             fd,
             AttachInfo {
@@ -600,22 +625,53 @@ impl NetworkService {
                 prefix: network.prefix(),
                 gateway: network.gateway(),
             },
+            generation,
         ))
+    }
+
+    /// Removes a live attachment (stopping its interface) if it is still the
+    /// generation that the calling keepalive thread created.
+    fn detach(&self, instance: &str, generation: u64) {
+        let mut active = self.active.lock().unwrap();
+        if active.get(instance).map(|a| a.generation) == Some(generation) {
+            active.remove(instance);
+        }
     }
 
     fn allocate(&self, instance: &str, network: &crate::vmnet::Network) -> Result<Ipv4Addr> {
         let mut allocations = self.allocations.lock().unwrap();
-        if let Some(ip) = allocations.get(instance) {
-            return Ok(*ip);
+        if let Some(ip) = allocations.get(instance).copied() {
+            if subnet_contains(network, ip) {
+                return Ok(ip);
+            }
+            // The subnet changed under a persisted reservation; reallocate.
+            allocations.remove(instance);
         }
         let subnet = u32::from(network.subnet());
         let broadcast = subnet | !u32::from(crate::vmnet::mask_for_prefix(network.prefix()));
         let used: std::collections::HashSet<Ipv4Addr> = allocations.values().copied().collect();
         // .0 is the network, .1 the host-side gateway, the last the broadcast.
-        let ip = (subnet + 2..broadcast)
+        let ip = match (subnet + 2..broadcast)
             .map(Ipv4Addr::from)
             .find(|candidate| !used.contains(candidate))
-            .with_context(|| format!("subnet {} is out of addresses", network.subnet()))?;
+        {
+            Some(ip) => ip,
+            None => {
+                // Out of addresses: reclaim a reservation with no live VM
+                // rather than failing, so churned instance names don't
+                // exhaust the subnet.
+                let active = self.active.lock().unwrap();
+                let victim = allocations
+                    .keys()
+                    .find(|name| !active.contains_key(*name))
+                    .cloned();
+                drop(active);
+                match victim.and_then(|name| allocations.remove(&name)) {
+                    Some(ip) => ip,
+                    None => bail!("subnet {} is out of addresses", network.subnet()),
+                }
+            }
+        };
         allocations.insert(instance.to_string(), ip);
         if let Err(e) = Self::save_allocations(&self.state_path, &allocations) {
             eprintln!("failed to persist {}: {e:#}", self.state_path.display());
@@ -641,10 +697,22 @@ impl NetworkService {
             fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         }
         let raw = serde_json::to_string_pretty(allocations).context("encode network state")?;
-        fs::write(path, raw).with_context(|| format!("write {}", path.display()))?;
+        // Atomic: a crash mid-write must not truncate the reservation file and
+        // silently reassign every instance's address on the next start.
+        let temp = path.with_extension("json.tmp");
+        fs::write(&temp, raw).with_context(|| format!("write {}", temp.display()))?;
+        fs::rename(&temp, path).with_context(|| format!("rename {}", path.display()))?;
         chown_to_ingress_user(path);
         Ok(())
     }
+}
+
+#[cfg(target_os = "macos")]
+fn subnet_contains(network: &crate::vmnet::Network, ip: Ipv4Addr) -> bool {
+    let subnet = u32::from(network.subnet());
+    let broadcast = subnet | !u32::from(crate::vmnet::mask_for_prefix(network.prefix()));
+    let ip = u32::from(ip);
+    ip > subnet + 1 && ip < broadcast
 }
 
 /// Per-VM networking needs vmnet; elsewhere the daemon only serves DNS and
@@ -666,9 +734,11 @@ impl NetworkService {
         HashMap::new()
     }
 
-    fn attach(&self, _instance: &str) -> Result<(OwnedFd, AttachInfo)> {
+    fn attach(&self, _instance: &str) -> Result<(OwnedFd, AttachInfo, u64)> {
         anyhow::bail!("per-VM networking requires macOS")
     }
+
+    fn detach(&self, _instance: &str, _generation: u64) {}
 }
 
 fn valid_instance_name(name: &str) -> bool {
@@ -685,7 +755,20 @@ fn attach_instance_from_request(request: &str) -> Option<String> {
         .split_whitespace()
         .next()?
         .strip_prefix("/network/attach?instance=")?;
-    valid_instance_name(target).then(|| target.to_string())
+    // Normalize case so the allocation key matches DNS lookups, which are
+    // lowercased.
+    valid_instance_name(target).then(|| target.to_ascii_lowercase())
+}
+
+/// SCM_RIGHTS control buffer aligned for `cmsghdr`. A plain `[u8; N]` has
+/// alignment 1, so reading/writing cmsghdr fields through it is UB.
+#[repr(C, align(8))]
+struct CmsgBuf([u8; 64]);
+
+impl CmsgBuf {
+    fn zeroed() -> Self {
+        CmsgBuf([0u8; 64])
+    }
 }
 
 fn send_bytes_with_fd(stream: &UnixStream, bytes: &[u8], fd: BorrowedFd<'_>) -> std::io::Result<()> {
@@ -693,12 +776,12 @@ fn send_bytes_with_fd(stream: &UnixStream, bytes: &[u8], fd: BorrowedFd<'_>) -> 
         iov_base: bytes.as_ptr() as *mut libc::c_void,
         iov_len: bytes.len(),
     };
-    let mut control = [0u8; unsafe { libc::CMSG_SPACE(4) as usize }];
+    let mut control = CmsgBuf::zeroed();
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len() as _;
+    msg.msg_control = control.0.as_mut_ptr().cast();
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as _;
     let raw_fd: i32 = fd.as_raw_fd();
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
@@ -718,6 +801,7 @@ fn send_bytes_with_fd(stream: &UnixStream, bytes: &[u8], fd: BorrowedFd<'_>) -> 
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn recv_bytes_with_fd(
     stream: &UnixStream,
     buf: &mut [u8],
@@ -726,12 +810,12 @@ fn recv_bytes_with_fd(
         iov_base: buf.as_mut_ptr().cast(),
         iov_len: buf.len(),
     };
-    let mut control = [0u8; unsafe { libc::CMSG_SPACE(4) as usize }];
+    let mut control = CmsgBuf::zeroed();
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len() as _;
+    msg.msg_control = control.0.as_mut_ptr().cast();
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as _;
     let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
     if received < 0 {
         return Err(std::io::Error::last_os_error());
@@ -757,16 +841,21 @@ fn recv_bytes_with_fd(
     Ok((received as usize, fd))
 }
 
+#[cfg(target_os = "macos")]
 pub struct NetworkAttachment {
     pub fd: OwnedFd,
     pub ip: Ipv4Addr,
     pub prefix: u8,
     pub gateway: Ipv4Addr,
+    /// Held open for the VM's lifetime; the daemon detaches the interface and
+    /// frees the address slot when this closes (owner exit).
+    pub keepalive: UnixStream,
 }
 
 /// Asks the ingress daemon for a routable network attachment. Returns
 /// Ok(None) when the daemon is not running or has no vmnet network, in
 /// which case the VM falls back to gvproxy NAT.
+#[cfg(target_os = "macos")]
 pub fn request_network_attachment(
     config: &Config,
     instance: &str,
@@ -775,7 +864,7 @@ pub fn request_network_attachment(
         return Ok(None);
     };
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_secs(10)))
         .context("set ingress attach timeout")?;
     stream
         .write_all(
@@ -783,14 +872,12 @@ pub fn request_network_attachment(
                 .as_bytes(),
         )
         .context("send ingress attach request")?;
+    // The daemon replies once (fd + headers + JSON in a single message) and
+    // then holds the connection open as a liveness channel, so read exactly
+    // that one message rather than to EOF.
     let mut buf = vec![0u8; 4096];
     let (received, fd) = recv_bytes_with_fd(&stream, &mut buf).context("read ingress attach")?;
-    let mut response = buf[..received].to_vec();
-    let mut rest = Vec::new();
-    if stream.read_to_end(&mut rest).is_ok() {
-        response.extend_from_slice(&rest);
-    }
-    let response = String::from_utf8_lossy(&response).into_owned();
+    let response = String::from_utf8_lossy(&buf[..received]).into_owned();
     if !response.starts_with("HTTP/1.1 200") {
         return Ok(None);
     }
@@ -810,11 +897,14 @@ pub fn request_network_attachment(
         .context("attach response missing prefix")?
         .parse()
         .context("parse attach prefix")?;
+    // No further reads; keep the stream solely as a liveness signal.
+    let _ = stream.set_read_timeout(None);
     Ok(Some(NetworkAttachment {
         fd,
         ip,
         prefix,
         gateway,
+        keepalive: stream,
     }))
 }
 
@@ -908,9 +998,11 @@ fn listen_admin(path: &PathBuf) -> Result<UnixListener> {
     let listener =
         UnixListener::bind(path).with_context(|| format!("listen {}", path.display()))?;
     chown_to_ingress_user(path);
+    // Owner-only: the socket grants VM network fds, so restrict it to the
+    // ingress user (and root) at the filesystem layer too.
     let _ = fs::set_permissions(
         path,
-        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o666),
+        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
     );
     Ok(listener)
 }
@@ -937,32 +1029,113 @@ fn handle_admin(
         );
         let _ = write_http_response(&mut stream, "200 OK", "application/json", body.as_bytes());
     } else if let Some(instance) = attach_instance_from_request(&request) {
-        match network.attach(&instance) {
-            Ok((fd, info)) => {
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\n\r\n{{\"ip\":\"{}\",\"prefix\":{},\"gateway\":\"{}\"}}",
-                    info.ip, info.prefix, info.gateway
-                );
-                if let Err(e) = send_bytes_with_fd(&stream, response.as_bytes(), fd.as_fd()) {
-                    eprintln!("network attach reply for {instance} failed: {e}");
-                }
-            }
-            Err(e) => {
-                eprintln!("network attach for {instance} failed: {e:#}");
-                let _ = write_http_response(
-                    &mut stream,
-                    "503 Service Unavailable",
-                    "text/plain",
-                    format!("{e:#}\n").as_bytes(),
-                );
-            }
+        // Granting a VM's network fd to an arbitrary local user would let
+        // them sniff or inject on its segment; only the owning user (or root)
+        // may attach.
+        if !peer_authorized(&stream) {
+            let _ = write_http_response(&mut stream, "403 Forbidden", "text/plain", b"forbidden\n");
+            return;
         }
+        let _ = stream.set_nonblocking(false);
+        let network = Arc::clone(network);
+        thread::spawn(move || serve_network_attachment(stream, instance, network));
     } else if request.starts_with("POST /stop ") {
+        if !peer_authorized(&stream) {
+            let _ = write_http_response(&mut stream, "403 Forbidden", "text/plain", b"forbidden\n");
+            return;
+        }
         stop.store(true, Ordering::SeqCst);
         let _ = write_http_response(&mut stream, "204 No Content", "text/plain", b"");
     } else {
         let _ = write_http_response(&mut stream, "404 Not Found", "text/plain", b"not found\n");
     }
+}
+
+/// Attaches the instance to the vmnet network, sends the guest fd to the
+/// requester, and holds the connection open as a liveness channel: when the
+/// VM owner exits and the connection closes, the interface is torn down and
+/// its address slot freed.
+fn serve_network_attachment(stream: UnixStream, instance: String, network: Arc<NetworkService>) {
+    match network.attach(&instance) {
+        Ok((fd, info, generation)) => {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\r\n{{\"ip\":\"{}\",\"prefix\":{},\"gateway\":\"{}\"}}",
+                info.ip, info.prefix, info.gateway
+            );
+            if let Err(e) = send_bytes_with_fd(&stream, response.as_bytes(), fd.as_fd()) {
+                eprintln!("network attach reply for {instance} failed: {e}");
+                network.detach(&instance, generation);
+                return;
+            }
+            // The fd is now duplicated into the owner; drop our copy.
+            drop(fd);
+            wait_for_peer_close(&stream);
+            network.detach(&instance, generation);
+        }
+        Err(e) => {
+            eprintln!("network attach for {instance} failed: {e:#}");
+            let mut stream = stream;
+            let _ = write_http_response(
+                &mut stream,
+                "503 Service Unavailable",
+                "text/plain",
+                format!("{e:#}\n").as_bytes(),
+            );
+        }
+    }
+}
+
+/// Blocks until the peer closes the connection (the VM owner exits).
+fn wait_for_peer_close(stream: &UnixStream) {
+    let mut stream = stream;
+    let mut buf = [0u8; 64];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => return,
+            Ok(_) => continue,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        }
+    }
+}
+
+/// The effective uid of the connected peer, used to authorize fd-granting
+/// requests. The daemon runs as root, so only the owning user or root pass.
+fn peer_authorized(stream: &UnixStream) -> bool {
+    let Some(uid) = peer_uid(stream) else {
+        return false;
+    };
+    let self_uid = unsafe { libc::geteuid() };
+    // root, the user running the daemon, or the configured ingress user.
+    uid == 0 || uid == self_uid || ingress_user_ids().map(|(u, _)| u) == Some(uid)
+}
+
+#[cfg(target_os = "macos")]
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    (rc == 0).then_some(uid)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(cred.uid)
 }
 
 fn status(config: &Config) -> Result<Status> {
@@ -1020,6 +1193,7 @@ fn json_field(body: &str, field: &str) -> Option<String> {
     Some(rest.split('"').next()?.to_string())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn json_number_field(body: &str, field: &str) -> Option<String> {
     let needle = format!("\"{field}\":");
     let rest = body.split(&needle).nth(1)?;

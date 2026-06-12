@@ -181,6 +181,9 @@ struct HiddenVmOwnerArgs {
 
     #[arg(long)]
     restore: Option<PathBuf>,
+
+    #[arg(long)]
+    skip_memory_restore: bool,
 }
 
 #[derive(Debug, Args)]
@@ -225,7 +228,7 @@ impl Cli {
             .unwrap_or(DEFAULT_MEMORY_MIB);
         match command {
             Some(Command::Init(args)) => match args.image {
-                Some(image) => crate::oci::import_image(&layout, &image),
+                Some(image) => crate::oci::import_image(&layout, &image, args.kernel.as_deref()),
                 None => init::run(&layout, args.kernel.as_deref(), args.rootfs.as_deref()),
             },
             Some(Command::Run(args)) => run_guest(
@@ -308,6 +311,7 @@ impl Cli {
                 memory_mib,
                 nested_kvm,
                 restore_snapshot: args.restore,
+                skip_memory_restore: args.skip_memory_restore,
                 forwards,
                 snapshot_output: None,
                 run_as_root: false,
@@ -606,6 +610,7 @@ fn run_guest(
         memory_mib,
         nested_kvm,
         restore_snapshot,
+        skip_memory_restore: false,
         forwards,
         run_as_root,
         snapshot_output: None,
@@ -684,6 +689,7 @@ fn initialize_vm_instance(layout: Layout, cpus: u8, memory_mib: u32) -> Result<(
         memory_mib,
         nested_kvm: false,
         restore_snapshot: None,
+        skip_memory_restore: false,
         forwards: Vec::new(),
         snapshot_output: Some(layout.snapshot_dir.join("latest")),
         run_as_root: false,
@@ -995,6 +1001,7 @@ fn create_checkpoint(
             memory_mib,
             nested_kvm: false,
             restore_snapshot,
+            skip_memory_restore: false,
             forwards,
             snapshot_output: Some(path.clone()),
             run_as_root: false,
@@ -1101,6 +1108,7 @@ fn create_internal_fork_checkpoint(
             memory_mib,
             nested_kvm: false,
             restore_snapshot,
+            skip_memory_restore: false,
             forwards,
             snapshot_output: Some(path.clone()),
             run_as_root: false,

@@ -56,10 +56,21 @@ try {
     vmstate[vmstate.length - 1] ^= 0xff;
     await writeFile(vmstatePath, vmstate);
 
-    const fallback = await lnx(ctx, ["bash", "-lc", "echo cold-fallback-ok"], {
+    // The cold boot must keep the snapshot's rootfs (its disk writes), not
+    // roll back to the base image: /root/compat-disk was written only into
+    // the snapshot, so reading it back proves the disk was preserved.
+    const fallback = await lnx(ctx, [
+      "bash",
+      "-lc",
+      'printf "%s/%s" "$(sudo cat /root/compat-disk)" cold-fallback-ok',
+    ], {
       timeoutMs: 240_000,
     });
-    assertEq(fallback.stdout, "cold-fallback-ok", "exec succeeds after restore refusal");
+    assertEq(
+      fallback.stdout,
+      "disk-from-snapshot/cold-fallback-ok",
+      "cold fallback keeps the snapshot's disk",
+    );
     const log = await run(["bash", "-lc", `cat ${join(ctx.runDir, "lnx.log")}`]);
     assertContains(
       log.stdout,

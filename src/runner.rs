@@ -68,10 +68,28 @@ pub struct RunConfig {
     pub memory_mib: u32,
     pub nested_kvm: bool,
     pub restore_snapshot: Option<PathBuf>,
+    /// Cold-boot from the snapshot's rootfs but skip the memory restore. Set
+    /// by the client when a previous owner's memory restore was refused, so
+    /// the retry keeps the disk while dropping the unusable memory image.
+    pub skip_memory_restore: bool,
     pub forwards: Vec<PortForward>,
     pub snapshot_output: Option<PathBuf>,
     pub run_as_root: bool,
 }
+
+/// Marks an owner start failure that happened while restoring a snapshot's
+/// memory, as opposed to an unrelated boot failure. Only these refusals are
+/// worth retrying as a cold boot.
+#[derive(Debug)]
+struct RestoreRefused;
+
+impl std::fmt::Display for RestoreRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "snapshot memory restore refused by the devices")
+    }
+}
+
+impl std::error::Error for RestoreRefused {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortForward {
@@ -190,8 +208,10 @@ pub fn run_owner(config: RunConfig) -> Result<()> {
         Ok(vm) => vm,
         // A snapshot the devices refuse (topology drift, corrupt sections)
         // must not strand the instance: hand the decision to the client,
-        // which respawns the owner for a cold boot.
-        Err(e) if config.restore_snapshot.is_some() => {
+        // which respawns the owner for a cold boot. Only genuine memory-
+        // restore refusals get this treatment — an unrelated boot failure
+        // surfaces as a normal error so the client reports it.
+        Err(e) if e.downcast_ref::<RestoreRefused>().is_some() => {
             run_log.line(format!("owner.start.restore_failed error={e:#}"));
             drop(bootstrap_lock);
             std::process::exit(EXIT_RESTORE_FAILED);
@@ -287,6 +307,9 @@ enum NetworkBacking {
         ip: std::net::Ipv4Addr,
         prefix: u8,
         gateway: std::net::Ipv4Addr,
+        // Held for the VM's lifetime; closing it tells the ingress daemon to
+        // tear down the vmnet interface and free the address.
+        _keepalive: std::os::unix::net::UnixStream,
     },
 }
 
@@ -348,6 +371,7 @@ fn start_network(
                 ip: attachment.ip,
                 prefix: attachment.prefix,
                 gateway: attachment.gateway,
+                _keepalive: attachment.keepalive,
             });
         }
     }
@@ -435,7 +459,13 @@ fn start_vm(
     let shares_stamp_path = config.layout.run_dir.join("shares.stamp");
     fs::write(&shares_stamp_path, &shares_stamp)
         .with_context(|| format!("write {}", shares_stamp_path.display()))?;
-    let restore_snapshot = if config
+    let restore_snapshot = if config.skip_memory_restore {
+        // A prior owner's memory restore was refused; keep the snapshot's
+        // rootfs (via requested_restore_snapshot) but boot cold.
+        timings.event("snapshot.restore.skipped.memory_refused");
+        run_log.line("snapshot.restore.skipped reason=memory_refused");
+        None
+    } else if config
         .restore_snapshot
         .as_ref()
         .is_some_and(|snapshot| !snapshot_initramfs_is_compatible(snapshot, &initramfs_stamp))
@@ -1132,7 +1162,14 @@ fn shares_stamp_content(
 }
 
 fn snapshot_shares_are_compatible(snapshot_path: &Path, current: &str) -> bool {
-    fs::read_to_string(snapshot_path.join("shares.stamp")).is_ok_and(|stamp| stamp == current)
+    match fs::read_to_string(snapshot_path.join("shares.stamp")) {
+        Ok(stamp) => stamp == current,
+        // Snapshots captured before share stamping have no stamp; treat them
+        // as compatible so an upgrade does not silently discard them. New
+        // snapshots always write the stamp, so this only affects legacy ones.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
 }
 
 fn stamp_sha256(path: &Path) -> Option<String> {
@@ -1682,7 +1719,13 @@ fn run_broker_owner(
             Err(e) => {
                 run_log.line(format!("agent.accept.error {e:#}"));
                 log_console_tail(&run_log, &console_log);
-                return Err(e).with_context(|| console_hint(&console_log));
+                let e = e.context(console_hint(&console_log));
+                // A restored guest that never reconnects means the devices
+                // refused the memory image; tag it so the client retries cold.
+                if restore_snapshot.is_some() {
+                    return Err(e.context(RestoreRefused));
+                }
+                return Err(e);
             }
         };
     write_message(
@@ -1986,6 +2029,9 @@ fn spawn_owner_process(config: &RunConfig, run_log: &RunLog) -> Result<Child> {
     if let Some(snapshot) = &config.restore_snapshot {
         command.arg("--restore").arg(snapshot);
     }
+    if config.skip_memory_restore {
+        command.arg("--skip-memory-restore");
+    }
     command
         .stdin(Stdio::null())
         .stdout(log.try_clone().context("clone owner log handle")?)
@@ -2005,7 +2051,7 @@ fn run_broker_client_awaiting_owner(
     layout: &Layout,
     run_log: &RunLog,
 ) -> Result<i32> {
-    let deadline = Instant::now() + OWNER_BOOT_TIMEOUT;
+    let mut deadline = Instant::now() + OWNER_BOOT_TIMEOUT;
     let mut last = None;
     let mut owner_config = config.clone();
     while Instant::now() < deadline {
@@ -2024,9 +2070,14 @@ fn run_broker_client_awaiting_owner(
                 *owner = spawn_owner_process(&owner_config, run_log)?;
             } else if status.code() == Some(EXIT_RESTORE_FAILED)
                 && owner_config.restore_snapshot.is_some()
+                && !owner_config.skip_memory_restore
             {
+                // Keep the snapshot's rootfs but drop the memory image, and
+                // give the cold boot a fresh deadline so a slow restore that
+                // burned the agent-accept timeout doesn't starve it.
                 run_log.line("snapshot.restore.skipped reason=start_failed retry=cold_boot");
-                owner_config.restore_snapshot = None;
+                owner_config.skip_memory_restore = true;
+                deadline = Instant::now() + OWNER_BOOT_TIMEOUT;
                 *owner = spawn_owner_process(&owner_config, run_log)?;
             } else {
                 run_log.line(format!("owner.exited.early status={status}"));
@@ -2962,8 +3013,9 @@ mod tests {
         fs::create_dir_all(temp.path()).expect("create snapshot dir");
         let current = shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy");
 
-        // A snapshot from before share stamping must not restore.
-        assert!(!snapshot_shares_are_compatible(temp.path(), &current));
+        // A snapshot from before share stamping has no stamp and must still
+        // restore (back-compat); only a present, differing stamp is rejected.
+        assert!(snapshot_shares_are_compatible(temp.path(), &current));
 
         fs::write(temp.path().join("shares.stamp"), &current).expect("write stamp");
         assert!(snapshot_shares_are_compatible(temp.path(), &current));
