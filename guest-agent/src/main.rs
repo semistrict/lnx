@@ -568,7 +568,6 @@ WantedBy=multi-user.target\n";
     let _ = fs::remove_dir("/oldroot");
 
     configure_network();
-    relax_static_devices();
 
     match detect_image_init() {
         // systemd reads the unit installed above and supervises the agent.
@@ -1106,22 +1105,10 @@ fn drop_to_exec_user(uid: u32, gid: u32) {
     }
 }
 
-/// Relax the static device nodes that udev normally opens up on a desktop
-/// distro. The guest runs systemd but not systemd-udevd (udev isn't
-/// installed), so nothing applies the usual `KERNEL=="fuse", MODE="0666"`
-/// rules and these nodes keep the kernel's restrictive default (e.g.
-/// /dev/fuse is 0600), which blocks unprivileged FUSE and tun. They exist
-/// from boot, so relaxing them once in the initramfs init is enough — no
-/// udev ever resets them. Best-effort: missing nodes are skipped.
-fn relax_static_devices() {
-    for path in ["/dev/fuse", "/dev/net/tun"] {
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o666));
-    }
-}
-
-/// Relax /dev/kvm so an unprivileged exec can run a nested VM. Unlike the
-/// static nodes, /dev/kvm only appears once nested virtualization is engaged,
-/// so it isn't present at boot — relax it right before each exec instead.
+/// Relax /dev/kvm so an unprivileged exec can run a nested VM. The image's
+/// udev rule sets it to 0660 root:kvm, and the exec user isn't in the kvm
+/// group; /dev/kvm also only appears once nested virtualization is engaged,
+/// so relax it right before each exec.
 fn relax_nested_kvm() {
     let _ = fs::set_permissions("/dev/kvm", fs::Permissions::from_mode(0o666));
 }
