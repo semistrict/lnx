@@ -17,6 +17,7 @@
 /.lnx-nested-kvm*/
 /.lnx-chaos/
 /.lnx-nk-*/
+/.lnx-oci-test/
 /.lnx-probe-*/
 /.lnx-snapshot-root-debug/
 

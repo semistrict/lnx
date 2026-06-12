@@ -47,6 +47,9 @@ pub struct Cli {
     #[arg(long, help = "Request nested KVM support for the guest")]
     nested_kvm: bool,
 
+    #[arg(long, help = "Run the guest command as root instead of the host-matching user")]
+    root: bool,
+
     #[arg(
         long = "forward",
         value_parser = parse_port_forward,
@@ -84,6 +87,9 @@ enum Command {
     #[command(name = "_vm-init")]
     HiddenVmInit,
     #[command(hide = true)]
+    #[command(name = "_oci-build")]
+    HiddenOciBuild(HiddenOciBuildArgs),
+    #[command(hide = true)]
     #[command(name = "_vm-owner")]
     HiddenVmOwner(HiddenVmOwnerArgs),
 }
@@ -95,6 +101,13 @@ struct InitArgs {
 
     #[arg(long)]
     rootfs: Option<PathBuf>,
+
+    #[arg(
+        long,
+        conflicts_with = "rootfs",
+        help = "Build the instance rootfs from an OCI image reference, like alpine:3.21"
+    )]
+    image: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -157,6 +170,11 @@ enum IngressCommand {
 }
 
 #[derive(Debug, Args)]
+struct HiddenOciBuildArgs {
+    staging: PathBuf,
+}
+
+#[derive(Debug, Args)]
 struct HiddenVmOwnerArgs {
     #[arg(long)]
     cwd: PathBuf,
@@ -191,6 +209,7 @@ impl Cli {
             snapshot: snapshot_path,
             no_snapshot_restore,
             nested_kvm,
+            root,
             forwards,
             command,
             guest_command,
@@ -205,9 +224,10 @@ impl Cli {
             .or(persisted.memory_mib)
             .unwrap_or(DEFAULT_MEMORY_MIB);
         match command {
-            Some(Command::Init(args)) => {
-                init::run(&layout, args.kernel.as_deref(), args.rootfs.as_deref())
-            }
+            Some(Command::Init(args)) => match args.image {
+                Some(image) => crate::oci::import_image(&layout, &image),
+                None => init::run(&layout, args.kernel.as_deref(), args.rootfs.as_deref()),
+            },
             Some(Command::Run(args)) => run_guest(
                 layout,
                 args.command,
@@ -216,6 +236,7 @@ impl Cli {
                 snapshot_path,
                 no_snapshot_restore,
                 nested_kvm,
+                root,
                 forwards,
                 explicit_kernel,
                 explicit_rootfs,
@@ -278,6 +299,7 @@ impl Cli {
                 )
             }
             Some(Command::HiddenVmInit) => initialize_vm_instance(layout, cpus, memory_mib),
+            Some(Command::HiddenOciBuild(args)) => crate::oci::build_rootfs(&args.staging),
             Some(Command::HiddenVmOwner(args)) => runner::run_owner(runner::RunConfig {
                 layout,
                 command: Vec::new(),
@@ -288,6 +310,7 @@ impl Cli {
                 restore_snapshot: args.restore,
                 forwards,
                 snapshot_output: None,
+                run_as_root: false,
             }),
             None => run_guest(
                 layout,
@@ -297,6 +320,7 @@ impl Cli {
                 snapshot_path,
                 no_snapshot_restore,
                 nested_kvm,
+                root,
                 forwards,
                 explicit_kernel,
                 explicit_rootfs,
@@ -530,6 +554,7 @@ fn run_guest(
     snapshot_path: Option<PathBuf>,
     no_snapshot_restore: bool,
     nested_kvm: bool,
+    run_as_root: bool,
     forwards: Vec<runner::PortForward>,
     explicit_kernel: bool,
     explicit_rootfs: bool,
@@ -582,6 +607,7 @@ fn run_guest(
         nested_kvm,
         restore_snapshot,
         forwards,
+        run_as_root,
         snapshot_output: None,
     };
 
@@ -660,6 +686,7 @@ fn initialize_vm_instance(layout: Layout, cpus: u8, memory_mib: u32) -> Result<(
         restore_snapshot: None,
         forwards: Vec::new(),
         snapshot_output: Some(layout.snapshot_dir.join("latest")),
+        run_as_root: false,
     })
     .context("initialize VM instance")?;
     if status != 0 {
@@ -970,6 +997,7 @@ fn create_checkpoint(
             restore_snapshot,
             forwards,
             snapshot_output: Some(path.clone()),
+            run_as_root: false,
         })?;
         if status != 0 {
             bail!("checkpoint command exited with status {status}");
@@ -1075,6 +1103,7 @@ fn create_internal_fork_checkpoint(
             restore_snapshot,
             forwards,
             snapshot_output: Some(path.clone()),
+            run_as_root: false,
         })?;
         if status != 0 {
             bail!("checkpoint command exited with status {status}");

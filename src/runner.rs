@@ -66,6 +66,7 @@ pub struct RunConfig {
     pub restore_snapshot: Option<PathBuf>,
     pub forwards: Vec<PortForward>,
     pub snapshot_output: Option<PathBuf>,
+    pub run_as_root: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,7 +106,13 @@ pub fn run(config: RunConfig) -> Result<i32> {
     ));
     let broker_socket = config.layout.run_dir.join("broker.sock");
     if let Some(status) =
-        run_existing_broker_client(&broker_socket, &config.command, &config.cwd, Some(&run_log))?
+        run_existing_broker_client(
+            &broker_socket,
+            &config.command,
+            &config.cwd,
+            config.run_as_root,
+            Some(&run_log),
+        )?
     {
         run_log.line(format!("run.done status={status}"));
         return Ok(status);
@@ -189,13 +196,20 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
         &broker_socket,
         &config.command,
         &config.cwd,
+        config.run_as_root,
         &run_log,
     )? {
         BootstrapOutcome::Lock(lock) => lock,
         BootstrapOutcome::Status(status) => return Ok(status),
     };
     if let Some(status) =
-        run_existing_broker_client(&broker_socket, &config.command, &config.cwd, Some(&run_log))?
+        run_existing_broker_client(
+            &broker_socket,
+            &config.command,
+            &config.cwd,
+            config.run_as_root,
+            Some(&run_log),
+        )?
     {
         drop(bootstrap_lock);
         return Ok(status);
@@ -221,6 +235,7 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
         &broker_socket,
         &config.command,
         &config.cwd,
+        config.run_as_root,
         Duration::from_secs(5),
     )
     .with_context(|| console_hint(&config.layout.console_log))
@@ -1148,6 +1163,7 @@ fn acquire_bootstrap_or_run_client(
     socket: &Path,
     command: &[String],
     cwd: &Path,
+    run_as_root: bool,
     run_log: &RunLog,
 ) -> Result<BootstrapOutcome> {
     let start = Instant::now();
@@ -1164,7 +1180,9 @@ fn acquire_bootstrap_or_run_client(
             run_log.line(format!("bootstrap.lock.busy path={}", lock_path.display()));
             logged_wait = true;
         }
-        if let Some(status) = run_existing_broker_client(socket, command, cwd, Some(run_log))? {
+        if let Some(status) =
+            run_existing_broker_client(socket, command, cwd, run_as_root, Some(run_log))?
+        {
             return Ok(BootstrapOutcome::Status(status));
         }
         if start.elapsed() > Duration::from_secs(120) {
@@ -1182,6 +1200,7 @@ fn run_existing_broker_client(
     socket: &Path,
     command: &[String],
     cwd: &Path,
+    run_as_root: bool,
     run_log: Option<&RunLog>,
 ) -> Result<Option<i32>> {
     match connect_broker(socket) {
@@ -1192,7 +1211,7 @@ fn run_existing_broker_client(
                     socket.display()
                 ));
             }
-            run_broker_session(stream, command, cwd).map(Some)
+            run_broker_session(stream, command, cwd, run_as_root).map(Some)
         }
         Err(e) => {
             if socket.exists() {
@@ -1227,7 +1246,12 @@ pub(crate) fn connect_broker(socket: &Path) -> Result<UnixStream> {
     Ok(stream)
 }
 
-fn run_broker_session(mut stream: UnixStream, command: &[String], cwd: &Path) -> Result<i32> {
+fn run_broker_session(
+    mut stream: UnixStream,
+    command: &[String],
+    cwd: &Path,
+    run_as_root: bool,
+) -> Result<i32> {
     INTERRUPTED.store(false, Ordering::SeqCst);
     let channel_id = new_request_id()?;
     let host_home = host_home_for_cwd(cwd)?;
@@ -1257,9 +1281,9 @@ fn run_broker_session(mut stream: UnixStream, command: &[String], cwd: &Path) ->
             colorterm,
             rows,
             cols,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            group: host_group_name(),
+            uid: if run_as_root { 0 } else { unsafe { libc::getuid() } },
+            gid: if run_as_root { 0 } else { unsafe { libc::getgid() } },
+            group: if run_as_root { String::new() } else { host_group_name() },
             env: forwarded_exec_env(),
         },
     )?;
@@ -1444,13 +1468,14 @@ fn run_broker_client_retry(
     socket: &Path,
     command: &[String],
     cwd: &Path,
+    run_as_root: bool,
     timeout: Duration,
 ) -> Result<i32> {
     let start = Instant::now();
     let mut last = None;
     while start.elapsed() < timeout {
         match connect_broker(socket) {
-            Ok(stream) => return run_broker_session(stream, command, cwd),
+            Ok(stream) => return run_broker_session(stream, command, cwd, run_as_root),
             Err(e) => {
                 last = Some(e);
                 thread::sleep(Duration::from_millis(10));
@@ -1831,7 +1856,7 @@ fn run_broker_client_awaiting_owner(
             return Ok(130);
         }
         match connect_broker(socket) {
-            Ok(stream) => return run_broker_session(stream, command, cwd),
+            Ok(stream) => return run_broker_session(stream, command, cwd, config.run_as_root),
             Err(e) => last = Some(e),
         }
         if let Some(status) = owner.try_wait().context("check lnx _vm-owner")? {

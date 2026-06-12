@@ -57,6 +57,7 @@ const outerVmArgs = [
 const fullSuite = [
   "scripts/test/system.test.ts",
   "scripts/test/instance-config.test.ts",
+  "scripts/test/oci-import.test.ts",
   "scripts/test/cp.test.ts",
   "scripts/test/checkpoint-fork.test.ts",
   "scripts/test/fork-fanout.test.ts",
@@ -94,6 +95,11 @@ const nestedDispositions: NestedDisposition[] = [
     kind: "caveat",
     testFile: "scripts/test/instance-config.test.ts",
     caveat: "host-side CLI and descriptor behavior with no guest-specific surface; the macOS-host suite covers it",
+  },
+  {
+    kind: "caveat",
+    testFile: "scripts/test/oci-import.test.ts",
+    caveat: "pulls from a registry and boots a builder VM; the macOS-host suite covers it and nested guests should not depend on registry availability",
   },
   { kind: "run", testFile: "scripts/test/cp.test.ts", script: "scripts/test/cp.ts" },
   {

@@ -88,6 +88,7 @@ try {
     assertContains((await lnx(ctx, ["bash", "-lc", "id -u; id -g"])).stdout, `${process.getuid?.() ?? 0}\n${process.getgid?.() ?? 0}`, "exec uid/gid match host");
     const hostGroup = (await run(["id", "-gn"])).stdout;
     assertEq((await lnx(ctx, ["id", "-gn"])).stdout, hostGroup, "exec primary group named like host");
+    assertEq((await lnx(ctx, ["--root", "id", "-un"])).stdout, "root", "--root runs as root");
     assertEq((await lnx(ctx, ["getconf", "PAGESIZE"])).stdout, "16384", "guest page size");
     assertEq((await lnx(ctx, ["nproc"])).stdout, "2", "default cpu count");
     assertContains((await lnx(ctx, ["bash", "-lc", "printf %s \"$PATH\""])).stdout, "/snap/bin", "exec PATH includes snap commands");

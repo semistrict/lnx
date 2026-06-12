@@ -9,6 +9,7 @@ import {
   lnx,
   prepareContext,
   run,
+  spawnLnx,
   testStep,
   waitForOwnerExit,
   waitForVmSuspend,
@@ -57,6 +58,22 @@ try {
       "2",
       "explicit cpus override",
     );
+  });
+
+  await testStep("inspect sees a running instance", async () => {
+    const running = spawnLnx(ctx, ["bash", "-lc", "echo inspect-ready; sleep 30"], {
+      stdout: "pipe",
+    });
+    for await (const chunk of running.stdout) {
+      if (new TextDecoder().decode(chunk).includes("inspect-ready")) {
+        break;
+      }
+    }
+    const inspect = JSON.parse((await lnxCommand(["inspect"])).stdout);
+    assertEq(inspect.state, "running", "inspect running state");
+    assertEq(inspect.pids.length > 0, true, "inspect lists owner pid");
+    running.kill("SIGKILL");
+    await running.exited.catch(() => {});
   });
 
   await testStep("inspect reports state and configuration", async () => {

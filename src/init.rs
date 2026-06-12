@@ -318,6 +318,12 @@ fn ensure_rootfs_min_size(path: &Path, min_size: u64) -> Result<()> {
     Ok(())
 }
 
+/// Validate an externally built image against the managed-rootfs contract
+/// (64 GiB sparse, 16 KiB-block ext4).
+pub fn validate_managed_rootfs_at(path: &Path) -> Result<()> {
+    validate_managed_rootfs(path, DEFAULT_ROOTFS_SIZE)
+}
+
 fn validate_managed_rootfs(path: &Path, min_size: u64) -> Result<()> {
     let size = fs::metadata(path)
         .with_context(|| format!("stat {}", path.display()))?
