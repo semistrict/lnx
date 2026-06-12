@@ -1,5 +1,6 @@
 const tests = [
   "system",
+  "instance-config",
   "cp",
   "checkpoint-fork",
   "fork-fanout",

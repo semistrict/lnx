@@ -1,5 +1,6 @@
 mod checkpoints;
 mod cli;
+mod descriptor;
 mod ingress;
 mod init;
 mod initramfs;

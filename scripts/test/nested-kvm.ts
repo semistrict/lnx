@@ -56,6 +56,7 @@ const outerVmArgs = [
 ];
 const fullSuite = [
   "scripts/test/system.test.ts",
+  "scripts/test/instance-config.test.ts",
   "scripts/test/cp.test.ts",
   "scripts/test/checkpoint-fork.test.ts",
   "scripts/test/fork-fanout.test.ts",
@@ -88,6 +89,11 @@ const nestedDispositions: NestedDisposition[] = [
     testFile: "scripts/test/system.test.ts",
     script: "scripts/test/nested-system.ts",
     caveat: "paths/exec/guest-shape/network coverage runs via scripts/test/nested-system.ts; snapshot restore coverage runs via scripts/test/nested-snapshot.ts",
+  },
+  {
+    kind: "caveat",
+    testFile: "scripts/test/instance-config.test.ts",
+    caveat: "host-side CLI and descriptor behavior with no guest-specific surface; the macOS-host suite covers it",
   },
   { kind: "run", testFile: "scripts/test/cp.test.ts", script: "scripts/test/cp.ts" },
   {

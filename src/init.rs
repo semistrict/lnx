@@ -50,6 +50,12 @@ pub fn run(layout: &Layout, kernel: Option<&Path>, rootfs: Option<&Path>) -> Res
         validate_managed_rootfs(&default_rootfs, DEFAULT_ROOTFS_SIZE)?;
     }
 
+    let image = match rootfs {
+        Some(rootfs) => format!("file:{}", rootfs.display()),
+        None => format!("release:{DEFAULT_IMAGE_VERSION}"),
+    };
+    crate::descriptor::ensure_identity(layout, &image)?;
+
     eprintln!("init: kernel {}", layout.kernel.display());
     eprintln!("init: rootfs {}", initialized_rootfs.display());
     eprintln!("init: complete");
@@ -74,6 +80,7 @@ pub fn ensure_instance(layout: &Layout) -> Result<()> {
     if !default_rootfs.exists() {
         bail!("missing default rootfs: {}", default_rootfs.display());
     }
+    crate::descriptor::ensure_identity(layout, &format!("clone:{}", default_rootfs.display()))?;
     eprintln!(
         "init: clone rootfs {} -> {}",
         default_rootfs.display(),

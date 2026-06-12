@@ -9,7 +9,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
-use crate::{checkpoints, ingress, init, paths::Layout, runner};
+use crate::{checkpoints, descriptor, ingress, init, paths::Layout, runner};
+
+const DEFAULT_CPUS: u8 = 2;
+const DEFAULT_MEMORY_MIB: u32 = 4096;
 
 #[derive(Debug, Parser)]
 #[command(name = "lnx", about = "Linux VM runner using Rust and libkrun")]
@@ -23,11 +26,14 @@ pub struct Cli {
     #[arg(long)]
     rootfs: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 2)]
-    cpus: u8,
+    #[arg(long, help = "Virtual CPUs (default: per-instance setting, then 2)")]
+    cpus: Option<u8>,
 
-    #[arg(long, default_value_t = 4096)]
-    memory_mib: u32,
+    #[arg(
+        long,
+        help = "Memory in MiB (default: per-instance setting, then 4096)"
+    )]
+    memory_mib: Option<u32>,
 
     #[arg(
         long,
@@ -65,6 +71,12 @@ enum Command {
     Fork(ForkArgs),
     Ingress(IngressArgs),
     Instances(InstancesArgs),
+    #[command(about = "Persist per-instance settings, like: set cpus=4 memory-mib=8192")]
+    Set(SetArgs),
+    #[command(about = "Print instance state and configuration as JSON")]
+    Inspect,
+    #[command(about = "Print instance logs")]
+    Logs(LogsArgs),
     #[command(hide = true)]
     #[command(name = "_ingress")]
     HiddenIngress(HiddenIngressArgs),
@@ -103,6 +115,21 @@ struct ForkArgs {
     checkpoint: Option<String>,
 
     instance: String,
+}
+
+#[derive(Debug, Args)]
+struct SetArgs {
+    #[arg(required = true, value_name = "KEY=VALUE")]
+    settings: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct LogsArgs {
+    #[arg(long, help = "Print the guest console log instead of the run log")]
+    console: bool,
+
+    #[arg(long, help = "Print the VM owner process log instead of the run log")]
+    owner: bool,
 }
 
 #[derive(Debug, Args)]
@@ -172,6 +199,11 @@ impl Cli {
         let explicit_kernel = kernel.is_some();
         let explicit_rootfs = rootfs.is_some();
         let layout = Layout::resolve(&instance, kernel, rootfs)?;
+        let persisted = descriptor::load(&layout)?;
+        let cpus = cpus.or(persisted.cpus).unwrap_or(DEFAULT_CPUS);
+        let memory_mib = memory_mib
+            .or(persisted.memory_mib)
+            .unwrap_or(DEFAULT_MEMORY_MIB);
         match command {
             Some(Command::Init(args)) => {
                 init::run(&layout, args.kernel.as_deref(), args.rootfs.as_deref())
@@ -232,6 +264,9 @@ impl Cli {
             Some(Command::Instances(args)) => match args.command {
                 InstancesCommand::List => list_instances(&layout.base),
             },
+            Some(Command::Set(args)) => set_instance_settings(&layout, &args.settings),
+            Some(Command::Inspect) => inspect_instance(&layout, cpus, memory_mib),
+            Some(Command::Logs(args)) => print_instance_logs(&layout, args.console, args.owner),
             Some(Command::HiddenIngress(args)) => {
                 let config = ingress::load_config()?;
                 ingress::run_hidden(
@@ -268,6 +303,109 @@ impl Cli {
             ),
         }
     }
+}
+
+fn set_instance_settings(layout: &Layout, settings: &[String]) -> Result<()> {
+    let mut config = descriptor::load(layout)?;
+    for setting in settings {
+        let (key, value) = setting
+            .split_once('=')
+            .with_context(|| format!("expected KEY=VALUE, got {setting}"))?;
+        match key {
+            "cpus" => {
+                let cpus: u8 = value.parse().with_context(|| format!("parse cpus {value}"))?;
+                if cpus == 0 {
+                    bail!("cpus must be at least 1");
+                }
+                config.cpus = Some(cpus);
+            }
+            "memory-mib" | "memory_mib" => {
+                let memory_mib: u32 = value
+                    .parse()
+                    .with_context(|| format!("parse memory-mib {value}"))?;
+                if memory_mib < 256 {
+                    bail!("memory-mib must be at least 256");
+                }
+                config.memory_mib = Some(memory_mib);
+            }
+            other => bail!("unknown setting {other} (valid: cpus, memory-mib)"),
+        }
+    }
+    if config.name.is_none() {
+        config.name = Some(layout.instance.clone());
+    }
+    descriptor::save(layout, &config)?;
+    println!("{}", serde_json::to_string_pretty(&config)?);
+    Ok(())
+}
+
+fn inspect_instance(layout: &Layout, cpus: u8, memory_mib: u32) -> Result<()> {
+    let config = descriptor::load(layout)?;
+    let latest_snapshot = layout.snapshot_dir.join("latest");
+    let checkpoints = match fs::read_dir(&layout.checkpoint_dir) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+            .count(),
+        Err(_) => 0,
+    };
+    let inspect = serde_json::json!({
+        "name": layout.instance,
+        "state": instance_state(layout),
+        "pids": instance_pids(layout),
+        "cpus": cpus,
+        "memory_mib": memory_mib,
+        "created": config.created,
+        "image": config.image,
+        "settings": config,
+        "rootfs": layout.rootfs,
+        "rootfs_size_bytes": file_len(&layout.rootfs),
+        "rootfs_allocated_bytes": allocated_bytes(&layout.rootfs),
+        "snapshot": if latest_snapshot.exists() {
+            serde_json::json!({
+                "path": latest_snapshot,
+                "pages_allocated_bytes": allocated_bytes(&latest_snapshot.join("pages.img")),
+            })
+        } else {
+            serde_json::Value::Null
+        },
+        "checkpoints": checkpoints,
+        "descriptor": descriptor::path(layout),
+        "logs": {
+            "run": layout.run_dir.join("lnx.log"),
+            "console": layout.console_log,
+            "owner": layout.run_dir.join("owner.log"),
+        },
+    });
+    println!("{}", serde_json::to_string_pretty(&inspect)?);
+    Ok(())
+}
+
+fn file_len(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().map(|meta| meta.len())
+}
+
+fn allocated_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).ok().map(|meta| meta.blocks() * 512)
+}
+
+fn print_instance_logs(layout: &Layout, console: bool, owner: bool) -> Result<()> {
+    let path = if console {
+        layout.console_log.clone()
+    } else if owner {
+        layout.run_dir.join("owner.log")
+    } else {
+        layout.run_dir.join("lnx.log")
+    };
+    let mut file = fs::File::open(&path).with_context(|| {
+        format!(
+            "open {} (has the instance been started?)",
+            path.display()
+        )
+    })?;
+    std::io::copy(&mut file, &mut std::io::stdout()).context("print log")?;
+    Ok(())
 }
 
 fn list_instances(base: &Path) -> Result<()> {
