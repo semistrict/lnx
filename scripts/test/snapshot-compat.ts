@@ -45,6 +45,52 @@ try {
     const log = await run(["bash", "-lc", `cat ${join(ctx.runDir, "lnx.log")}`]);
     assertContains(log.stdout, "snapshot.restore.skipped reason=config_mismatch", "config mismatch logged");
   });
+
+  await testStep("corrupt snapshot section falls back to a cold boot", async () => {
+    // Flip the last byte of vmstate.bin: the header still parses, so the
+    // pre-flight accepts the snapshot, but the section hash check refuses it
+    // at restore time and the client must respawn the owner cold.
+    await waitForVmSuspend(ctx);
+    const vmstatePath = join(ctx.snapshotDir, "latest", "vmstate.bin");
+    const vmstate = Buffer.from(await readFile(vmstatePath));
+    vmstate[vmstate.length - 1] ^= 0xff;
+    await writeFile(vmstatePath, vmstate);
+
+    const fallback = await lnx(ctx, ["bash", "-lc", "echo cold-fallback-ok"], {
+      timeoutMs: 240_000,
+    });
+    assertEq(fallback.stdout, "cold-fallback-ok", "exec succeeds after restore refusal");
+    const log = await run(["bash", "-lc", `cat ${join(ctx.runDir, "lnx.log")}`]);
+    assertContains(
+      log.stdout,
+      "snapshot.restore.skipped reason=start_failed retry=cold_boot",
+      "restore refusal logged and retried cold",
+    );
+  });
+
+  await testStep("share root drift skips restore and boots cold", async () => {
+    // The earlier steps captured snapshots from this suite's cwd. Running
+    // from the other side of the $HOME boundary changes the host share
+    // roots, so the pre-flight must skip the restore and boot cold; a
+    // restored guest would keep mounts backed by the old share roots.
+    await waitForVmSuspend(ctx);
+    const home = Bun.env.HOME ?? "/";
+    const insideHome = `${process.cwd()}/`.startsWith(`${home}/`);
+    const otherSide = insideHome ? "/tmp" : home;
+    // A working exec proves the cwd chdir succeeded: the agent fails the
+    // exec outright when the share backing the cwd is missing.
+    const drifted = await lnx(ctx, ["bash", "-lc", "echo share-drift-ok"], {
+      cwd: otherSide,
+      timeoutMs: 240_000,
+    });
+    assertEq(drifted.stdout, "share-drift-ok", "exec runs in the drifted cwd");
+    const log = await run(["bash", "-lc", `cat ${join(ctx.runDir, "lnx.log")}`]);
+    assertContains(
+      log.stdout,
+      "snapshot.restore.skipped reason=share_mismatch",
+      "share root drift skips the restore",
+    );
+  });
 } finally {
   await cleanupContext(ctx);
 }

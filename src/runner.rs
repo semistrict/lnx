@@ -38,6 +38,10 @@ const SNAPSHOT_VMSTATE_VERSION: u32 = 1;
 #[cfg(not(target_os = "macos"))]
 const SNAPSHOT_VMSTATE_VERSION: u32 = 2;
 
+// Owner exit status meaning "the VM failed to start with a restore
+// configured"; the client retries the spawn with a cold boot.
+const EXIT_RESTORE_FAILED: i32 = 86;
+
 const DEFAULT_BROKER_IDLE_TTL: Duration = Duration::ZERO;
 const DEFAULT_OWNER_IDLE_TTL: Duration = Duration::from_secs(5);
 // The detached owner counts idle time from broker start, so a TTL shorter than
@@ -182,7 +186,18 @@ pub fn run_owner(config: RunConfig) -> Result<()> {
         ttl: owner_idle_ttl(),
         starts_idle: true,
     };
-    let vm = start_vm(&config, &run_log, &broker_socket, idle)?;
+    let vm = match start_vm(&config, &run_log, &broker_socket, idle) {
+        Ok(vm) => vm,
+        // A snapshot the devices refuse (topology drift, corrupt sections)
+        // must not strand the instance: hand the decision to the client,
+        // which respawns the owner for a cold boot.
+        Err(e) if config.restore_snapshot.is_some() => {
+            run_log.line(format!("owner.start.restore_failed error={e:#}"));
+            drop(bootstrap_lock);
+            std::process::exit(EXIT_RESTORE_FAILED);
+        }
+        Err(e) => return Err(e),
+    };
     let _ = vm.owner.join();
     run_log.line("owner.done");
     drop(vm.network);
@@ -311,6 +326,12 @@ fn start_vm(
     });
     let requested_restore_snapshot = config.restore_snapshot.clone();
     let initramfs_stamp = config.layout.run_dir.join("initramfs.stamp");
+    let host_home = host_home_for_cwd(&config.cwd)?;
+    let outside_home_cwd = (!config.cwd.starts_with(&host_home)).then(|| config.cwd.clone());
+    let shares_stamp = shares_stamp_content(&host_home, outside_home_cwd.as_deref());
+    let shares_stamp_path = config.layout.run_dir.join("shares.stamp");
+    fs::write(&shares_stamp_path, &shares_stamp)
+        .with_context(|| format!("write {}", shares_stamp_path.display()))?;
     let restore_snapshot = if config
         .restore_snapshot
         .as_ref()
@@ -318,6 +339,14 @@ fn start_vm(
     {
         timings.event("snapshot.restore.skipped.agent_changed");
         run_log.line("snapshot.restore.skipped reason=agent_changed");
+        None
+    } else if config
+        .restore_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| !snapshot_shares_are_compatible(snapshot, &shares_stamp))
+    {
+        timings.event("snapshot.restore.skipped.share_mismatch");
+        run_log.line("snapshot.restore.skipped reason=share_mismatch");
         None
     } else if let Some(snapshot) = &config.restore_snapshot {
         match snapshot_vm_config(snapshot) {
@@ -396,12 +425,10 @@ fn start_vm(
             "/dev/vda"
         }
     };
-    let host_home = host_home_for_cwd(&config.cwd)?;
     let guest_home = guest_home(&host_home);
     let guest_cwd = guest_cwd(&config.cwd, &host_home);
     ctx.add_policy_virtiofs("home", &host_home)?;
     set_home_write_allowlist(ctx.as_ref(), &config.cwd, &host_home)?;
-    let outside_home_cwd = (!config.cwd.starts_with(&host_home)).then(|| config.cwd.clone());
     if let Some(cwd) = &outside_home_cwd {
         ctx.add_virtiofs("cwd", cwd, false)?;
     }
@@ -977,6 +1004,21 @@ fn snapshot_initramfs_is_compatible(snapshot_path: &Path, current_stamp: &Path) 
         return false;
     };
     snapshot_sha == current_sha
+}
+
+// A restored guest keeps its snapshot-time share mounts, so a snapshot is only
+// valid for the same host share roots: a drifted root would silently back the
+// old guest mount points with a different host directory.
+fn shares_stamp_content(host_home: &Path, outside_home_cwd: Option<&Path>) -> String {
+    let mut content = format!("home={}\n", host_home.display());
+    if let Some(cwd) = outside_home_cwd {
+        content.push_str(&format!("cwd={}\n", cwd.display()));
+    }
+    content
+}
+
+fn snapshot_shares_are_compatible(snapshot_path: &Path, current: &str) -> bool {
+    fs::read_to_string(snapshot_path.join("shares.stamp")).is_ok_and(|stamp| stamp == current)
 }
 
 fn stamp_sha256(path: &Path) -> Option<String> {
@@ -1851,6 +1893,7 @@ fn run_broker_client_awaiting_owner(
 ) -> Result<i32> {
     let deadline = Instant::now() + OWNER_BOOT_TIMEOUT;
     let mut last = None;
+    let mut owner_config = config.clone();
     while Instant::now() < deadline {
         if INTERRUPTED.load(Ordering::SeqCst) {
             return Ok(130);
@@ -1864,7 +1907,13 @@ fn run_broker_client_awaiting_owner(
             // owner, so keep retrying until that one's broker comes up.
             if status.success() {
                 run_log.line("owner.exited.early status=0 retry=spawn");
-                *owner = spawn_owner_process(config, run_log)?;
+                *owner = spawn_owner_process(&owner_config, run_log)?;
+            } else if status.code() == Some(EXIT_RESTORE_FAILED)
+                && owner_config.restore_snapshot.is_some()
+            {
+                run_log.line("snapshot.restore.skipped reason=start_failed retry=cold_boot");
+                owner_config.restore_snapshot = None;
+                *owner = spawn_owner_process(&owner_config, run_log)?;
             } else {
                 run_log.line(format!("owner.exited.early status={status}"));
                 bail!(
@@ -2560,7 +2609,13 @@ fn seed_incremental_snapshot(
     remove_path_if_exists(snapshot_path)?;
     fs::create_dir_all(snapshot_path)
         .with_context(|| format!("create {}", snapshot_path.display()))?;
-    for name in ["pages.img", "vmstate.bin", "rootfs.ext4", "initramfs.stamp"] {
+    for name in [
+        "pages.img",
+        "vmstate.bin",
+        "rootfs.ext4",
+        "initramfs.stamp",
+        "shares.stamp",
+    ] {
         let src = base.join(name);
         if src.exists() {
             clone_or_copy_file(&src, &snapshot_path.join(name))?;
@@ -2597,13 +2652,15 @@ fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn copy_snapshot_stamp(snapshot_path: &Path, initramfs_stamp: &Path) -> Result<()> {
-    fs::copy(initramfs_stamp, snapshot_path.join("initramfs.stamp")).with_context(|| {
-        format!(
-            "copy {} to {}",
-            initramfs_stamp.display(),
-            snapshot_path.join("initramfs.stamp").display()
-        )
-    })?;
+    // Both stamps live in the run dir; they travel with the snapshot so a
+    // later restore can check agent and share-root compatibility.
+    let shares_stamp = initramfs_stamp.with_file_name("shares.stamp");
+    for stamp in [initramfs_stamp, shares_stamp.as_path()] {
+        let name = stamp.file_name().context("stamp file name")?;
+        let target = snapshot_path.join(name);
+        fs::copy(stamp, &target)
+            .with_context(|| format!("copy {} to {}", stamp.display(), target.display()))?;
+    }
     Ok(())
 }
 
@@ -2767,6 +2824,34 @@ mod tests {
         assert!(config.matches(2, 4096));
         assert!(!config.matches(1, 4096));
         assert!(!config.matches(2, 8192));
+    }
+
+    #[test]
+    fn shares_stamp_content_lists_home_and_outside_home_cwd() {
+        assert_eq!(
+            shares_stamp_content(Path::new("/Users/ramon"), None),
+            "home=/Users/ramon\n"
+        );
+        assert_eq!(
+            shares_stamp_content(Path::new("/Users/ramon"), Some(Path::new("/tmp/build"))),
+            "home=/Users/ramon\ncwd=/tmp/build\n"
+        );
+    }
+
+    #[test]
+    fn snapshot_shares_compatibility_requires_identical_stamp() {
+        let temp = TempDir::new("snapshot-shares");
+        fs::create_dir_all(temp.path()).expect("create snapshot dir");
+        let current = shares_stamp_content(Path::new("/Users/ramon"), None);
+
+        // A snapshot from before share stamping must not restore.
+        assert!(!snapshot_shares_are_compatible(temp.path(), &current));
+
+        fs::write(temp.path().join("shares.stamp"), &current).expect("write stamp");
+        assert!(snapshot_shares_are_compatible(temp.path(), &current));
+
+        let drifted = shares_stamp_content(Path::new("/home/ramon"), None);
+        assert!(!snapshot_shares_are_compatible(temp.path(), &drifted));
     }
 
     #[test]

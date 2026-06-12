@@ -197,6 +197,7 @@ fn clone_snapshot_dir(src: &Path, dest: &Path) -> Result<()> {
         "rootfs.ext4",
         "checkpoint.meta",
         "initramfs.stamp",
+        "shares.stamp",
     ] {
         let src_file = src.join(name);
         if src_file.exists() {
