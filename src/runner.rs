@@ -273,8 +273,106 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
 
 struct VmHandles {
     owner: thread::JoinHandle<()>,
-    network: Gvproxy,
+    network: NetworkBacking,
     timings: Arc<TimingLog>,
+}
+
+/// How the VM reaches the network: a routable per-VM address on the ingress
+/// daemon's vmnet network when available, else a private gvproxy NAT.
+enum NetworkBacking {
+    Gvproxy(Gvproxy),
+    #[cfg(target_os = "macos")]
+    Vmnet {
+        fd: Option<std::os::fd::OwnedFd>,
+        ip: std::net::Ipv4Addr,
+        prefix: u8,
+        gateway: std::net::Ipv4Addr,
+    },
+}
+
+impl NetworkBacking {
+    /// One line of guest-visible network identity. Part of the snapshot
+    /// stamp: a snapshot taken on one backing must not restore on another.
+    fn stamp_line(&self) -> String {
+        match self {
+            NetworkBacking::Gvproxy(_) => "net=gvproxy".to_string(),
+            #[cfg(target_os = "macos")]
+            NetworkBacking::Vmnet {
+                ip,
+                prefix,
+                gateway,
+                ..
+            } => format!("net=vmnet:{ip}/{prefix}:{gateway}"),
+        }
+    }
+
+    /// LNX_NET_IP / LNX_NET_GATEWAY values for the guest agent; empty means
+    /// the agent uses the gvproxy static configuration.
+    fn guest_env(&self) -> (String, String) {
+        match self {
+            NetworkBacking::Gvproxy(_) => (String::new(), String::new()),
+            #[cfg(target_os = "macos")]
+            NetworkBacking::Vmnet {
+                ip,
+                prefix,
+                gateway,
+                ..
+            } => (format!("{ip}/{prefix}"), gateway.to_string()),
+        }
+    }
+}
+
+fn start_network(
+    config: &RunConfig,
+    run_log: &RunLog,
+    timings: &TimingLog,
+) -> Result<NetworkBacking> {
+    #[cfg(target_os = "macos")]
+    {
+        let attachment = crate::ingress::load_config()
+            .and_then(|ingress| {
+                crate::ingress::request_network_attachment(&ingress, &config.layout.instance)
+            })
+            .unwrap_or_else(|e| {
+                run_log.line(format!("network.vmnet.unavailable error={e:#}"));
+                None
+            });
+        if let Some(attachment) = attachment {
+            timings.event("network.vmnet.ready");
+            run_log.line(format!(
+                "network.vmnet ip={}/{} gateway={}",
+                attachment.ip, attachment.prefix, attachment.gateway
+            ));
+            return Ok(NetworkBacking::Vmnet {
+                fd: Some(attachment.fd),
+                ip: attachment.ip,
+                prefix: attachment.prefix,
+                gateway: attachment.gateway,
+            });
+        }
+    }
+    let gvproxy = start_gvproxy(&config.layout.run_dir)?;
+    timings.event("gvproxy.ready");
+    run_log.line(format!(
+        "gvproxy.ready socket={}",
+        config.layout.run_dir.join("gvproxy.sock").display()
+    ));
+    Ok(NetworkBacking::Gvproxy(gvproxy))
+}
+
+/// A stable, locally administered unicast MAC derived from the instance
+/// name. All instances share the vmnet network's L2 segment, so each needs
+/// its own address, and keeping it stable preserves neighbor caches across
+/// reboots and restores.
+#[cfg(target_os = "macos")]
+fn instance_mac(instance: &str) -> [u8; 6] {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(format!("lnx-mac:{instance}"));
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&digest[..6]);
+    mac[0] = (mac[0] & 0xFE) | 0x02;
+    mac
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -326,9 +424,14 @@ fn start_vm(
     });
     let requested_restore_snapshot = config.restore_snapshot.clone();
     let initramfs_stamp = config.layout.run_dir.join("initramfs.stamp");
+    let mut network = start_network(&config, &run_log, &timings)?;
     let host_home = host_home_for_cwd(&config.cwd)?;
     let outside_home_cwd = (!config.cwd.starts_with(&host_home)).then(|| config.cwd.clone());
-    let shares_stamp = shares_stamp_content(&host_home, outside_home_cwd.as_deref());
+    let shares_stamp = shares_stamp_content(
+        &host_home,
+        outside_home_cwd.as_deref(),
+        &network.stamp_line(),
+    );
     let shares_stamp_path = config.layout.run_dir.join("shares.stamp");
     fs::write(&shares_stamp_path, &shares_stamp)
         .with_context(|| format!("write {}", shares_stamp_path.display()))?;
@@ -394,13 +497,6 @@ fn start_vm(
         control_socket.display(),
         broker_socket.display()
     ));
-    let network = start_gvproxy(&config.layout.run_dir)?;
-    timings.event("gvproxy.ready");
-    run_log.line(format!(
-        "gvproxy.ready socket={}",
-        config.layout.run_dir.join("gvproxy.sock").display()
-    ));
-
     KrunContext::set_log_level(2)?;
     let ctx = Arc::new(KrunContext::create()?);
     ctx.set_console_output(&config.layout.console_log)?;
@@ -444,7 +540,14 @@ fn start_vm(
     ctx.add_vsock_connector(AGENT_PORT, &socket)?;
     ctx.add_vsock_connector(SNAPSHOT_PORT, &snapshot_socket)?;
     ctx.add_vsock_connector(CONTROL_PORT, &control_socket)?;
-    ctx.add_gvproxy_network(&network.socket)?;
+    match &mut network {
+        NetworkBacking::Gvproxy(gvproxy) => ctx.add_gvproxy_network(&gvproxy.socket)?,
+        #[cfg(target_os = "macos")]
+        NetworkBacking::Vmnet { fd, .. } => {
+            let fd = fd.take().context("vmnet attachment fd already consumed")?;
+            ctx.add_fd_network(fd, instance_mac(&config.layout.instance))?;
+        }
+    }
     timings.event("krun.devices.configured");
 
     if let Some(snapshot) = &restore_snapshot {
@@ -461,6 +564,7 @@ fn start_vm(
         .duration_since(UNIX_EPOCH)
         .context("host clock is before Unix epoch")?
         .as_secs();
+    let (net_ip, net_gateway) = network.guest_env();
     ctx.set_exec(
         "/init",
         &["--init".to_string()],
@@ -469,6 +573,8 @@ fn start_vm(
             "container=lnx".to_string(),
             format!("LNX_HOST_UNIX_SECS={now}"),
             format!("LNX_ROOT_DEVICE={root_device}"),
+            format!("LNX_NET_IP={net_ip}"),
+            format!("LNX_NET_GATEWAY={net_gateway}"),
             format!("LNX_VIRTIOFS_HOME={guest_home}"),
             outside_home_cwd
                 .as_ref()
@@ -1006,14 +1112,22 @@ fn snapshot_initramfs_is_compatible(snapshot_path: &Path, current_stamp: &Path) 
     snapshot_sha == current_sha
 }
 
-// A restored guest keeps its snapshot-time share mounts, so a snapshot is only
-// valid for the same host share roots: a drifted root would silently back the
-// old guest mount points with a different host directory.
-fn shares_stamp_content(host_home: &Path, outside_home_cwd: Option<&Path>) -> String {
+// A restored guest keeps its snapshot-time share mounts and network
+// configuration, so a snapshot is only valid for the same host share roots
+// and network backing: a drifted root would silently back the old guest
+// mount points with a different host directory, and a drifted network would
+// strand the guest's addresses.
+fn shares_stamp_content(
+    host_home: &Path,
+    outside_home_cwd: Option<&Path>,
+    net_stamp_line: &str,
+) -> String {
     let mut content = format!("home={}\n", host_home.display());
     if let Some(cwd) = outside_home_cwd {
         content.push_str(&format!("cwd={}\n", cwd.display()));
     }
+    content.push_str(net_stamp_line);
+    content.push('\n');
     content
 }
 
@@ -2827,14 +2941,18 @@ mod tests {
     }
 
     #[test]
-    fn shares_stamp_content_lists_home_and_outside_home_cwd() {
+    fn shares_stamp_content_lists_home_cwd_and_network() {
         assert_eq!(
-            shares_stamp_content(Path::new("/Users/ramon"), None),
-            "home=/Users/ramon\n"
+            shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy"),
+            "home=/Users/ramon\nnet=gvproxy\n"
         );
         assert_eq!(
-            shares_stamp_content(Path::new("/Users/ramon"), Some(Path::new("/tmp/build"))),
-            "home=/Users/ramon\ncwd=/tmp/build\n"
+            shares_stamp_content(
+                Path::new("/Users/ramon"),
+                Some(Path::new("/tmp/build")),
+                "net=vmnet:192.168.106.2/24:192.168.106.1"
+            ),
+            "home=/Users/ramon\ncwd=/tmp/build\nnet=vmnet:192.168.106.2/24:192.168.106.1\n"
         );
     }
 
@@ -2842,7 +2960,7 @@ mod tests {
     fn snapshot_shares_compatibility_requires_identical_stamp() {
         let temp = TempDir::new("snapshot-shares");
         fs::create_dir_all(temp.path()).expect("create snapshot dir");
-        let current = shares_stamp_content(Path::new("/Users/ramon"), None);
+        let current = shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy");
 
         // A snapshot from before share stamping must not restore.
         assert!(!snapshot_shares_are_compatible(temp.path(), &current));
@@ -2850,8 +2968,27 @@ mod tests {
         fs::write(temp.path().join("shares.stamp"), &current).expect("write stamp");
         assert!(snapshot_shares_are_compatible(temp.path(), &current));
 
-        let drifted = shares_stamp_content(Path::new("/home/ramon"), None);
+        let drifted = shares_stamp_content(Path::new("/home/ramon"), None, "net=gvproxy");
         assert!(!snapshot_shares_are_compatible(temp.path(), &drifted));
+
+        // The same shares on a different network backing must not restore.
+        let renetworked = shares_stamp_content(
+            Path::new("/Users/ramon"),
+            None,
+            "net=vmnet:192.168.106.2/24:192.168.106.1",
+        );
+        assert!(!snapshot_shares_are_compatible(temp.path(), &renetworked));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn instance_macs_are_stable_local_and_unicast() {
+        let mac = instance_mac("default");
+        assert_eq!(mac, instance_mac("default"));
+        assert_ne!(mac, instance_mac("other"));
+        // Locally administered, unicast.
+        assert_eq!(mac[0] & 0x02, 0x02);
+        assert_eq!(mac[0] & 0x01, 0x00);
     }
 
     #[test]

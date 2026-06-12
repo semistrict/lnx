@@ -10,6 +10,8 @@ mod paths;
 mod runner;
 #[cfg(not(target_os = "macos"))]
 mod sparse_copy;
+#[cfg(target_os = "macos")]
+mod vmnet;
 
 use anyhow::Result;
 use clap::Parser;

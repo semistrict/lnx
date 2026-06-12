@@ -161,6 +161,29 @@ impl Context {
         )
     }
 
+    /// Attaches a connected datagram socket carrying one ethernet frame per
+    /// datagram (the ingress daemon's vmnet pump). libkrun takes ownership
+    /// of the fd.
+    #[cfg(target_os = "macos")]
+    pub fn add_fd_network(&self, fd: std::os::fd::OwnedFd, mac: [u8; 6]) -> Result<()> {
+        use std::os::fd::IntoRawFd;
+
+        let mut mac = mac;
+        call(
+            unsafe {
+                libkrun::krun_add_net_unixgram(
+                    self.id,
+                    std::ptr::null(),
+                    fd.into_raw_fd(),
+                    mac.as_mut_ptr(),
+                    COMPAT_NET_FEATURES,
+                    0,
+                )
+            },
+            "krun_add_net_unixgram(vmnet)",
+        )
+    }
+
     pub fn set_workdir(&self, path: &str) -> Result<()> {
         let path = CString::new(path)?;
         call(

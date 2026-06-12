@@ -288,31 +288,35 @@ fn run_status(args: &[&str]) -> c_int {
     }
 }
 
+/// The host passes a routable address when the VM sits on the shared vmnet
+/// network; without one the VM is behind its own gvproxy NAT at the fixed
+/// gvproxy addresses.
+fn network_config() -> (String, String) {
+    match (env::var("LNX_NET_IP"), env::var("LNX_NET_GATEWAY")) {
+        (Ok(ip), Ok(gateway)) if !ip.is_empty() && !gateway.is_empty() => (ip, gateway),
+        _ => ("192.168.127.2/24".to_string(), "192.168.127.1".to_string()),
+    }
+}
+
 fn configure_network() {
+    let (ip, gateway) = network_config();
     let _ = run_status(&["/sbin/ip", "link", "set", "lo", "up"]);
     let _ = run_status(&["/sbin/ip", "link", "set", "eth0", "up"]);
-    let _ = run_status(&[
-        "/sbin/ip",
-        "addr",
-        "replace",
-        "192.168.127.2/24",
-        "dev",
-        "eth0",
-    ]);
+    let _ = run_status(&["/sbin/ip", "addr", "replace", &ip, "dev", "eth0"]);
     let _ = run_status(&[
         "/sbin/ip",
         "route",
         "replace",
         "default",
         "via",
-        "192.168.127.1",
+        &gateway,
         "dev",
         "eth0",
     ]);
     let _ = fs::remove_file("/etc/resolv.conf");
     let _ = fs::write(
         "/etc/resolv.conf",
-        "nameserver 192.168.127.1\nnameserver 1.1.1.1\n",
+        format!("nameserver {gateway}\nnameserver 1.1.1.1\n"),
     );
 }
 

@@ -1,8 +1,10 @@
 use std::{
+    collections::HashMap,
     ffi::CString,
     fs,
     io::{BufReader, ErrorKind, Read, Write},
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
     os::unix::{
         ffi::OsStrExt,
         net::{UnixListener, UnixStream},
@@ -11,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -34,6 +36,7 @@ const DEFAULT_DOMAIN: &str = "lnx";
 const DEFAULT_DNS_ADDR: &str = "127.0.0.1:5354";
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:80";
 const DEFAULT_HTTPS_ADDR: &str = "127.0.0.1:443";
+const DEFAULT_SUBNET: &str = "192.168.106.0/24";
 const AUTOSTART_IDLE_TTL_MS: &str = "30000";
 const CA_COMMON_NAME: &str = "lnx local ingress CA";
 const SERVICE_LABEL: &str = "com.semistrict.lnx.ingress";
@@ -46,6 +49,7 @@ pub struct Config {
     pub dns_addr: String,
     pub http_addr: String,
     pub https_addr: String,
+    pub subnet: String,
     pub resolver_dir: PathBuf,
     pub state_dir: PathBuf,
 }
@@ -63,6 +67,7 @@ pub fn load_config() -> Result<Config> {
         dns_addr: env_or("LNX_INGRESS_DNS_ADDR", DEFAULT_DNS_ADDR),
         http_addr: env_or("LNX_INGRESS_HTTP_ADDR", DEFAULT_HTTP_ADDR),
         https_addr: env_or("LNX_INGRESS_HTTPS_ADDR", DEFAULT_HTTPS_ADDR),
+        subnet: env_or("LNX_INGRESS_SUBNET", DEFAULT_SUBNET),
         resolver_dir: PathBuf::from(env_or("LNX_INGRESS_RESOLVER_DIR", "/etc/resolver")),
         state_dir: PathBuf::from(env_or(
             "LNX_INGRESS_STATE_DIR",
@@ -125,6 +130,10 @@ pub fn print_status(config: &Config) -> Result<()> {
             println!("http: {}", status.http_addr);
             println!("https: {}", status.https_addr);
             println!("resolver: {}", status.resolver_path);
+            println!(
+                "network: {}",
+                status.network.as_deref().unwrap_or("disabled")
+            );
         }
         Err(_) => println!("disabled"),
     }
@@ -238,6 +247,7 @@ struct Status {
     http_addr: String,
     https_addr: String,
     resolver_path: String,
+    network: Option<String>,
 }
 
 fn env_or(key: &str, fallback: &str) -> String {
@@ -312,6 +322,7 @@ fn start_helper(config: &Config, args: &[&str]) -> Result<()> {
             "LNX_INGRESS_DNS_ADDR",
             "LNX_INGRESS_HTTP_ADDR",
             "LNX_INGRESS_HTTPS_ADDR",
+            "LNX_INGRESS_SUBNET",
             "LNX_INGRESS_RESOLVER_DIR",
             "LNX_INGRESS_STATE_DIR",
             "LNX_INGRESS_USER",
@@ -437,6 +448,8 @@ fn launchd_plist(config: &Config) -> Result<String> {
     <string>{http_addr}</string>
     <key>LNX_INGRESS_HTTPS_ADDR</key>
     <string>{https_addr}</string>
+    <key>LNX_INGRESS_SUBNET</key>
+    <string>{subnet}</string>
     <key>LNX_INGRESS_RESOLVER_DIR</key>
     <string>{resolver_dir}</string>
     <key>LNX_INGRESS_STATE_DIR</key>
@@ -458,6 +471,7 @@ fn launchd_plist(config: &Config) -> Result<String> {
         dns_addr = xml_escape(&config.dns_addr),
         http_addr = xml_escape(&config.http_addr),
         https_addr = xml_escape(&config.https_addr),
+        subnet = xml_escape(&config.subnet),
         resolver_dir = xml_escape(&config.resolver_dir.display().to_string()),
         state_dir = xml_escape(&config.state_dir.display().to_string()),
         user = xml_escape(&user),
@@ -500,6 +514,310 @@ fn spawn_daemon(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Routable per-VM networking, mirroring Apple's container tool: one
+/// NAT-mode vmnet network with a dedicated subnet, DHCP disabled, and
+/// addresses allocated here per instance. Lives in the ingress daemon
+/// because creating vmnet interfaces requires root.
+#[cfg(target_os = "macos")]
+struct NetworkService {
+    network: Option<crate::vmnet::Network>,
+    state_path: PathBuf,
+    allocations: Mutex<HashMap<String, Ipv4Addr>>,
+    attachments: Mutex<HashMap<String, crate::vmnet::Attachment>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AttachInfo {
+    ip: Ipv4Addr,
+    prefix: u8,
+    gateway: Ipv4Addr,
+}
+
+#[cfg(target_os = "macos")]
+impl NetworkService {
+    fn start(config: &Config) -> Arc<NetworkService> {
+        let state_path = config.state_dir.join("network.json");
+        let allocations = Self::load_allocations(&state_path);
+        let network = match crate::vmnet::parse_subnet(&config.subnet)
+            .and_then(|(subnet, prefix)| crate::vmnet::Network::create(subnet, prefix))
+        {
+            Ok(network) => {
+                eprintln!(
+                    "vmnet network ready subnet={}/{} gateway={}",
+                    network.subnet(),
+                    network.prefix(),
+                    network.gateway()
+                );
+                Some(network)
+            }
+            Err(e) => {
+                eprintln!("vmnet network unavailable, VMs fall back to gvproxy NAT: {e:#}");
+                None
+            }
+        };
+        Arc::new(NetworkService {
+            network,
+            state_path,
+            allocations: Mutex::new(allocations),
+            attachments: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn subnet_json(&self) -> String {
+        match &self.network {
+            Some(network) => format!("\"{}/{}\"", network.subnet(), network.prefix()),
+            None => "null".to_string(),
+        }
+    }
+
+    fn instance_ips(&self) -> HashMap<String, Ipv4Addr> {
+        if self.network.is_none() {
+            return HashMap::new();
+        }
+        self.allocations.lock().unwrap().clone()
+    }
+
+    fn attach(&self, instance: &str) -> Result<(OwnedFd, AttachInfo)> {
+        let network = self
+            .network
+            .as_ref()
+            .context("vmnet network is not available")?;
+        let ip = self.allocate(instance, network)?;
+        let mut attachment = network.attach(instance)?;
+        let fd = attachment
+            .take_guest_fd()
+            .context("vmnet attachment has no guest fd")?;
+        // Replacing an existing attachment stops the previous interface; the
+        // bootstrap lock guarantees at most one live owner per instance.
+        self.attachments
+            .lock()
+            .unwrap()
+            .insert(instance.to_string(), attachment);
+        Ok((
+            fd,
+            AttachInfo {
+                ip,
+                prefix: network.prefix(),
+                gateway: network.gateway(),
+            },
+        ))
+    }
+
+    fn allocate(&self, instance: &str, network: &crate::vmnet::Network) -> Result<Ipv4Addr> {
+        let mut allocations = self.allocations.lock().unwrap();
+        if let Some(ip) = allocations.get(instance) {
+            return Ok(*ip);
+        }
+        let subnet = u32::from(network.subnet());
+        let broadcast = subnet | !u32::from(crate::vmnet::mask_for_prefix(network.prefix()));
+        let used: std::collections::HashSet<Ipv4Addr> = allocations.values().copied().collect();
+        // .0 is the network, .1 the host-side gateway, the last the broadcast.
+        let ip = (subnet + 2..broadcast)
+            .map(Ipv4Addr::from)
+            .find(|candidate| !used.contains(candidate))
+            .with_context(|| format!("subnet {} is out of addresses", network.subnet()))?;
+        allocations.insert(instance.to_string(), ip);
+        if let Err(e) = Self::save_allocations(&self.state_path, &allocations) {
+            eprintln!("failed to persist {}: {e:#}", self.state_path.display());
+        }
+        Ok(ip)
+    }
+
+    fn load_allocations(path: &Path) -> HashMap<String, Ipv4Addr> {
+        let Ok(raw) = fs::read_to_string(path) else {
+            return HashMap::new();
+        };
+        match serde_json::from_str::<HashMap<String, Ipv4Addr>>(&raw) {
+            Ok(allocations) => allocations,
+            Err(e) => {
+                eprintln!("ignoring malformed {}: {e}", path.display());
+                HashMap::new()
+            }
+        }
+    }
+
+    fn save_allocations(path: &Path, allocations: &HashMap<String, Ipv4Addr>) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        let raw = serde_json::to_string_pretty(allocations).context("encode network state")?;
+        fs::write(path, raw).with_context(|| format!("write {}", path.display()))?;
+        chown_to_ingress_user(path);
+        Ok(())
+    }
+}
+
+/// Per-VM networking needs vmnet; elsewhere the daemon only serves DNS and
+/// the HTTP ingress, and VMs keep their gvproxy NAT.
+#[cfg(not(target_os = "macos"))]
+struct NetworkService;
+
+#[cfg(not(target_os = "macos"))]
+impl NetworkService {
+    fn start(_config: &Config) -> Arc<NetworkService> {
+        Arc::new(NetworkService)
+    }
+
+    fn subnet_json(&self) -> String {
+        "null".to_string()
+    }
+
+    fn instance_ips(&self) -> HashMap<String, Ipv4Addr> {
+        HashMap::new()
+    }
+
+    fn attach(&self, _instance: &str) -> Result<(OwnedFd, AttachInfo)> {
+        anyhow::bail!("per-VM networking requires macOS")
+    }
+}
+
+fn valid_instance_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn attach_instance_from_request(request: &str) -> Option<String> {
+    let target = request
+        .strip_prefix("POST ")?
+        .split_whitespace()
+        .next()?
+        .strip_prefix("/network/attach?instance=")?;
+    valid_instance_name(target).then(|| target.to_string())
+}
+
+fn send_bytes_with_fd(stream: &UnixStream, bytes: &[u8], fd: BorrowedFd<'_>) -> std::io::Result<()> {
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_ptr() as *mut libc::c_void,
+        iov_len: bytes.len(),
+    };
+    let mut control = [0u8; unsafe { libc::CMSG_SPACE(4) as usize }];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len() as _;
+    let raw_fd: i32 = fd.as_raw_fd();
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(4) as _;
+        std::ptr::copy_nonoverlapping(
+            (&raw const raw_fd).cast::<u8>(),
+            libc::CMSG_DATA(cmsg),
+            std::mem::size_of::<i32>(),
+        );
+    }
+    let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, 0) };
+    if sent < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn recv_bytes_with_fd(
+    stream: &UnixStream,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, Option<OwnedFd>)> {
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    let mut control = [0u8; unsafe { libc::CMSG_SPACE(4) as usize }];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len() as _;
+    let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
+    if received < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut fd = None;
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let mut raw_fd: i32 = -1;
+                std::ptr::copy_nonoverlapping(
+                    libc::CMSG_DATA(cmsg),
+                    (&raw mut raw_fd).cast::<u8>(),
+                    std::mem::size_of::<i32>(),
+                );
+                if raw_fd >= 0 {
+                    fd = Some(OwnedFd::from_raw_fd(raw_fd));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+    Ok((received as usize, fd))
+}
+
+pub struct NetworkAttachment {
+    pub fd: OwnedFd,
+    pub ip: Ipv4Addr,
+    pub prefix: u8,
+    pub gateway: Ipv4Addr,
+}
+
+/// Asks the ingress daemon for a routable network attachment. Returns
+/// Ok(None) when the daemon is not running or has no vmnet network, in
+/// which case the VM falls back to gvproxy NAT.
+pub fn request_network_attachment(
+    config: &Config,
+    instance: &str,
+) -> Result<Option<NetworkAttachment>> {
+    let Ok(mut stream) = UnixStream::connect(config.socket_path()) else {
+        return Ok(None);
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .context("set ingress attach timeout")?;
+    stream
+        .write_all(
+            format!("POST /network/attach?instance={instance} HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .as_bytes(),
+        )
+        .context("send ingress attach request")?;
+    let mut buf = vec![0u8; 4096];
+    let (received, fd) = recv_bytes_with_fd(&stream, &mut buf).context("read ingress attach")?;
+    let mut response = buf[..received].to_vec();
+    let mut rest = Vec::new();
+    if stream.read_to_end(&mut rest).is_ok() {
+        response.extend_from_slice(&rest);
+    }
+    let response = String::from_utf8_lossy(&response).into_owned();
+    if !response.starts_with("HTTP/1.1 200") {
+        return Ok(None);
+    }
+    let Some(fd) = fd else {
+        return Ok(None);
+    };
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
+    let ip: Ipv4Addr = json_field(body, "ip")
+        .context("attach response missing ip")?
+        .parse()
+        .context("parse attach ip")?;
+    let gateway: Ipv4Addr = json_field(body, "gateway")
+        .context("attach response missing gateway")?
+        .parse()
+        .context("parse attach gateway")?;
+    let prefix: u8 = json_number_field(body, "prefix")
+        .context("attach response missing prefix")?
+        .parse()
+        .context("parse attach prefix")?;
+    Ok(Some(NetworkAttachment {
+        fd,
+        ip,
+        prefix,
+        gateway,
+    }))
+}
+
 fn run_daemon(config: Config) -> Result<()> {
     fs::create_dir_all(&config.state_dir)
         .with_context(|| format!("create {}", config.state_dir.display()))?;
@@ -526,14 +844,17 @@ fn run_daemon(config: Config) -> Result<()> {
         .set_nonblocking(true)
         .context("set ingress admin nonblocking")?;
 
+    let network = NetworkService::start(&config);
+
     let stop = Arc::new(AtomicBool::new(false));
     let dns_stop = Arc::clone(&stop);
     let dns_domain = config.domain.clone();
-    thread::spawn(move || serve_dns(dns, dns_domain, dns_stop));
+    let dns_network = Arc::clone(&network);
+    thread::spawn(move || serve_dns(dns, dns_domain, dns_stop, dns_network));
 
     while !stop.load(Ordering::SeqCst) {
         match admin.accept() {
-            Ok((stream, _)) => handle_admin(stream, &config, Arc::clone(&stop)),
+            Ok((stream, _)) => handle_admin(stream, &config, Arc::clone(&stop), &network),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => break,
         }
@@ -594,21 +915,48 @@ fn listen_admin(path: &PathBuf) -> Result<UnixListener> {
     Ok(listener)
 }
 
-fn handle_admin(mut stream: UnixStream, config: &Config, stop: Arc<AtomicBool>) {
+fn handle_admin(
+    mut stream: UnixStream,
+    config: &Config,
+    stop: Arc<AtomicBool>,
+    network: &Arc<NetworkService>,
+) {
     let mut buf = [0u8; 512];
     let n = stream.read(&mut buf).unwrap_or(0);
     let request = String::from_utf8_lossy(&buf[..n]);
     if request.starts_with("GET /status ") {
         let body = format!(
-            "{{\"enabled\":true,\"domain\":\"{}\",\"dns_addr\":\"{}\",\"http_addr\":\"{}\",\"https_addr\":\"{}\",\"resolver_path\":\"{}\",\"pid\":{}}}",
+            "{{\"enabled\":true,\"domain\":\"{}\",\"dns_addr\":\"{}\",\"http_addr\":\"{}\",\"https_addr\":\"{}\",\"resolver_path\":\"{}\",\"network\":{},\"pid\":{}}}",
             config.domain,
             config.dns_addr,
             config.http_addr,
             config.https_addr,
             config.resolver_path().display(),
+            network.subnet_json(),
             std::process::id()
         );
         let _ = write_http_response(&mut stream, "200 OK", "application/json", body.as_bytes());
+    } else if let Some(instance) = attach_instance_from_request(&request) {
+        match network.attach(&instance) {
+            Ok((fd, info)) => {
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\r\n{{\"ip\":\"{}\",\"prefix\":{},\"gateway\":\"{}\"}}",
+                    info.ip, info.prefix, info.gateway
+                );
+                if let Err(e) = send_bytes_with_fd(&stream, response.as_bytes(), fd.as_fd()) {
+                    eprintln!("network attach reply for {instance} failed: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("network attach for {instance} failed: {e:#}");
+                let _ = write_http_response(
+                    &mut stream,
+                    "503 Service Unavailable",
+                    "text/plain",
+                    format!("{e:#}\n").as_bytes(),
+                );
+            }
+        }
     } else if request.starts_with("POST /stop ") {
         stop.store(true, Ordering::SeqCst);
         let _ = write_http_response(&mut stream, "204 No Content", "text/plain", b"");
@@ -627,6 +975,7 @@ fn status(config: &Config) -> Result<Status> {
         https_addr: json_field(body, "https_addr").unwrap_or_else(|| config.https_addr.clone()),
         resolver_path: json_field(body, "resolver_path")
             .unwrap_or_else(|| config.resolver_path().display().to_string()),
+        network: json_field(body, "network"),
     })
 }
 
@@ -669,6 +1018,13 @@ fn json_field(body: &str, field: &str) -> Option<String> {
     let needle = format!("\"{field}\":\"");
     let rest = body.split(&needle).nth(1)?;
     Some(rest.split('"').next()?.to_string())
+}
+
+fn json_number_field(body: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\":");
+    let rest = body.split(&needle).nth(1)?;
+    let value: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    (!value.is_empty()).then_some(value)
 }
 
 fn ensure_ca(config: &Config) -> Result<()> {
@@ -1371,12 +1727,12 @@ fn strip_optional_port(host: &str) -> &str {
         .unwrap_or(host)
 }
 
-fn serve_dns(socket: UdpSocket, domain: String, stop: Arc<AtomicBool>) {
+fn serve_dns(socket: UdpSocket, domain: String, stop: Arc<AtomicBool>, network: Arc<NetworkService>) {
     let mut buf = [0u8; 1500];
     while !stop.load(Ordering::SeqCst) {
         match socket.recv_from(&mut buf) {
             Ok((n, addr)) => {
-                if let Some(response) = dns_response(&buf[..n], &domain) {
+                if let Some(response) = dns_response(&buf[..n], &domain, &network.instance_ips()) {
                     let _ = socket.send_to(&response, addr);
                 }
             }
@@ -1390,7 +1746,23 @@ fn serve_dns(socket: UdpSocket, domain: String, stop: Arc<AtomicBool>) {
     }
 }
 
-fn dns_response(packet: &[u8], domain: &str) -> Option<Vec<u8>> {
+/// The instance name for a bare `<instance>.<domain>` host, which resolves
+/// to the instance's routable address when one is allocated. Port-labeled
+/// `p<port>-<instance>` hosts keep resolving to the local ingress proxy.
+fn instance_from_host(host: &str, domain: &str) -> Option<String> {
+    let host = strip_optional_port(host)
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let suffix = format!(".{}", domain.to_ascii_lowercase());
+    let name = host.strip_suffix(&suffix)?;
+    (!name.is_empty() && !name.contains('.')).then(|| name.to_string())
+}
+
+fn dns_response(
+    packet: &[u8],
+    domain: &str,
+    instance_ips: &HashMap<String, Ipv4Addr>,
+) -> Option<Vec<u8>> {
     if packet.len() < 12 {
         return None;
     }
@@ -1411,23 +1783,33 @@ fn dns_response(packet: &[u8], domain: &str) -> Option<Vec<u8>> {
     let qtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
     let qclass = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]);
     let name = labels.join(".");
-    let valid = parse_host(&name, domain).is_ok() && qtype == 1 && qclass == 1;
+    let answer = if parse_host(&name, domain).is_ok() {
+        Some(Ipv4Addr::LOCALHOST)
+    } else {
+        instance_from_host(&name, domain)
+            .and_then(|instance| instance_ips.get(&instance).copied())
+    };
+    let answer = answer.filter(|_| qtype == 1 && qclass == 1);
 
     let mut response = Vec::new();
     response.extend_from_slice(&packet[0..2]);
-    response.extend_from_slice(if valid { &[0x84, 0x00] } else { &[0x84, 0x03] });
+    response.extend_from_slice(if answer.is_some() {
+        &[0x84, 0x00]
+    } else {
+        &[0x84, 0x03]
+    });
     response.extend_from_slice(&1u16.to_be_bytes());
-    response.extend_from_slice(&(if valid { 1u16 } else { 0u16 }).to_be_bytes());
+    response.extend_from_slice(&(if answer.is_some() { 1u16 } else { 0u16 }).to_be_bytes());
     response.extend_from_slice(&0u16.to_be_bytes());
     response.extend_from_slice(&0u16.to_be_bytes());
     response.extend_from_slice(question);
-    if valid {
+    if let Some(answer) = answer {
         response.extend_from_slice(&[0xc0, 0x0c]);
         response.extend_from_slice(&1u16.to_be_bytes());
         response.extend_from_slice(&1u16.to_be_bytes());
         response.extend_from_slice(&1u32.to_be_bytes());
         response.extend_from_slice(&4u16.to_be_bytes());
-        response.extend_from_slice(&[127, 0, 0, 1]);
+        response.extend_from_slice(&answer.octets());
     }
     Some(response)
 }
@@ -1450,6 +1832,76 @@ mod tests {
         assert!(parse_host("8080-dev.lnx", "lnx").is_err());
         assert!(parse_host("p8080.lnx", "lnx").is_err());
         assert!(parse_host("p8080.dev.lnx", "lnx").is_err());
+    }
+
+    #[test]
+    fn extracts_instance_from_bare_hosts() {
+        assert_eq!(instance_from_host("dev.lnx", "lnx"), Some("dev".to_string()));
+        assert_eq!(
+            instance_from_host("Dev.LNX:443", "lnx"),
+            Some("dev".to_string())
+        );
+        assert_eq!(instance_from_host("a.dev.lnx", "lnx"), None);
+        assert_eq!(instance_from_host(".lnx", "lnx"), None);
+        assert_eq!(instance_from_host("dev.local", "lnx"), None);
+    }
+
+    #[test]
+    fn parses_attach_requests() {
+        assert_eq!(
+            attach_instance_from_request(
+                "POST /network/attach?instance=dev-1 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            ),
+            Some("dev-1".to_string())
+        );
+        assert_eq!(
+            attach_instance_from_request("POST /network/attach?instance= HTTP/1.1\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            attach_instance_from_request("POST /network/attach?instance=../etc HTTP/1.1\r\n\r\n"),
+            None
+        );
+        assert_eq!(attach_instance_from_request("GET /status HTTP/1.1\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn parses_json_number_fields() {
+        assert_eq!(
+            json_number_field("{\"prefix\":24,\"x\":\"y\"}", "prefix"),
+            Some("24".to_string())
+        );
+        assert_eq!(json_number_field("{\"prefix\":\"24\"}", "prefix"), None);
+        assert_eq!(json_number_field("{}", "prefix"), None);
+    }
+
+    fn dns_query(host: &str) -> Vec<u8> {
+        let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        for label in host.split('.') {
+            packet.push(label.len() as u8);
+            packet.extend_from_slice(label.as_bytes());
+        }
+        packet.push(0);
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn dns_answers_port_hosts_with_localhost_and_instances_with_their_ip() {
+        let mut ips = HashMap::new();
+        ips.insert("dev".to_string(), Ipv4Addr::new(192, 168, 106, 2));
+
+        let response = dns_response(&dns_query("p8080-dev.lnx"), "lnx", &ips).expect("response");
+        assert_eq!(&response[response.len() - 4..], &[127, 0, 0, 1]);
+
+        let response = dns_response(&dns_query("dev.lnx"), "lnx", &ips).expect("response");
+        assert_eq!(&response[response.len() - 4..], &[192, 168, 106, 2]);
+
+        // NXDOMAIN: rcode 3, no answer records.
+        let response = dns_response(&dns_query("other.lnx"), "lnx", &ips).expect("response");
+        assert_eq!(response[3], 0x03);
+        assert_eq!(&response[6..8], &[0, 0]);
     }
 
     #[test]
