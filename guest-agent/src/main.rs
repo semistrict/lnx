@@ -541,12 +541,126 @@ WantedBy=multi-user.target\n";
 
     configure_network();
 
-    let init = cstr(b"/sbin/init\0");
-    let argv = [init, ptr::null()];
-    unsafe {
-        execvp(init, argv.as_ptr());
+    match detect_image_init() {
+        // systemd reads the unit installed above and supervises the agent.
+        Some(init) if init_is_systemd(&init) => exec_init(&init),
+        Some(init) => {
+            log(&format!("image init {init} is not systemd; supervising agent directly"));
+            spawn_agent_supervisor();
+            exec_init(&init)
+        }
+        None => {
+            log("image ships no init; lnx-agent stays pid 1");
+            run_pid1_supervisor()
+        }
     }
-    die("exec /sbin/init")
+}
+
+fn detect_image_init() -> Option<String> {
+    ["/sbin/init", "/usr/sbin/init", "/etc/init", "/bin/init"]
+        .into_iter()
+        .find(|path| fs::metadata(path).is_ok())
+        .map(str::to_string)
+}
+
+fn init_is_systemd(init: &str) -> bool {
+    let mut path = std::path::PathBuf::from(init);
+    for _ in 0..8 {
+        match fs::read_link(&path) {
+            Ok(target) if target.is_absolute() => path = target,
+            Ok(target) => {
+                path = path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("/"))
+                    .join(target)
+            }
+            Err(_) => break,
+        }
+    }
+    path.file_name().is_some_and(|name| name == "systemd")
+}
+
+fn exec_init(init: &str) -> ! {
+    let init = CString::new(init).unwrap();
+    let argv = [init.as_ptr(), ptr::null()];
+    unsafe {
+        execvp(init.as_ptr(), argv.as_ptr());
+    }
+    die("exec image init")
+}
+
+fn exec_agent_service() -> ! {
+    unsafe {
+        setenv(
+            cstr(b"LNX_CONTROL_SOCKET\0"),
+            cstr(b"/run/lnx-agent.sock\0"),
+            1,
+        );
+    }
+    let agent = cstr(b"/run/lnx/lnx-agent\0");
+    let argv = [agent, cstr(b"--agent\0"), cstr(b"10240\0"), ptr::null()];
+    unsafe {
+        execvp(agent, argv.as_ptr());
+        _exit(125)
+    }
+}
+
+fn spawn_agent_child() -> c_int {
+    let pid = unsafe { fork() };
+    if pid == 0 {
+        exec_agent_service();
+    }
+    pid
+}
+
+/// For images whose init will not start the agent for us: keep an agent
+/// running from a supervisor forked off pid 1. The supervisor is inherited by
+/// the image init when we exec it.
+fn spawn_agent_supervisor() {
+    let pid = unsafe { fork() };
+    if pid < 0 {
+        die("fork agent supervisor");
+    }
+    if pid > 0 {
+        return;
+    }
+    unsafe {
+        setsid();
+    }
+    loop {
+        let agent = spawn_agent_child();
+        if agent > 0 {
+            let mut status = 0;
+            unsafe {
+                waitpid(agent, &mut status, 0);
+            }
+            log(&format!(
+                "agent exited status={}; restarting",
+                exit_status(status)
+            ));
+        }
+        unsafe {
+            usleep(1_000_000);
+        }
+    }
+}
+
+/// For images with no init at all (plain container images): stay pid 1,
+/// reap every orphan, and keep the agent alive as our child. Exec channels
+/// are children of the agent process, so reaping here cannot steal their
+/// exit statuses.
+fn run_pid1_supervisor() -> ! {
+    let mut agent = spawn_agent_child();
+    loop {
+        let mut status = 0;
+        let pid = unsafe { waitpid(-1, &mut status, 0) };
+        if pid == agent || (pid < 0 && errno() == ECHILD) {
+            unsafe {
+                usleep(1_000_000);
+            }
+            agent = spawn_agent_child();
+        }
+    }
 }
 
 fn connect_vsock(port: u32) -> c_int {
@@ -1048,6 +1162,15 @@ fn push_env(storage: &mut Vec<CString>, name: &str, value: &str) {
     }
 }
 
+/// An empty argv asks for a login shell; resolve it from the exec user's
+/// passwd entry so images without bash still get their own shell.
+fn resolve_login_shell(argv: Vec<String>, uid: u32) -> Vec<String> {
+    if !argv.is_empty() {
+        return argv;
+    }
+    vec![user::login_shell_for_uid(uid), "-l".to_string()]
+}
+
 fn make_exec_paths(argv0: &str) -> Vec<CString> {
     if argv0.contains('/') {
         return CString::new(argv0)
@@ -1227,6 +1350,7 @@ fn run_channel_pty(
 ) {
     ensure_exec_user(uid, gid, &group);
     allow_nested_kvm_for_exec_user();
+    let argv = resolve_login_shell(argv, uid);
     let mut pty_master = -1;
     let mut pty_slave = -1;
     let control_socket = channel_control_socket(channel_id);
@@ -1441,6 +1565,7 @@ fn run_channel_pipe(
 ) {
     ensure_exec_user(uid, gid, &group);
     allow_nested_kvm_for_exec_user();
+    let argv = resolve_login_shell(argv, uid);
     let control_socket = channel_control_socket(channel_id);
     let child_exec = make_child_exec(&argv, &cwd, &env, channel_id, &control_socket);
     let mut stdin_pipe = [-1; 2];

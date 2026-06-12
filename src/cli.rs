@@ -544,11 +544,8 @@ fn run_guest(
         snapshot_path.is_some(),
     )?;
 
-    let command = if command.is_empty() {
-        vec!["bash".to_string(), "-l".to_string()]
-    } else {
-        command
-    };
+    // An empty command means "login shell"; the agent resolves which shell
+    // the image actually ships.
     if command.first().map(String::as_str) == Some("cp")
         && command.iter().any(|arg| is_host_path(arg))
     {

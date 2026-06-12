@@ -7,6 +7,46 @@ use std::process::Command;
 pub const EXEC_USER: &str = "lnxuser";
 pub const EXEC_HOME: &str = "/home/lnxuser";
 
+/// The image's preferred login shell, the way adduser/useradd would pick it:
+/// Debian's adduser.conf DSHELL, then useradd's SHELL default, then bash if
+/// the image ships it, then /bin/sh.
+pub fn default_image_shell() -> String {
+    for (path, key) in [
+        ("/etc/adduser.conf", "DSHELL="),
+        ("/etc/default/useradd", "SHELL="),
+    ] {
+        if let Some(shell) = shell_from_config(path, key) {
+            return shell;
+        }
+    }
+    if fs::metadata("/bin/bash").is_ok() {
+        return "/bin/bash".to_string();
+    }
+    "/bin/sh".to_string()
+}
+
+fn shell_from_config(path: &str, key: &str) -> Option<String> {
+    fs::read_to_string(path).ok()?.lines().find_map(|line| {
+        let shell = line.trim().strip_prefix(key)?.trim_matches('"');
+        (shell.starts_with('/') && fs::metadata(shell).is_ok()).then(|| shell.to_string())
+    })
+}
+
+/// Login shell for a uid per /etc/passwd, falling back to the image default.
+pub fn login_shell_for_uid(uid: u32) -> String {
+    let uid = uid.to_string();
+    fs::read_to_string("/etc/passwd")
+        .ok()
+        .and_then(|passwd| {
+            passwd.lines().find_map(|line| {
+                let fields = line.split(':').collect::<Vec<_>>();
+                (fields.len() >= 7 && fields[2] == uid && !fields[6].is_empty())
+                    .then(|| fields[6].to_string())
+            })
+        })
+        .unwrap_or_else(default_image_shell)
+}
+
 unsafe extern "C" {
     fn chown(path: *const c_char, owner: c_uint, group: c_uint) -> c_int;
 }
@@ -17,10 +57,11 @@ pub fn ensure_exec_user(uid: u32, gid: u32, group: &str) {
     }
     ensure_exec_group(gid, group);
     if !file_contains_line_prefix("/etc/passwd", "lnxuser:") {
-        if !create_exec_user_with_useradd(uid, gid) {
+        let shell = default_image_shell();
+        if !create_exec_user_with_useradd(uid, gid, &shell) {
             append_file(
                 "/etc/passwd",
-                &format!("{EXEC_USER}:x:{uid}:{gid}::/home/{EXEC_USER}:/bin/bash\n"),
+                &format!("{EXEC_USER}:x:{uid}:{gid}::/home/{EXEC_USER}:{shell}\n"),
             );
             if !file_contains_line_prefix("/etc/shadow", "lnxuser:") {
                 append_file("/etc/shadow", &format!("{EXEC_USER}:!::0:99999:7:::\n"));
@@ -115,7 +156,7 @@ fn rename_group_entry(old: &str, new: &str) {
     let _ = fs::write("/etc/group", renamed + "\n");
 }
 
-fn create_exec_user_with_useradd(uid: u32, gid: u32) -> bool {
+fn create_exec_user_with_useradd(uid: u32, gid: u32, shell: &str) -> bool {
     let _ = Command::new("/usr/sbin/groupadd")
         .arg("-g")
         .arg(gid.to_string())
@@ -126,7 +167,7 @@ fn create_exec_user_with_useradd(uid: u32, gid: u32) -> bool {
         .arg("-d")
         .arg(EXEC_HOME)
         .arg("-s")
-        .arg("/bin/bash")
+        .arg(shell)
         .arg("-u")
         .arg(uid.to_string())
         .arg("-g")
