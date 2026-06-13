@@ -15,6 +15,11 @@ try {
     assertEq(shape.stdout, "systemd\n/\nprivate\nclean", "stock root handoff");
   });
 
+  await testStep("stock exec user uses Ubuntu login shell", async () => {
+    const shell = await lnx(ctx, ["bash", "-lc", 'grep "^lnxuser:" /etc/passwd | cut -d: -f7']);
+    assertEq(shell.stdout, "/bin/bash", "stock lnxuser login shell");
+  });
+
   await testStep("apt works", async () => {
     await lnx(ctx, ["sudo", "apt-get", "update"], { timeoutMs: 300_000 });
     const ruby = await lnx(ctx, ["bash", "-lc", "apt-cache policy ruby | sed -n '1,6p'"]);

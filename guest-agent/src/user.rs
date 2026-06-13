@@ -8,16 +8,14 @@ pub const EXEC_USER: &str = "lnxuser";
 pub const EXEC_HOME: &str = "/home/lnxuser";
 
 /// The image's preferred login shell, the way adduser/useradd would pick it:
-/// Debian's adduser.conf DSHELL, then useradd's SHELL default, then bash if
-/// the image ships it, then /bin/sh.
+/// Debian's adduser.conf DSHELL, then adduser's documented default, then
+/// useradd's SHELL default, then bash if the image ships it, then /bin/sh.
 pub fn default_image_shell() -> String {
-    for (path, key) in [
-        ("/etc/adduser.conf", "DSHELL="),
-        ("/etc/default/useradd", "SHELL="),
-    ] {
-        if let Some(shell) = shell_from_config(path, key) {
-            return shell;
-        }
+    if let Some(shell) = adduser_shell_from_config("/etc/adduser.conf") {
+        return shell;
+    }
+    if let Some(shell) = shell_from_config("/etc/default/useradd", "SHELL=") {
+        return shell;
     }
     if fs::metadata("/bin/bash").is_ok() {
         return "/bin/bash".to_string();
@@ -25,11 +23,34 @@ pub fn default_image_shell() -> String {
     "/bin/sh".to_string()
 }
 
-fn shell_from_config(path: &str, key: &str) -> Option<String> {
-    fs::read_to_string(path).ok()?.lines().find_map(|line| {
-        let shell = line.trim().strip_prefix(key)?.trim_matches('"');
-        (shell.starts_with('/') && fs::metadata(shell).is_ok()).then(|| shell.to_string())
+fn adduser_shell_from_config(path: &str) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    adduser_shell_from_config_contents(&contents)
+}
+
+fn adduser_shell_from_config_contents(contents: &str) -> Option<String> {
+    shell_from_config_contents(contents, "DSHELL=").or_else(|| {
+        contents.lines().find_map(|line| {
+            let line = line.trim().strip_prefix('#')?.trim();
+            let default = line.strip_prefix("Default:")?.trim();
+            shell_from_config_line(default, "DSHELL=")
+        })
     })
+}
+
+fn shell_from_config(path: &str, key: &str) -> Option<String> {
+    shell_from_config_contents(&fs::read_to_string(path).ok()?, key)
+}
+
+fn shell_from_config_contents(contents: &str, key: &str) -> Option<String> {
+    contents
+        .lines()
+        .find_map(|line| shell_from_config_line(line.trim(), key))
+}
+
+fn shell_from_config_line(line: &str, key: &str) -> Option<String> {
+    let shell = line.strip_prefix(key)?.trim_matches('"');
+    (shell.starts_with('/') && fs::metadata(shell).is_ok()).then(|| shell.to_string())
 }
 
 /// Login shell for a uid per /etc/passwd, falling back to the image default.
@@ -56,8 +77,8 @@ pub fn ensure_exec_user(uid: u32, gid: u32, group: &str) {
         return;
     }
     ensure_exec_group(gid, group);
+    let shell = default_image_shell();
     if !file_contains_line_prefix("/etc/passwd", "lnxuser:") {
-        let shell = default_image_shell();
         if !create_exec_user_with_useradd(uid, gid, &shell) {
             append_file(
                 "/etc/passwd",
@@ -71,6 +92,8 @@ pub fn ensure_exec_user(uid: u32, gid: u32, group: &str) {
             }
             let _ = fs::create_dir_all(EXEC_HOME);
         }
+    } else {
+        ensure_exec_user_shell(&shell);
     }
     ensure_exec_user_skel(uid, gid);
     let _ = fs::create_dir_all("/etc/sudoers.d");
@@ -79,6 +102,51 @@ pub fn ensure_exec_user(uid: u32, gid: u32, group: &str) {
         format!("{EXEC_USER} ALL=(ALL) NOPASSWD: ALL\n"),
     );
     let _ = fs::set_permissions("/etc/sudoers.d/lnx", fs::Permissions::from_mode(0o440));
+}
+
+fn ensure_exec_user_shell(shell: &str) {
+    if passwd_shell_for_user(EXEC_USER).as_deref() == Some(shell) {
+        return;
+    }
+    let changed = Command::new("/usr/sbin/usermod")
+        .arg("-s")
+        .arg(shell)
+        .arg(EXEC_USER)
+        .status()
+        .is_ok_and(|status| status.success());
+    if !changed {
+        rewrite_passwd_shell(EXEC_USER, shell);
+    }
+}
+
+fn passwd_shell_for_user(user: &str) -> Option<String> {
+    fs::read_to_string("/etc/passwd")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let fields = line.split(':').collect::<Vec<_>>();
+            (fields.len() >= 7 && fields[0] == user).then(|| fields[6].to_string())
+        })
+}
+
+fn rewrite_passwd_shell(user: &str, shell: &str) {
+    let Ok(contents) = fs::read_to_string("/etc/passwd") else {
+        return;
+    };
+    let rewritten = contents
+        .lines()
+        .map(|line| {
+            let mut fields = line.split(':').collect::<Vec<_>>();
+            if fields.len() >= 7 && fields[0] == user {
+                fields[6] = shell;
+                fields.join(":")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = fs::write("/etc/passwd", rewritten + "\n");
 }
 
 /// Make the guest's group for `gid` carry the host's name for it, so shared
@@ -129,12 +197,15 @@ fn is_portable_group_name(name: &str) -> bool {
 
 fn group_name_for_gid(gid: u32) -> Option<String> {
     let gid = gid.to_string();
-    fs::read_to_string("/etc/group").ok()?.lines().find_map(|line| {
-        let mut fields = line.split(':');
-        let name = fields.next()?;
-        let _password = fields.next()?;
-        (fields.next()? == gid).then(|| name.to_string())
-    })
+    fs::read_to_string("/etc/group")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split(':');
+            let name = fields.next()?;
+            let _password = fields.next()?;
+            (fields.next()? == gid).then(|| name.to_string())
+        })
 }
 
 fn rename_group_entry(old: &str, new: &str) {
@@ -206,5 +277,37 @@ fn chown_path(path: &str, uid: u32, gid: u32) {
         unsafe {
             chown(path.as_ptr(), uid, gid);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adduser_shell_uses_active_dshell() {
+        assert_eq!(
+            adduser_shell_from_config_contents(
+                r#"
+# Default: DSHELL=/bin/bash
+DSHELL=/bin/sh
+"#,
+            ),
+            Some("/bin/sh".to_string())
+        );
+    }
+
+    #[test]
+    fn adduser_shell_uses_documented_default() {
+        assert_eq!(
+            adduser_shell_from_config_contents(
+                r#"
+# The DSHELL variable specifies the default login shell.
+# Default: DSHELL=/bin/bash
+#DSHELL=/bin/bash
+"#,
+            ),
+            Some("/bin/bash".to_string())
+        );
     }
 }
