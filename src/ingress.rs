@@ -42,6 +42,7 @@ const CA_COMMON_NAME: &str = "lnx local ingress CA";
 const SERVICE_LABEL: &str = "com.semistrict.lnx.ingress";
 const LAUNCH_DAEMON_PATH: &str = "/Library/LaunchDaemons/com.semistrict.lnx.ingress.plist";
 const LAUNCH_AGENT_NAME: &str = "com.semistrict.lnx.ingress.plist";
+const CHROME_DEVTOOLS_PORT: u16 = 9222;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -77,14 +78,7 @@ pub fn load_config() -> Result<Config> {
 }
 
 pub fn enable(config: &Config) -> Result<()> {
-    if status(config).is_ok_and(|status| status.https_addr == config.https_addr)
-        && service_loaded(config)
-        && config.ca_cert_path().exists()
-    {
-        println!("ingress enabled for .{}", config.domain);
-        return Ok(());
-    }
-    ensure_ca(config)?;
+    regenerate_ca(config)?;
     println!("writing {}", config.resolver_path().display());
     println!("starting dns on {}", config.dns_addr);
     println!("starting http on {}", config.http_addr);
@@ -299,7 +293,7 @@ fn ensure_user_owned_lnx_dirs(config: &Config) {
     chown_to_ingress_user(&config.state_dir);
     if let Some(base) = config.state_dir.parent() {
         chown_to_ingress_user(base);
-        for name in ["instances", "images"] {
+        for name in ["instances", "cache"] {
             let path = base.join(name);
             if fs::create_dir_all(&path).is_ok() {
                 chown_to_ingress_user(&path);
@@ -337,7 +331,11 @@ fn start_helper(config: &Config, args: &[&str]) -> Result<()> {
         Command::new(exe)
     };
     command.args(args);
-    command.status().context("start ingress helper")?;
+    let debug = format!("{command:?}");
+    let status = command.status().context("start ingress helper")?;
+    if !status.success() {
+        bail!("{debug} failed with {status}");
+    }
     Ok(())
 }
 
@@ -347,16 +345,23 @@ fn install_service(config: &Config) -> Result<()> {
     ensure_user_owned_lnx_dirs(config);
     ensure_ca(config)?;
     if config.requires_privileged_service() {
+        eprintln!("trusting local CA in System keychain");
         trust_ca(config)?;
     }
     if let Some(parent) = config.launchd_path().parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     if stop(config).is_ok() {
+        eprintln!("stopping existing ingress daemon");
         let _ = wait_for_stop(config, Duration::from_secs(5));
     }
+    eprintln!(
+        "writing launchd service {}",
+        config.launchd_path().display()
+    );
     fs::write(config.launchd_path(), launchd_plist(config)?)
         .with_context(|| format!("write {}", config.launchd_path().display()))?;
+    eprintln!("bootstrapping launchd service {}", SERVICE_LABEL);
     unload_service(config);
     run_launchctl(&[
         "bootstrap",
@@ -365,6 +370,7 @@ fn install_service(config: &Config) -> Result<()> {
     ])
     .context("bootstrap ingress launchd service")?;
     let target = format!("{}/{}", config.launchd_domain(), SERVICE_LABEL);
+    eprintln!("starting launchd service {target}");
     let _ = run_launchctl(&["kickstart", "-k", &target]);
     Ok(())
 }
@@ -387,11 +393,6 @@ fn unload_service(config: &Config) {
     ]);
     let target = format!("{}/{}", config.launchd_domain(), SERVICE_LABEL);
     let _ = run_launchctl_quiet(&["bootout", &target]);
-}
-
-fn service_loaded(config: &Config) -> bool {
-    let target = format!("{}/{}", config.launchd_domain(), SERVICE_LABEL);
-    run_launchctl_quiet(&["print", &target]).is_ok()
 }
 
 fn run_launchctl(args: &[&str]) -> Result<()> {
@@ -1225,6 +1226,25 @@ fn ensure_ca(config: &Config) -> Result<()> {
     if config.ca_cert_path().exists() && config.ca_key_path().exists() {
         return Ok(());
     }
+    generate_ca(config)
+}
+
+fn regenerate_ca(config: &Config) -> Result<()> {
+    if config.ca_dir().exists() {
+        fs::remove_dir_all(config.ca_dir())
+            .with_context(|| format!("remove {}", config.ca_dir().display()))?;
+    }
+    if config.cert_dir().exists() {
+        fs::remove_dir_all(config.cert_dir())
+            .with_context(|| format!("remove {}", config.cert_dir().display()))?;
+    }
+    fs::create_dir_all(config.ca_dir())
+        .with_context(|| format!("create {}", config.ca_dir().display()))?;
+    chown_to_ingress_user(&config.ca_dir());
+    generate_ca(config)
+}
+
+fn generate_ca(config: &Config) -> Result<()> {
     let key = config.ca_key_path();
     let cert = config.ca_cert_path();
     run_command(
@@ -1261,12 +1281,6 @@ fn trust_ca(config: &Config) -> Result<()> {
     if !cfg!(target_os = "macos") {
         return Ok(());
     }
-    // Trusting the CA opens a Security auth dialog; skip it when the CA is
-    // already in the System keychain so repeated enable/disable cycles don't
-    // re-prompt. The CA is stable once generated, so present means trusted.
-    if ca_already_trusted() {
-        return Ok(());
-    }
     run_command(
         Command::new("security")
             .arg("add-trusted-cert")
@@ -1278,19 +1292,6 @@ fn trust_ca(config: &Config) -> Result<()> {
             .arg(config.ca_cert_path()),
     )
     .context("trust ingress CA")
-}
-
-fn ca_already_trusted() -> bool {
-    Command::new("security")
-        .arg("find-certificate")
-        .arg("-c")
-        .arg(CA_COMMON_NAME)
-        .arg("/Library/Keychains/System.keychain")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
 }
 
 // Retained for an explicit teardown; normal disable leaves the CA trusted.
@@ -1489,6 +1490,7 @@ fn handle_https(
         flush_tls(&mut conn, &mut stream)?;
         return Ok(());
     };
+    let request = rewrite_proxy_request_host(request, route.port);
     flush_tls(&mut conn, &mut stream)?;
     proxy_tls_to_guest(stream, conn, &broker_socket, request, route.port)
 }
@@ -1502,7 +1504,7 @@ fn proxy_tls_to_guest(
 ) -> Result<()> {
     let first_response_deadline = Instant::now() + Duration::from_secs(5);
     let (mut broker, channel_id, first_bytes) = 'connect: loop {
-        let mut broker = runner::connect_broker(broker_socket)?;
+        let mut broker = connect_broker_retry(broker_socket, first_response_deadline)?;
         let channel_id = runner::new_request_id()?;
         runner::write_message(
             &mut broker,
@@ -1608,6 +1610,23 @@ fn proxy_tls_to_guest(
     }
 }
 
+fn connect_broker_retry(socket: &Path, deadline: Instant) -> Result<UnixStream> {
+    let mut last = None;
+    while Instant::now() < deadline {
+        match runner::connect_broker(socket) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                last = Some(e);
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+    match last {
+        Some(e) => Err(e),
+        None => bail!("timed out connecting to broker"),
+    }
+}
+
 fn flush_tls(conn: &mut ServerConnection, stream: &mut TcpStream) -> Result<()> {
     while conn.wants_write() {
         conn.write_tls(stream).context("write tls")?;
@@ -1662,7 +1681,46 @@ fn handle_http(mut stream: TcpStream, config: Config) -> Result<()> {
     let Some((broker_socket, route)) = route_http_host(&mut stream, &host, &config)? else {
         return Ok(());
     };
+    let request = rewrite_proxy_request_host(request, route.port);
     runner::proxy_stream_to_guest(&broker_socket, stream, request, "127.0.0.1", route.port)
+}
+
+fn rewrite_proxy_request_host(request: Vec<u8>, guest_port: u16) -> Vec<u8> {
+    if guest_port != CHROME_DEVTOOLS_PORT {
+        return request;
+    }
+    rewrite_http_host_header(request, &format!("127.0.0.1:{guest_port}"))
+}
+
+fn rewrite_http_host_header(request: Vec<u8>, host: &str) -> Vec<u8> {
+    let Some(headers_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return request;
+    };
+
+    let mut line_start = 0;
+    while line_start < headers_end {
+        let Some(line_len) = request[line_start..headers_end]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+        else {
+            return request;
+        };
+        let line_end = line_start + line_len;
+        if line_end >= line_start + 5
+            && request[line_start..line_start + 5].eq_ignore_ascii_case(b"Host:")
+        {
+            let mut rewritten =
+                Vec::with_capacity(request.len() + host.len().saturating_sub(line_len));
+            rewritten.extend_from_slice(&request[..line_start]);
+            rewritten.extend_from_slice(b"Host: ");
+            rewritten.extend_from_slice(host.as_bytes());
+            rewritten.extend_from_slice(&request[line_end..]);
+            return rewritten;
+        }
+        line_start = line_end + 2;
+    }
+
+    request
 }
 
 fn maybe_fork_and_redirect(
@@ -1709,7 +1767,7 @@ fn route_http_host(
 }
 
 fn ensure_instance_broker(instance: &str, broker_socket: &PathBuf, config: &Config) -> Result<()> {
-    if broker_accepts_connections(broker_socket) {
+    if broker_accepts_connections(broker_socket).is_ok() {
         return Ok(());
     }
     start_instance(instance, config)?;
@@ -1717,19 +1775,26 @@ fn ensure_instance_broker(instance: &str, broker_socket: &PathBuf, config: &Conf
         .with_context(|| format!("start lnx instance {instance}"))
 }
 
-fn broker_accepts_connections(broker_socket: &PathBuf) -> bool {
-    UnixStream::connect(broker_socket).is_ok()
+fn broker_accepts_connections(broker_socket: &PathBuf) -> Result<()> {
+    runner::connect_broker(broker_socket).map(|_| ())
 }
 
 fn wait_for_broker(broker_socket: &PathBuf, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
+    let mut last = None;
     while Instant::now() < deadline {
-        if broker_accepts_connections(broker_socket) {
-            return Ok(());
+        match broker_accepts_connections(broker_socket) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Some(e),
         }
         thread::sleep(Duration::from_millis(100));
     }
-    bail!("timed out waiting for {}", broker_socket.display())
+    match last {
+        Some(e) => {
+            Err(e).with_context(|| format!("timed out waiting for {}", broker_socket.display()))
+        }
+        None => bail!("timed out waiting for {}", broker_socket.display()),
+    }
 }
 
 fn start_instance(instance: &str, config: &Config) -> Result<()> {
@@ -1740,10 +1805,10 @@ fn start_instance(instance: &str, config: &Config) -> Result<()> {
         {
             command = Command::new("sudo");
             command.arg("-u").arg(user);
-            command.arg(format!(
-                "HOME={}",
-                std::env::var("HOME").unwrap_or_default()
-            ));
+            if let Ok(home) = std::env::var("HOME") {
+                command.arg(format!("HOME={home}"));
+                command.current_dir(home);
+            }
             command.arg(exe);
         } else {
             command = Command::new(exe);
@@ -1786,10 +1851,10 @@ fn fork_instance(source: &str, dest: &str, config: &Config) -> Result<()> {
         {
             command = Command::new("sudo");
             command.arg("-u").arg(user);
-            command.arg(format!(
-                "HOME={}",
-                std::env::var("HOME").unwrap_or_default()
-            ));
+            if let Ok(home) = std::env::var("HOME") {
+                command.arg(format!("HOME={home}"));
+                command.current_dir(home);
+            }
             command.arg(exe);
         } else {
             command = Command::new(exe);
@@ -2163,5 +2228,25 @@ mod tests {
             request_target(b"GET /vnc.html?lnx:fork=foo HTTP/1.1\r\nHost: p6080.bar.lnx\r\n\r\n"),
             Some("/vnc.html?lnx:fork=foo")
         );
+    }
+
+    #[test]
+    fn rewrites_chrome_devtools_host_header() {
+        let request =
+            b"GET /json/version HTTP/1.1\r\nHost: p9222-default.lnx\r\nConnection: close\r\n\r\n"
+                .to_vec();
+
+        assert_eq!(
+            rewrite_proxy_request_host(request, 9222),
+            b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:9222\r\nConnection: close\r\n\r\n"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn preserves_other_proxy_host_headers() {
+        let request = b"GET / HTTP/1.1\r\nHost: p6080-default.lnx\r\n\r\n".to_vec();
+
+        assert_eq!(rewrite_proxy_request_host(request.clone(), 6080), request);
     }
 }

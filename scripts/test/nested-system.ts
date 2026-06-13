@@ -24,7 +24,7 @@ try {
   });
 
   await testStep("basic exec and guest shape work on a Linux host", async () => {
-    assertEq((await lnxVm(["--no-snapshot-restore", "echo", "cold"])).stdout, "cold", "cold exec");
+    assertEq((await lnxVm(["echo", "cold"])).stdout, "cold", "cold exec");
     assertEq((await lnxVm(["run", "echo", "run-subcommand"])).stdout, "run-subcommand", "run subcommand exec");
     assertEq((await lnxVm(["cat"], { stdin: "stdin-ok" })).stdout, "stdin-ok", "non-pty stdin");
     assertEq((await lnxVm([], { stdin: "echo noargs-shell; exit\n" })).stdout, "noargs-shell", "default shell over stdin");

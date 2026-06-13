@@ -6,13 +6,13 @@ Bun.env.LNX_BROKER_IDLE_TTL_MS ??= "500";
 
 const ctx = defaultContext("snapshot-compat");
 const badSnapshot = join(ctx.tmpdir, "bad-memory-snapshot");
+const legacyCacheSnapshot = join(ctx.tmpdir, "legacy-cache-snapshot");
 
 try {
   await prepareContext(ctx);
 
   await testStep("create restorable baseline", async () => {
     await lnx(ctx, [
-      "--no-snapshot-restore",
       "bash",
       "-lc",
       "printf disk-from-snapshot | sudo tee /root/compat-disk >/dev/null; printf memory-from-snapshot | sudo tee /run/compat-memory >/dev/null",
@@ -44,6 +44,27 @@ try {
     assertEq(result.stdout, "disk-from-snapshot/", "mismatch skips memory restore while using requested snapshot rootfs");
     const log = await run(["bash", "-lc", `cat ${join(ctx.runDir, "lnx.log")}`]);
     assertContains(log.stdout, "snapshot.restore.skipped reason=config_mismatch", "config mismatch logged");
+  });
+
+  await testStep("legacy host-share cache policy stamp skips memory restore clearly", async () => {
+    await waitForVmSuspend(ctx);
+    await cp(join(ctx.snapshotDir, "latest"), legacyCacheSnapshot, { recursive: true });
+    const stampPath = join(legacyCacheSnapshot, "shares.stamp");
+    const currentStamp = await readFile(stampPath, "utf8");
+    await writeFile(stampPath, currentStamp.replace(/^host-share-cache=.*\n/, ""));
+
+    const result = await lnx(ctx, [
+      "--snapshot",
+      legacyCacheSnapshot,
+      "bash",
+      "-lc",
+      'disk="$(sudo cat /root/compat-disk 2>/dev/null || true)"; memory="$(sudo cat /run/compat-memory 2>/dev/null || true)"; printf "%s/%s" "$disk" "$memory"',
+    ], {
+      timeoutMs: 240_000,
+    });
+    assertEq(result.stdout, "disk-from-snapshot/", "legacy cache stamp skips memory restore while using requested snapshot rootfs");
+    const log = await run(["bash", "-lc", `cat ${join(ctx.runDir, "lnx.log")}`]);
+    assertContains(log.stdout, "snapshot.restore.skipped reason=host_share_cache_policy", "legacy cache policy skip logged");
   });
 
   await testStep("corrupt snapshot section falls back to a cold boot", async () => {

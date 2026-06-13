@@ -14,7 +14,7 @@ try {
   await prepareContext(ctx);
 
   await testStep("warm nested-host VM", async () => {
-    assertEq((await lnxVm(["--no-snapshot-restore", "echo", "warm"])).stdout, "warm", "warm exec");
+    assertEq((await lnxVm(["echo", "warm"])).stdout, "warm", "warm exec");
   });
 
   await testStep("parallel non-pty channels on a Linux host", async () => {

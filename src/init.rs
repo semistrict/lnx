@@ -72,9 +72,6 @@ pub fn ensure_instance(layout: &Layout) -> Result<()> {
     if layout.rootfs.exists() {
         return Ok(());
     }
-    if layout.instance == "default" {
-        bail!("missing rootfs: {}", layout.rootfs.display());
-    }
     let default_rootfs = default_rootfs(layout);
     if !default_rootfs.exists() {
         bail!("missing default rootfs: {}", default_rootfs.display());
@@ -119,11 +116,7 @@ fn copy_if_needed(src: &Path, dest: &Path, label: &str) -> Result<()> {
 }
 
 fn default_rootfs(layout: &Layout) -> PathBuf {
-    layout
-        .base
-        .join("images")
-        .join("default")
-        .join("rootfs.ext4")
+    layout.base.join("cache").join("rootfs.ext4")
 }
 
 fn clone_or_copy(src: &Path, dest: &Path) -> Result<()> {

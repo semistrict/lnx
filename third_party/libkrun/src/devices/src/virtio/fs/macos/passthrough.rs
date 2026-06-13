@@ -4,13 +4,14 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::btree_map;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -158,7 +159,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, RwLock};
 
-    use super::{Config, Context, Extensions, FileSystem, FsOptions, PassthroughFs, fuse};
+    use super::{
+        CachePolicy, Config, Context, DaxMappingSnapshot, Extensions, FileSystem, FsOptions,
+        PassthroughFs, fuse,
+    };
     use crate::virtio::fs::bindings;
     use crate::virtio::fs::inode_alloc::InodeAllocator;
 
@@ -210,6 +214,127 @@ mod tests {
         .unwrap();
         fs.init(FsOptions::empty()).unwrap();
         fs
+    }
+
+    #[test]
+    fn cache_policy_never_opens_files_with_direct_io() {
+        let temp = TempRoot::new("cache-policy-never");
+        fs::write(temp.path().join("file.txt"), b"contents").unwrap();
+        let fs = PassthroughFs::new(
+            Config {
+                root_dir: temp.path().to_string_lossy().into_owned(),
+                cache_policy: CachePolicy::Never,
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let ctx = test_ctx();
+
+        let file = fs.lookup(ctx, fuse::ROOT_ID, &cstr("file.txt")).unwrap();
+        let (_, file_opts) = fs
+            .open(ctx, file.inode, false, libc::O_RDONLY as u32)
+            .unwrap();
+        assert!(file_opts.contains(fuse::OpenOptions::DIRECT_IO));
+        assert!(!file_opts.contains(fuse::OpenOptions::KEEP_CACHE));
+    }
+
+    #[test]
+    fn cache_policy_auto_uses_close_to_open_consistency() {
+        let temp = TempRoot::new("cache-policy-auto");
+        fs::write(temp.path().join("file.txt"), b"contents").unwrap();
+        let fs = PassthroughFs::new(
+            Config {
+                root_dir: temp.path().to_string_lossy().into_owned(),
+                cache_policy: CachePolicy::Auto,
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let ctx = test_ctx();
+
+        let file = fs.lookup(ctx, fuse::ROOT_ID, &cstr("file.txt")).unwrap();
+        let (_, file_opts) = fs
+            .open(ctx, file.inode, false, libc::O_RDONLY as u32)
+            .unwrap();
+        assert!(!file_opts.contains(fuse::OpenOptions::DIRECT_IO));
+        assert!(!file_opts.contains(fuse::OpenOptions::KEEP_CACHE));
+    }
+
+    #[test]
+    fn zero_timeouts_report_uncacheable_metadata() {
+        let temp = TempRoot::new("metadata-timeouts");
+        fs::write(temp.path().join("file.txt"), b"contents").unwrap();
+        let fs = PassthroughFs::new(
+            Config {
+                root_dir: temp.path().to_string_lossy().into_owned(),
+                attr_timeout: std::time::Duration::ZERO,
+                entry_timeout: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let ctx = test_ctx();
+
+        let entry = fs.lookup(ctx, fuse::ROOT_ID, &cstr("file.txt")).unwrap();
+        let (_, attr_timeout) = fs.getattr(ctx, entry.inode, None).unwrap();
+
+        assert_eq!(entry.attr_timeout, std::time::Duration::ZERO);
+        assert_eq!(entry.entry_timeout, std::time::Duration::ZERO);
+        assert_eq!(attr_timeout, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn restore_drops_dax_mapping_for_changed_host_file() {
+        let temp = TempRoot::new("restore-dax-changed");
+        let path = temp.path().join("file.txt");
+        fs::write(&path, b"before\n").unwrap();
+        let fs = new_fs(temp.path(), vec![PathBuf::from(".")]);
+        let ctx = test_ctx();
+
+        let file = fs.lookup(ctx, fuse::ROOT_ID, &cstr("file.txt")).unwrap();
+        let mut snap = fs.snapshot_state().unwrap();
+        snap.dax_mappings.push(DaxMappingSnapshot {
+            guest_addr: 0x200000,
+            inode: file.inode,
+            foffset: 0,
+            len: 2 * 1024 * 1024,
+            writable: false,
+        });
+
+        fs::write(&path, b"after-after\n").unwrap();
+        fs.restore_state(&snap).unwrap();
+
+        assert!(fs.pending_dax_mappings.lock().unwrap().is_empty());
+        let (st, _) = fs.getattr(ctx, file.inode, None).unwrap();
+        assert_eq!(st.st_size, b"after-after\n".len() as i64);
+    }
+
+    #[test]
+    fn restore_keeps_dax_mapping_for_unchanged_host_file() {
+        let temp = TempRoot::new("restore-dax-unchanged");
+        fs::write(temp.path().join("file.txt"), b"contents\n").unwrap();
+        let fs = new_fs(temp.path(), vec![PathBuf::from(".")]);
+        let ctx = test_ctx();
+
+        let file = fs.lookup(ctx, fuse::ROOT_ID, &cstr("file.txt")).unwrap();
+        let mut snap = fs.snapshot_state().unwrap();
+        snap.dax_mappings.push(DaxMappingSnapshot {
+            guest_addr: 0x200000,
+            inode: file.inode,
+            foffset: 0,
+            len: 2 * 1024 * 1024,
+            writable: false,
+        });
+
+        fs.restore_state(&snap).unwrap();
+
+        assert_eq!(fs.pending_dax_mappings.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -381,6 +506,35 @@ struct InodeDataSnapshot {
     ino: u64,
     dev: i32,
     refcount: u64,
+    #[serde(default)]
+    host_object: Option<HostObjectSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct HostObjectSnapshot {
+    ino: u64,
+    dev: i32,
+    size: i64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+    mode: u32,
+}
+
+impl HostObjectSnapshot {
+    fn from_stat(st: &bindings::stat64) -> Self {
+        Self {
+            ino: st.st_ino,
+            dev: st.st_dev,
+            size: st.st_size,
+            mtime: st.st_mtime,
+            mtime_nsec: st.st_mtime_nsec,
+            ctime: st.st_ctime,
+            ctime_nsec: st.st_ctime_nsec,
+            mode: st.st_mode as u32,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -708,7 +862,7 @@ fn istat(ihandle: &InodeHandle, host: bool) -> io::Result<bindings::stat64> {
 /// The caching policy that the file system should report to the FUSE client. By default the FUSE
 /// protocol uses close-to-open consistency. This means that any cached contents of the file are
 /// invalidated the next time that file is opened.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum CachePolicy {
     /// The client should never cache file data and all I/O should be directly forwarded to the
     /// server. This policy must be selected when file contents may change without the knowledge of
@@ -1036,6 +1190,36 @@ impl PassthroughFs {
         Ok((end - offset_in).try_into().unwrap_or(copied))
     }
 
+    fn rel_path_to_cstring(&self, rel_path: &Path) -> io::Result<CString> {
+        let mut path = PathBuf::from(&self.cfg.root_dir);
+        if !rel_path.as_os_str().is_empty() {
+            path.push(rel_path);
+        }
+        CString::new(path.to_string_lossy().into_owned()).map_err(|_| einval())
+    }
+
+    fn current_host_object(
+        &self,
+        rel_path: &Path,
+    ) -> io::Result<(InodeAltKey, HostObjectSnapshot)> {
+        let path = self.rel_path_to_cstring(rel_path)?;
+        let st = lstat(&path, false)?;
+        Ok((
+            InodeAltKey {
+                ino: st.st_ino,
+                dev: st.st_dev,
+            },
+            HostObjectSnapshot::from_stat(&st),
+        ))
+    }
+
+    fn snapshot_host_object(&self, data: &InodeData) -> Option<HostObjectSnapshot> {
+        let path = CString::new(format!("/.vol/{}/{}", data.dev, data.ino)).ok()?;
+        lstat(&path, false)
+            .ok()
+            .map(|st| HostObjectSnapshot::from_stat(&st))
+    }
+
     fn install_dax_mapping(
         &self,
         mapping: DaxMappingSnapshot,
@@ -1123,6 +1307,7 @@ impl PassthroughFs {
                     ino: data.ino,
                     dev: data.dev,
                     refcount: data.refcount.load(Ordering::Acquire),
+                    host_object: self.snapshot_host_object(data),
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
@@ -1189,18 +1374,41 @@ impl PassthroughFs {
     }
 
     pub(crate) fn restore_state(&self, snap: &PassthroughFsSnapshot) -> io::Result<()> {
+        let host_share = self.cfg.write_allowlist.is_some();
+        let path_by_inode = snap
+            .inode_paths
+            .iter()
+            .map(|path| (path.inode, PathBuf::from(&path.path)))
+            .collect::<HashMap<_, _>>();
+        let mut changed_inodes = HashSet::new();
         let mut inodes = MultikeyBTreeMap::new();
         for inode in &snap.inodes {
+            let mut ino = inode.ino;
+            let mut dev = inode.dev;
+            if host_share {
+                let current = path_by_inode
+                    .get(&inode.inode)
+                    .map(|path| self.current_host_object(path));
+                match current {
+                    Some(Ok((altkey, object))) => {
+                        ino = altkey.ino;
+                        dev = altkey.dev;
+                        if inode.host_object.as_ref() != Some(&object) {
+                            changed_inodes.insert(inode.inode);
+                        }
+                    }
+                    Some(Err(_)) | None => {
+                        changed_inodes.insert(inode.inode);
+                    }
+                }
+            }
             inodes.insert(
                 inode.inode,
-                InodeAltKey {
-                    ino: inode.ino,
-                    dev: inode.dev,
-                },
+                InodeAltKey { ino, dev },
                 Arc::new(InodeData {
                     inode: inode.inode,
-                    ino: inode.ino,
-                    dev: inode.dev,
+                    ino,
+                    dev,
                     refcount: AtomicU64::new(inode.refcount),
                     unlinked_fd: AtomicI64::new(-1),
                 }),
@@ -1218,7 +1426,15 @@ impl PassthroughFs {
             .map(|path| (path.inode, PathBuf::from(&path.path)))
             .collect();
         *self.map_windows.lock().unwrap() = HashMap::new();
-        *self.pending_dax_mappings.lock().unwrap() = snap.dax_mappings.clone();
+        *self.pending_dax_mappings.lock().unwrap() = if host_share {
+            snap.dax_mappings
+                .iter()
+                .filter(|mapping| !changed_inodes.contains(&mapping.inode))
+                .cloned()
+                .collect()
+        } else {
+            snap.dax_mappings.clone()
+        };
         for handle in &snap.handles {
             let flags = handle.flags & !libc::O_EXLOCK;
             let backing = self
@@ -1228,27 +1444,41 @@ impl PassthroughFs {
                 .get(&handle.inode)
                 .map(|inode| format!("/.vol/{}/{}", inode.dev, inode.ino))
                 .unwrap_or_else(|| "<missing inode>".to_string());
-            let file = RwLock::new(self.open_inode(handle.inode, flags).map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!(
-                        "open restored handle {} inode {} backing {} flags {:#x}: {}",
+            let file = match self.open_inode(handle.inode, flags) {
+                Ok(file) => RwLock::new(file),
+                Err(e) if host_share && changed_inodes.contains(&handle.inode) => {
+                    warn!(
+                        "dropping restored virtio-fs handle {} inode {} backing {} flags {:#x}: {}",
                         handle.handle, handle.inode, backing, flags, e
-                    ),
-                )
-            })?);
-            let dirstream = DirStream {
-                ready: handle.dirstream.ready,
-                entries: handle
-                    .dirstream
-                    .entries
-                    .iter()
-                    .map(|e| CachedDirEntry {
-                        ino: e.ino,
-                        name: Box::<[u8]>::from(e.name.as_slice()),
-                        type_: e.type_,
-                    })
-                    .collect(),
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "open restored handle {} inode {} backing {} flags {:#x}: {}",
+                            handle.handle, handle.inode, backing, flags, e
+                        ),
+                    ));
+                }
+            };
+            let dirstream = if host_share {
+                DirStream::new()
+            } else {
+                DirStream {
+                    ready: handle.dirstream.ready,
+                    entries: handle
+                        .dirstream
+                        .entries
+                        .iter()
+                        .map(|e| CachedDirEntry {
+                            ino: e.ino,
+                            name: Box::<[u8]>::from(e.name.as_slice()),
+                            type_: e.type_,
+                        })
+                        .collect(),
+                }
             };
             handles.insert(
                 handle.handle,

@@ -295,7 +295,11 @@ impl VirtioDevice for Net {
         let body: NetSnapshotBody = bincode::deserialize(&snap.payload)
             .map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
         if body.mac != self.config.mac {
-            return Err(DeviceSnapshotError::Invalid("net MAC mismatch".into()));
+            warn!(
+                "net.restore.mac_mismatch current={:02x?} snapshot={:02x?}; using snapshot MAC",
+                self.config.mac, body.mac
+            );
+            self.config.mac = body.mac;
         }
         self.acked_features = body.acked_features;
         stop.rx_q.queue.restore_state(&snap.queues[0]);
@@ -308,4 +312,105 @@ impl VirtioDevice for Net {
 struct NetSnapshotBody {
     mac: [u8; 6],
     acked_features: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::virtio::net::QUEUE_SIZE;
+    use crate::virtio::net::backend::NetBackend;
+    use crate::virtio::queue::{Queue, QueueState};
+    use std::sync::Arc;
+    use utils::eventfd::{EFD_NONBLOCK, EventFd};
+
+    struct DummyBackend;
+
+    impl NetBackend for DummyBackend {
+        fn read_frame(&mut self, _buf: &mut [u8]) -> std::result::Result<usize, ReadError> {
+            Err(ReadError::NothingRead)
+        }
+
+        fn write_frame(
+            &mut self,
+            _hdr_len: usize,
+            _buf: &mut [u8],
+        ) -> std::result::Result<(), WriteError> {
+            Err(WriteError::NothingWritten)
+        }
+
+        fn has_unfinished_write(&self) -> bool {
+            false
+        }
+
+        fn try_finish_write(
+            &mut self,
+            _hdr_len: usize,
+            _buf: &[u8],
+        ) -> std::result::Result<(), WriteError> {
+            Ok(())
+        }
+
+        fn raw_socket_fd(&self) -> RawFd {
+            -1
+        }
+    }
+
+    fn device_queue() -> DeviceQueue {
+        DeviceQueue::new(
+            Queue::new(QUEUE_SIZE),
+            Arc::new(EventFd::new(EFD_NONBLOCK).expect("eventfd")),
+        )
+    }
+
+    fn queue_state(next_avail: u16, next_used: u16) -> QueueState {
+        QueueState {
+            max_size: QUEUE_SIZE,
+            size: QUEUE_SIZE,
+            ready: true,
+            desc_table: 0x1000,
+            avail_ring: 0x2000,
+            used_ring: 0x3000,
+            next_avail,
+            next_used,
+            event_idx_enabled: true,
+            num_added: 7,
+        }
+    }
+
+    #[test]
+    fn restore_state_adopts_snapshot_mac_for_forked_instance() {
+        let current_mac = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+        let snapshot_mac = [0x02, 0x10, 0x20, 0x30, 0x40, 0x50];
+        let mut net = Net::new(
+            "net".to_string(),
+            VirtioNetBackend::UnixstreamPath(PathBuf::from("/unused")),
+            current_mac,
+            0,
+        )
+        .expect("net");
+        net.paused = Some(NetWorkerStopResult {
+            rx_q: device_queue(),
+            tx_q: device_queue(),
+            backend: Box::new(DummyBackend),
+        });
+        let rx = queue_state(11, 5);
+        let tx = queue_state(13, 7);
+        let payload = bincode::serialize(&NetSnapshotBody {
+            mac: snapshot_mac,
+            acked_features: 0x1234,
+        })
+        .expect("payload");
+        let snap = DeviceSnapshot {
+            queues: vec![rx.clone(), tx.clone()],
+            payload,
+        };
+
+        net.restore_state(&snap).expect("restore net snapshot");
+
+        assert_eq!(net.config.mac, snapshot_mac);
+        assert_eq!(net.acked_features, 0x1234);
+        let paused = net.paused.as_ref().expect("paused net worker");
+        assert_eq!(paused.rx_q.queue.to_state().next_avail, rx.next_avail);
+        assert_eq!(paused.tx_q.queue.to_state().next_used, tx.next_used);
+    }
 }

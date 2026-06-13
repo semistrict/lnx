@@ -71,7 +71,7 @@ try {
 
   await testStep("routable vmnet address, DNS name, and reachability", async () => {
     // Cold-boot a VM that serves http inline; hold it alive for every check.
-    const holder = spawnLnx(ctx, ["--no-snapshot-restore", "bash", "-lc", SERVE]);
+    const holder = spawnLnx(ctx, ["bash", "-lc", SERVE]);
     try {
       const ip = await holderVmnetIp();
       // Reach the routable address directly (host -> vmnet bridge -> VM).
@@ -101,9 +101,7 @@ try {
       const peer = await run([
         ctx.lnxBin,
         "--instance",
-        peerInstance,
-        "--no-snapshot-restore",
-        "bash",
+        peerInstance,        "bash",
         "-lc",
         `curl -fsS --connect-timeout 10 --max-time 30 http://${ip}:8080/`,
       ], { timeoutMs: 600_000 });

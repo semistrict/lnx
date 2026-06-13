@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +60,12 @@ pub enum Message {
     Error {
         channel_id: u64,
         message: String,
+    },
+    RestoreSync {
+        channel_id: u64,
+    },
+    RestoreSynced {
+        channel_id: u64,
     },
     SnapshotExit {
         channel_id: u64,

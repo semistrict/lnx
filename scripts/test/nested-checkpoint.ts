@@ -45,7 +45,6 @@ try {
 
   await testStep("named checkpoint restores disk and memory in nested Linux", async () => {
     const write = await lnxVm([
-      "--no-snapshot-restore",
       "bash",
       "-lc",
       "printf nested-disk-before | sudo tee /root/lnx-nested-checkpoint-disk >/dev/null; printf nested-memory-before | sudo tee /run/lnx-nested-checkpoint-memory >/dev/null; echo ready",

@@ -27,7 +27,7 @@ master, slave = pty.openpty()
 env = os.environ.copy()
 env["TERM"] = "xterm-256color"
 proc = subprocess.Popen(
-    [lnx_bin, "--instance", instance, "--no-snapshot-restore", "bash", "-lc", "echo BEFORE; lnxctl snapshot-exit; echo AFTER"],
+    [lnx_bin, "--instance", instance, "bash", "-lc", "echo BEFORE; lnxctl snapshot-exit; echo AFTER"],
     stdin=slave,
     stdout=slave,
     stderr=slave,

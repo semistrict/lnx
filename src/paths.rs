@@ -29,14 +29,13 @@ impl Layout {
                 home.join(".lnx")
             }
         };
-        let image_dir = base.join("images").join(instance);
         let instance_dir = base.join("instances").join(instance);
-        let snapshot_dir = image_dir.join("memory-snapshots");
-        let checkpoint_dir = image_dir.join("checkpoints");
-        let vm_initialized = image_dir.join("vm-initialized");
+        let snapshot_dir = instance_dir.join("memory-snapshots");
+        let checkpoint_dir = instance_dir.join("checkpoints");
+        let vm_initialized = instance_dir.join("vm-initialized");
         let run_dir = instance_dir.clone();
         let kernel = kernel.unwrap_or_else(|| base.join("vmlinuz"));
-        let rootfs = rootfs.unwrap_or_else(|| image_dir.join("rootfs.ext4"));
+        let rootfs = rootfs.unwrap_or_else(|| instance_dir.join("rootfs.ext4"));
         let console_log = run_dir.join("console.log");
 
         Ok(Self {
@@ -69,28 +68,28 @@ mod tests {
         assert_eq!(
             layout.rootfs,
             home.join(".lnx")
-                .join("images")
+                .join("instances")
                 .join("dev")
                 .join("rootfs.ext4")
         );
         assert_eq!(
             layout.snapshot_dir,
             home.join(".lnx")
-                .join("images")
+                .join("instances")
                 .join("dev")
                 .join("memory-snapshots")
         );
         assert_eq!(
             layout.checkpoint_dir,
             home.join(".lnx")
-                .join("images")
+                .join("instances")
                 .join("dev")
                 .join("checkpoints")
         );
         assert_eq!(
             layout.vm_initialized,
             home.join(".lnx")
-                .join("images")
+                .join("instances")
                 .join("dev")
                 .join("vm-initialized")
         );
@@ -131,7 +130,7 @@ mod tests {
             layout.rootfs,
             layout
                 .base
-                .join("images")
+                .join("instances")
                 .join("envbase")
                 .join("rootfs.ext4")
         );

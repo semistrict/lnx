@@ -60,7 +60,7 @@ listeners, and trusts a local `lnx` CA in the macOS System keychain. HTTPS
 certificates are generated per `.lnx` host on first use and terminate at the
 host ingress before proxying plain HTTP/WebSocket traffic to the guest port.
 
-Memory snapshot restore defaults to `~/.lnx/images/<instance>/memory-snapshots/latest`
+Memory snapshot restore defaults to `~/.lnx/instances/<instance>/memory-snapshots/latest`
 and can be overridden with `--snapshot <dir>`. The VM runs in a detached
 `_vm-owner` process, so `lnx` exits as soon as the guest command's status
 arrives. The owner keeps the VM alive for an idle grace period (5s by default,

@@ -167,6 +167,33 @@ impl Fs {
     }
 }
 
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+mod tests {
+    use super::*;
+    use std::sync::RwLock;
+
+    #[test]
+    fn write_allowlisted_host_share_enables_fast_cache_settings() {
+        let mut fs = Fs::new(
+            "home".to_string(),
+            Some("/Users/ramon".to_string()),
+            Arc::new(AtomicI32::new(0)),
+            false,
+            Vec::new(),
+        )
+        .expect("create fs");
+
+        assert!(fs.enable_write_allowlist(Arc::new(RwLock::new(Vec::new()))));
+
+        let cfg = fs.passthrough_cfg.as_ref().expect("passthrough config");
+        assert_eq!(cfg.cache_policy, passthrough::CachePolicy::Always);
+        assert_eq!(cfg.attr_timeout, std::time::Duration::from_secs(5));
+        assert_eq!(cfg.entry_timeout, std::time::Duration::from_secs(5));
+        assert!(cfg.writeback);
+    }
+}
+
 impl VirtioDevice for Fs {
     fn avail_features(&self) -> u64 {
         self.avail_features

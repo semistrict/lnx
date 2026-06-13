@@ -20,7 +20,7 @@ try {
   await prepareContext(ctx);
 
   await testStep("client exits before the post-command snapshot", async () => {
-    assertEq((await lnx(ctx, ["--no-snapshot-restore", "echo", "cold"])).stdout, "cold", "cold exec");
+    assertEq((await lnx(ctx, ["echo", "cold"])).stdout, "cold", "cold exec");
     assertEq(existsSync(join(ctx.snapshotDir, "latest", "vmstate.bin")), false, "snapshot deferred past client exit");
     assertEq(existsSync(join(ctx.runDir, "broker.sock")), true, "broker stays up for the grace period");
   });

@@ -14,11 +14,10 @@ try {
     await skip("dirty filesystem test requires host e2fsck");
   }
   await prepareContext(ctx);
-  await run(["rm", "-rf", join(ctx.base, "images", forkName), join(ctx.base, "instances", forkName)], { check: false });
+  await run(["rm", "-rf", join(ctx.base, "instances", forkName), join(ctx.base, "instances", forkName)], { check: false });
 
   await testStep("write dirty workload and checkpoint", async () => {
     await lnx(ctx, [
-      "--no-snapshot-restore",
       "bash",
       "-lc",
       "rm -rf /root/dirty; mkdir /root/dirty; for i in $(seq 1 250); do printf file-$i >/root/dirty/file-$i; done; sync",
@@ -30,7 +29,7 @@ try {
   await testStep("offline repair fsck of checkpoint and fork rootfs clones", async () => {
     for (const rootfs of [
       join(ctx.imageDir, "checkpoints"),
-      join(ctx.base, "images", forkName, "rootfs.ext4"),
+      join(ctx.base, "instances", forkName, "rootfs.ext4"),
     ]) {
       const target = rootfs.endsWith("checkpoints")
         ? (await run(["bash", "-lc", `find ${rootfs} -name rootfs.ext4 | head -n1`])).stdout
@@ -45,5 +44,5 @@ try {
   });
 } finally {
   await cleanupContext(ctx);
-  await run(["rm", "-rf", join(ctx.base, "images", forkName), join(ctx.base, "instances", forkName)], { check: false });
+  await run(["rm", "-rf", join(ctx.base, "instances", forkName), join(ctx.base, "instances", forkName)], { check: false });
 }

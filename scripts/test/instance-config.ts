@@ -37,7 +37,7 @@ try {
 
   await testStep("persisted settings drive the VM", async () => {
     assertEq(
-      (await lnx(ctx, ["--no-snapshot-restore", "nproc"])).stdout,
+      (await lnx(ctx, ["nproc"])).stdout,
       "1",
       "nproc honors persisted cpus",
     );
@@ -54,7 +54,7 @@ try {
 
   await testStep("explicit flags override persisted settings", async () => {
     assertEq(
-      (await lnx(ctx, ["--cpus", "2", "--no-snapshot-restore", "nproc"])).stdout,
+      (await lnx(ctx, ["--cpus", "2", "nproc"])).stdout,
       "2",
       "explicit cpus override",
     );

@@ -20,7 +20,7 @@ Bun.env.LNX_BROKER_IDLE_TTL_MS ??= "500";
 
 const ctx = defaultContext("system");
 const copyInstance = `${ctx.instance}-copy`;
-const copyImageDir = join(ctx.base, "images", copyInstance);
+const copyImageDir = join(ctx.base, "instances", copyInstance);
 const copyRunDir = join(ctx.base, "instances", copyInstance);
 
 try {
@@ -57,7 +57,7 @@ try {
   });
 
   await testStep("basic exec and snapshots", async () => {
-    assertEq((await lnx(ctx, ["--no-snapshot-restore", "echo", "cold"])).stdout, "cold", "cold exec");
+    assertEq((await lnx(ctx, ["echo", "cold"])).stdout, "cold", "cold exec");
     assertFile(join(ctx.base, "vmlinuz"), "auto-init kernel");
     assertFile(join(ctx.imageDir, "rootfs.ext4"), "auto-init rootfs");
     await waitForVmSuspend(ctx);

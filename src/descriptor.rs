@@ -30,7 +30,7 @@ pub struct InstanceDescriptor {
 pub fn path(layout: &Layout) -> PathBuf {
     layout
         .base
-        .join("images")
+        .join("instances")
         .join(&layout.instance)
         .join(DESCRIPTOR_FILE)
 }
@@ -89,11 +89,11 @@ mod tests {
             base: base.to_path_buf(),
             instance: "test".to_string(),
             kernel: base.join("vmlinuz"),
-            rootfs: base.join("images/test/rootfs.ext4"),
+            rootfs: base.join("instances/test/rootfs.ext4"),
             instance_dir: base.join("instances/test"),
-            snapshot_dir: base.join("images/test/memory-snapshots"),
-            checkpoint_dir: base.join("images/test/checkpoints"),
-            vm_initialized: base.join("images/test/vm-initialized"),
+            snapshot_dir: base.join("instances/test/memory-snapshots"),
+            checkpoint_dir: base.join("instances/test/checkpoints"),
+            vm_initialized: base.join("instances/test/vm-initialized"),
             run_dir: base.join("instances/test"),
             console_log: base.join("instances/test/console.log"),
         }

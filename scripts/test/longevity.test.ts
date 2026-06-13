@@ -117,7 +117,7 @@ test("network after restore loop", async () => {
     await lnxExpect(["apt-get", "update"], { timeoutMs: 300_000 });
     for (let i = 0; i < Math.min(restoreIterations, 100); i++) {
       const result = await lnxExpect([
-        "bash",
+      "bash",
         "-lc",
         "curl -fsS --max-time 20 https://example.com >/dev/null && apt-cache policy ruby | grep -q Candidate: && getent hosts ports.ubuntu.com >/dev/null && echo ok",
       ]);
@@ -129,7 +129,6 @@ test("network after restore loop", async () => {
 test("long-lived tcp across snapshot reconnects cleanly", async () => {
   await maybe("long-lived tcp across snapshot", async () => {
     await lnxExpect([
-      "--no-snapshot-restore",
       "bash",
       "-lc",
       "mkdir -p /tmp/lnx-http; printf tcp-ok >/tmp/lnx-http/index.html; cat >/etc/systemd/system/lnx-long-tcp.service <<'UNIT'\n[Service]\nWorkingDirectory=/tmp/lnx-http\nExecStart=/usr/bin/python3 -m http.server 8081 --bind 127.0.0.1\n[Install]\nWantedBy=multi-user.target\nUNIT\nsystemctl daemon-reload; systemctl enable --now lnx-long-tcp.service; sleep 1; systemctl is-active lnx-long-tcp.service",
@@ -146,7 +145,6 @@ test("port forward restore", async () => {
   await maybe("port forward restore", async () => {
     const forwardPort = configuredForwardPort ?? await freePort();
     await lnxExpect([
-      "--no-snapshot-restore",
       "bash",
       "-lc",
       "mkdir -p /tmp/lnx-forward; printf forward-ok >/tmp/lnx-forward/index.html; cat >/etc/systemd/system/lnx-forward-test.service <<'UNIT'\n[Service]\nWorkingDirectory=/tmp/lnx-forward\nExecStart=/usr/bin/python3 -m http.server 8080 --bind 127.0.0.1\n[Install]\nWantedBy=multi-user.target\nUNIT\nsystemctl daemon-reload; systemctl enable --now lnx-forward-test.service; sleep 1; curl -fsS http://127.0.0.1:8080",
@@ -186,7 +184,6 @@ test("ingress restore", async () => {
     };
     await run([ctx.lnxBin, "ingress", "enable"], { env, timeoutMs: 30_000 });
     await lnxExpect([
-      "--no-snapshot-restore",
       "bash",
       "-lc",
       "mkdir -p /tmp/lnx-ingress; printf ingress-ok >/tmp/lnx-ingress/index.html; cat >/etc/systemd/system/lnx-ingress-test.service <<'UNIT'\n[Service]\nWorkingDirectory=/tmp/lnx-ingress\nExecStart=/usr/bin/python3 -m http.server 8080 --bind 127.0.0.1\n[Install]\nWantedBy=multi-user.target\nUNIT\nsystemctl daemon-reload; systemctl enable --now lnx-ingress-test.service; sleep 1; curl -fsS http://127.0.0.1:8080",
@@ -208,7 +205,7 @@ test("ingress restore", async () => {
 
 test("concurrent snapshot pressure", async () => {
   await maybe("concurrent snapshot pressure", async () => {
-    await lnxExpect(["--no-snapshot-restore", "true"]);
+    await lnxExpect(["true"]);
     const workers = Array.from({ length: 10 }, (_, i) => lnx(ctx, ["bash", "-lc", `sleep 0.$(( ${i} % 5 )); echo worker-${i}`]));
     const checkpoints = Array.from({ length: 5 }, (_, i) =>
       run([ctx.lnxBin, "--instance", ctx.instance, "checkpoint", "-m", `pressure-${i}`], { timeoutMs: 240_000 }),
@@ -262,7 +259,6 @@ test("memory pressure snapshot", async () => {
   await maybe("memory pressure snapshot", async () => {
     const mib = Number(Bun.env.LNX_MEMORY_PRESSURE_MIB ?? "1024");
     await lnxExpect([
-      "--no-snapshot-restore",
       "bash",
       "-lc",
       `python3 - <<'PY'
@@ -302,7 +298,7 @@ test("file descriptor and process tree longevity", async () => {
 
 test("host kill during snapshot recovers or fails cleanly", async () => {
   await maybe("host kill during snapshot", async () => {
-    await lnxExpect(["--no-snapshot-restore", "bash", "-lc", "dd if=/dev/zero of=/root/kill-snapshot bs=1M count=64 status=none; sync"]);
+    await lnxExpect(["bash", "-lc", "dd if=/dev/zero of=/root/kill-snapshot bs=1M count=64 status=none; sync"]);
     const proc = spawnLnx(ctx, ["checkpoint", "-m", "kill-during-snapshot"]);
     await sleep(250);
     proc.kill("SIGKILL");

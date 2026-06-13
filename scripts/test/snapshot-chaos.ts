@@ -106,7 +106,7 @@ async function awaitWorkload(running: Running, timeoutMs: number): Promise<void>
 function timerLadder(): Running {
   const n = randInt(30, 70);
   const proc = spawnGuest([
-    "bash",
+      "bash",
     "-lc",
     `out=""; for i in $(seq 1 ${n}); do sleep 0.05; out="$out$i,"; done; echo "T1:$out"`,
   ]);
@@ -255,7 +255,7 @@ try {
   await mkdir(cwd, { recursive: true });
 
   await testStep("warm up instance", async () => {
-    const ready = await lnx(ctx, [...vmArgs, "--no-snapshot-restore", "echo", "ready"], { cwd });
+    const ready = await lnx(ctx, [...vmArgs, "echo", "ready"], { cwd });
     assertEq(ready.stdout, "ready", "warmup boot");
   });
 

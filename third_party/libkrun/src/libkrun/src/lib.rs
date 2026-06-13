@@ -1506,7 +1506,7 @@ unsafe fn collapse_str_array(array: &[*const c_char]) -> Result<String, std::str
                 break;
             } else {
                 let s = CStr::from_ptr(*item).to_str()?;
-                strvec.push(format!("\"{s}\""));
+                strvec.push(s.to_string());
             }
         }
 
@@ -1556,7 +1556,7 @@ pub unsafe extern "C" fn krun_set_exec(
             }
         } else {
             env::vars()
-                .map(|(key, value)| format!(" {key}=\"{value}\""))
+                .map(|(key, value)| format!(" {key}={value}"))
                 .collect()
         };
 
@@ -1590,7 +1590,7 @@ pub unsafe extern "C" fn krun_set_env(ctx_id: u32, c_envp: *const *const c_char)
             }
         } else {
             env::vars()
-                .map(|(key, value)| format!(" {key}=\"{value}\""))
+                .map(|(key, value)| format!(" {key}={value}"))
                 .collect()
         };
 

@@ -7,7 +7,6 @@ try {
 
   await testStep("fresh stock shape", async () => {
     const shape = await lnx(ctx, [
-      "--no-snapshot-restore",
       "bash",
       "-lc",
       'cat /proc/1/comm; sudo readlink /proc/1/root; findmnt -n -o PROPAGATION /; if test -e /newroot || test -e /oldroot; then echo leaked; else echo clean; fi',

@@ -1,4 +1,4 @@
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::fcntl::{FcntlArg, fcntl};
 use nix::sys::socket::{
     AddressFamily, MsgFlags, SockFlag, SockType, UnixAddr, bind, connect, getsockopt, recv, send,
     setsockopt, socket, sockopt,
@@ -47,14 +47,16 @@ impl Unixgram {
     pub fn new(fd: OwnedFd) -> Self {
         // Ensure the socket is in non-blocking mode.
         match fcntl(&fd, FcntlArg::F_GETFL) {
-            Ok(flags) => match OFlag::from_bits(flags) {
-                Some(flags) => {
-                    if let Err(e) = fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)) {
-                        warn!("error switching to non-blocking: id={fd:?}, err={e}");
-                    }
+            Ok(flags) => {
+                let desired = nonblocking_flags(flags);
+                let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, desired) };
+                if rc < 0 {
+                    warn!(
+                        "error switching to non-blocking: id={fd:?}, err={}",
+                        std::io::Error::last_os_error()
+                    );
                 }
-                None => error!("invalid fd flags id={fd:?}"),
-            },
+            }
             Err(e) => error!("couldn't obtain fd flags id={fd:?}, err={e}"),
         };
 
@@ -125,6 +127,10 @@ impl Unixgram {
     }
 }
 
+fn nonblocking_flags(flags: libc::c_int) -> libc::c_int {
+    flags | libc::O_NONBLOCK
+}
+
 impl NetBackend for Unixgram {
     /// Try to read a frame the proxy. If no bytes are available reports ReadError::NothingRead
     fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
@@ -185,5 +191,34 @@ impl NetBackend for Unixgram {
     #[cfg(target_os = "macos")]
     fn write_retry_delay_us(&self) -> u64 {
         50
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixDatagram;
+
+    #[test]
+    fn nonblocking_flags_preserve_unknown_bits() {
+        let unknown = 0x4000_0000;
+        let flags = unknown | libc::O_APPEND;
+
+        let updated = nonblocking_flags(flags);
+
+        assert_ne!(updated & libc::O_NONBLOCK, 0);
+        assert_eq!(updated & unknown, unknown);
+        assert_eq!(updated & libc::O_APPEND, libc::O_APPEND);
+    }
+
+    #[test]
+    fn new_marks_socketpair_nonblocking() {
+        let (socket, _peer) = UnixDatagram::pair().expect("create datagram pair");
+        let backend = Unixgram::new(socket.into());
+
+        let flags = unsafe { libc::fcntl(backend.fd.as_raw_fd(), libc::F_GETFL) };
+
+        assert!(flags >= 0, "F_GETFL failed");
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
     }
 }

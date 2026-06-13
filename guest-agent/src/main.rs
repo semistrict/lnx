@@ -227,6 +227,18 @@ fn mount_host_shares() {
     }
 }
 
+fn restore_sync_guest_caches() -> Result<(), String> {
+    unsafe {
+        sync();
+    }
+    fs::write("/proc/sys/vm/drop_caches", b"3\n")
+        .map_err(|e| format!("drop guest caches after restore: {e}"))?;
+    unsafe {
+        sync();
+    }
+    Ok(())
+}
+
 fn wait_for_path(path: &str) -> bool {
     for _ in 0..100 {
         if fs::metadata(path).is_ok() {
@@ -2062,6 +2074,20 @@ fn agent_loop() {
                     let _ = state.tx.send(ChannelInput::SnapshotFailed);
                 }
             }
+            Message::RestoreSync { channel_id } => match restore_sync_guest_caches() {
+                Ok(()) => {
+                    let _ = write_message_locked(&agent_fd, &Message::RestoreSynced { channel_id });
+                }
+                Err(message) => {
+                    let _ = write_message_locked(
+                        &agent_fd,
+                        &Message::Error {
+                            channel_id,
+                            message,
+                        },
+                    );
+                }
+            },
             Message::ExitStatus { channel_id, .. } => {
                 channels.retain(|(id, _)| *id != channel_id);
             }

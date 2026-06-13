@@ -6,6 +6,9 @@
 /vmlinuz.gz
 /rootfs.ext4.zst
 
+# macOS
+.DS_Store
+
 # Claude Code
 .claude/settings.local.json
 .inbox/

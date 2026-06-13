@@ -10,7 +10,6 @@ try {
 
   await testStep("create named checkpoint", async () => {
     await lnx(ctx, [
-      "--no-snapshot-restore",
       "bash",
       "-lc",
       "printf base | sudo tee /root/fanout-marker >/dev/null; printf base-memory | sudo tee /run/fanout-marker >/dev/null",

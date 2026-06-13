@@ -20,7 +20,7 @@ try {
   await prepareContext(ctx);
 
   await testStep("killed owner leaves next command recoverable", async () => {
-    const proc = spawnLnxVm(["--no-snapshot-restore", "bash", "-lc", "echo owner-ready; sleep 60"], {
+    const proc = spawnLnxVm(["bash", "-lc", "echo owner-ready; sleep 60"], {
       stdout: "pipe",
       stderr: "pipe",
     });

@@ -162,13 +162,9 @@ impl Network {
     /// the underlying objects are intentionally never released.
     pub fn create(subnet: Ipv4Addr, prefix: u8) -> Result<Network> {
         let mask = mask_for_prefix(prefix);
-        // vmnet's set_ipv4_subnet takes the host (gateway) address, not the
-        // network address: it assigns this to the host-side bridge. Passing
-        // the network address (.0) would strand the guests, whose gateway is
-        // .1. (Matches Apple's container tool.)
-        let gateway_addr = libc::in_addr {
-            s_addr: u32::from(gateway_for_subnet(subnet)).to_be(),
-        };
+        // vmnet reserves the first, second, and last addresses in this subnet.
+        // The second address becomes the host-side gateway.
+        let subnet_addr = in_addr(subnet);
         let mask_addr = libc::in_addr {
             s_addr: u32::from(mask).to_be(),
         };
@@ -178,7 +174,7 @@ impl Network {
             if config.is_null() {
                 return Err(vmnet_error("vmnet_network_configuration_create", status));
             }
-            let rc = vmnet_network_configuration_set_ipv4_subnet(config, &gateway_addr, &mask_addr);
+            let rc = vmnet_network_configuration_set_ipv4_subnet(config, &subnet_addr, &mask_addr);
             if rc != VMNET_SUCCESS {
                 return Err(vmnet_error(
                     "vmnet_network_configuration_set_ipv4_subnet",
@@ -318,6 +314,12 @@ impl Network {
             inner,
             pump: Some(pump),
         })
+    }
+}
+
+fn in_addr(addr: Ipv4Addr) -> libc::in_addr {
+    libc::in_addr {
+        s_addr: u32::from(addr).to_be(),
     }
 }
 
@@ -635,5 +637,14 @@ mod tests {
             gateway_for_subnet(Ipv4Addr::new(192, 168, 106, 0)),
             Ipv4Addr::new(192, 168, 106, 1)
         );
+    }
+
+    #[test]
+    fn vmnet_configuration_uses_network_address() {
+        let subnet = Ipv4Addr::new(192, 168, 106, 0);
+        let gateway = gateway_for_subnet(subnet);
+
+        assert_eq!(in_addr(subnet).s_addr, u32::from(subnet).to_be());
+        assert_ne!(in_addr(subnet).s_addr, u32::from(gateway).to_be());
     }
 }

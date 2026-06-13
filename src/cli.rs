@@ -41,9 +41,6 @@ pub struct Cli {
     )]
     snapshot: Option<PathBuf>,
 
-    #[arg(long)]
-    no_snapshot_restore: bool,
-
     #[arg(long, help = "Request nested KVM support for the guest")]
     nested_kvm: bool,
 
@@ -213,7 +210,6 @@ impl Cli {
             cpus,
             memory_mib,
             snapshot: snapshot_path,
-            no_snapshot_restore,
             nested_kvm,
             root,
             forwards,
@@ -240,7 +236,6 @@ impl Cli {
                 cpus,
                 memory_mib,
                 snapshot_path,
-                no_snapshot_restore,
                 nested_kvm,
                 root,
                 forwards,
@@ -262,7 +257,6 @@ impl Cli {
                 cpus,
                 memory_mib,
                 snapshot_path,
-                no_snapshot_restore,
                 forwards,
                 explicit_kernel,
                 explicit_rootfs,
@@ -275,7 +269,6 @@ impl Cli {
                 cpus,
                 memory_mib,
                 snapshot_path,
-                no_snapshot_restore,
                 forwards,
                 explicit_kernel,
                 explicit_rootfs,
@@ -325,7 +318,6 @@ impl Cli {
                 cpus,
                 memory_mib,
                 snapshot_path,
-                no_snapshot_restore,
                 nested_kvm,
                 root,
                 forwards,
@@ -439,7 +431,6 @@ fn print_instance_logs(layout: &Layout, console: bool, owner: bool) -> Result<()
 
 fn list_instances(base: &Path) -> Result<()> {
     let mut names = BTreeSet::new();
-    collect_child_dir_names(&base.join("images"), &mut names)?;
     collect_child_dir_names(&base.join("instances"), &mut names)?;
 
     let mut instances = names
@@ -557,7 +548,6 @@ fn run_guest(
     cpus: u8,
     memory_mib: u32,
     snapshot_path: Option<PathBuf>,
-    no_snapshot_restore: bool,
     nested_kvm: bool,
     run_as_root: bool,
     forwards: Vec<runner::PortForward>,
@@ -570,7 +560,6 @@ fn run_guest(
         cpus,
         memory_mib,
         forwards.clone(),
-        no_snapshot_restore,
         snapshot_path.is_some(),
     )?;
 
@@ -594,14 +583,10 @@ fn run_guest(
     }
     let cwd = std::env::current_dir().context("current directory")?;
 
-    let restore_snapshot = if no_snapshot_restore {
-        None
-    } else {
-        snapshot_path.or_else(|| {
-            let latest = layout.snapshot_dir.join("latest");
-            latest.exists().then_some(latest)
-        })
-    };
+    let restore_snapshot = snapshot_path.or_else(|| {
+        let latest = layout.snapshot_dir.join("latest");
+        latest.exists().then_some(latest)
+    });
 
     let config = runner::RunConfig {
         layout,
@@ -651,10 +636,9 @@ fn ensure_vm_initialized(
     cpus: u8,
     memory_mib: u32,
     _forwards: Vec<runner::PortForward>,
-    no_snapshot_restore: bool,
     explicit_snapshot: bool,
 ) -> Result<()> {
-    if layout.vm_initialized.exists() || no_snapshot_restore || explicit_snapshot {
+    if layout.vm_initialized.exists() || explicit_snapshot {
         return Ok(());
     }
     if layout.snapshot_dir.join("latest").exists() {
@@ -965,7 +949,6 @@ fn create_checkpoint(
     cpus: u8,
     memory_mib: u32,
     snapshot_path: Option<PathBuf>,
-    no_snapshot_restore: bool,
     forwards: Vec<runner::PortForward>,
     explicit_kernel: bool,
     explicit_rootfs: bool,
@@ -980,14 +963,10 @@ fn create_checkpoint(
         runner::request_checkpoint(&broker_socket, &path).context("checkpoint running VM")?;
     } else {
         let cwd = std::env::current_dir().context("current directory")?;
-        let restore_snapshot = if no_snapshot_restore {
-            None
-        } else {
-            snapshot_path.or_else(|| {
-                let latest = layout.snapshot_dir.join("latest");
-                latest.exists().then_some(latest)
-            })
-        };
+        let restore_snapshot = snapshot_path.or_else(|| {
+            let latest = layout.snapshot_dir.join("latest");
+            latest.exists().then_some(latest)
+        });
         runner::seed_checkpoint_from_base(
             &layout,
             &path,
@@ -1043,7 +1022,6 @@ fn fork_checkpoint(
     cpus: u8,
     memory_mib: u32,
     snapshot_path: Option<PathBuf>,
-    no_snapshot_restore: bool,
     forwards: Vec<runner::PortForward>,
     explicit_kernel: bool,
     explicit_rootfs: bool,
@@ -1055,7 +1033,6 @@ fn fork_checkpoint(
             cpus,
             memory_mib,
             snapshot_path,
-            no_snapshot_restore,
             forwards,
             explicit_kernel,
             explicit_rootfs,
@@ -1072,7 +1049,6 @@ fn create_internal_fork_checkpoint(
     cpus: u8,
     memory_mib: u32,
     snapshot_path: Option<PathBuf>,
-    no_snapshot_restore: bool,
     forwards: Vec<runner::PortForward>,
     explicit_kernel: bool,
     explicit_rootfs: bool,
@@ -1087,14 +1063,10 @@ fn create_internal_fork_checkpoint(
         runner::request_checkpoint(&broker_socket, &path).context("checkpoint running VM")?;
     } else {
         let cwd = std::env::current_dir().context("current directory")?;
-        let restore_snapshot = if no_snapshot_restore {
-            None
-        } else {
-            snapshot_path.or_else(|| {
-                let latest = layout.snapshot_dir.join("latest");
-                latest.exists().then_some(latest)
-            })
-        };
+        let restore_snapshot = snapshot_path.or_else(|| {
+            let latest = layout.snapshot_dir.join("latest");
+            latest.exists().then_some(latest)
+        });
         runner::seed_checkpoint_from_base(
             layout,
             &path,

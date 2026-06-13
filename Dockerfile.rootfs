@@ -17,11 +17,6 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-RUN printf '%s\n' \
-    'deb http://ports.ubuntu.com/ubuntu-ports resolute main universe' \
-    'deb http://ports.ubuntu.com/ubuntu-ports resolute-updates main universe' \
-    > /etc/apt/sources.list
-
 FROM ubuntu:26.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

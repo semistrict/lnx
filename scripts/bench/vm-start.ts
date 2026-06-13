@@ -128,7 +128,6 @@ async function run(
 }
 
 async function removeInstance(instance: string): Promise<void> {
-  await rm(join(base, "images", instance), { recursive: true, force: true });
   await rm(join(base, "instances", instance), { recursive: true, force: true });
 }
 

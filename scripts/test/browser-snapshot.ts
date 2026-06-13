@@ -144,10 +144,10 @@ if (Bun.env.LNX_RUN_BROWSER_TEST !== "1") {
 
 try {
   await prepareContext(ctx);
-  await run(["rm", "-rf", `${ctx.base}/images/${forkName}`, `${ctx.base}/instances/${forkName}`], { check: false });
+  await run(["rm", "-rf", `${ctx.base}/instances/${forkName}`, `${ctx.base}/instances/${forkName}`], { check: false });
 
   await testStep("install stock browser stack", async () => {
-    await lnx(ctx, ["--no-snapshot-restore", "sudo", "apt-get", "update"], { timeoutMs: 300_000 });
+    await lnx(ctx, ["sudo", "apt-get", "update"], { timeoutMs: 300_000 });
     await lnx(ctx, ["bash", "-lc", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y snapd squashfs-tools cage wayvnc novnc websockify"], { timeoutMs: 600_000 });
     await lnx(ctx, ["sudo", "systemctl", "enable", "--now", "snapd.socket"], { timeoutMs: 120_000 });
     await lnx(ctx, ["bash", "-lc", "sudo systemctl start snapd.service || true"], { timeoutMs: 120_000 });
@@ -190,7 +190,7 @@ for i in $(seq 1 100); do
 done
 [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] || { tail -120 /tmp/lnx-cage.log; exit 1; }
 printf 'enable_auth=false\n' >/tmp/lnx-wayvnc.ini
-env XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" wayvnc -C /tmp/lnx-wayvnc.ini --disable-input 127.0.0.1 5900 >/tmp/lnx-wayvnc.log 2>&1 &
+env XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" wayvnc -C /tmp/lnx-wayvnc.ini 127.0.0.1 5900 >/tmp/lnx-wayvnc.log 2>&1 &
 for i in $(seq 1 100); do
   ss -ltn sport = :5900 | grep -q 5900 && break
   sleep 0.1
@@ -253,7 +253,7 @@ exit 1
   });
 } finally {
   await cleanupContext(ctx);
-  await run(["rm", "-rf", `${ctx.base}/images/${forkName}`, `${ctx.base}/instances/${forkName}`], { check: false });
+  await run(["rm", "-rf", `${ctx.base}/instances/${forkName}`, `${ctx.base}/instances/${forkName}`], { check: false });
 }
 
 process.exit(0);

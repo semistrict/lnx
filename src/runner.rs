@@ -310,18 +310,16 @@ enum NetworkBacking {
 }
 
 impl NetworkBacking {
-    /// One line of guest-visible network identity. Part of the snapshot
-    /// stamp: a snapshot taken on one backing must not restore on another.
+    /// One line of network backing identity. Part of the snapshot stamp: a
+    /// snapshot taken on one backing must not restore on another, while forked
+    /// instances on the same vmnet subnet can still resume from the checkpoint.
     fn stamp_line(&self) -> String {
         match self {
             NetworkBacking::Gvproxy(_) => "net=gvproxy".to_string(),
             #[cfg(target_os = "macos")]
             NetworkBacking::Vmnet {
-                ip,
-                prefix,
-                gateway,
-                ..
-            } => format!("net=vmnet:{ip}/{prefix}:{gateway}"),
+                prefix, gateway, ..
+            } => format!("net=vmnet:prefix={prefix}:gateway={gateway}"),
         }
     }
 
@@ -469,13 +467,13 @@ fn start_vm(
         timings.event("snapshot.restore.skipped.agent_changed");
         run_log.line("snapshot.restore.skipped reason=agent_changed");
         None
-    } else if config
+    } else if let Some(reason) = config
         .restore_snapshot
         .as_ref()
-        .is_some_and(|snapshot| !snapshot_shares_are_compatible(snapshot, &shares_stamp))
+        .and_then(|snapshot| snapshot_shares_incompatibility(snapshot, &shares_stamp))
     {
-        timings.event("snapshot.restore.skipped.share_mismatch");
-        run_log.line("snapshot.restore.skipped reason=share_mismatch");
+        timings.event(&format!("snapshot.restore.skipped.{reason}"));
+        run_log.line(format!("snapshot.restore.skipped reason={reason}"));
         None
     } else if let Some(snapshot) = &config.restore_snapshot {
         match snapshot_vm_config(snapshot) {
@@ -549,10 +547,13 @@ fn start_vm(
     };
     let guest_home = guest_home(&host_home);
     let guest_cwd = guest_cwd(&config.cwd, &host_home);
-    ctx.add_policy_virtiofs("home", &host_home)?;
-    set_home_write_allowlist(ctx.as_ref(), &config.cwd, &host_home)?;
+    ctx.add_host_virtiofs(
+        "home",
+        &host_home,
+        &home_write_allowlist(&config.cwd, &host_home),
+    )?;
     if let Some(cwd) = &outside_home_cwd {
-        ctx.add_virtiofs("cwd", cwd, false)?;
+        ctx.add_host_virtiofs("cwd", cwd, &cwd_write_allowlist())?;
     }
     let mut kernel_cmdline =
         format!("console=hvc0 reboot=k panic=1 root={root_device} rw rootfstype=ext4");
@@ -1138,17 +1139,21 @@ fn snapshot_initramfs_is_compatible(snapshot_path: &Path, current_stamp: &Path) 
     snapshot_sha == current_sha
 }
 
-// A restored guest keeps its snapshot-time share mounts and network
-// configuration, so a snapshot is only valid for the same host share roots
-// and network backing: a drifted root would silently back the old guest
-// mount points with a different host directory, and a drifted network would
-// strand the guest's addresses.
+const HOST_SHARE_CACHE_STAMP: &str = "host-share-cache=dax+keep-cache+writeback+restore-sync-v1";
+
+// A restored guest keeps its snapshot-time share mounts, network
+// configuration, and kernel-side virtiofs caches. A snapshot is only valid for
+// the same host share roots, network backing, and host-share cache policy: a
+// drifted root would silently back the old guest mount points with a different
+// host directory, a drifted network would strand the guest's addresses, and an
+// old cache policy can preserve stale host-file contents or size after the
+// host changed while the VM was stopped.
 fn shares_stamp_content(
     host_home: &Path,
     outside_home_cwd: Option<&Path>,
     net_stamp_line: &str,
 ) -> String {
-    let mut content = format!("home={}\n", host_home.display());
+    let mut content = format!("{HOST_SHARE_CACHE_STAMP}\nhome={}\n", host_home.display());
     if let Some(cwd) = outside_home_cwd {
         content.push_str(&format!("cwd={}\n", cwd.display()));
     }
@@ -1157,14 +1162,18 @@ fn shares_stamp_content(
     content
 }
 
-fn snapshot_shares_are_compatible(snapshot_path: &Path, current: &str) -> bool {
+fn snapshot_shares_incompatibility(snapshot_path: &Path, current: &str) -> Option<&'static str> {
     match fs::read_to_string(snapshot_path.join("shares.stamp")) {
-        Ok(stamp) => stamp == current,
-        // Snapshots captured before share stamping have no stamp; treat them
-        // as compatible so an upgrade does not silently discard them. New
-        // snapshots always write the stamp, so this only affects legacy ones.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-        Err(_) => false,
+        Ok(stamp) if stamp == current => None,
+        Ok(stamp) if !stamp.lines().any(|line| line == HOST_SHARE_CACHE_STAMP) => {
+            Some("host_share_cache_policy")
+        }
+        Ok(_) => Some("share_mismatch"),
+        // Missing stamps predate the host-share cache-policy stamp. Do not
+        // memory-restore them: the guest may hold stale page-cache, inode-size,
+        // or dentry state for host-owned files.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some("host_share_cache_policy"),
+        Err(_) => Some("share_mismatch"),
     }
 }
 
@@ -1742,6 +1751,44 @@ fn run_broker_owner(
             version: PROTOCOL_VERSION,
         },
     )?;
+
+    if restore_snapshot.is_some() {
+        let channel_id = new_request_id()?;
+        timings.event("snapshot.restore.sync.begin");
+        run_log.line(format!(
+            "snapshot.restore.sync.begin channel_id={channel_id:016x}"
+        ));
+        agent_stream
+            .set_read_timeout(Some(DEFAULT_AGENT_ACCEPT_TIMEOUT))
+            .context("set restore-sync read timeout")?;
+        let sync_result = (|| -> Result<()> {
+            write_message(&mut agent_stream, &Message::RestoreSync { channel_id })?;
+            loop {
+                match read_message(&mut agent_stream)? {
+                    Message::RestoreSynced { channel_id: id } if id == channel_id => return Ok(()),
+                    Message::Error {
+                        channel_id: id,
+                        message,
+                    } if id == channel_id => bail!("{message}"),
+                    Message::Hello { .. } => {}
+                    _ => {}
+                }
+            }
+        })();
+        let _ = agent_stream.set_read_timeout(None);
+        match sync_result {
+            Ok(()) => {
+                timings.event("snapshot.restore.sync.done");
+                run_log.line(format!(
+                    "snapshot.restore.sync.done channel_id={channel_id:016x}"
+                ));
+            }
+            Err(e) => {
+                timings.event("snapshot.restore.sync.error");
+                return Err(e.context("restore sync failed").context(RestoreRefused));
+            }
+        }
+    }
 
     let (agent_tx, agent_rx) = mpsc::channel::<Message>();
     let (checkpoint_tx, checkpoint_rx) = mpsc::channel::<CheckpointRequest>();
@@ -2678,9 +2725,13 @@ fn home_write_allowlist(cwd: &Path, host_home: &Path) -> Vec<String> {
     }
 }
 
+fn cwd_write_allowlist() -> Vec<String> {
+    vec![".".to_string()]
+}
+
 #[cfg(target_os = "macos")]
 fn set_home_write_allowlist(ctx: &KrunContext, cwd: &Path, host_home: &Path) -> Result<()> {
-    ctx.set_virtiofs_write_allowlist("home", &home_write_allowlist(cwd, host_home))
+    ctx.set_host_virtiofs_write_allowlist("home", &home_write_allowlist(cwd, host_home))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -3003,15 +3054,15 @@ mod tests {
     fn shares_stamp_content_lists_home_cwd_and_network() {
         assert_eq!(
             shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy"),
-            "home=/Users/ramon\nnet=gvproxy\n"
+            "host-share-cache=dax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\nnet=gvproxy\n"
         );
         assert_eq!(
             shares_stamp_content(
                 Path::new("/Users/ramon"),
                 Some(Path::new("/tmp/build")),
-                "net=vmnet:192.168.106.2/24:192.168.106.1"
+                "net=vmnet:prefix=24:gateway=192.168.106.1"
             ),
-            "home=/Users/ramon\ncwd=/tmp/build\nnet=vmnet:192.168.106.2/24:192.168.106.1\n"
+            "host-share-cache=dax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\ncwd=/tmp/build\nnet=vmnet:prefix=24:gateway=192.168.106.1\n"
         );
     }
 
@@ -3021,23 +3072,40 @@ mod tests {
         fs::create_dir_all(temp.path()).expect("create snapshot dir");
         let current = shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy");
 
-        // A snapshot from before share stamping has no stamp and must still
-        // restore (back-compat); only a present, differing stamp is rejected.
-        assert!(snapshot_shares_are_compatible(temp.path(), &current));
+        // A snapshot from before share/cache-policy stamping may preserve
+        // unsafe host-file cache state, so it must not memory-restore.
+        assert_eq!(
+            snapshot_shares_incompatibility(temp.path(), &current),
+            Some("host_share_cache_policy")
+        );
 
         fs::write(temp.path().join("shares.stamp"), &current).expect("write stamp");
-        assert!(snapshot_shares_are_compatible(temp.path(), &current));
+        assert_eq!(snapshot_shares_incompatibility(temp.path(), &current), None);
+
+        let legacy_cache_policy = "home=/Users/ramon\nnet=gvproxy\n";
+        fs::write(temp.path().join("shares.stamp"), legacy_cache_policy).expect("write stamp");
+        assert_eq!(
+            snapshot_shares_incompatibility(temp.path(), &current),
+            Some("host_share_cache_policy")
+        );
 
         let drifted = shares_stamp_content(Path::new("/home/ramon"), None, "net=gvproxy");
-        assert!(!snapshot_shares_are_compatible(temp.path(), &drifted));
+        fs::write(temp.path().join("shares.stamp"), &current).expect("write stamp");
+        assert_eq!(
+            snapshot_shares_incompatibility(temp.path(), &drifted),
+            Some("share_mismatch")
+        );
 
         // The same shares on a different network backing must not restore.
         let renetworked = shares_stamp_content(
             Path::new("/Users/ramon"),
             None,
-            "net=vmnet:192.168.106.2/24:192.168.106.1",
+            "net=vmnet:prefix=24:gateway=192.168.106.1",
         );
-        assert!(!snapshot_shares_are_compatible(temp.path(), &renetworked));
+        assert_eq!(
+            snapshot_shares_incompatibility(temp.path(), &renetworked),
+            Some("share_mismatch")
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -3206,6 +3274,11 @@ mod tests {
         assert!(
             home_write_allowlist(Path::new("/tmp/build"), Path::new("/Users/ramon")).is_empty()
         );
+    }
+
+    #[test]
+    fn cwd_write_allowlist_allows_entire_outside_home_cwd_share() {
+        assert_eq!(cwd_write_allowlist(), vec![".".to_string()]);
     }
 }
 

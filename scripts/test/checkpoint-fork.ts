@@ -14,9 +14,9 @@ import {
 const ctx = defaultContext("checkpoint");
 const forkA = `${ctx.instance}-from-named`;
 const forkB = `${ctx.instance}-from-current`;
-const forkAImage = join(ctx.base, "images", forkA);
+const forkAImage = join(ctx.base, "instances", forkA);
 const forkARun = join(ctx.base, "instances", forkA);
-const forkBImage = join(ctx.base, "images", forkB);
+const forkBImage = join(ctx.base, "instances", forkB);
 const forkBRun = join(ctx.base, "instances", forkB);
 const vmArgs = [
   ...(Bun.env.LNX_TEST_CPUS ? ["--cpus", Bun.env.LNX_TEST_CPUS] : []),
@@ -41,7 +41,6 @@ try {
 
   await testStep("checkpoint captures disk and memory", async () => {
     const write = await lnxVm([
-      "--no-snapshot-restore",
       "bash",
       "-lc",
       "printf disk-before | sudo tee /root/lnx-checkpoint-disk >/dev/null; printf memory-before | sudo tee /run/lnx-checkpoint-memory >/dev/null; echo ready",

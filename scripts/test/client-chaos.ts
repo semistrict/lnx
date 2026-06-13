@@ -6,7 +6,7 @@ try {
   await prepareContext(ctx);
 
   await testStep("disconnecting non-pty client does not poison broker", async () => {
-    const proc = spawnLnx(ctx, ["--no-snapshot-restore", "bash", "-lc", "trap 'exit 0' TERM; sleep 60"], {
+    const proc = spawnLnx(ctx, ["bash", "-lc", "trap 'exit 0' TERM; sleep 60"], {
       stdout: "pipe",
       stderr: "pipe",
     });

@@ -31,7 +31,7 @@ const linuxLinker = Bun.env.CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER
   ?? "/opt/homebrew/bin/aarch64-linux-musl-gcc";
 const hostHome = Bun.env.HOME ?? "";
 const kernel = join(hostHome, ".lnx", "vmlinuz");
-const rootfs = Bun.env.LNX_NESTED_ROOTFS ?? join(hostHome, ".lnx", "images", "default", "rootfs.ext4");
+const rootfs = Bun.env.LNX_NESTED_ROOTFS ?? join(hostHome, ".lnx", "instances", "default", "rootfs.ext4");
 const snapshotInnerRootfs = join(cwd, "snapshot-inner-rootfs.ext4");
 const nestedCheckpointInstance = "lnx-checkpoint-nested";
 const nestedSnapshotInstance = "lnx-nested-snapshot";
@@ -293,9 +293,9 @@ async function waitForOuterExit(instance: string) {
   await waitForOwnerExit({
     ...ctx,
     instance,
-    imageDir: join(ctx.base, "images", instance),
+    imageDir: join(ctx.base, "instances", instance),
     runDir: join(ctx.base, "instances", instance),
-    snapshotDir: join(ctx.base, "images", instance, "memory-snapshots"),
+    snapshotDir: join(ctx.base, "instances", instance, "memory-snapshots"),
   }, 120_000);
 }
 
@@ -343,9 +343,9 @@ async function cloneShrunkRootfs(src: string, dest: string) {
 
 async function prepareInnerBase(base: string, instance: string) {
   await rm(base, { recursive: true, force: true });
-  await mkdir(join(base, "images", instance), { recursive: true });
+  await mkdir(join(base, "instances", instance), { recursive: true });
   await run(["cp", kernel, join(base, "vmlinuz")], { timeoutMs: 180_000 });
-  await cloneRootfs(snapshotInnerRootfs, join(base, "images", instance, "rootfs.ext4"));
+  await cloneRootfs(snapshotInnerRootfs, join(base, "instances", instance, "rootfs.ext4"));
 }
 
 async function innerOwnerCounts(base: string, instance: string): Promise<{ starts: number; dones: number }> {
@@ -386,7 +386,6 @@ async function runInnerViaOuter(
   innerInstance: string,
   innerArgs: string[],
   options: {
-    outerNoSnapshotRestore?: boolean;
     prelude?: string[];
     timeoutMs?: number;
   } = {},
@@ -409,7 +408,6 @@ async function runInnerViaOuter(
     outer,
     [
       ...outerVmArgs,
-      ...(options.outerNoSnapshotRestore ? ["--no-snapshot-restore"] : []),
       "bash",
       "-lc",
       script,
@@ -507,9 +505,8 @@ try {
       instance,
       innerBase,
       innerInstance,
-      ["--no-snapshot-restore", "uname", "-m"],
+      ["uname", "-m"],
       {
-        outerNoSnapshotRestore: true,
         prelude: ["lnxctl snapshot-exit"],
         timeoutMs: 300_000,
       },
@@ -532,12 +529,10 @@ try {
       innerBase,
       innerInstance,
       [
-        "--no-snapshot-restore",
         "bash",
         "-lc",
         "printf nested-disk >/home/lnxuser/nested-kvm-state && cat /home/lnxuser/nested-kvm-state",
       ],
-      { outerNoSnapshotRestore: true },
     );
     assertEq(cold.stdout, "nested-disk", "inner cold write");
 
@@ -556,7 +551,7 @@ try {
     );
   } else await testStep("run Linux-host-compatible suite in nested-capable guest", async () => {
     const suiteBase = join(cwd, "suite");
-    const suiteDefaultImage = join(suiteBase, "images", "default");
+    const suiteDefaultImage = join(suiteBase, "instances", "default");
     const suiteKernel = join(suiteBase, "vmlinuz");
     const suiteRootfs = join(suiteDefaultImage, "rootfs.ext4");
     const suiteLog = join(cwd, "nested-suite.log");
@@ -569,7 +564,7 @@ try {
       if (!instance) {
         continue;
       }
-      const image = join(suiteBase, "images", instance);
+      const image = join(suiteBase, "instances", instance);
       await mkdir(image, { recursive: true });
       await cloneRootfs(suiteRootfs, join(image, "rootfs.ext4"));
     }
@@ -630,7 +625,6 @@ try {
       outerInstance("suite"),
       [
         ...outerVmArgs,
-        "--no-snapshot-restore",
         "bash",
         "-lc",
         script,

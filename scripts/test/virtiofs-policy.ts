@@ -45,8 +45,7 @@ try {
     const result = await lnx(
       ctx,
       [
-        "--no-snapshot-restore",
-        "bash",
+      "bash",
         "-lc",
         [
           "printf allowed > allowed.txt",
@@ -68,7 +67,7 @@ try {
     await lnx(
       ctx,
       [
-        "bash",
+      "bash",
         "-lc",
         "printf memory-policy | sudo tee /run/virtiofs-policy-memory >/dev/null; printf snapshot-root | sudo tee /root/virtiofs-policy-root >/dev/null; printf before > before-snapshot.txt",
       ],
@@ -104,7 +103,7 @@ try {
     const result = await lnx(
       ctx,
       [
-        "bash",
+      "bash",
         "-lc",
         String.raw`
 set -euo pipefail

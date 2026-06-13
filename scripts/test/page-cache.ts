@@ -24,7 +24,6 @@ try {
     const result = await lnx(
       ctx,
       [
-        "--no-snapshot-restore",
         "bash",
         "-lc",
         String.raw`

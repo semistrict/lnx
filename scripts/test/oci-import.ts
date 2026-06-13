@@ -47,7 +47,7 @@ try {
   });
 
   await testStep("alpine boots busybox init with a supervised agent", async () => {
-    const release = await lnx(ctx, ["--no-snapshot-restore", "cat", "/etc/alpine-release"], {
+    const release = await lnx(ctx, ["cat", "/etc/alpine-release"], {
       timeoutMs: 180_000,
     });
     assertContains(release.stdout, "3.21.", "alpine release file");
@@ -128,9 +128,7 @@ try {
       [
         ctx.lnxBin,
         "--instance",
-        noInitInstance,
-        "--no-snapshot-restore",
-        "cat",
+        noInitInstance,        "cat",
         "/proc/1/comm",
       ],
       { timeoutMs: 180_000 },

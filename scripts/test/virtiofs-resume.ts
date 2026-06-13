@@ -13,14 +13,18 @@ import {
   sleep,
   spawnLnx,
   testStep,
+  waitForVmSuspend,
+  write,
 } from "./lib";
 
 const ctx = defaultContext("virtiofs-resume");
 const forkInstance = `${ctx.instance}-fork`;
 const cwd = join(ctx.repoRoot, ".lnx-virtiofs-resume");
+const outsideCwd = `/tmp/lnx-virtiofs-resume-outside-${process.pid}`;
 
 async function cleanupDirs() {
   await rm(cwd, { recursive: true, force: true });
+  await rm(outsideCwd, { recursive: true, force: true });
 }
 
 async function waitForSourceReady(): Promise<void> {
@@ -38,12 +42,12 @@ try {
   await cleanupInstance(ctx, forkInstance);
   await cleanupDirs();
   await mkdir(cwd, { recursive: true });
+  await mkdir(outsideCwd, { recursive: true });
 
   await testStep("open virtiofs fd and mmap survive snapshot-exit", async () => {
     const result = await lnx(
       ctx,
       [
-        "--no-snapshot-restore",
         "python3",
         "-",
       ],
@@ -95,11 +99,45 @@ finally:
     assertContains(host, "fd-after", "host saw post-snapshot fd write");
   });
 
+  await testStep("restored virtiofs sees host edits after prior guest read", async () => {
+    await write(join(cwd, "host-edited.txt"), "before\n");
+
+    const before = await lnx(ctx, ["cat", "host-edited.txt"], { cwd, timeoutMs: 180_000 });
+    assertEq(before.stdout, "before", "guest read initial host file");
+    await waitForVmSuspend(ctx);
+
+    await write(join(cwd, "host-edited.txt"), "after-after-after\n");
+
+    const after = await lnx(ctx, ["cat", "host-edited.txt"], { cwd, timeoutMs: 180_000 });
+    assertEq(after.stdout, "after-after-after", "restored guest read host-edited file");
+  });
+
+  await testStep("restored outside-home virtiofs sees host edits after prior guest read", async () => {
+    await waitForVmSuspend(ctx);
+    await write(join(outsideCwd, "outside-host-edited.txt"), "outside-before\n");
+
+    const before = await lnx(ctx, ["cat", "outside-host-edited.txt"], {
+      cwd: outsideCwd,
+      timeoutMs: 180_000,
+    });
+    assertEq(before.stdout, "outside-before", "outside-home guest read initial host file");
+    await waitForVmSuspend(ctx);
+
+    await write(join(outsideCwd, "outside-host-edited.txt"), "outside-after-after\n");
+
+    const after = await lnx(ctx, ["cat", "outside-host-edited.txt"], {
+      cwd: outsideCwd,
+      timeoutMs: 180_000,
+    });
+    assertEq(after.stdout, "outside-after-after", "restored outside-home guest read host-edited file");
+  });
+
   await testStep("open virtiofs fd and mmap survive fork restore", async () => {
+    await waitForVmSuspend(ctx);
+
     const owner = spawnLnx(
       ctx,
       [
-        "--no-snapshot-restore",
         "python3",
         "-",
       ],

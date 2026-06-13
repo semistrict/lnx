@@ -89,24 +89,12 @@ impl Context {
         )
     }
 
-    pub fn add_virtiofs(&self, tag: &str, path: &Path, read_only: bool) -> Result<()> {
-        let tag = CString::new(tag)?;
-        let path = cstring_path(path)?;
-        call(
-            unsafe {
-                libkrun::krun_add_virtiofs3(
-                    self.id,
-                    tag.as_ptr(),
-                    path.as_ptr(),
-                    VIRTIOFS_DAX_WINDOW_BYTES,
-                    read_only,
-                )
-            },
-            "krun_add_virtiofs3",
-        )
-    }
-
-    pub fn add_policy_virtiofs(&self, tag: &str, path: &Path) -> Result<()> {
+    pub fn add_host_virtiofs(
+        &self,
+        tag: &str,
+        path: &Path,
+        write_allowlist: &[String],
+    ) -> Result<()> {
         let tag = CString::new(tag)?;
         let path = cstring_path(path)?;
         call(
@@ -121,11 +109,20 @@ impl Context {
                 )
             },
             "krun_add_virtiofs4",
-        )
+        )?;
+        self.set_host_virtiofs_write_allowlist_cstr(&tag, write_allowlist)
     }
 
-    pub fn set_virtiofs_write_allowlist(&self, tag: &str, paths: &[String]) -> Result<()> {
+    pub fn set_host_virtiofs_write_allowlist(&self, tag: &str, paths: &[String]) -> Result<()> {
         let tag = CString::new(tag)?;
+        self.set_host_virtiofs_write_allowlist_cstr(&tag, paths)
+    }
+
+    fn set_host_virtiofs_write_allowlist_cstr(
+        &self,
+        tag: &CString,
+        paths: &[String],
+    ) -> Result<()> {
         let paths = CString::new(paths.join("\n"))?;
         call(
             unsafe {

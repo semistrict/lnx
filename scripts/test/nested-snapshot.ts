@@ -27,7 +27,6 @@ try {
 
   await testStep("Linux-host snapshot restores disk and memory state", async () => {
     const write = await lnxVm([
-      "--no-snapshot-restore",
       "bash",
       "-lc",
       "printf nested-disk | sudo tee /root/lnx-nested-snapshot-disk >/dev/null; printf nested-memory | sudo tee /run/lnx-nested-snapshot-memory >/dev/null; echo ready",

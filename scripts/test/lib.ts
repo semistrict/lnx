@@ -28,7 +28,7 @@ export function defaultContext(name: string): TestContext {
   const root = repoRoot();
   const instance = Bun.env.LNX_TEST_INSTANCE ?? `lnx-${name}-${process.pid}`;
   const base = Bun.env.LNX_BASE ?? join(Bun.env.HOME ?? ".", ".lnx");
-  const imageDir = join(base, "images", instance);
+  const imageDir = join(base, "instances", instance);
   const runDir = join(base, "instances", instance);
   return {
     repoRoot: root,
@@ -82,7 +82,6 @@ export async function waitForVmSuspend(ctx: TestContext, timeoutMs = 60_000): Pr
 }
 
 export async function cleanupInstance(ctx: TestContext, instance: string): Promise<void> {
-  await rm(join(ctx.base, "images", instance), { recursive: true, force: true });
   await rm(join(ctx.base, "instances", instance), { recursive: true, force: true });
 }
 
