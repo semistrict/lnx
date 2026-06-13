@@ -82,6 +82,20 @@ type Result<T> = ::std::result::Result<T, Error>;
 /// Currently hardcoded to 4K.
 const MMIO_LEN: u64 = 0x1000;
 
+#[cfg(target_arch = "aarch64")]
+fn irqfd_pin_for_guest_irq(irq: u32) -> u32 {
+    if std::env::var_os("LNX_KVM_IRQFD_MACOS_SPI").is_some() {
+        irq.saturating_sub(arch::aarch64::layout::IRQ_BASE)
+    } else {
+        irq
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn irqfd_pin_for_guest_irq(irq: u32) -> u32 {
+    irq
+}
+
 /// Manages the complexities of registering a MMIO device.
 pub struct MMIODeviceManager {
     pub bus: devices::Bus,
@@ -153,8 +167,11 @@ impl MMIODeviceManager {
                 .map_err(Error::RegisterIoEvent)?;
         }
 
-        vm.register_irqfd(mmio_device.interrupt_evt(), self.irq)
-            .map_err(Error::RegisterIrqFd)?;
+        vm.register_irqfd(
+            mmio_device.interrupt_evt(),
+            irqfd_pin_for_guest_irq(self.irq),
+        )
+        .map_err(Error::RegisterIrqFd)?;
 
         mmio_device.set_irq_line(self.irq);
 
@@ -212,8 +229,11 @@ impl MMIODeviceManager {
             return Err(Error::IrqsExhausted);
         }
 
-        vm.register_irqfd(serial.lock().unwrap().interrupt_evt(), self.irq)
-            .map_err(Error::RegisterIrqFd)?;
+        vm.register_irqfd(
+            serial.lock().unwrap().interrupt_evt(),
+            irqfd_pin_for_guest_irq(self.irq),
+        )
+        .map_err(Error::RegisterIrqFd)?;
 
         {
             let mut serial = serial.lock().unwrap();
@@ -261,7 +281,7 @@ impl MMIODeviceManager {
         // Attaching the RTC device.
         let rtc_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
         let device = devices::legacy::RTC::new(rtc_evt.try_clone().map_err(Error::EventFd)?);
-        vm.register_irqfd(&rtc_evt, self.irq)
+        vm.register_irqfd(&rtc_evt, irqfd_pin_for_guest_irq(self.irq))
             .map_err(Error::RegisterIrqFd)?;
 
         self.bus
@@ -346,6 +366,22 @@ mod tests {
     use vm_memory::{GuestAddress, GuestMemoryMmap};
 
     const QUEUE_CONFIG: &[QueueConfig] = &[QueueConfig::new(64)];
+    #[cfg(target_arch = "aarch64")]
+    static MACOS_IRQFD_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(target_arch = "aarch64")]
+    struct MacosIrqfdEnvGuard;
+
+    #[cfg(target_arch = "aarch64")]
+    impl Drop for MacosIrqfdEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests using this guard hold MACOS_IRQFD_ENV_LOCK, so
+            // this process environment mutation is serialized.
+            unsafe {
+                std::env::remove_var("LNX_KVM_IRQFD_MACOS_SPI");
+            }
+        }
+    }
 
     impl MMIODeviceManager {
         fn register_virtio_device(
@@ -501,6 +537,39 @@ mod tests {
         let dummy = DummyDevice::new();
         assert_eq!(dummy.device_type(), 0);
         assert_eq!(dummy.queue_config().len(), QUEUE_CONFIG.len());
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn irqfd_pin_uses_guest_irq_by_default() {
+        let _guard = MACOS_IRQFD_ENV_LOCK.lock().unwrap();
+        // SAFETY: this test serializes access to the process environment for
+        // this internal switch.
+        unsafe {
+            std::env::remove_var("LNX_KVM_IRQFD_MACOS_SPI");
+        }
+
+        assert_eq!(
+            irqfd_pin_for_guest_irq(arch::aarch64::layout::IRQ_BASE + 7),
+            arch::aarch64::layout::IRQ_BASE + 7
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn irqfd_pin_translates_macos_spi_to_kvm_irqfd_pin() {
+        let _guard = MACOS_IRQFD_ENV_LOCK.lock().unwrap();
+        // SAFETY: this test serializes access to the process environment for
+        // this internal switch.
+        unsafe {
+            std::env::set_var("LNX_KVM_IRQFD_MACOS_SPI", "1");
+        }
+        let _env_guard = MacosIrqfdEnvGuard;
+
+        assert_eq!(
+            irqfd_pin_for_guest_irq(arch::aarch64::layout::IRQ_BASE + 7),
+            7
+        );
     }
 
     #[test]

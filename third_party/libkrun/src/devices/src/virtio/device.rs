@@ -257,6 +257,12 @@ pub trait VirtioDevice: AsAny + Send {
             self.device_name().to_string(),
         ))
     }
+
+    /// Apply a macOS-origin snapshot while running on another backend. Device
+    /// payloads with backend-independent layouts can use normal restore.
+    fn restore_macos_state(&mut self, snap: &DeviceSnapshot) -> Result<(), DeviceSnapshotError> {
+        self.restore_state(snap)
+    }
 }
 
 pub trait VmmExitObserver: Send {

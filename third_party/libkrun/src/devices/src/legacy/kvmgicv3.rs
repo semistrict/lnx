@@ -1,6 +1,8 @@
 // Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
 use std::io;
 
 use crate::Error as DeviceError;
@@ -52,6 +54,16 @@ struct DeviceReg64 {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
+struct MacosGicV3State {
+    gicd_ctlr: u32,
+    edge_trigger: Vec<u32>,
+    gicr_waker: u32,
+    gicd_irouter: Vec<u64>,
+}
+
+#[cfg(target_os = "linux")]
 const GIC_INTERNAL: u32 = 32;
 #[cfg(target_os = "linux")]
 const GICD_CTLR: u32 = 0x0000;
@@ -75,6 +87,12 @@ const GICD_IPRIORITYR: u32 = 0x0400;
 const GICD_ICFGR: u32 = 0x0c00;
 #[cfg(target_os = "linux")]
 const GICD_IROUTER: u32 = 0x6000;
+#[cfg(target_os = "linux")]
+const GICD_CTLR_ENABLE_SS_G1: u32 = 1 << 1;
+#[cfg(target_os = "linux")]
+const GICD_CTLR_ARE_NS: u32 = 1 << 4;
+#[cfg(target_os = "linux")]
+const GICD_CTLR_DS: u32 = 1 << 6;
 // KVM's redistributor uaccess space covers both 64KiB frames: the RD_base
 // frame at offset 0 and the SGI_base frame (SGI/PPI registers) at 0x10000.
 // Frame-relative offsets in the SGI frame read back as zero through the
@@ -96,11 +114,15 @@ const GICR_ICENABLER0: u32 = GICR_SGI_BASE + 0x0180;
 #[cfg(target_os = "linux")]
 const GICR_ISPENDR0: u32 = GICR_SGI_BASE + 0x0200;
 #[cfg(target_os = "linux")]
+const GICR_ICPENDR0: u32 = GICR_SGI_BASE + 0x0280;
+#[cfg(target_os = "linux")]
 const GICR_ISACTIVER0: u32 = GICR_SGI_BASE + 0x0300;
 #[cfg(target_os = "linux")]
 const GICR_ICACTIVER0: u32 = GICR_SGI_BASE + 0x0380;
 #[cfg(target_os = "linux")]
 const GICR_IPRIORITYR: u32 = GICR_SGI_BASE + 0x0400;
+#[cfg(target_os = "linux")]
+const GICR_ICFGR0: u32 = GICR_SGI_BASE + 0x0c00;
 #[cfg(target_os = "linux")]
 const GICR_ICFGR1: u32 = GICR_SGI_BASE + 0x0c04;
 #[cfg(target_os = "linux")]
@@ -131,6 +153,12 @@ const ICC_SRE_EL1: u64 = vgic_sysreg(3, 0, 12, 12, 5);
 const ICC_IGRPEN0_EL1: u64 = vgic_sysreg(3, 0, 12, 12, 6);
 #[cfg(target_os = "linux")]
 const ICC_IGRPEN1_EL1: u64 = vgic_sysreg(3, 0, 12, 12, 7);
+#[cfg(target_os = "linux")]
+const ICC_CTLR_EL1_CBPR_MASK: u64 = 1 << 0;
+#[cfg(target_os = "linux")]
+const ICC_CTLR_EL1_EOIMODE_MASK: u64 = 1 << 1;
+#[cfg(target_os = "linux")]
+const ICC_SRE_EL1_SRE: u64 = 1 << 0;
 #[cfg(target_os = "linux")]
 const ICC_BASE_SYSREGS: &[u64] = &[
     ICC_PMR_EL1,
@@ -353,6 +381,200 @@ impl KvmGicV3 {
                 reg.group, reg.attr
             )))
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_macos_vcpu_gic(
+        &self,
+        cpu: u64,
+        icc_regs: &[(u16, u64)],
+        redist_regs: &[(u32, u64)],
+    ) -> Result<(), DeviceError> {
+        let redist = kvm_bindings::KVM_DEV_ARM_VGIC_GRP_REDIST_REGS;
+        let cpu_sysregs = kvm_bindings::KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS;
+        let current_ctlr = self
+            .read_reg64(cpu_sysregs, Self::attr(ICC_CTLR_EL1, cpu))?
+            .value;
+
+        for &(offset, value) in redist_regs {
+            let value = u32::try_from(value).map_err(|_| {
+                DeviceError::FailedSignalingUsedQueue(io::Error::other(format!(
+                    "macOS GIC redistributor value does not fit u32 offset=0x{offset:x}"
+                )))
+            })?;
+            let reg = DeviceReg32 {
+                group: redist,
+                attr: Self::attr(offset.into(), cpu),
+                value,
+            };
+            match offset {
+                GICR_ISENABLER0 => {
+                    self.write_reg32_clear(&reg, GICR_ICENABLER0, u32::MAX)?;
+                    self.write_reg32(&reg)?;
+                }
+                GICR_ISPENDR0 => {
+                    self.write_reg32_clear(&reg, GICR_ICPENDR0, u32::MAX)?;
+                    self.write_reg32(&reg)?;
+                }
+                GICR_ISACTIVER0 => {
+                    self.write_reg32_clear(&reg, GICR_ICACTIVER0, u32::MAX)?;
+                    self.write_reg32(&reg)?;
+                }
+                GICR_IGROUPR0 | GICR_ICFGR0 | GICR_ICFGR1 => {
+                    self.write_reg32(&reg)?;
+                }
+                offset if Self::offset_in_range(offset.into(), GICR_IPRIORITYR, GIC_INTERNAL) => {
+                    self.write_reg32(&reg)?;
+                }
+                _ => {
+                    return Err(DeviceError::FailedSignalingUsedQueue(io::Error::other(
+                        format!("unsupported macOS GIC redistributor offset=0x{offset:x}"),
+                    )));
+                }
+            }
+        }
+
+        for sysreg in [
+            ICC_SRE_EL1,
+            ICC_CTLR_EL1,
+            ICC_IGRPEN0_EL1,
+            ICC_IGRPEN1_EL1,
+            ICC_PMR_EL1,
+            ICC_BPR0_EL1,
+            ICC_BPR1_EL1,
+        ] {
+            for &(reg, value) in icc_regs {
+                if u64::from(reg) == sysreg {
+                    let value = match sysreg {
+                        ICC_SRE_EL1 => value | ICC_SRE_EL1_SRE,
+                        ICC_CTLR_EL1 => macos_portable_icc_ctlr(value, current_ctlr),
+                        _ => value,
+                    };
+                    self.write_reg64(&DeviceReg64 {
+                        group: cpu_sysregs,
+                        attr: Self::attr(sysreg, cpu),
+                        value,
+                    })?;
+                }
+            }
+        }
+        // Active-priority registers are implementation state, not portable
+        // architectural guest state. Leave KVM's fresh AP state in place so
+        // pending wake interrupts are not filtered by stale HVF priorities.
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_macos_gic_dist(&self, data: &[u8]) -> Result<(), DeviceError> {
+        let state: Option<MacosGicV3State> = if data.is_empty() {
+            None
+        } else {
+            Some(
+                bincode::deserialize(data)
+                    .map_err(|e| DeviceError::FailedSignalingUsedQueue(io::Error::other(e)))?,
+            )
+        };
+        let dist = kvm_bindings::KVM_DEV_ARM_VGIC_GRP_DIST_REGS;
+        let nr_irqs = arch::aarch64::layout::IRQ_MAX - arch::aarch64::layout::IRQ_BASE + 1;
+
+        for irq in (GIC_INTERNAL..nr_irqs).step_by(32) {
+            let attr = Self::attr((GICD_IGROUPR + irq / 8).into(), 0);
+            self.write_reg32(&DeviceReg32 {
+                group: dist,
+                attr,
+                value: u32::MAX,
+            })?;
+        }
+
+        for irq in GIC_INTERNAL..nr_irqs {
+            let value = state
+                .as_ref()
+                .and_then(|state| state.gicd_irouter.get(irq as usize).copied())
+                .unwrap_or(0);
+            let offset = GICD_IROUTER + irq * 8;
+            self.write_reg32(&DeviceReg32 {
+                group: dist,
+                attr: Self::attr(offset.into(), 0),
+                value: value as u32,
+            })?;
+            self.write_reg32(&DeviceReg32 {
+                group: dist,
+                attr: Self::attr((offset + 4).into(), 0),
+                value: (value >> 32) as u32,
+            })?;
+        }
+
+        for irq in (GIC_INTERNAL..nr_irqs).step_by(16) {
+            self.write_reg32(&DeviceReg32 {
+                group: dist,
+                attr: Self::attr((GICD_ICFGR + irq / 4).into(), 0),
+                value: state
+                    .as_ref()
+                    .map(|state| macos_edge_bitmap_to_icfgr(&state.edge_trigger, irq))
+                    .unwrap_or(0),
+            })?;
+        }
+
+        for irq in (GIC_INTERNAL..nr_irqs).step_by(4) {
+            self.write_reg32(&DeviceReg32 {
+                group: dist,
+                attr: Self::attr((GICD_IPRIORITYR + irq).into(), 0),
+                value: 0x8080_8080,
+            })?;
+        }
+
+        for irq in (GIC_INTERNAL..nr_irqs).step_by(32) {
+            let offset = GICD_ISENABLER + irq / 8;
+            let reg = DeviceReg32 {
+                group: dist,
+                attr: Self::attr(offset.into(), 0),
+                value: u32::MAX,
+            };
+            self.write_reg32_clear(&reg, GICD_ICENABLER + (offset - GICD_ISENABLER), u32::MAX)?;
+            self.write_reg32(&reg)?;
+        }
+
+        let enabled = state
+            .as_ref()
+            .map(|state| (state.gicd_ctlr & 0x3) != 0)
+            .unwrap_or(true);
+        let linux_ctlr =
+            GICD_CTLR_ARE_NS | GICD_CTLR_DS | if enabled { GICD_CTLR_ENABLE_SS_G1 } else { 0 };
+        self.write_reg32(&DeviceReg32 {
+            group: dist,
+            attr: Self::attr(GICD_CTLR.into(), 0),
+            value: linux_ctlr,
+        })?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_macos_virtio_edge_irqs(&self, irqs: &[u32]) -> Result<(), DeviceError> {
+        let dist = kvm_bindings::KVM_DEV_ARM_VGIC_GRP_DIST_REGS;
+        let mut words = BTreeMap::<u32, (u32, u32)>::new();
+
+        for &irq in irqs {
+            if irq < GIC_INTERNAL {
+                continue;
+            }
+            let first_irq = irq & !0xf;
+            let bit = irq - first_irq;
+            let shift = bit * 2;
+            let entry = words.entry(first_irq).or_insert((0, 0));
+            entry.0 |= 0b11 << shift;
+            entry.1 |= 0b10 << shift;
+        }
+
+        for (first_irq, (clear_mask, set_mask)) in words {
+            let attr = Self::attr((GICD_ICFGR + first_irq / 4).into(), 0);
+            let mut reg = self.read_reg32(dist, attr)?;
+            reg.value = (reg.value & !clear_mask) | set_mask;
+            self.write_reg32(&reg)?;
+        }
+
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -618,6 +840,26 @@ impl IrqChipT for KvmGicV3 {
     fn restore_snapshot_state(&mut self, data: &[u8]) -> Result<(), DeviceError> {
         self.restore_snapshot(data)
     }
+
+    #[cfg(target_os = "linux")]
+    fn restore_macos_vcpu_gic_state(
+        &mut self,
+        vcpu_index: u64,
+        icc_regs: &[(u16, u64)],
+        redist_regs: &[(u32, u64)],
+    ) -> Result<(), DeviceError> {
+        self.restore_macos_vcpu_gic(vcpu_index, icc_regs, redist_regs)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_macos_gic_dist_state(&mut self, data: &[u8]) -> Result<(), DeviceError> {
+        self.restore_macos_gic_dist(data)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_macos_virtio_edge_irqs(&mut self, irqs: &[u32]) -> Result<(), DeviceError> {
+        self.set_macos_virtio_edge_irqs(irqs)
+    }
 }
 
 impl BusDevice for KvmGicV3 {
@@ -649,5 +891,55 @@ impl GICDevice for KvmGicV3 {
 
     fn version(&self) -> u32 {
         kvm_bindings::kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn macos_edge_bitmap_to_icfgr(edge_trigger: &[u32], first_irq: u32) -> u32 {
+    let mut value = 0u32;
+    for bit in 0..16 {
+        let irq = first_irq + bit;
+        let word = edge_trigger.get((irq / 32) as usize).copied().unwrap_or(0);
+        if ((word >> (irq & 0x1f)) & 1) != 0 {
+            value |= 0b10 << (bit * 2);
+        }
+    }
+    value
+}
+
+#[cfg(target_os = "linux")]
+fn macos_portable_icc_ctlr(macos_ctlr: u64, current_ctlr: u64) -> u64 {
+    let portable = ICC_CTLR_EL1_CBPR_MASK | ICC_CTLR_EL1_EOIMODE_MASK;
+    (current_ctlr & !portable) | (macos_ctlr & portable)
+}
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_edge_bitmap_to_icfgr_maps_one_sixteen_irq_window() {
+        let mut edge_trigger = vec![0u32; 3];
+        edge_trigger[1] = (1 << 0) | (1 << 3) | (1 << 15);
+        edge_trigger[2] = 1 << 1;
+
+        assert_eq!(
+            macos_edge_bitmap_to_icfgr(&edge_trigger, 32),
+            (0b10 << 0) | (0b10 << 6) | (0b10 << 30)
+        );
+        assert_eq!(macos_edge_bitmap_to_icfgr(&edge_trigger, 48), 0);
+    }
+
+    #[test]
+    fn macos_portable_icc_ctlr_keeps_kvm_implementation_bits() {
+        let current_ctlr = 0b1010_1100;
+        let macos_ctlr = ICC_CTLR_EL1_CBPR_MASK | 0b0101_1000;
+
+        assert_eq!(
+            macos_portable_icc_ctlr(macos_ctlr, current_ctlr),
+            (current_ctlr & !(ICC_CTLR_EL1_CBPR_MASK | ICC_CTLR_EL1_EOIMODE_MASK))
+                | ICC_CTLR_EL1_CBPR_MASK
+        );
     }
 }

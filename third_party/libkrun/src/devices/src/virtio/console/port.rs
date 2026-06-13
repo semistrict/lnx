@@ -103,6 +103,10 @@ impl Port {
         self.terminal.as_deref()
     }
 
+    pub fn is_active(&self) -> bool {
+        matches!(self.state, PortState::Active { .. })
+    }
+
     pub fn notify_rx(&self) {
         if let PortState::Active {
             rx_thread: Some(handle),

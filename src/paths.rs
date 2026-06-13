@@ -33,7 +33,10 @@ impl Layout {
         let snapshot_dir = instance_dir.join("memory-snapshots");
         let checkpoint_dir = instance_dir.join("checkpoints");
         let vm_initialized = instance_dir.join("vm-initialized");
-        let run_dir = instance_dir.clone();
+        let run_dir = std::env::var_os("LNX_RUN_BASE")
+            .map(PathBuf::from)
+            .map(|base| base.join("instances").join(instance))
+            .unwrap_or_else(|| instance_dir.clone());
         let kernel = kernel.unwrap_or_else(|| base.join("vmlinuz"));
         let rootfs = rootfs.unwrap_or_else(|| instance_dir.join("rootfs.ext4"));
         let console_log = run_dir.join("console.log");
@@ -134,5 +137,29 @@ mod tests {
                 .join("envbase")
                 .join("rootfs.ext4")
         );
+    }
+
+    #[test]
+    fn resolve_honors_lnx_run_base_env() {
+        let base = std::env::temp_dir().join(format!("lnx-base-test-{}", std::process::id()));
+        let run_base =
+            std::env::temp_dir().join(format!("lnx-run-base-test-{}", std::process::id()));
+        unsafe {
+            std::env::set_var("LNX_BASE", &base);
+            std::env::set_var("LNX_RUN_BASE", &run_base);
+        }
+        let layout = Layout::resolve("dev", None, None).expect("resolve layout");
+        unsafe {
+            std::env::remove_var("LNX_BASE");
+            std::env::remove_var("LNX_RUN_BASE");
+        }
+
+        assert_eq!(layout.instance_dir, base.join("instances/dev"));
+        assert_eq!(
+            layout.snapshot_dir,
+            base.join("instances/dev/memory-snapshots")
+        );
+        assert_eq!(layout.run_dir, run_base.join("instances/dev"));
+        assert_eq!(layout.console_log, layout.run_dir.join("console.log"));
     }
 }

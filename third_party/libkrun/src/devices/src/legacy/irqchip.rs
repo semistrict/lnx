@@ -59,6 +59,27 @@ impl IrqChipDevice {
     pub fn restore_snapshot_state(&mut self, data: &[u8]) -> Result<(), DeviceError> {
         self.inner.restore_snapshot_state(data)
     }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub fn restore_macos_vcpu_gic_state(
+        &mut self,
+        vcpu_index: u64,
+        icc_regs: &[(u16, u64)],
+        redist_regs: &[(u32, u64)],
+    ) -> Result<(), DeviceError> {
+        self.inner
+            .restore_macos_vcpu_gic_state(vcpu_index, icc_regs, redist_regs)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub fn restore_macos_gic_dist_state(&mut self, data: &[u8]) -> Result<(), DeviceError> {
+        self.inner.restore_macos_gic_dist_state(data)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub fn restore_macos_virtio_edge_irqs(&mut self, irqs: &[u32]) -> Result<(), DeviceError> {
+        self.inner.restore_macos_virtio_edge_irqs(irqs)
+    }
 }
 
 impl BusDevice for IrqChipDevice {
@@ -182,6 +203,26 @@ pub trait IrqChipT: BusDevice + GICDevice {
 
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     fn restore_snapshot_state(&mut self, _data: &[u8]) -> Result<(), DeviceError> {
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn restore_macos_vcpu_gic_state(
+        &mut self,
+        _vcpu_index: u64,
+        _icc_regs: &[(u16, u64)],
+        _redist_regs: &[(u32, u64)],
+    ) -> Result<(), DeviceError> {
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn restore_macos_gic_dist_state(&mut self, _data: &[u8]) -> Result<(), DeviceError> {
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn restore_macos_virtio_edge_irqs(&mut self, _irqs: &[u32]) -> Result<(), DeviceError> {
         Ok(())
     }
 }

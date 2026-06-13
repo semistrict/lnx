@@ -63,6 +63,7 @@ fn main() {
     });
 
     println!("cargo:rustc-env=LNX_AGENT={}", agent.display());
+    println!("cargo:rustc-env=LNX_AGENT_SOURCE_STAMP={source_stamp}");
 }
 
 fn tracked_source_paths() -> Vec<PathBuf> {

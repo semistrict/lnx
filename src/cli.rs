@@ -46,6 +46,12 @@ pub struct Cli {
 
     #[arg(
         long,
+        help = "Do not mount host directories into the guest with virtio-fs"
+    )]
+    no_host_shares: bool,
+
+    #[arg(
+        long,
         help = "Run the guest command as root instead of the host-matching user"
     )]
     root: bool,
@@ -184,6 +190,9 @@ struct HiddenVmOwnerArgs {
 
     #[arg(long)]
     skip_memory_restore: bool,
+
+    #[arg(long)]
+    no_host_shares: bool,
 }
 
 #[derive(Debug, Args)]
@@ -211,6 +220,7 @@ impl Cli {
             memory_mib,
             snapshot: snapshot_path,
             nested_kvm,
+            no_host_shares,
             root,
             forwards,
             command,
@@ -237,6 +247,7 @@ impl Cli {
                 memory_mib,
                 snapshot_path,
                 nested_kvm,
+                no_host_shares,
                 root,
                 forwards,
                 explicit_kernel,
@@ -260,6 +271,7 @@ impl Cli {
                 forwards,
                 explicit_kernel,
                 explicit_rootfs,
+                no_host_shares,
             ),
             Some(Command::Checkpoints) => list_checkpoints(&layout),
             Some(Command::Fork(args)) => fork_checkpoint(
@@ -272,6 +284,7 @@ impl Cli {
                 forwards,
                 explicit_kernel,
                 explicit_rootfs,
+                no_host_shares,
             ),
             Some(Command::Ingress(args)) => {
                 let config = ingress::load_config()?;
@@ -297,7 +310,9 @@ impl Cli {
                     config,
                 )
             }
-            Some(Command::HiddenVmInit) => initialize_vm_instance(layout, cpus, memory_mib),
+            Some(Command::HiddenVmInit) => {
+                initialize_vm_instance(layout, cpus, memory_mib, nested_kvm, no_host_shares)
+            }
             Some(Command::HiddenOciBuild(args)) => crate::oci::build_rootfs(&args.staging),
             Some(Command::HiddenVmOwner(args)) => runner::run_owner(runner::RunConfig {
                 layout,
@@ -311,6 +326,7 @@ impl Cli {
                 forwards,
                 snapshot_output: None,
                 run_as_root: false,
+                no_host_shares: no_host_shares || args.no_host_shares,
             }),
             None => run_guest(
                 layout,
@@ -319,6 +335,7 @@ impl Cli {
                 memory_mib,
                 snapshot_path,
                 nested_kvm,
+                no_host_shares,
                 root,
                 forwards,
                 explicit_kernel,
@@ -549,6 +566,7 @@ fn run_guest(
     memory_mib: u32,
     snapshot_path: Option<PathBuf>,
     nested_kvm: bool,
+    no_host_shares: bool,
     run_as_root: bool,
     forwards: Vec<runner::PortForward>,
     explicit_kernel: bool,
@@ -561,6 +579,8 @@ fn run_guest(
         memory_mib,
         forwards.clone(),
         snapshot_path.is_some(),
+        nested_kvm,
+        no_host_shares,
     )?;
 
     // An empty command means "login shell"; the agent resolves which shell
@@ -600,6 +620,7 @@ fn run_guest(
         forwards,
         run_as_root,
         snapshot_output: None,
+        no_host_shares,
     };
 
     let status = runner::run(config)?;
@@ -637,6 +658,8 @@ fn ensure_vm_initialized(
     memory_mib: u32,
     _forwards: Vec<runner::PortForward>,
     explicit_snapshot: bool,
+    nested_kvm: bool,
+    no_host_shares: bool,
 ) -> Result<()> {
     if layout.vm_initialized.exists() || explicit_snapshot {
         return Ok(());
@@ -648,12 +671,22 @@ fn ensure_vm_initialized(
     eprintln!("first run: initializing VM instance {}", layout.instance);
     let cpus = cpus.to_string();
     let memory_mib = memory_mib.to_string();
+    let no_host_shares_arg = no_host_shares.then_some("--no-host-shares");
+    let nested_kvm_arg = nested_kvm.then_some("--nested-kvm");
+    let mut command = vec!["--cpus", &cpus, "--memory-mib", &memory_mib];
+    if let Some(arg) = nested_kvm_arg {
+        command.push(arg);
+    }
+    if let Some(arg) = no_host_shares_arg {
+        command.push(arg);
+    }
+    command.push("_vm-init");
     run_lnx_child(
         layout,
         Some(&layout.kernel),
         Some(&layout.rootfs),
         None,
-        &["--cpus", &cpus, "--memory-mib", &memory_mib, "_vm-init"],
+        &command,
         None,
         false,
     )
@@ -661,7 +694,13 @@ fn ensure_vm_initialized(
     Ok(())
 }
 
-fn initialize_vm_instance(layout: Layout, cpus: u8, memory_mib: u32) -> Result<()> {
+fn initialize_vm_instance(
+    layout: Layout,
+    cpus: u8,
+    memory_mib: u32,
+    nested_kvm: bool,
+    no_host_shares: bool,
+) -> Result<()> {
     if layout.vm_initialized.exists() {
         return Ok(());
     }
@@ -672,12 +711,13 @@ fn initialize_vm_instance(layout: Layout, cpus: u8, memory_mib: u32) -> Result<(
         cwd,
         cpus,
         memory_mib,
-        nested_kvm: false,
+        nested_kvm,
         restore_snapshot: None,
         skip_memory_restore: false,
         forwards: Vec::new(),
         snapshot_output: Some(layout.snapshot_dir.join("latest")),
         run_as_root: false,
+        no_host_shares,
     })
     .context("initialize VM instance")?;
     if status != 0 {
@@ -952,6 +992,7 @@ fn create_checkpoint(
     forwards: Vec<runner::PortForward>,
     explicit_kernel: bool,
     explicit_rootfs: bool,
+    no_host_shares: bool,
 ) -> Result<()> {
     ensure_image_and_instance(&layout, explicit_kernel, explicit_rootfs)?;
 
@@ -985,6 +1026,7 @@ fn create_checkpoint(
             forwards,
             snapshot_output: Some(path.clone()),
             run_as_root: false,
+            no_host_shares,
         })?;
         if status != 0 {
             bail!("checkpoint command exited with status {status}");
@@ -1025,6 +1067,7 @@ fn fork_checkpoint(
     forwards: Vec<runner::PortForward>,
     explicit_kernel: bool,
     explicit_rootfs: bool,
+    no_host_shares: bool,
 ) -> Result<()> {
     let checkpoint = match checkpoint {
         Some(checkpoint) => checkpoints::resolve(&source, checkpoint)?,
@@ -1036,6 +1079,7 @@ fn fork_checkpoint(
             forwards,
             explicit_kernel,
             explicit_rootfs,
+            no_host_shares,
         )?,
     };
     let dest = Layout::resolve(instance, None, None)?;
@@ -1052,6 +1096,7 @@ fn create_internal_fork_checkpoint(
     forwards: Vec<runner::PortForward>,
     explicit_kernel: bool,
     explicit_rootfs: bool,
+    no_host_shares: bool,
 ) -> Result<checkpoints::Checkpoint> {
     ensure_image_and_instance(layout, explicit_kernel, explicit_rootfs)?;
 
@@ -1085,6 +1130,7 @@ fn create_internal_fork_checkpoint(
             forwards,
             snapshot_output: Some(path.clone()),
             run_as_root: false,
+            no_host_shares,
         })?;
         if status != 0 {
             bail!("checkpoint command exited with status {status}");

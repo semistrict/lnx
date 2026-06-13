@@ -29,7 +29,8 @@ export function defaultContext(name: string): TestContext {
   const instance = Bun.env.LNX_TEST_INSTANCE ?? `lnx-${name}-${process.pid}`;
   const base = Bun.env.LNX_BASE ?? join(Bun.env.HOME ?? ".", ".lnx");
   const imageDir = join(base, "instances", instance);
-  const runDir = join(base, "instances", instance);
+  const runBase = Bun.env.LNX_RUN_BASE ?? base;
+  const runDir = join(runBase, "instances", instance);
   return {
     repoRoot: root,
     // Resolve now: tests spawn lnx from other working directories.

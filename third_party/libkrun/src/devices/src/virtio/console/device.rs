@@ -253,7 +253,18 @@ impl Console {
                         continue;
                     }
 
-                    ports_to_start.push(cmd.id as usize);
+                    let port_id = cmd.id as usize;
+                    if port_id >= self.active_ports.len() {
+                        log::error!("Guest opened invalid console port {}", cmd.id);
+                        continue;
+                    }
+                    if self.ports[port_id].is_active() {
+                        log::debug!("Console port {} is already open", cmd.id);
+                        self.active_ports[port_id] = true;
+                        continue;
+                    }
+
+                    ports_to_start.push(port_id);
                 }
                 _ => log::warn!("Unknown console control event {:x}", cmd.event),
             }
@@ -270,18 +281,39 @@ impl Console {
         log::trace!("Starting port io for port {port_id}");
         let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
         let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
+        if rx_idx >= self.queues.len() || tx_idx >= self.queues.len() {
+            log::error!("Console port {port_id} queue index is out of range");
+            return;
+        }
 
         // Take ownership of port queues - they are moved to the port.
-        let rx_queue = self.queues[rx_idx]
-            .take()
-            .expect("port rx queue should exist")
-            .queue;
-        let tx_queue = self.queues[tx_idx]
-            .take()
-            .expect("port tx queue should exist")
-            .queue;
+        let Some(rx_device_queue) = self.queues[rx_idx].take() else {
+            if self.ports[port_id].is_active() {
+                log::debug!("Console port {port_id} rx queue is already owned");
+                self.active_ports[port_id] = true;
+            } else {
+                log::error!("Console port {port_id} rx queue is missing");
+            }
+            return;
+        };
+        let Some(tx_device_queue) = self.queues[tx_idx].take() else {
+            self.queues[rx_idx] = Some(rx_device_queue);
+            if self.ports[port_id].is_active() {
+                log::debug!("Console port {port_id} tx queue is already owned");
+                self.active_ports[port_id] = true;
+            } else {
+                log::error!("Console port {port_id} tx queue is missing");
+            }
+            return;
+        };
 
-        self.ports[port_id].start(mem, rx_queue, tx_queue, interrupt, self.control.clone());
+        self.ports[port_id].start(
+            mem,
+            rx_device_queue.queue,
+            tx_device_queue.queue,
+            interrupt,
+            self.control.clone(),
+        );
         self.active_ports[port_id] = true;
     }
 }

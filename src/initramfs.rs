@@ -5,13 +5,16 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
 
-pub fn write_from_agent(agent: &[u8], dir: PathBuf) -> Result<(PathBuf, bool)> {
+pub fn write_from_agent(
+    agent: &[u8],
+    agent_source_stamp: &str,
+    dir: PathBuf,
+) -> Result<(PathBuf, bool)> {
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join("initramfs.cpio");
     let stamp_path = dir.join("initramfs.stamp");
-    let stamp = stamp(agent);
+    let stamp = stamp(agent_source_stamp);
 
     if path.exists() && stamp_path.exists() {
         if fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str()) {
@@ -37,8 +40,8 @@ fn write_agent(agent: &[u8], path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn stamp(agent: &[u8]) -> String {
-    format!("len={}\nsha256={:x}\n", agent.len(), Sha256::digest(agent))
+fn stamp(agent_source_stamp: &str) -> String {
+    format!("source={agent_source_stamp}\n")
 }
 
 fn entry(buf: &mut Vec<u8>, name: &str, data: &[u8], mode: u32) -> Result<()> {
@@ -112,7 +115,8 @@ mod tests {
     fn write_from_agent_creates_expected_initramfs_entries() {
         let temp = TempDir::new("initramfs-entries");
         let (initrd, rebuilt) =
-            write_from_agent(b"agent-bytes", temp.path().join("run")).expect("write initramfs");
+            write_from_agent(b"agent-bytes", "source-a", temp.path().join("run"))
+                .expect("write initramfs");
 
         assert!(rebuilt);
         let bytes = fs::read(&initrd).expect("read initramfs");
@@ -126,20 +130,22 @@ mod tests {
     }
 
     #[test]
-    fn write_from_agent_reuses_cache_until_agent_changes() {
+    fn write_from_agent_reuses_cache_until_source_stamp_changes() {
         let temp = TempDir::new("initramfs-cache");
         let run_dir = temp.path().join("run");
 
         let (initrd, rebuilt) =
-            write_from_agent(b"first-agent", run_dir.clone()).expect("first write");
+            write_from_agent(b"first-agent", "source-a", run_dir.clone()).expect("first write");
         assert!(rebuilt);
         let first = fs::read(&initrd).expect("read first");
 
-        let (_, rebuilt) = write_from_agent(b"first-agent", run_dir.clone()).expect("cached write");
+        let (_, rebuilt) = write_from_agent(b"different-binary", "source-a", run_dir.clone())
+            .expect("cached write");
         assert!(!rebuilt);
         assert_eq!(fs::read(&initrd).expect("read cached"), first);
 
-        let (_, rebuilt) = write_from_agent(b"second-agent", run_dir).expect("rewritten initramfs");
+        let (_, rebuilt) =
+            write_from_agent(b"second-agent", "source-b", run_dir).expect("rewritten initramfs");
         assert!(rebuilt);
         let second = fs::read(&initrd).expect("read second");
         assert_ne!(second, first);

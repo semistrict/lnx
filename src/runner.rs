@@ -30,13 +30,17 @@ const SNAPSHOT_PORT: u32 = 10241;
 const CONTROL_PORT: u32 = 10242;
 const FRAME_SNAPSHOT: u8 = b'K';
 const INTERRUPT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
-// Accepted vmstate.bin container version. The macOS and Linux snapshot
+// Accepted vmstate.bin container versions. The macOS and Linux snapshot
 // containers version independently; keep in sync with VERSION in
 // third_party/libkrun/src/vmm/src/{macos,linux}/snapshot/container.rs.
+#[cfg(all(test, target_os = "macos"))]
+const SNAPSHOT_VMSTATE_NATIVE_VERSION: u32 = 1;
+#[cfg(all(test, not(target_os = "macos")))]
+const SNAPSHOT_VMSTATE_NATIVE_VERSION: u32 = 2;
 #[cfg(target_os = "macos")]
-const SNAPSHOT_VMSTATE_VERSION: u32 = 1;
+const SNAPSHOT_VMSTATE_SUPPORTED_VERSIONS: &[u32] = &[1];
 #[cfg(not(target_os = "macos"))]
-const SNAPSHOT_VMSTATE_VERSION: u32 = 2;
+const SNAPSHOT_VMSTATE_SUPPORTED_VERSIONS: &[u32] = &[2, 1];
 
 // Owner exit status meaning "the VM failed to start with a restore
 // configured"; the client retries the spawn with a cold boot.
@@ -51,6 +55,11 @@ const MIN_OWNER_IDLE_TTL: Duration = Duration::from_millis(250);
 const OWNER_BOOT_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_AGENT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(90);
 const ROOTFS_BACKEND_ENV: &str = "LNX_ROOTFS_BACKEND";
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+const MACOS_VMSTATE_VERSION: u32 = 1;
 
 static SIGNAL_INIT: Once = Once::new();
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -75,6 +84,7 @@ pub struct RunConfig {
     pub forwards: Vec<PortForward>,
     pub snapshot_output: Option<PathBuf>,
     pub run_as_root: bool,
+    pub no_host_shares: bool,
 }
 
 /// Marks an owner start failure that happened while restoring a snapshot's
@@ -132,6 +142,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
         &config.command,
         &config.cwd,
         config.run_as_root,
+        config.no_host_shares,
         Some(&run_log),
     )? {
         run_log.line(format!("run.done status={status}"));
@@ -230,6 +241,7 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
         &config.command,
         &config.cwd,
         config.run_as_root,
+        config.no_host_shares,
         &run_log,
     )? {
         BootstrapOutcome::Lock(lock) => lock,
@@ -240,6 +252,7 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
         &config.command,
         &config.cwd,
         config.run_as_root,
+        config.no_host_shares,
         Some(&run_log),
     )? {
         drop(bootstrap_lock);
@@ -267,6 +280,7 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
         &config.command,
         &config.cwd,
         config.run_as_root,
+        config.no_host_shares,
         Duration::from_secs(5),
     )
     .with_context(|| console_hint(&config.layout.console_log))
@@ -433,6 +447,7 @@ fn start_vm(
 
     let (initrd, rebuilt_initramfs) = initramfs::write_from_agent(
         include_bytes!(env!("LNX_AGENT")),
+        env!("LNX_AGENT_SOURCE_STAMP"),
         config.layout.run_dir.clone(),
     )?;
     timings.event(if rebuilt_initramfs {
@@ -449,6 +464,7 @@ fn start_vm(
         &host_home,
         outside_home_cwd.as_deref(),
         &network.stamp_line(),
+        config.no_host_shares,
     );
     let shares_stamp_path = config.layout.run_dir.join("shares.stamp");
     fs::write(&shares_stamp_path, &shares_stamp)
@@ -505,6 +521,7 @@ fn start_vm(
     if let Some(snapshot) = &requested_restore_snapshot {
         log_snapshot_summary(&run_log, "snapshot.requested", snapshot);
     }
+    configure_snapshot_restore_compat(restore_snapshot.as_deref(), &run_log);
 
     let socket = config.layout.run_dir.join("lnx-agent.sock");
     let snapshot_socket = config.layout.run_dir.join("lnx-snapshot.sock");
@@ -545,15 +562,22 @@ fn start_vm(
             "/dev/vda"
         }
     };
-    let guest_home = guest_home(&host_home);
-    let guest_cwd = guest_cwd(&config.cwd, &host_home);
-    ctx.add_host_virtiofs(
-        "home",
-        &host_home,
-        &home_write_allowlist(&config.cwd, &host_home),
-    )?;
-    if let Some(cwd) = &outside_home_cwd {
-        ctx.add_host_virtiofs("cwd", cwd, &cwd_write_allowlist())?;
+    let (guest_home, guest_cwd) = if config.no_host_shares {
+        (String::new(), String::new())
+    } else {
+        (guest_home(&host_home), guest_cwd(&config.cwd, &host_home))
+    };
+    if config.no_host_shares {
+        run_log.line("host_shares.disabled");
+    } else {
+        ctx.add_host_virtiofs(
+            "home",
+            &host_home,
+            &home_write_allowlist(&config.cwd, &host_home),
+        )?;
+        if let Some(cwd) = &outside_home_cwd {
+            ctx.add_host_virtiofs("cwd", cwd, &cwd_write_allowlist())?;
+        }
     }
     let mut kernel_cmdline =
         format!("console=hvc0 reboot=k panic=1 root={root_device} rw rootfstype=ext4");
@@ -605,6 +629,7 @@ fn start_vm(
             format!("LNX_VIRTIOFS_HOME={guest_home}"),
             outside_home_cwd
                 .as_ref()
+                .filter(|_| !config.no_host_shares)
                 .map(|_| format!("LNX_VIRTIOFS_CWD={guest_cwd}"))
                 .unwrap_or_else(|| "LNX_VIRTIOFS_CWD=".to_string()),
         ],
@@ -651,6 +676,7 @@ fn start_vm(
         restore_snapshot,
         config.forwards.clone(),
         host_home,
+        config.no_host_shares,
         idle,
         Arc::clone(&timings),
         Arc::clone(&run_log),
@@ -834,6 +860,11 @@ struct RunLog {
 }
 
 struct SnapshotVmConfig {
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    version: u32,
     memory_bytes: u64,
     vcpu_count: u32,
 }
@@ -845,6 +876,14 @@ impl SnapshotVmConfig {
 
     fn matches(&self, cpus: u8, memory_mib: u32) -> bool {
         self.vcpu_count == cpus as u32 && self.memory_mib() == memory_mib as u64
+    }
+
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    fn is_macos_format(&self) -> bool {
+        self.version == MACOS_VMSTATE_VERSION
     }
 }
 
@@ -1117,29 +1156,56 @@ fn snapshot_vm_config(snapshot: &Path) -> Result<Option<SnapshotVmConfig>> {
         bail!("bad snapshot magic in {}", path.display());
     }
     let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
-    if version != SNAPSHOT_VMSTATE_VERSION {
+    if !SNAPSHOT_VMSTATE_SUPPORTED_VERSIONS.contains(&version) {
         bail!(
             "unsupported snapshot version {version} in {}",
             path.display()
         );
     }
     Ok(Some(SnapshotVmConfig {
+        version,
         memory_bytes: u64::from_le_bytes(header[16..24].try_into().unwrap()),
         vcpu_count: u32::from_le_bytes(header[32..36].try_into().unwrap()),
     }))
 }
 
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn configure_snapshot_restore_compat(restore_snapshot: Option<&Path>, run_log: &RunLog) {
+    let needs_macos_irqfd_compat = restore_snapshot
+        .and_then(|snapshot| snapshot_vm_config(snapshot).ok().flatten())
+        .is_some_and(|config| config.is_macos_format());
+
+    if needs_macos_irqfd_compat {
+        // libkrun's KVM device manager registers aarch64 irqfds with Linux's
+        // native GSI numbering by default. macOS snapshots encode virtio
+        // devices as SPI-relative interrupts, so restore needs the matching
+        // registration mode before device realization.
+        unsafe {
+            std::env::set_var("LNX_KVM_IRQFD_MACOS_SPI", "1");
+        }
+        run_log.line("snapshot.restore.macos_irqfd_compat enabled");
+    } else {
+        unsafe {
+            std::env::remove_var("LNX_KVM_IRQFD_MACOS_SPI");
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+fn configure_snapshot_restore_compat(_restore_snapshot: Option<&Path>, _run_log: &RunLog) {}
+
 fn snapshot_initramfs_is_compatible(snapshot_path: &Path, current_stamp: &Path) -> bool {
-    let Some(snapshot_sha) = stamp_sha256(&snapshot_path.join("initramfs.stamp")) else {
+    let Some(snapshot_key) = initramfs_stamp_key(&snapshot_path.join("initramfs.stamp")) else {
         return false;
     };
-    let Some(current_sha) = stamp_sha256(current_stamp) else {
+    let Some(current_key) = initramfs_stamp_key(current_stamp) else {
         return false;
     };
-    snapshot_sha == current_sha
+    snapshot_key == current_key
 }
 
 const HOST_SHARE_CACHE_STAMP: &str = "host-share-cache=dax+keep-cache+writeback+restore-sync-v1";
+const HOST_SHARES_DISABLED_STAMP: &str = "host-shares=disabled-v1";
 
 // A restored guest keeps its snapshot-time share mounts, network
 // configuration, and kernel-side virtiofs caches. A snapshot is only valid for
@@ -1152,7 +1218,11 @@ fn shares_stamp_content(
     host_home: &Path,
     outside_home_cwd: Option<&Path>,
     net_stamp_line: &str,
+    no_host_shares: bool,
 ) -> String {
+    if no_host_shares {
+        return format!("{HOST_SHARES_DISABLED_STAMP}\n{net_stamp_line}\n");
+    }
     let mut content = format!("{HOST_SHARE_CACHE_STAMP}\nhome={}\n", host_home.display());
     if let Some(cwd) = outside_home_cwd {
         content.push_str(&format!("cwd={}\n", cwd.display()));
@@ -1165,7 +1235,11 @@ fn shares_stamp_content(
 fn snapshot_shares_incompatibility(snapshot_path: &Path, current: &str) -> Option<&'static str> {
     match fs::read_to_string(snapshot_path.join("shares.stamp")) {
         Ok(stamp) if stamp == current => None,
-        Ok(stamp) if !stamp.lines().any(|line| line == HOST_SHARE_CACHE_STAMP) => {
+        Ok(stamp)
+            if !stamp.lines().any(|line| {
+                line == HOST_SHARE_CACHE_STAMP || line == HOST_SHARES_DISABLED_STAMP
+            }) =>
+        {
             Some("host_share_cache_policy")
         }
         Ok(_) => Some("share_mismatch"),
@@ -1177,11 +1251,19 @@ fn snapshot_shares_incompatibility(snapshot_path: &Path, current: &str) -> Optio
     }
 }
 
-fn stamp_sha256(path: &Path) -> Option<String> {
-    fs::read_to_string(path).ok()?.lines().find_map(|line| {
-        let value = line.strip_prefix("sha256=")?;
-        Some(value.to_string())
-    })
+fn initramfs_stamp_key(path: &Path) -> Option<String> {
+    let stamp = fs::read_to_string(path).ok()?;
+    for line in stamp.lines() {
+        if let Some(value) = line.strip_prefix("source=") {
+            return Some(format!("source={value}"));
+        }
+    }
+    for line in stamp.lines() {
+        if let Some(value) = line.strip_prefix("sha256=") {
+            return Some(format!("sha256={value}"));
+        }
+    }
+    None
 }
 
 fn replace_timing_state(file: &mut fs::File, base: u128, now: u128) -> std::io::Result<u128> {
@@ -1268,14 +1350,47 @@ fn unused_local_port() -> Result<u16> {
 }
 
 fn wait_for_path(path: &Path, timeout: Duration) -> Result<()> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if path.exists() {
+    let deadline = Instant::now() + timeout;
+    let mut attempts = 0usize;
+    loop {
+        if path_is_visible(path) {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(5));
+        if Instant::now() >= deadline {
+            break;
+        }
+        attempts = attempts.wrapping_add(1);
+        // In nested Linux, the musl build has been observed to wedge in a
+        // short nanosleep here even after gvproxy has created the socket.
+        // Yielding keeps this startup wait responsive without relying on
+        // guest timer delivery.
+        if attempts & 0x7f == 0 {
+            thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
     }
     bail!("timed out waiting for {}", path.display())
+}
+
+fn path_is_visible(path: &Path) -> bool {
+    if path.exists() {
+        return true;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    parent
+        .read_dir()
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry.file_name() == name)
+        })
+        .unwrap_or(false)
 }
 
 fn bind_unix_listener(path: &Path) -> Result<UnixListener> {
@@ -1362,6 +1477,7 @@ fn acquire_bootstrap_or_run_client(
     command: &[String],
     cwd: &Path,
     run_as_root: bool,
+    no_host_shares: bool,
     run_log: &RunLog,
 ) -> Result<BootstrapOutcome> {
     let start = Instant::now();
@@ -1378,9 +1494,14 @@ fn acquire_bootstrap_or_run_client(
             run_log.line(format!("bootstrap.lock.busy path={}", lock_path.display()));
             logged_wait = true;
         }
-        if let Some(status) =
-            run_existing_broker_client(socket, command, cwd, run_as_root, Some(run_log))?
-        {
+        if let Some(status) = run_existing_broker_client(
+            socket,
+            command,
+            cwd,
+            run_as_root,
+            no_host_shares,
+            Some(run_log),
+        )? {
             return Ok(BootstrapOutcome::Status(status));
         }
         if start.elapsed() > Duration::from_secs(120) {
@@ -1399,6 +1520,7 @@ fn run_existing_broker_client(
     command: &[String],
     cwd: &Path,
     run_as_root: bool,
+    no_host_shares: bool,
     run_log: Option<&RunLog>,
 ) -> Result<Option<i32>> {
     match connect_broker(socket) {
@@ -1409,7 +1531,7 @@ fn run_existing_broker_client(
                     socket.display()
                 ));
             }
-            run_broker_session(stream, command, cwd, run_as_root).map(Some)
+            run_broker_session(stream, command, cwd, run_as_root, no_host_shares).map(Some)
         }
         Err(e) => {
             if socket.exists() {
@@ -1449,10 +1571,16 @@ fn run_broker_session(
     command: &[String],
     cwd: &Path,
     run_as_root: bool,
+    no_host_shares: bool,
 ) -> Result<i32> {
     INTERRUPTED.store(false, Ordering::SeqCst);
     let channel_id = new_request_id()?;
     let host_home = host_home_for_cwd(cwd)?;
+    let guest_cwd = if no_host_shares {
+        "/".to_string()
+    } else {
+        guest_cwd(cwd, &host_home)
+    };
     let use_pty = should_request_pty();
     let raw_mode = if use_pty { RawTerminal::enter() } else { None };
     let (term, colorterm, rows, cols) = if use_pty {
@@ -1473,7 +1601,7 @@ fn run_broker_session(
         &Message::OpenExec {
             channel_id,
             argv: command.to_vec(),
-            cwd: guest_cwd(cwd, &host_home),
+            cwd: guest_cwd,
             pty: use_pty,
             term,
             colorterm,
@@ -1679,13 +1807,16 @@ fn run_broker_client_retry(
     command: &[String],
     cwd: &Path,
     run_as_root: bool,
+    no_host_shares: bool,
     timeout: Duration,
 ) -> Result<i32> {
     let start = Instant::now();
     let mut last = None;
     while start.elapsed() < timeout {
         match connect_broker(socket) {
-            Ok(stream) => return run_broker_session(stream, command, cwd, run_as_root),
+            Ok(stream) => {
+                return run_broker_session(stream, command, cwd, run_as_root, no_host_shares);
+            }
             Err(e) => {
                 last = Some(e);
                 thread::sleep(Duration::from_millis(10));
@@ -1712,6 +1843,7 @@ fn run_broker_owner(
     restore_snapshot: Option<PathBuf>,
     forwards: Vec<PortForward>,
     host_home: PathBuf,
+    no_host_shares: bool,
     idle: IdlePolicy,
     timings: Arc<TimingLog>,
     run_log: Arc<RunLog>,
@@ -1918,6 +2050,7 @@ fn run_broker_owner(
                             seen,
                             client_ctx,
                             client_host_home,
+                            no_host_shares,
                             Arc::clone(&client_log),
                         ) {
                             client_log.line(format!("broker.client.error {e:#}"));
@@ -2077,6 +2210,9 @@ fn spawn_owner_process(config: &RunConfig, run_log: &RunLog) -> Result<Child> {
     if config.nested_kvm {
         command.arg("--nested-kvm");
     }
+    if config.no_host_shares {
+        command.arg("--no-host-shares");
+    }
     for forward in &config.forwards {
         command.arg("--forward").arg(forward_spec(forward));
     }
@@ -2114,7 +2250,15 @@ fn run_broker_client_awaiting_owner(
             return Ok(130);
         }
         match connect_broker(socket) {
-            Ok(stream) => return run_broker_session(stream, command, cwd, config.run_as_root),
+            Ok(stream) => {
+                return run_broker_session(
+                    stream,
+                    command,
+                    cwd,
+                    config.run_as_root,
+                    config.no_host_shares,
+                );
+            }
             Err(e) => last = Some(e),
         }
         if let Some(status) = owner.try_wait().context("check lnx _vm-owner")? {
@@ -2224,6 +2368,7 @@ fn handle_broker_client(
     seen_active: Arc<AtomicBool>,
     ctx: Arc<KrunContext>,
     host_home: PathBuf,
+    no_host_shares: bool,
     run_log: Arc<RunLog>,
 ) -> Result<()> {
     client
@@ -2265,8 +2410,10 @@ fn handle_broker_client(
         _ => bail!("client did not open a channel"),
     };
     run_log.line(format!("broker.client.open channel={channel_id:016x}"));
-    if let Message::OpenExec { cwd, .. } = &first {
-        set_home_write_allowlist(ctx.as_ref(), Path::new(cwd), &host_home)?;
+    if !no_host_shares {
+        if let Message::OpenExec { cwd, .. } = &first {
+            set_home_write_allowlist(ctx.as_ref(), Path::new(cwd), &host_home)?;
+        }
     }
     seen_active.store(true, Ordering::SeqCst);
     let (to_client_tx, to_client_rx) = mpsc::channel::<Message>();
@@ -3013,14 +3160,28 @@ mod tests {
         }
     }
 
-    fn write_vmstate_header(snapshot: &Path, memory_bytes: u64, vcpu_count: u32) {
+    fn write_vmstate_header_with_version(
+        snapshot: &Path,
+        version: u32,
+        memory_bytes: u64,
+        vcpu_count: u32,
+    ) {
         fs::create_dir_all(snapshot).expect("create snapshot dir");
         let mut header = [0u8; 40];
         header[0..8].copy_from_slice(b"LKRNSS01");
-        header[8..12].copy_from_slice(&SNAPSHOT_VMSTATE_VERSION.to_le_bytes());
+        header[8..12].copy_from_slice(&version.to_le_bytes());
         header[16..24].copy_from_slice(&memory_bytes.to_le_bytes());
         header[32..36].copy_from_slice(&vcpu_count.to_le_bytes());
         fs::write(snapshot.join("vmstate.bin"), header).expect("write vmstate");
+    }
+
+    fn write_vmstate_header(snapshot: &Path, memory_bytes: u64, vcpu_count: u32) {
+        write_vmstate_header_with_version(
+            snapshot,
+            SNAPSHOT_VMSTATE_NATIVE_VERSION,
+            memory_bytes,
+            vcpu_count,
+        );
     }
 
     #[test]
@@ -3043,6 +3204,7 @@ mod tests {
             .expect("read config")
             .expect("config present");
 
+        assert_eq!(config.version, SNAPSHOT_VMSTATE_NATIVE_VERSION);
         assert_eq!(config.vcpu_count, 2);
         assert_eq!(config.memory_mib(), 4096);
         assert!(config.matches(2, 4096));
@@ -3050,19 +3212,40 @@ mod tests {
         assert!(!config.matches(2, 8192));
     }
 
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn snapshot_vm_config_accepts_macos_vmstate_on_linux() {
+        let temp = TempDir::new("snapshot-header-macos");
+        write_vmstate_header_with_version(temp.path(), 1, 2 * 1024 * 1024 * 1024, 4);
+
+        let config = snapshot_vm_config(temp.path())
+            .expect("read config")
+            .expect("config present");
+
+        assert_eq!(config.version, 1);
+        assert!(config.is_macos_format());
+        assert_eq!(config.vcpu_count, 4);
+        assert_eq!(config.memory_mib(), 2048);
+    }
+
     #[test]
     fn shares_stamp_content_lists_home_cwd_and_network() {
         assert_eq!(
-            shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy"),
+            shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", false),
             "host-share-cache=dax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\nnet=gvproxy\n"
         );
         assert_eq!(
             shares_stamp_content(
                 Path::new("/Users/ramon"),
                 Some(Path::new("/tmp/build")),
-                "net=vmnet:prefix=24:gateway=192.168.106.1"
+                "net=vmnet:prefix=24:gateway=192.168.106.1",
+                false,
             ),
             "host-share-cache=dax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\ncwd=/tmp/build\nnet=vmnet:prefix=24:gateway=192.168.106.1\n"
+        );
+        assert_eq!(
+            shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", true),
+            "host-shares=disabled-v1\nnet=gvproxy\n"
         );
     }
 
@@ -3070,7 +3253,7 @@ mod tests {
     fn snapshot_shares_compatibility_requires_identical_stamp() {
         let temp = TempDir::new("snapshot-shares");
         fs::create_dir_all(temp.path()).expect("create snapshot dir");
-        let current = shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy");
+        let current = shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", false);
 
         // A snapshot from before share/cache-policy stamping may preserve
         // unsafe host-file cache state, so it must not memory-restore.
@@ -3089,7 +3272,7 @@ mod tests {
             Some("host_share_cache_policy")
         );
 
-        let drifted = shares_stamp_content(Path::new("/home/ramon"), None, "net=gvproxy");
+        let drifted = shares_stamp_content(Path::new("/home/ramon"), None, "net=gvproxy", false);
         fs::write(temp.path().join("shares.stamp"), &current).expect("write stamp");
         assert_eq!(
             snapshot_shares_incompatibility(temp.path(), &drifted),
@@ -3101,11 +3284,55 @@ mod tests {
             Path::new("/Users/ramon"),
             None,
             "net=vmnet:prefix=24:gateway=192.168.106.1",
+            false,
         );
         assert_eq!(
             snapshot_shares_incompatibility(temp.path(), &renetworked),
             Some("share_mismatch")
         );
+
+        let disabled = shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", true);
+        fs::write(temp.path().join("shares.stamp"), &disabled).expect("write stamp");
+        assert_eq!(
+            snapshot_shares_incompatibility(temp.path(), &disabled),
+            None
+        );
+
+        assert_eq!(
+            snapshot_shares_incompatibility(temp.path(), &current),
+            Some("share_mismatch")
+        );
+
+        fs::write(temp.path().join("shares.stamp"), &current).expect("write stamp");
+        assert_eq!(
+            snapshot_shares_incompatibility(temp.path(), &disabled),
+            Some("share_mismatch")
+        );
+    }
+
+    #[test]
+    fn initramfs_stamp_key_prefers_source_but_keeps_sha256_compatibility() {
+        let temp = TempDir::new("initramfs-stamp-key");
+        let stamp = temp.path().join("initramfs.stamp");
+
+        fs::write(&stamp, "sha256=old-binary-hash\n").expect("write legacy stamp");
+        assert_eq!(
+            initramfs_stamp_key(&stamp),
+            Some("sha256=old-binary-hash".to_string())
+        );
+
+        fs::write(
+            &stamp,
+            "sha256=old-binary-hash\nsource=guest-agent-source-hash\n",
+        )
+        .expect("write mixed stamp");
+        assert_eq!(
+            initramfs_stamp_key(&stamp),
+            Some("source=guest-agent-source-hash".to_string())
+        );
+
+        fs::write(&stamp, "unrelated=true\n").expect("write unrelated stamp");
+        assert_eq!(initramfs_stamp_key(&stamp), None);
     }
 
     #[cfg(target_os = "macos")]
@@ -3128,7 +3355,7 @@ mod tests {
 
         let mut header = [0u8; 40];
         header[0..8].copy_from_slice(b"LKRNSS01");
-        header[8..12].copy_from_slice(&(SNAPSHOT_VMSTATE_VERSION + 1).to_le_bytes());
+        header[8..12].copy_from_slice(&(SNAPSHOT_VMSTATE_NATIVE_VERSION + 97).to_le_bytes());
         fs::write(temp.path().join("vmstate.bin"), header).expect("write bad version");
         assert!(snapshot_vm_config(temp.path()).is_err());
     }
