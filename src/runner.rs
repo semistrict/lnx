@@ -127,15 +127,13 @@ pub fn run(config: RunConfig) -> Result<i32> {
         config.layout.run_dir.join("gvproxy.log").display()
     ));
     let broker_socket = config.layout.run_dir.join("broker.sock");
-    if let Some(status) =
-        run_existing_broker_client(
-            &broker_socket,
-            &config.command,
-            &config.cwd,
-            config.run_as_root,
-            Some(&run_log),
-        )?
-    {
+    if let Some(status) = run_existing_broker_client(
+        &broker_socket,
+        &config.command,
+        &config.cwd,
+        config.run_as_root,
+        Some(&run_log),
+    )? {
         run_log.line(format!("run.done status={status}"));
         return Ok(status);
     }
@@ -237,15 +235,13 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
         BootstrapOutcome::Lock(lock) => lock,
         BootstrapOutcome::Status(status) => return Ok(status),
     };
-    if let Some(status) =
-        run_existing_broker_client(
-            &broker_socket,
-            &config.command,
-            &config.cwd,
-            config.run_as_root,
-            Some(&run_log),
-        )?
-    {
+    if let Some(status) = run_existing_broker_client(
+        &broker_socket,
+        &config.command,
+        &config.cwd,
+        config.run_as_root,
+        Some(&run_log),
+    )? {
         drop(bootstrap_lock);
         return Ok(status);
     }
@@ -1474,9 +1470,21 @@ fn run_broker_session(
             colorterm,
             rows,
             cols,
-            uid: if run_as_root { 0 } else { unsafe { libc::getuid() } },
-            gid: if run_as_root { 0 } else { unsafe { libc::getgid() } },
-            group: if run_as_root { String::new() } else { host_group_name() },
+            uid: if run_as_root {
+                0
+            } else {
+                unsafe { libc::getuid() }
+            },
+            gid: if run_as_root {
+                0
+            } else {
+                unsafe { libc::getgid() }
+            },
+            group: if run_as_root {
+                String::new()
+            } else {
+                host_group_name()
+            },
             env: forwarded_exec_env(),
         },
     )?;

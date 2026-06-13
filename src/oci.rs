@@ -32,10 +32,11 @@ pub fn import_image(layout: &Layout, reference: &str, kernel: Option<&Path>) -> 
     }
 
     let image = ImageReference::parse(reference)?;
-    let staging = layout.base.join(format!("oci-import-{}", std::process::id()));
+    let staging = layout
+        .base
+        .join(format!("oci-import-{}", std::process::id()));
     let result = (|| {
-        fs::create_dir_all(&staging)
-            .with_context(|| format!("create {}", staging.display()))?;
+        fs::create_dir_all(&staging).with_context(|| format!("create {}", staging.display()))?;
         let layers = pull_layers(&image, &staging)?;
         if layers.is_empty() {
             bail!("image has no layers");
@@ -67,7 +68,9 @@ impl ImageReference {
         let mut parts = rest.splitn(2, '/');
         let first = parts.next().context("empty image reference")?;
         let (registry, repository) = match parts.next() {
-            Some(remainder) if first.contains('.') || first.contains(':') || first == "localhost" => {
+            Some(remainder)
+                if first.contains('.') || first.contains(':') || first == "localhost" =>
+            {
                 (first.to_string(), remainder.to_string())
             }
             Some(remainder) => ("docker.io".to_string(), format!("{first}/{remainder}")),
@@ -101,8 +104,7 @@ fn pull_layers(image: &ImageReference, staging: &Path) -> Result<Vec<PathBuf>> {
             .into_iter()
             .flatten()
             .find(|entry| {
-                entry["platform"]["os"] == "linux"
-                    && entry["platform"]["architecture"] == "arm64"
+                entry["platform"]["os"] == "linux" && entry["platform"]["architecture"] == "arm64"
             })
             .and_then(|entry| entry["digest"].as_str())
             .with_context(|| format!("no linux/arm64 manifest for {}", image.repository))?
@@ -117,9 +119,7 @@ fn pull_layers(image: &ImageReference, staging: &Path) -> Result<Vec<PathBuf>> {
         .context("manifest has no layers")?;
     let mut paths = Vec::new();
     for (index, layer) in layers.iter().enumerate() {
-        let digest = layer["digest"]
-            .as_str()
-            .context("layer missing digest")?;
+        let digest = layer["digest"].as_str().context("layer missing digest")?;
         let dest = staging.join(format!("layer-{index:03}"));
         eprintln!("oci: pull layer {} {digest}", index + 1);
         fetch_blob(image, &token, digest, &dest)?;
@@ -143,16 +143,18 @@ fn fetch_token(image: &ImageReference) -> Result<Option<String>> {
         return Ok(None);
     }
     let field = |key: &str| {
-        challenge.split(&format!("{key}=\"")).nth(1).and_then(|rest| {
-            rest.split('"').next().map(str::to_string)
-        })
+        challenge
+            .split(&format!("{key}=\""))
+            .nth(1)
+            .and_then(|rest| rest.split('"').next().map(str::to_string))
     };
-    let realm = field("realm")
-        .with_context(|| format!("registry {} sent no auth realm: {challenge}", image.registry))?;
-    let mut url = format!(
-        "{realm}?scope=repository:{}:pull",
-        image.repository
-    );
+    let realm = field("realm").with_context(|| {
+        format!(
+            "registry {} sent no auth realm: {challenge}",
+            image.registry
+        )
+    })?;
+    let mut url = format!("{realm}?scope=repository:{}:pull", image.repository);
     if let Some(service) = field("service") {
         url.push_str(&format!("&service={service}"));
     }
@@ -181,7 +183,11 @@ fn fetch_manifest(
         image.registry_host(),
         image.repository
     );
-    let mut args = vec!["-fsS".to_string(), "-H".to_string(), MANIFEST_ACCEPT.to_string()];
+    let mut args = vec![
+        "-fsS".to_string(),
+        "-H".to_string(),
+        MANIFEST_ACCEPT.to_string(),
+    ];
     if let Some(token) = token {
         args.push("-H".to_string());
         args.push(format!("Authorization: Bearer {token}"));
@@ -324,13 +330,8 @@ fn publish_rootfs(layout: &Layout, staging: &Path, reference: &str) -> Result<()
     if let Some(parent) = layout.rootfs.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    fs::rename(&built, &layout.rootfs).with_context(|| {
-        format!(
-            "move {} to {}",
-            built.display(),
-            layout.rootfs.display()
-        )
-    })?;
+    fs::rename(&built, &layout.rootfs)
+        .with_context(|| format!("move {} to {}", built.display(), layout.rootfs.display()))?;
     descriptor::ensure_identity(layout, &format!("oci:{reference}"))?;
     eprintln!("oci: imported {reference} as {}", layout.rootfs.display());
     Ok(())

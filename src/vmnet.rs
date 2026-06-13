@@ -14,8 +14,8 @@ use std::ffi::{c_char, c_int, c_void};
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -409,7 +409,9 @@ struct RxScratch {
 impl RxScratch {
     fn new(max_packet_size: usize) -> Self {
         Self {
-            buffers: (0..READ_BATCH).map(|_| vec![0u8; max_packet_size]).collect(),
+            buffers: (0..READ_BATCH)
+                .map(|_| vec![0u8; max_packet_size])
+                .collect(),
         }
     }
 }
@@ -432,7 +434,6 @@ unsafe impl Sync for AttachmentInner {}
 fn vmnet_debug() -> bool {
     std::env::var_os("LNX_VMNET_DEBUG").is_some()
 }
-
 
 impl AttachmentInner {
     fn forward_available_packets(&self) {
@@ -466,11 +467,18 @@ impl AttachmentInner {
             if rc != VMNET_SUCCESS || count <= 0 {
                 return;
             }
-            let sizes: Vec<usize> = descs.iter().take(count as usize).map(|d| d.vm_pkt_size).collect();
+            let sizes: Vec<usize> = descs
+                .iter()
+                .take(count as usize)
+                .map(|d| d.vm_pkt_size)
+                .collect();
             if vmnet_debug() {
                 let n = self.rx_frames.fetch_add(count as u64, Ordering::Relaxed);
                 if n < 16 {
-                    eprintln!("vmnet.rx frames+={count} total={} sizes={sizes:?}", n + count as u64);
+                    eprintln!(
+                        "vmnet.rx frames+={count} total={} sizes={sizes:?}",
+                        n + count as u64
+                    );
                 }
             }
             for (size, buffer) in sizes.iter().zip(&rx.buffers) {

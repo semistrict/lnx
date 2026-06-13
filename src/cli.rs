@@ -47,7 +47,10 @@ pub struct Cli {
     #[arg(long, help = "Request nested KVM support for the guest")]
     nested_kvm: bool,
 
-    #[arg(long, help = "Run the guest command as root instead of the host-matching user")]
+    #[arg(
+        long,
+        help = "Run the guest command as root instead of the host-matching user"
+    )]
     root: bool,
 
     #[arg(
@@ -341,7 +344,9 @@ fn set_instance_settings(layout: &Layout, settings: &[String]) -> Result<()> {
             .with_context(|| format!("expected KEY=VALUE, got {setting}"))?;
         match key {
             "cpus" => {
-                let cpus: u8 = value.parse().with_context(|| format!("parse cpus {value}"))?;
+                let cpus: u8 = value
+                    .parse()
+                    .with_context(|| format!("parse cpus {value}"))?;
                 if cpus == 0 {
                     bail!("cpus must be at least 1");
                 }
@@ -426,12 +431,8 @@ fn print_instance_logs(layout: &Layout, console: bool, owner: bool) -> Result<()
     } else {
         layout.run_dir.join("lnx.log")
     };
-    let mut file = fs::File::open(&path).with_context(|| {
-        format!(
-            "open {} (has the instance been started?)",
-            path.display()
-        )
-    })?;
+    let mut file = fs::File::open(&path)
+        .with_context(|| format!("open {} (has the instance been started?)", path.display()))?;
     std::io::copy(&mut file, &mut std::io::stdout()).context("print log")?;
     Ok(())
 }

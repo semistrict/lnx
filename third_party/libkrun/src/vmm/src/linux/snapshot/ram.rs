@@ -131,7 +131,10 @@ pub fn restore_pages_img(dir: &Path, layout: &RamLayout) -> Result<GuestMemoryMm
         }
     }
     if !fs_supports_kvm_file_backing(&file) {
-        info!("snapshot.ram.copy_restore reason=fuse_backed path={}", pages_path.display());
+        info!(
+            "snapshot.ram.copy_restore reason=fuse_backed path={}",
+            pages_path.display()
+        );
         return restore_copied(&file, &pages_path, layout);
     }
     match restore_mapped(&file, layout) {
@@ -229,7 +232,9 @@ mod tests {
     const MIB: u64 = 1024 * 1024;
 
     fn pattern(len: usize, salt: u8) -> Vec<u8> {
-        (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(salt)).collect()
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(salt))
+            .collect()
     }
 
     #[test]
@@ -251,7 +256,8 @@ mod tests {
             (0x9000_0000u64 + MIB + 17, pattern(4096, 3)),
         ];
         for (addr, bytes) in &chunks {
-            mem.write_slice(bytes, GuestAddress(*addr)).expect("write pattern");
+            mem.write_slice(bytes, GuestAddress(*addr))
+                .expect("write pattern");
         }
 
         let layout = write_full_pages_img(&mem, &ranges, &dir).expect("capture");
@@ -271,14 +277,19 @@ mod tests {
         let restored = restore_pages_img(&dir, &layout).expect("restore");
         for (addr, bytes) in &chunks {
             let mut got = vec![0u8; bytes.len()];
-            restored.read_slice(&mut got, GuestAddress(*addr)).expect("read pattern");
+            restored
+                .read_slice(&mut got, GuestAddress(*addr))
+                .expect("read pattern");
             assert_eq!(&got, bytes, "data at 0x{addr:x} survives restore");
         }
         let mut zeros = vec![0u8; 64 * 1024];
         restored
             .read_slice(&mut zeros, GuestAddress(0x8000_0000 + MIB))
             .expect("read hole");
-        assert!(zeros.iter().all(|byte| *byte == 0), "holes restore as zeros");
+        assert!(
+            zeros.iter().all(|byte| *byte == 0),
+            "holes restore as zeros"
+        );
 
         // Guest writes must stay private to the mapping, not dirty the file.
         restored
@@ -289,7 +300,11 @@ mod tests {
             .expect("open pages.img")
             .read_exact_at(&mut on_disk, 4096)
             .expect("read pages.img");
-        assert_eq!(&on_disk, &pattern(4096, 1)[..4096], "file unchanged by guest write");
+        assert_eq!(
+            &on_disk,
+            &pattern(4096, 1)[..4096],
+            "file unchanged by guest write"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -300,8 +315,9 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create temp dir");
 
         let ranges = [(0x8000_0000u64, 2 * MIB)];
-        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(ranges[0].0), ranges[0].1 as usize)])
-            .expect("guest memory");
+        let mem =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(ranges[0].0), ranges[0].1 as usize)])
+                .expect("guest memory");
         let layout = write_full_pages_img(&mem, &ranges, &dir).expect("capture");
 
         let file = OpenOptions::new()

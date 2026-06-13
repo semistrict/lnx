@@ -784,7 +784,11 @@ impl CmsgBuf {
     }
 }
 
-fn send_bytes_with_fd(stream: &UnixStream, bytes: &[u8], fd: BorrowedFd<'_>) -> std::io::Result<()> {
+fn send_bytes_with_fd(
+    stream: &UnixStream,
+    bytes: &[u8],
+    fd: BorrowedFd<'_>,
+) -> std::io::Result<()> {
     let mut iov = libc::iovec {
         iov_base: bytes.as_ptr() as *mut libc::c_void,
         iov_len: bytes.len(),
@@ -1937,7 +1941,12 @@ fn strip_optional_port(host: &str) -> &str {
         .unwrap_or(host)
 }
 
-fn serve_dns(socket: UdpSocket, domain: String, stop: Arc<AtomicBool>, network: Arc<NetworkService>) {
+fn serve_dns(
+    socket: UdpSocket,
+    domain: String,
+    stop: Arc<AtomicBool>,
+    network: Arc<NetworkService>,
+) {
     let mut buf = [0u8; 1500];
     while !stop.load(Ordering::SeqCst) {
         match socket.recv_from(&mut buf) {
@@ -1996,8 +2005,7 @@ fn dns_response(
     let answer = if parse_host(&name, domain).is_ok() {
         Some(Ipv4Addr::LOCALHOST)
     } else {
-        instance_from_host(&name, domain)
-            .and_then(|instance| instance_ips.get(&instance).copied())
+        instance_from_host(&name, domain).and_then(|instance| instance_ips.get(&instance).copied())
     };
     let answer = answer.filter(|_| qtype == 1 && qclass == 1);
 
@@ -2046,7 +2054,10 @@ mod tests {
 
     #[test]
     fn extracts_instance_from_bare_hosts() {
-        assert_eq!(instance_from_host("dev.lnx", "lnx"), Some("dev".to_string()));
+        assert_eq!(
+            instance_from_host("dev.lnx", "lnx"),
+            Some("dev".to_string())
+        );
         assert_eq!(
             instance_from_host("Dev.LNX:443", "lnx"),
             Some("dev".to_string())
@@ -2072,7 +2083,10 @@ mod tests {
             attach_instance_from_request("POST /network/attach?instance=../etc HTTP/1.1\r\n\r\n"),
             None
         );
-        assert_eq!(attach_instance_from_request("GET /status HTTP/1.1\r\n\r\n"), None);
+        assert_eq!(
+            attach_instance_from_request("GET /status HTTP/1.1\r\n\r\n"),
+            None
+        );
     }
 
     #[test]
@@ -2086,7 +2100,9 @@ mod tests {
     }
 
     fn dns_query(host: &str) -> Vec<u8> {
-        let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut packet = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
         for label in host.split('.') {
             packet.push(label.len() as u8);
             packet.extend_from_slice(label.as_bytes());

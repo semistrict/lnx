@@ -304,14 +304,7 @@ fn configure_network() {
     let _ = run_status(&["/sbin/ip", "link", "set", "eth0", "up"]);
     let _ = run_status(&["/sbin/ip", "addr", "replace", &ip, "dev", "eth0"]);
     let _ = run_status(&[
-        "/sbin/ip",
-        "route",
-        "replace",
-        "default",
-        "via",
-        &gateway,
-        "dev",
-        "eth0",
+        "/sbin/ip", "route", "replace", "default", "via", &gateway, "dev", "eth0",
     ]);
     let _ = fs::remove_file("/etc/resolv.conf");
     let _ = fs::write(
@@ -326,7 +319,11 @@ fn configure_network() {
 /// makes getaddrinfo fail and tools like sudo warn "unable to resolve host".
 /// Only writes when the file is empty so an image's own hosts is preserved.
 fn ensure_hosts() {
-    if !fs::read_to_string("/etc/hosts").unwrap_or_default().trim().is_empty() {
+    if !fs::read_to_string("/etc/hosts")
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
         return;
     }
     let mut names = String::from("localhost localhost.localdomain");
@@ -573,7 +570,9 @@ WantedBy=multi-user.target\n";
         // systemd reads the unit installed above and supervises the agent.
         Some(init) if init_is_systemd(&init) => exec_init(&init),
         Some(init) => {
-            log(&format!("image init {init} is not systemd; supervising agent directly"));
+            log(&format!(
+                "image init {init} is not systemd; supervising agent directly"
+            ));
             spawn_agent_supervisor();
             exec_init(&init)
         }

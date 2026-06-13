@@ -309,7 +309,10 @@ mod tests {
         assert_eq!(reader.header.ram_size, 0x4000_0000);
         assert_eq!(reader.header.ram_base, 0x8000_0000);
         assert_eq!(reader.header.vcpu_count, 2);
-        assert_eq!(reader.get_raw(SectionId::Vcpu, 0).expect("vcpu0"), &[1, 2, 3]);
+        assert_eq!(
+            reader.get_raw(SectionId::Vcpu, 0).expect("vcpu0"),
+            &[1, 2, 3]
+        );
         assert_eq!(reader.get_raw(SectionId::Vcpu, 1).expect("vcpu1"), &[4, 5]);
         let meta: (String, u64) = reader.get_bincode(SectionId::Meta, 0).expect("meta");
         assert_eq!(meta, ("meta".to_string(), 7));
