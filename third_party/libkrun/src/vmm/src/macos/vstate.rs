@@ -11,6 +11,7 @@ use std::fmt::{Display, Formatter};
 use std::io;
 use std::result;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -21,10 +22,13 @@ use arch::ArchMemoryInfo;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use devices::legacy::VcpuList;
 use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
+use serde::Deserialize;
 use utils::eventfd::EventFd;
 use vm_memory::{
     Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
 };
+
+static VCPU_EXIT_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 /// Errors associated with the wrappers over KVM ioctls.
 #[derive(Debug)]
@@ -390,11 +394,11 @@ impl Vcpu {
         match hvf_vcpu.run(self.vcpu_list.clone()) {
             Ok(exit) => match exit {
                 VcpuExit::Breakpoint => {
-                    debug!("vCPU {vcpuid} breakpoint");
+                    debug_log_vcpu_exit(vcpuid, "breakpoint".to_string());
                     Ok(VcpuEmulation::Interrupted)
                 }
                 VcpuExit::Canceled => {
-                    debug!("vCPU {vcpuid} canceled");
+                    debug_log_vcpu_exit(vcpuid, "canceled".to_string());
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::CpuOn(mpidr, entry, context_id) => {
@@ -409,10 +413,14 @@ impl Vcpu {
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::HypervisorCall => {
-                    debug!("vCPU {vcpuid} HVC");
+                    debug_log_vcpu_exit(vcpuid, "hvc".to_string());
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::MmioRead(addr, data) => {
+                    debug_log_vcpu_exit(
+                        vcpuid,
+                        format!("mmio_read addr=0x{addr:x} len={}", data.len()),
+                    );
                     if let Some(ref mmio_bus) = self.mmio_bus {
                         debug!("vCPU {vcpuid} MMIO read 0x{addr:x}");
                         mmio_bus.read(vcpuid, addr, data);
@@ -420,18 +428,28 @@ impl Vcpu {
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::MmioWrite(addr, data) => {
+                    debug_log_vcpu_exit(
+                        vcpuid,
+                        format!(
+                            "mmio_write addr=0x{addr:x} len={} data={data:x?}",
+                            data.len()
+                        ),
+                    );
                     if let Some(ref mmio_bus) = self.mmio_bus {
                         mmio_bus.write(vcpuid, addr, data);
                     }
                     Ok(VcpuEmulation::Handled)
                 }
-                VcpuExit::DirtyMemory => Ok(VcpuEmulation::Handled),
+                VcpuExit::DirtyMemory => {
+                    debug_log_vcpu_exit(vcpuid, "dirty_memory".to_string());
+                    Ok(VcpuEmulation::Handled)
+                }
                 VcpuExit::PsciHandled => {
-                    debug!("vCPU {vcpuid} PSCI");
+                    debug_log_vcpu_exit(vcpuid, "psci".to_string());
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::SecureMonitorCall => {
-                    debug!("vCPU {vcpuid} SMC");
+                    debug_log_vcpu_exit(vcpuid, "smc".to_string());
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::Shutdown => {
@@ -439,11 +457,11 @@ impl Vcpu {
                     Ok(VcpuEmulation::Stopped)
                 }
                 VcpuExit::SystemRegister => {
-                    debug!("vCPU {vcpuid} accessed a system register");
+                    debug_log_vcpu_exit(vcpuid, "system_register".to_string());
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::VtimerActivated => {
-                    debug!("vCPU {vcpuid} VtimerActivated");
+                    debug_log_vcpu_exit(vcpuid, "vtimer_activated".to_string());
                     self.vcpu_list.set_vtimer_irq(vcpuid);
                     Ok(VcpuEmulation::Handled)
                 }
@@ -553,6 +571,7 @@ impl Vcpu {
                     loop {
                         match self.event_receiver.recv() {
                             Ok(VcpuEvent::Resume) => {
+                                debug!("vcpu.debug paused.resume_ack vcpu={}", hvf_vcpu.id());
                                 let _ = self.response_sender.send(VcpuResponse::Resumed);
                                 break;
                             }
@@ -575,6 +594,29 @@ impl Vcpu {
                                         Err(e) => VcpuResponse::Error(format!("restore: {e}")),
                                     },
                                     Err(e) => VcpuResponse::Error(format!("decode: {e}")),
+                                };
+                                let _ = self.response_sender.send(resp);
+                            }
+                            Ok(VcpuEvent::RestoreKvmState {
+                                state,
+                                restore_counter,
+                                gic,
+                            }) => {
+                                let resp = match restore_kvm_state(
+                                    hvf_vcpu,
+                                    &state,
+                                    restore_counter,
+                                    gic.as_ref(),
+                                ) {
+                                    Ok(()) => VcpuResponse::Restored,
+                                    Err(e) => VcpuResponse::Error(format!("restore kvm: {e}")),
+                                };
+                                let _ = self.response_sender.send(resp);
+                            }
+                            Ok(VcpuEvent::RestoreGicRedist(regs)) => {
+                                let resp = match hvf_vcpu.restore_gic_redist_regs(&regs) {
+                                    Ok(()) => VcpuResponse::Restored,
+                                    Err(e) => VcpuResponse::Error(format!("restore redist: {e}")),
                                 };
                                 let _ = self.response_sender.send(resp);
                             }
@@ -614,9 +656,13 @@ impl Vcpu {
                 }
                 Ok(VcpuEvent::Resume) => {
                     // Spurious resume — ack and continue.
+                    debug!("vcpu.debug running.resume_ack vcpu={}", hvf_vcpu.id());
                     let _ = self.response_sender.send(VcpuResponse::Resumed);
                 }
-                Ok(VcpuEvent::RestoreState(_)) | Ok(VcpuEvent::RebaseTimer(_)) => {
+                Ok(VcpuEvent::RestoreState(_))
+                | Ok(VcpuEvent::RestoreKvmState { .. })
+                | Ok(VcpuEvent::RestoreGicRedist(_))
+                | Ok(VcpuEvent::RebaseTimer(_)) => {
                     let _ = self
                         .response_sender
                         .send(VcpuResponse::Error("not paused".into()));
@@ -634,16 +680,20 @@ impl Vcpu {
         timeout: Option<Duration>,
     ) {
         if self.vcpu_list.should_wait(hvf_vcpuid) {
+            debug!("vcpu.debug wait_for_event.enter vcpu={hvf_vcpuid} timeout={timeout:?}");
             if let Some(timeout) = timeout {
                 match receiver.recv_timeout(timeout) {
-                    Ok(_) => {}
+                    Ok(_) => debug!("vcpu.debug wait_for_event.wake vcpu={hvf_vcpuid}"),
                     Err(e) => match e {
-                        RecvTimeoutError::Timeout => {}
+                        RecvTimeoutError::Timeout => {
+                            debug!("vcpu.debug wait_for_event.timeout vcpu={hvf_vcpuid}")
+                        }
                         RecvTimeoutError::Disconnected => panic!("WFE channel closed unexpectedly"),
                     },
                 }
             } else {
                 receiver.recv().unwrap();
+                debug!("vcpu.debug wait_for_event.wake vcpu={hvf_vcpuid}");
             }
         }
     }
@@ -677,6 +727,14 @@ pub enum VcpuEvent {
     Resume,
     /// Apply a captured HvfVcpuState (bincode-encoded) — only legal while paused.
     RestoreState(Vec<u8>),
+    /// Apply a captured Linux/KVM aarch64 vCPU state while paused.
+    RestoreKvmState {
+        state: Vec<u8>,
+        restore_counter: u64,
+        gic: Option<KvmGicVcpuState>,
+    },
+    /// Apply GIC redistributor registers on the owning vCPU thread.
+    RestoreGicRedist(Vec<(u32, u64)>),
     /// Re-arm virtual timer state after snapshot restore — only legal while paused.
     RebaseTimer(u64),
 }
@@ -748,6 +806,394 @@ pub struct SnapshotCtx {
     pub nested_enabled: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct KvmGicVcpuState {
+    pub icc_regs: Vec<(u16, u64)>,
+    pub redist_regs: Vec<(u32, u64)>,
+    pub ich_regs: Vec<(u16, u64)>,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Debug, Deserialize)]
+struct KvmAarch64OneRegCompat {
+    id: u64,
+    value: Vec<u8>,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Debug, Deserialize)]
+struct KvmVcpuStateCompat {
+    regs: Vec<KvmAarch64OneRegCompat>,
+    #[serde(default)]
+    mp_state: Option<Vec<u8>>,
+    #[serde(default)]
+    vcpu_events: Option<Vec<u8>>,
+}
+
+#[cfg(target_arch = "aarch64")]
+fn restore_kvm_state(
+    hvf_vcpu: &mut HvfVcpu,
+    bytes: &[u8],
+    restore_counter: u64,
+    gic: Option<&KvmGicVcpuState>,
+) -> std::result::Result<(), String> {
+    let kvm_state =
+        bincode::deserialize::<KvmVcpuStateCompat>(bytes).map_err(|e| format!("decode: {e}"))?;
+    let hvf_state = kvm_state_to_hvf_state(&kvm_state, restore_counter, gic)?;
+    hvf_vcpu
+        .restore_state(&hvf_state)
+        .map_err(|e| format!("restore: {e:?}"))
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn restore_kvm_state(
+    _hvf_vcpu: &mut HvfVcpu,
+    _bytes: &[u8],
+    _restore_counter: u64,
+    _gic: Option<&KvmGicVcpuState>,
+) -> std::result::Result<(), String> {
+    Err("KVM aarch64 state restore is unsupported on this architecture".to_string())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn kvm_state_to_hvf_state(
+    state: &KvmVcpuStateCompat,
+    restore_counter: u64,
+    gic: Option<&KvmGicVcpuState>,
+) -> std::result::Result<hvf::state::HvfVcpuState, String> {
+    let _ = (&state.mp_state, &state.vcpu_events);
+
+    let mut gp = [0u64; 31];
+    for (index, slot) in gp.iter_mut().enumerate() {
+        *slot = required_kvm_reg_u64(state, core_user_reg_id(index))?;
+    }
+
+    let pc = required_kvm_reg_u64(state, core_user_pc_id())?;
+    let cpsr = required_kvm_reg_u64(state, core_user_pstate_id())?;
+    let fpsr = required_kvm_reg_u32(state, core_fp_fpsr_id())? as u64;
+    let fpcr = required_kvm_reg_u32(state, core_fp_fpcr_id())? as u64;
+    let mut fp = [0u128; 32];
+    for (index, slot) in fp.iter_mut().enumerate() {
+        *slot = required_kvm_reg_u128(state, core_fp_vreg_id(index))?;
+    }
+
+    let mut sysregs = Vec::new();
+    push_required_core_sysreg(
+        state,
+        &mut sysregs,
+        core_spsr_id(0),
+        hvf_sys_reg(3, 0, 4, 0, 0),
+    )?;
+    push_required_core_sysreg(
+        state,
+        &mut sysregs,
+        core_elr_el1_id(),
+        hvf_sys_reg(3, 0, 4, 0, 1),
+    )?;
+    push_required_core_sysreg(
+        state,
+        &mut sysregs,
+        core_user_sp_id(),
+        hvf_sys_reg(3, 0, 4, 1, 0),
+    )?;
+    push_required_core_sysreg(
+        state,
+        &mut sysregs,
+        core_sp_el1_id(),
+        hvf_sys_reg(3, 4, 4, 1, 0),
+    )?;
+
+    let mut saved_counter = None;
+    for reg in &state.regs {
+        if !kvm_reg_is_sysreg(reg.id) {
+            continue;
+        }
+        let value = kvm_reg_value_u64(reg)?;
+        if reg.id == kvm_timer_counter_id() {
+            saved_counter = Some(value);
+            continue;
+        }
+        if reg.id == kvm_timer_cval_id() {
+            sysregs.push((hvf_sys_reg(3, 3, 14, 3, 2), value));
+            continue;
+        }
+        sysregs.push((kvm_sysreg_to_hvf_sysreg(reg.id), value));
+    }
+
+    let vtimer_offset = saved_counter
+        .map(|counter| restore_counter.wrapping_sub(counter))
+        .unwrap_or(0);
+
+    let (gic_icc_regs, gic_redist_regs, gic_ich_regs) = gic
+        .map(|state| {
+            (
+                state.icc_regs.clone(),
+                state.redist_regs.clone(),
+                state.ich_regs.clone(),
+            )
+        })
+        .unwrap_or_default();
+    debug!(
+        "hvf.kvm_state.translated pc=0x{pc:x} cpsr=0x{cpsr:x} vtimer_offset=0x{vtimer_offset:x} sysregs={} gic_icc={} gic_redist={} gic_ich={}",
+        sysregs.len(),
+        gic_icc_regs.len(),
+        gic_redist_regs.len(),
+        gic_ich_regs.len()
+    );
+
+    Ok(hvf::state::HvfVcpuState {
+        gp,
+        pc,
+        cpsr,
+        fpcr,
+        fpsr,
+        fp,
+        sysregs,
+        gic_icc_regs,
+        gic_redist_regs,
+        gic_ich_regs,
+        vtimer_masked: false,
+        vtimer_offset,
+    })
+}
+
+#[cfg(target_arch = "aarch64")]
+fn push_required_core_sysreg(
+    state: &KvmVcpuStateCompat,
+    sysregs: &mut Vec<(u16, u64)>,
+    kvm_id: u64,
+    hvf_id: u16,
+) -> std::result::Result<(), String> {
+    sysregs.push((hvf_id, required_kvm_reg_u64(state, kvm_id)?));
+    Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn required_kvm_reg_u64(state: &KvmVcpuStateCompat, id: u64) -> std::result::Result<u64, String> {
+    let reg = state
+        .regs
+        .iter()
+        .find(|reg| reg.id == id)
+        .ok_or_else(|| format!("missing KVM reg 0x{id:x}"))?;
+    kvm_reg_value_u64(reg)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn required_kvm_reg_u32(state: &KvmVcpuStateCompat, id: u64) -> std::result::Result<u32, String> {
+    let reg = state
+        .regs
+        .iter()
+        .find(|reg| reg.id == id)
+        .ok_or_else(|| format!("missing KVM reg 0x{id:x}"))?;
+    let bytes = reg
+        .value
+        .get(..4)
+        .ok_or_else(|| format!("short KVM reg 0x{id:x}"))?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+#[cfg(target_arch = "aarch64")]
+fn required_kvm_reg_u128(state: &KvmVcpuStateCompat, id: u64) -> std::result::Result<u128, String> {
+    let reg = state
+        .regs
+        .iter()
+        .find(|reg| reg.id == id)
+        .ok_or_else(|| format!("missing KVM reg 0x{id:x}"))?;
+    let bytes = reg
+        .value
+        .get(..16)
+        .ok_or_else(|| format!("short KVM reg 0x{id:x}"))?;
+    Ok(u128::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+#[cfg(target_arch = "aarch64")]
+fn kvm_reg_value_u64(reg: &KvmAarch64OneRegCompat) -> std::result::Result<u64, String> {
+    let bytes = reg
+        .value
+        .get(..8)
+        .ok_or_else(|| format!("short KVM reg 0x{:x}", reg.id))?;
+    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+#[cfg(target_arch = "aarch64")]
+fn kvm_reg_is_sysreg(id: u64) -> bool {
+    (id & KVM_REG_ARM_COPROC_MASK) == KVM_REG_ARM64_SYSREG
+}
+
+#[cfg(target_arch = "aarch64")]
+fn kvm_sysreg_to_hvf_sysreg(id: u64) -> u16 {
+    hvf_sys_reg(
+        ((id & KVM_REG_ARM64_SYSREG_OP0_MASK) >> KVM_REG_ARM64_SYSREG_OP0_SHIFT) as u16,
+        ((id & KVM_REG_ARM64_SYSREG_OP1_MASK) >> KVM_REG_ARM64_SYSREG_OP1_SHIFT) as u16,
+        ((id & KVM_REG_ARM64_SYSREG_CRN_MASK) >> KVM_REG_ARM64_SYSREG_CRN_SHIFT) as u16,
+        ((id & KVM_REG_ARM64_SYSREG_CRM_MASK) >> KVM_REG_ARM64_SYSREG_CRM_SHIFT) as u16,
+        ((id & KVM_REG_ARM64_SYSREG_OP2_MASK) >> KVM_REG_ARM64_SYSREG_OP2_SHIFT) as u16,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+fn core_reg_id(offset: usize, size: u64) -> u64 {
+    KVM_REG_ARM64 | size | KVM_REG_ARM_CORE | (offset / std::mem::size_of::<u32>()) as u64
+}
+
+#[cfg(target_arch = "aarch64")]
+fn core_user_reg_id(index: usize) -> u64 {
+    core_reg_id(
+        KVM_REGS_REGS_OFFSET + USER_PT_REGS_REGS_OFFSET + index * 8,
+        KVM_REG_SIZE_U64,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+fn core_user_sp_id() -> u64 {
+    core_reg_id(
+        KVM_REGS_REGS_OFFSET + USER_PT_REGS_SP_OFFSET,
+        KVM_REG_SIZE_U64,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+fn core_user_pc_id() -> u64 {
+    core_reg_id(
+        KVM_REGS_REGS_OFFSET + USER_PT_REGS_PC_OFFSET,
+        KVM_REG_SIZE_U64,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+fn core_user_pstate_id() -> u64 {
+    core_reg_id(
+        KVM_REGS_REGS_OFFSET + USER_PT_REGS_PSTATE_OFFSET,
+        KVM_REG_SIZE_U64,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+fn core_sp_el1_id() -> u64 {
+    core_reg_id(KVM_REGS_SP_EL1_OFFSET, KVM_REG_SIZE_U64)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn core_elr_el1_id() -> u64 {
+    core_reg_id(KVM_REGS_ELR_EL1_OFFSET, KVM_REG_SIZE_U64)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn core_spsr_id(index: usize) -> u64 {
+    core_reg_id(KVM_REGS_SPSR_OFFSET + index * 8, KVM_REG_SIZE_U64)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn core_fp_vreg_id(index: usize) -> u64 {
+    core_reg_id(
+        KVM_REGS_FP_REGS_OFFSET + USER_FPSIMD_VREGS_OFFSET + index * 16,
+        KVM_REG_SIZE_U128,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+fn core_fp_fpsr_id() -> u64 {
+    core_reg_id(
+        KVM_REGS_FP_REGS_OFFSET + USER_FPSIMD_FPSR_OFFSET,
+        KVM_REG_SIZE_U32,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+fn core_fp_fpcr_id() -> u64 {
+    core_reg_id(
+        KVM_REGS_FP_REGS_OFFSET + USER_FPSIMD_FPCR_OFFSET,
+        KVM_REG_SIZE_U32,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+const fn hvf_sys_reg(op0: u16, op1: u16, crn: u16, crm: u16, op2: u16) -> u16 {
+    (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2
+}
+
+#[cfg(target_arch = "aarch64")]
+fn kvm_timer_cval_id() -> u64 {
+    arm64_sys_reg_id(3, 3, 14, 0, 2)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn kvm_timer_counter_id() -> u64 {
+    arm64_sys_reg_id(3, 3, 14, 3, 2)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn arm64_sys_reg_id(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
+    KVM_REG_ARM64
+        | KVM_REG_SIZE_U64
+        | KVM_REG_ARM64_SYSREG
+        | ((op0 << KVM_REG_ARM64_SYSREG_OP0_SHIFT) & KVM_REG_ARM64_SYSREG_OP0_MASK)
+        | ((op1 << KVM_REG_ARM64_SYSREG_OP1_SHIFT) & KVM_REG_ARM64_SYSREG_OP1_MASK)
+        | ((crn << KVM_REG_ARM64_SYSREG_CRN_SHIFT) & KVM_REG_ARM64_SYSREG_CRN_MASK)
+        | ((crm << KVM_REG_ARM64_SYSREG_CRM_SHIFT) & KVM_REG_ARM64_SYSREG_CRM_MASK)
+        | ((op2 << KVM_REG_ARM64_SYSREG_OP2_SHIFT) & KVM_REG_ARM64_SYSREG_OP2_MASK)
+}
+
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_ARM64: u64 = 0x6000_0000_0000_0000;
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_ARM_COPROC_MASK: u64 = 0x0fff_0000;
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_ARM_CORE: u64 = 0x0010_0000;
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_ARM64_SYSREG: u64 = 0x0013_0000;
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_ARM64_SYSREG_OP0_MASK: u64 = 0x0000_c000;
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_ARM64_SYSREG_OP0_SHIFT: u64 = 14;
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_ARM64_SYSREG_OP1_MASK: u64 = 0x0000_3800;
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_ARM64_SYSREG_OP1_SHIFT: u64 = 11;
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_ARM64_SYSREG_CRN_MASK: u64 = 0x0000_0780;
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_ARM64_SYSREG_CRN_SHIFT: u64 = 7;
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_ARM64_SYSREG_CRM_MASK: u64 = 0x0000_0078;
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_ARM64_SYSREG_CRM_SHIFT: u64 = 3;
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_ARM64_SYSREG_OP2_MASK: u64 = 0x0000_0007;
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_ARM64_SYSREG_OP2_SHIFT: u64 = 0;
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_SIZE_U32: u64 = 0x0020_0000_0000_0000;
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_SIZE_U64: u64 = 0x0030_0000_0000_0000;
+#[cfg(target_arch = "aarch64")]
+const KVM_REG_SIZE_U128: u64 = 0x0040_0000_0000_0000;
+
+#[cfg(target_arch = "aarch64")]
+const KVM_REGS_REGS_OFFSET: usize = 0;
+#[cfg(target_arch = "aarch64")]
+const KVM_REGS_SP_EL1_OFFSET: usize = 272;
+#[cfg(target_arch = "aarch64")]
+const KVM_REGS_ELR_EL1_OFFSET: usize = 280;
+#[cfg(target_arch = "aarch64")]
+const KVM_REGS_SPSR_OFFSET: usize = 288;
+#[cfg(target_arch = "aarch64")]
+const KVM_REGS_FP_REGS_OFFSET: usize = 336;
+#[cfg(target_arch = "aarch64")]
+const USER_PT_REGS_REGS_OFFSET: usize = 0;
+#[cfg(target_arch = "aarch64")]
+const USER_PT_REGS_SP_OFFSET: usize = 248;
+#[cfg(target_arch = "aarch64")]
+const USER_PT_REGS_PC_OFFSET: usize = 256;
+#[cfg(target_arch = "aarch64")]
+const USER_PT_REGS_PSTATE_OFFSET: usize = 264;
+#[cfg(target_arch = "aarch64")]
+const USER_FPSIMD_VREGS_OFFSET: usize = 0;
+#[cfg(target_arch = "aarch64")]
+const USER_FPSIMD_FPSR_OFFSET: usize = 512;
+#[cfg(target_arch = "aarch64")]
+const USER_FPSIMD_FPCR_OFFSET: usize = 516;
+
 enum VcpuEmulation {
     Handled,
     Interrupted,
@@ -755,6 +1201,12 @@ enum VcpuEmulation {
     WaitForEvent,
     WaitForEventExpired,
     WaitForEventTimeout(Duration),
+}
+
+fn debug_log_vcpu_exit(vcpuid: u64, kind: String) {
+    if VCPU_EXIT_DEBUG_LOGS.fetch_add(1, Ordering::Relaxed) < 200 {
+        debug!("vcpu.debug hvf_exit vcpu={vcpuid} {kind}");
+    }
 }
 
 #[cfg(test)]
@@ -769,6 +1221,112 @@ mod tests {
     use arch::aarch64::layout::DRAM_MEM_START_EFI;
     use devices::legacy::VcpuList;
     use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    #[cfg(target_arch = "aarch64")]
+    fn one_reg_u64(id: u64, value: u64) -> KvmAarch64OneRegCompat {
+        KvmAarch64OneRegCompat {
+            id,
+            value: value.to_le_bytes().to_vec(),
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn one_reg_u32(id: u64, value: u32) -> KvmAarch64OneRegCompat {
+        KvmAarch64OneRegCompat {
+            id,
+            value: value.to_le_bytes().to_vec(),
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn one_reg_u128(id: u64, value: u128) -> KvmAarch64OneRegCompat {
+        KvmAarch64OneRegCompat {
+            id,
+            value: value.to_le_bytes().to_vec(),
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn sysreg_value(state: &hvf::state::HvfVcpuState, reg: u16) -> u64 {
+        state
+            .sysregs
+            .iter()
+            .find_map(|&(candidate, value)| (candidate == reg).then_some(value))
+            .expect("missing sysreg")
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn kvm_state_translation_maps_core_fp_sysregs_and_timer() {
+        let writable_sysreg = arm64_sys_reg_id(3, 0, 1, 0, 0);
+        let mut regs = Vec::new();
+        for index in 0..31 {
+            regs.push(one_reg_u64(core_user_reg_id(index), 0x1000 + index as u64));
+        }
+        regs.extend([
+            one_reg_u64(core_user_sp_id(), 0x2000),
+            one_reg_u64(core_user_pc_id(), 0x3000),
+            one_reg_u64(core_user_pstate_id(), 0x3c5),
+            one_reg_u64(core_spsr_id(0), 0x4000),
+            one_reg_u64(core_elr_el1_id(), 0x5000),
+            one_reg_u64(core_sp_el1_id(), 0x6000),
+            one_reg_u32(core_fp_fpsr_id(), 0x77),
+            one_reg_u32(core_fp_fpcr_id(), 0x88),
+            one_reg_u128(
+                core_fp_vreg_id(0),
+                0x1111_2222_3333_4444_5555_6666_7777_8888,
+            ),
+            one_reg_u64(writable_sysreg, 0x9000),
+            one_reg_u64(kvm_timer_cval_id(), 0xa000),
+            one_reg_u64(kvm_timer_counter_id(), 0xb000),
+        ]);
+        for index in 1..32 {
+            regs.push(one_reg_u128(core_fp_vreg_id(index), index as u128));
+        }
+
+        let kvm = KvmVcpuStateCompat {
+            regs,
+            mp_state: Some(vec![0; 4]),
+            vcpu_events: Some(vec![1, 2, 3]),
+        };
+
+        let gic = KvmGicVcpuState {
+            icc_regs: vec![(hvf_sys_reg(3, 0, 4, 6, 0), 0xf0)],
+            redist_regs: vec![(0x1_0100, 0xffff_ffff)],
+            ich_regs: vec![(hvf_sys_reg(3, 4, 12, 12, 0), 0x8000_0000_0000_0045)],
+        };
+        let hvf = kvm_state_to_hvf_state(&kvm, 0xf000, Some(&gic)).expect("translate");
+
+        assert_eq!(hvf.gp[0], 0x1000);
+        assert_eq!(hvf.gp[30], 0x101e);
+        assert_eq!(hvf.pc, 0x3000);
+        assert_eq!(hvf.cpsr, 0x3c5);
+        assert_eq!(hvf.fpsr, 0x77);
+        assert_eq!(hvf.fpcr, 0x88);
+        assert_eq!(hvf.fp[0], 0x1111_2222_3333_4444_5555_6666_7777_8888);
+        assert_eq!(sysreg_value(&hvf, hvf_sys_reg(3, 0, 4, 0, 0)), 0x4000);
+        assert_eq!(sysreg_value(&hvf, hvf_sys_reg(3, 0, 4, 0, 1)), 0x5000);
+        assert_eq!(sysreg_value(&hvf, hvf_sys_reg(3, 0, 4, 1, 0)), 0x2000);
+        assert_eq!(sysreg_value(&hvf, hvf_sys_reg(3, 4, 4, 1, 0)), 0x6000);
+        assert_eq!(sysreg_value(&hvf, hvf_sys_reg(3, 0, 1, 0, 0)), 0x9000);
+        assert_eq!(sysreg_value(&hvf, hvf_sys_reg(3, 3, 14, 3, 2)), 0xa000);
+        assert_eq!(hvf.vtimer_offset, 0x4000);
+        assert_eq!(hvf.gic_icc_regs, gic.icc_regs);
+        assert_eq!(hvf.gic_redist_regs, gic.redist_regs);
+        assert_eq!(hvf.gic_ich_regs, gic.ich_regs);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn kvm_state_translation_requires_core_registers() {
+        let kvm = KvmVcpuStateCompat {
+            regs: vec![one_reg_u64(core_user_pc_id(), 0)],
+            mp_state: None,
+            vcpu_events: None,
+        };
+
+        assert!(kvm_state_to_hvf_state(&kvm, 0, None).is_err());
+    }
 
     // Auxiliary function being used throughout the tests.
     // Does NOT create a real HVF VM — Vcpu::new_aarch64 and most vcpu methods

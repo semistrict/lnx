@@ -8,7 +8,6 @@ mod krun;
 mod oci;
 mod paths;
 mod runner;
-#[cfg(not(target_os = "macos"))]
 mod sparse_copy;
 #[cfg(target_os = "macos")]
 mod vmnet;

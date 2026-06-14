@@ -7,11 +7,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use utils::byte_order;
 use utils::eventfd::EventFd;
-use vm_memory::{Address, Bytes, GuestMemoryMmap};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceSnapshot, DeviceSnapshotError, DeviceState,
@@ -51,6 +52,7 @@ pub struct Vsock {
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
     pending_transport_reset: bool,
+    restore_kick_pending: bool,
 }
 
 impl Vsock {
@@ -74,6 +76,7 @@ impl Vsock {
                 .map_err(super::VsockError::EventFd)?,
             device_state: DeviceState::Inactive,
             pending_transport_reset: false,
+            restore_kick_pending: false,
         })
     }
 
@@ -195,8 +198,22 @@ impl Vsock {
         };
 
         let mut queue_ev = queue_ev.lock().unwrap();
+        let load_u16 = |addr: Option<GuestAddress>| -> Option<u16> {
+            addr.and_then(|addr| mem.load(addr, Ordering::Acquire).ok())
+        };
+        let avail_idx_before = load_u16(queue_ev.avail_ring.checked_add(2));
+        let used_idx_before = load_u16(queue_ev.used_ring.checked_add(2));
+        let avail_flags_before = load_u16(Some(queue_ev.avail_ring));
+        let used_flags_before = load_u16(Some(queue_ev.used_ring));
+        debug!(
+            "vsock.restore.eventq.before len={} next_avail={} next_used={} avail_idx={avail_idx_before:?} used_idx={used_idx_before:?} avail_flags={avail_flags_before:?} used_flags={used_flags_before:?} size={}",
+            queue_ev.len(mem),
+            queue_ev.next_avail.0,
+            queue_ev.next_used.0,
+            queue_ev.size,
+        );
         let Some(head) = queue_ev.pop(mem) else {
-            warn!(
+            debug!(
                 "vsock.restore.transport_reset_pending_no_descriptor len={} next_avail={} next_used={}",
                 queue_ev.len(mem),
                 queue_ev.next_avail.0,
@@ -232,10 +249,15 @@ impl Vsock {
                 "vsock transport reset event used ring: {e:?}"
             )));
         }
+        let avail_idx_after = load_u16(queue_ev.avail_ring.checked_add(2));
+        let used_idx_after = load_u16(queue_ev.used_ring.checked_add(2));
 
-        warn!(
-            "vsock.restore.transport_reset_event index={} next_avail={} next_used={}",
-            head.index, queue_ev.next_avail.0, queue_ev.next_used.0
+        debug!(
+            "vsock.restore.transport_reset_event index={} len={} next_avail={} next_used={} avail_idx={avail_idx_after:?} used_idx={used_idx_after:?}",
+            head.index,
+            event.len(),
+            queue_ev.next_avail.0,
+            queue_ev.next_used.0
         );
         Ok(true)
     }
@@ -256,6 +278,29 @@ impl Vsock {
                 error!("failed to write pending vsock transport reset event: {e:?}");
                 false
             }
+        }
+    }
+
+    fn rx_queue_restore_state(&self) -> Option<(u16, u16, u16)> {
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem, _) => mem,
+            DeviceState::Inactive => return None,
+        };
+        let queue_rx = self.queue_rx.as_ref()?;
+        let queue_rx = queue_rx.lock().unwrap();
+        Some((
+            queue_rx.len(mem),
+            queue_rx.next_avail.0,
+            queue_rx.next_used.0,
+        ))
+    }
+
+    fn restore_interrupt_status(&self) -> Option<usize> {
+        match self.device_state {
+            DeviceState::Activated(_, ref interrupt) => {
+                Some(interrupt.status().load(std::sync::atomic::Ordering::SeqCst))
+            }
+            DeviceState::Inactive => None,
         }
     }
 }
@@ -383,15 +428,43 @@ impl VirtioDevice for Vsock {
     }
 
     fn post_restore(&mut self) -> Result<(), DeviceSnapshotError> {
-        let mut raise_irq = self.process_transport_reset_event();
+        let before_rx = self.rx_queue_restore_state();
+        let before_interrupt = self.restore_interrupt_status();
+        debug!(
+            "vsock.restore.post_restore.begin pending_rx={} rxq={before_rx:?} interrupt={before_interrupt:?}",
+            self.muxer.has_pending_rx()
+        );
+        let wrote_reset_event = self.process_transport_reset_event();
+        let mut raise_irq = wrote_reset_event;
         raise_irq |= self.process_stream_tx();
         if self.muxer.has_pending_rx() {
             raise_irq |= self.process_stream_rx();
         }
+        if wrote_reset_event {
+            self.restore_kick_pending = true;
+        }
+        let after_rx = self.rx_queue_restore_state();
+        let after_interrupt = self.restore_interrupt_status();
+        debug!(
+            "vsock.restore.post_restore.done raise_irq={raise_irq} pending_rx={} rxq={after_rx:?} interrupt={after_interrupt:?}",
+            self.muxer.has_pending_rx()
+        );
         if let DeviceState::Activated(_, ref interrupt) = self.device_state {
             if raise_irq {
                 interrupt.signal_used_queue();
             }
+        }
+        Ok(())
+    }
+
+    fn post_vcpu_restore(&mut self) -> Result<(), DeviceSnapshotError> {
+        if !self.restore_kick_pending {
+            return Ok(());
+        }
+        self.restore_kick_pending = false;
+        if let DeviceState::Activated(_, ref interrupt) = self.device_state {
+            debug!("vsock.restore.post_vcpu_kick");
+            interrupt.signal_used_queue();
         }
         Ok(())
     }
@@ -410,7 +483,15 @@ impl VirtioDevice for Vsock {
             cid: self.cid,
             acked_features: self.acked_features,
             stream_listeners: self.muxer.stream_listener_snapshots(),
-            pending_rx: Vec::new(),
+            pending_rx: self
+                .muxer
+                .stream_connection_ports()
+                .into_iter()
+                .map(|(local_port, peer_port)| LegacyStreamReset {
+                    local_port,
+                    peer_port,
+                })
+                .collect(),
             transport_reset,
         };
         let payload =
@@ -449,7 +530,13 @@ impl VirtioDevice for Vsock {
         self.muxer
             .restore_stream_listeners(&body.stream_listeners)
             .map_err(DeviceSnapshotError::Invalid)?;
-        self.pending_transport_reset = body.transport_reset || !body.pending_rx.is_empty();
+        let stream_resets: Vec<_> = body
+            .pending_rx
+            .iter()
+            .map(|reset| (reset.local_port, reset.peer_port))
+            .collect();
+        let queued_stream_reset = self.muxer.queue_stream_resets(&stream_resets);
+        self.pending_transport_reset = body.transport_reset || queued_stream_reset;
         Ok(())
     }
 }
@@ -460,12 +547,16 @@ struct VsockSnapshotBody {
     acked_features: u64,
     #[serde(default)]
     stream_listeners: Vec<StreamListenerSnapshot>,
+    // Active stream connections are intentionally restored as reset packets:
+    // host-side sockets do not survive a VMM restart, so the guest must
+    // reconnect instead of hanging on a half-open stream.
     #[serde(default)]
     pending_rx: Vec<LegacyStreamReset>,
     #[serde(default)]
     transport_reset: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct LegacyStreamReset {
     local_port: u32,

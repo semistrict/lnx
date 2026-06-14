@@ -1,4 +1,4 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { cp, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertContains,
@@ -13,6 +13,7 @@ import {
 } from "./lib";
 
 const ctx = defaultContext("nested-snapshot");
+const corruptSectionSnapshot = join(ctx.tmpdir, "corrupt-section-snapshot");
 const vmArgs = [
   ...(Bun.env.LNX_TEST_CPUS ? ["--cpus", Bun.env.LNX_TEST_CPUS] : []),
   ...(Bun.env.LNX_TEST_MEMORY_MIB ? ["--memory-mib", Bun.env.LNX_TEST_MEMORY_MIB] : []),
@@ -56,29 +57,44 @@ try {
     assertEq(slept.stdout, "slept", "sleep completed in restored VM");
   });
 
-  await testStep("corrupt snapshot section falls back to a cold boot", async () => {
+  await testStep("corrupt snapshot section fails hard", async () => {
     // Flip the last byte of vmstate.bin: the header still parses, so the
     // pre-flight accepts the snapshot, but the section hash check refuses it
-    // at restore time and the client must respawn the owner cold.
+    // at restore time.
     await waitForVmSuspend(ctx, 120_000);
-    const vmstatePath = join(ctx.snapshotDir, "latest", "vmstate.bin");
+    await cp(join(ctx.snapshotDir, "latest"), corruptSectionSnapshot, { recursive: true });
+    const vmstatePath = join(corruptSectionSnapshot, "vmstate.bin");
     const vmstate = Buffer.from(await readFile(vmstatePath));
     vmstate[vmstate.length - 1] ^= 0xff;
     await writeFile(vmstatePath, vmstate);
 
-    const fallback = await lnxVm(["bash", "-lc", "echo cold-fallback-ok"], {
+    const failure = await lnxVm([
+      "--snapshot",
+      corruptSectionSnapshot,
+      "bash",
+      "-lc",
+      "echo should-not-run",
+    ], {
       timeoutMs: 240_000,
+      check: false,
     });
-    assertEq(fallback.stdout, "cold-fallback-ok", "exec succeeds after restore refusal");
+    if (failure.status === 0) {
+      throw new Error("corrupt snapshot restore succeeded unexpectedly");
+    }
+    assertContains(
+      failure.stderr,
+      "lnx VM owner exited with exit status: 86 before the broker came up",
+      "restore refusal fails hard",
+    );
     const log = await Bun.file(`${ctx.runDir}/lnx.log`).text();
     assertContains(
       log,
-      "snapshot.restore.skipped reason=start_failed retry=cold_boot",
-      "restore refusal logged and retried cold",
+      "owner.start.restore_failed",
+      "restore refusal logged",
     );
   });
 
-  await testStep("share root drift skips restore and boots cold", async () => {
+  await testStep("share root drift rejects restore", async () => {
     // Running from the other side of the $HOME boundary changes the host
     // share roots, so the pre-flight must skip the restore and boot cold; a
     // restored guest would keep mounts backed by the old share roots.
@@ -88,16 +104,18 @@ try {
     const otherSide = insideHome ? "/tmp" : home;
     // A working exec proves the cwd chdir succeeded: the agent fails the
     // exec outright when the share backing the cwd is missing.
-    const drifted = await lnxVm(["bash", "-lc", "echo share-drift-ok"], {
+    const drifted = await lnxVm(["bash", "-lc", "echo should-not-run"], {
       cwd: otherSide,
       timeoutMs: 240_000,
+      check: false,
     });
-    assertEq(drifted.stdout, "share-drift-ok", "exec runs in the drifted cwd");
-    const log = await Bun.file(`${ctx.runDir}/lnx.log`).text();
+    if (drifted.status === 0) {
+      throw new Error("share-drifted snapshot restore succeeded unexpectedly");
+    }
     assertContains(
-      log,
-      "snapshot.restore.skipped reason=share_mismatch",
-      "share root drift skips the restore",
+      drifted.stderr,
+      "snapshot host-share/network stamp is incompatible (share_mismatch)",
+      "share root drift rejects the restore",
     );
   });
 } finally {

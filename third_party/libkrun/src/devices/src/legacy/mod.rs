@@ -63,9 +63,13 @@ pub use self::i8042::{Error as I8042DeviceError, I8042Device};
 pub use self::ioapic_kvm::IoApic;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use self::ioapic_whp::WhpIoapic;
+#[cfg(target_arch = "aarch64")]
+pub use self::irqchip::HvfGicDistReg;
 #[cfg(any(test, feature = "test_utils"))]
 pub use self::irqchip::test_utils::DummyIrqChip;
 pub use self::irqchip::{IrqChip, IrqChipDevice, IrqChipT};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use self::irqchip::{LinuxGicDistReg, LinuxGicDistRestorePhase};
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
 pub use self::kvmaia::KvmAia;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]

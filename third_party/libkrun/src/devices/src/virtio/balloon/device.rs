@@ -206,10 +206,8 @@ impl VirtioDevice for Balloon {
         let queues = self
             .queues
             .as_ref()
-            .ok_or_else(|| DeviceSnapshotError::Invalid("balloon not activated".into()))?
-            .iter()
-            .map(|q| q.queue.to_state())
-            .collect();
+            .map(|queues| queues.iter().map(|q| q.queue.to_state()).collect())
+            .unwrap_or_default();
         let body = BalloonSnapshotBody {
             acked_features: self.acked_features,
             config: self.config,
@@ -220,6 +218,13 @@ impl VirtioDevice for Balloon {
     }
 
     fn restore_state(&mut self, snap: &DeviceSnapshot) -> Result<(), DeviceSnapshotError> {
+        let body: BalloonSnapshotBody = bincode::deserialize(&snap.payload)
+            .map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
+        self.acked_features = body.acked_features;
+        self.config = body.config;
+        if snap.queues.is_empty() {
+            return Ok(());
+        }
         let queues = self
             .queues
             .as_mut()
@@ -231,10 +236,6 @@ impl VirtioDevice for Balloon {
                 snap.queues.len()
             )));
         }
-        let body: BalloonSnapshotBody = bincode::deserialize(&snap.payload)
-            .map_err(|e| DeviceSnapshotError::Codec(e.to_string()))?;
-        self.acked_features = body.acked_features;
-        self.config = body.config;
         for (queue, state) in queues.iter_mut().zip(&snap.queues) {
             queue.queue.restore_state(state);
         }

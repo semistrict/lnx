@@ -275,7 +275,85 @@ fn clone_pages_img(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 fn clone_pages_img(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::copy(src, dst).map(|_| ())
+    sparse_clone_pages_img(src, dst)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sparse_clone_pages_img(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
+
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut src_file = File::open(src)?;
+    let mut dst_file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(dst)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        const FICLONE: libc::Ioctl = 0x4004_9409;
+        if unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0 {
+            return Ok(());
+        }
+    }
+
+    let len = src_file.metadata()?.len();
+    dst_file.set_len(len)?;
+
+    let mut offset = 0u64;
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    while offset < len {
+        #[cfg(target_os = "linux")]
+        let data =
+            unsafe { libc::lseek(src_file.as_raw_fd(), offset as libc::off_t, libc::SEEK_DATA) };
+        #[cfg(not(target_os = "linux"))]
+        let data = -1;
+
+        if data < 0 {
+            let err = std::io::Error::last_os_error();
+            #[cfg(target_os = "linux")]
+            if err.raw_os_error() == Some(libc::ENXIO) {
+                return Ok(());
+            }
+            src_file.seek(SeekFrom::Start(offset))?;
+            while offset < len {
+                let want = std::cmp::min(buf.len() as u64, len - offset) as usize;
+                src_file.read_exact(&mut buf[..want])?;
+                if buf[..want].iter().any(|byte| *byte != 0) {
+                    dst_file.seek(SeekFrom::Start(offset))?;
+                    dst_file.write_all(&buf[..want])?;
+                }
+                offset += want as u64;
+            }
+            return Ok(());
+        }
+
+        let data = data as u64;
+        let hole =
+            unsafe { libc::lseek(src_file.as_raw_fd(), data as libc::off_t, libc::SEEK_HOLE) };
+        if hole < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let end = std::cmp::min(hole as u64, len);
+        let mut copied = data;
+        while copied < end {
+            let want = std::cmp::min(buf.len() as u64, end - copied) as usize;
+            src_file.seek(SeekFrom::Start(copied))?;
+            src_file.read_exact(&mut buf[..want])?;
+            if buf[..want].iter().any(|byte| *byte != 0) {
+                dst_file.seek(SeekFrom::Start(copied))?;
+                dst_file.write_all(&buf[..want])?;
+            }
+            copied += want as u64;
+        }
+        offset = end;
+    }
+    Ok(())
 }
 
 fn layout_from_ranges(ranges: &[(u64, u64)]) -> RamLayout {

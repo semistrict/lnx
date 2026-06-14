@@ -4,9 +4,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(target_os = "macos")]
-use std::ffi::CString;
-
 use anyhow::{Context, Result, bail};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -211,33 +208,6 @@ fn clone_or_copy(src: &Path, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    match clone_file(src, dest) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            fs::copy(src, dest)
-                .with_context(|| format!("copy {} to {}", src.display(), dest.display()))?;
-            Ok(())
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn clone_file(src: &Path, dest: &Path) -> Result<()> {
-    unsafe extern "C" {
-        fn clonefile(src: *const libc::c_char, dst: *const libc::c_char, flags: u32) -> i32;
-    }
-
-    let src = CString::new(src.to_string_lossy().as_bytes())?;
-    let dest = CString::new(dest.to_string_lossy().as_bytes())?;
-    if unsafe { clonefile(src.as_ptr(), dest.as_ptr(), 0) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error()).context("clonefile")
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn clone_file(src: &Path, dest: &Path) -> Result<()> {
     crate::sparse_copy::clone_or_copy_file(src, dest)
 }
 

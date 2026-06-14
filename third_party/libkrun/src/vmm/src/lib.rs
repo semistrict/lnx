@@ -38,12 +38,12 @@ use macos::vstate;
 
 use std::fmt::{Display, Formatter};
 use std::io;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "aarch64"))]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "aarch64"))]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -400,6 +400,18 @@ impl Vmm {
         &self.guest_memory
     }
 
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
+    fn post_vcpu_restore_devices(&mut self) -> std::result::Result<(), String> {
+        for (base, transport) in self.mmio_device_manager.virtio_transports() {
+            let device = transport.lock().unwrap().device();
+            let mut device = device.lock().unwrap();
+            device
+                .post_vcpu_restore()
+                .map_err(|e| format!("base=0x{base:x}: post vcpu restore: {e}"))?;
+        }
+        Ok(())
+    }
+
     #[cfg(target_os = "macos")]
     pub fn set_virtiofs_write_allowlist(&mut self, tag: &str, paths: Vec<PathBuf>) -> bool {
         for (_, transport) in self.mmio_device_manager.virtio_transports() {
@@ -648,6 +660,7 @@ impl Vmm {
         crate::macos::snapshot::orchestrator::resume_vcpus(&self.vcpus_handles)
             .map_err(|e| e.to_string())?;
         crate::timing_event("snapshot.restore.resume_vcpus.done");
+        self.post_vcpu_restore_devices()?;
         Ok(())
     }
 
@@ -656,6 +669,7 @@ impl Vmm {
         crate::timing_event("snapshot.restore.resume_vcpus.begin");
         self.resume_vcpus().map_err(|e| format!("{e:?}"))?;
         crate::timing_event("snapshot.restore.resume_vcpus.done");
+        self.post_vcpu_restore_devices()?;
         Ok(())
     }
 }
@@ -665,23 +679,25 @@ fn clone_or_copy_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = std::fs::remove_file(dst);
     let c_src = CString::new(src.as_os_str().as_bytes())?;
     let c_dst = CString::new(dst.as_os_str().as_bytes())?;
     let rc = unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) };
     if rc == 0 {
         return Ok(());
     }
-    std::fs::copy(src, dst).map(|_| ())
+    sparse_copy_extents_macos(src, dst)
 }
 
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-fn clone_or_copy_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn sparse_copy_extents_macos(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::fd::AsRawFd;
 
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    const LARGE_SPARSE_IMAGE_BYTES: u64 = 1024 * 1024 * 1024;
 
     let mut src_file = std::fs::File::open(src)?;
     let mut dst_file = std::fs::OpenOptions::new()
@@ -689,13 +705,96 @@ fn clone_or_copy_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::
         .truncate(true)
         .write(true)
         .open(dst)?;
+    let len = src_file.metadata()?.len();
+    dst_file.set_len(len)?;
 
-    const FICLONE: libc::Ioctl = 0x4004_9409;
-    if unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0 {
-        return Ok(());
+    let mut offset = 0u64;
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    while offset < len {
+        let data =
+            unsafe { libc::lseek(src_file.as_raw_fd(), offset as libc::off_t, libc::SEEK_DATA) };
+        if data < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENXIO) {
+                return Ok(());
+            }
+            if len >= LARGE_SPARSE_IMAGE_BYTES {
+                return Err(err);
+            }
+            src_file.seek(SeekFrom::Start(offset))?;
+            while offset < len {
+                let want = std::cmp::min(buf.len() as u64, len - offset) as usize;
+                src_file.read_exact(&mut buf[..want])?;
+                if buf[..want].iter().any(|byte| *byte != 0) {
+                    dst_file.seek(SeekFrom::Start(offset))?;
+                    dst_file.write_all(&buf[..want])?;
+                }
+                offset += want as u64;
+            }
+            return Ok(());
+        }
+
+        let data = data as u64;
+        let hole =
+            unsafe { libc::lseek(src_file.as_raw_fd(), data as libc::off_t, libc::SEEK_HOLE) };
+        if hole < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let end = std::cmp::min(hole as u64, len);
+        let mut copied = data;
+        while copied < end {
+            let want = std::cmp::min(buf.len() as u64, end - copied) as usize;
+            src_file.seek(SeekFrom::Start(copied))?;
+            src_file.read_exact(&mut buf[..want])?;
+            if buf[..want].iter().any(|byte| *byte != 0) {
+                dst_file.seek(SeekFrom::Start(copied))?;
+                dst_file.write_all(&buf[..want])?;
+            }
+            copied += want as u64;
+        }
+        offset = end;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn clone_or_copy_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
     }
 
-    let len = src_file.metadata()?.len();
+    let mut src_file = std::fs::File::open(src)?;
+    let src_metadata = src_file.metadata()?;
+    let len = src_metadata.len();
+    let src_allocated = src_metadata.blocks() * 512;
+    let mut dst_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(dst)?;
+
+    const FICLONE: libc::Ioctl = 0x4004_9409;
+    if clone_is_sparse_safe(len, src_allocated)
+        && unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0
+    {
+        let dst_allocated = dst_file.metadata()?.blocks() * 512;
+        if clone_is_sparse_safe(len, dst_allocated) {
+            return Ok(());
+        }
+        drop(dst_file);
+        std::fs::remove_file(dst)?;
+        dst_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(dst)?;
+    }
+
     dst_file.set_len(len)?;
 
     // A whole-file copy_file_range is deliberately avoided: on filesystems
@@ -704,7 +803,15 @@ fn clone_or_copy_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::
     // each data extent — on virtiofs the whole file is one extent but
     // FUSE_COPY_FILE_RANGE is serviced server-side instead of streaming
     // bytes through the guest.
-    if sparse_copy_extents(&mut src_file, &mut dst_file, len).is_ok() {
+    if sparse_copy_extents(
+        &mut src_file,
+        &mut dst_file,
+        len,
+        is_large_sparse_image(len, src_allocated),
+    )
+    .is_ok()
+        && clone_is_sparse_safe(len, dst_file.metadata()?.blocks() * 512)
+    {
         return Ok(());
     }
 
@@ -727,10 +834,24 @@ fn clone_or_copy_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::
 }
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const LARGE_SPARSE_IMAGE_BYTES: u64 = 1024 * 1024 * 1024;
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn clone_is_sparse_safe(len: u64, allocated: u64) -> bool {
+    len < LARGE_SPARSE_IMAGE_BYTES || allocated <= len / 2
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn is_large_sparse_image(len: u64, allocated: u64) -> bool {
+    len >= LARGE_SPARSE_IMAGE_BYTES && allocated <= len / 2
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 fn sparse_copy_extents(
     src_file: &mut std::fs::File,
     dst_file: &mut std::fs::File,
     len: u64,
+    source_is_large_sparse: bool,
 ) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::fd::AsRawFd;
@@ -757,6 +878,11 @@ fn sparse_copy_extents(
 
         let mut copied = data;
         let end = std::cmp::min(hole as u64, len);
+        if source_is_large_sparse && data == 0 && end == len {
+            return Err(std::io::Error::other(
+                "filesystem reports one full-file data extent for sparse source",
+            ));
+        }
         while copied < end {
             let want = std::cmp::min(end - copied, 128 * 1024 * 1024) as libc::size_t;
             let mut off_in = copied as libc::loff_t;
@@ -793,17 +919,17 @@ fn sparse_copy_extents(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "aarch64"))]
 struct TimingState {
     file: std::fs::File,
     state_file: std::fs::File,
     base_unix_nanos: u128,
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "aarch64"))]
 static TIMING_LOG: OnceLock<Option<Mutex<TimingState>>> = OnceLock::new();
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "aarch64"))]
 pub fn timing_event(label: &str) {
     let Some(lock) = TIMING_LOG
         .get_or_init(|| {
@@ -855,7 +981,7 @@ pub fn timing_event(label: &str) {
     let _ = unlock_file(&state.state_file);
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "aarch64"))]
 fn unix_nanos() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -863,7 +989,7 @@ fn unix_nanos() -> u128 {
         .as_nanos()
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "aarch64"))]
 fn replace_timing_state(file: &mut std::fs::File, base: u128, now: u128) -> std::io::Result<u128> {
     file.seek(SeekFrom::Start(0))?;
     let mut raw = String::new();
@@ -875,7 +1001,7 @@ fn replace_timing_state(file: &mut std::fs::File, base: u128, now: u128) -> std:
     Ok(now.saturating_sub(previous))
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "aarch64"))]
 fn lock_file(file: &std::fs::File) -> std::io::Result<()> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
         Ok(())
@@ -884,7 +1010,7 @@ fn lock_file(file: &std::fs::File) -> std::io::Result<()> {
     }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "aarch64"))]
 fn unlock_file(file: &std::fs::File) -> std::io::Result<()> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
         Ok(())
@@ -893,7 +1019,7 @@ fn unlock_file(file: &std::fs::File) -> std::io::Result<()> {
     }
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(not(all(any(target_os = "linux", target_os = "macos"), target_arch = "aarch64")))]
 pub fn timing_event(_label: &str) {}
 
 impl Subscriber for Vmm {

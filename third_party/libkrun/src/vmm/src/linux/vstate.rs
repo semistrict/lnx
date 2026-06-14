@@ -953,6 +953,8 @@ pub struct Vcpu {
 
     #[cfg(target_arch = "aarch64")]
     mpidr: u64,
+    #[cfg(target_arch = "aarch64")]
+    pending_hvf_timer_restore: Option<HvfTimerRestoreState>,
 
     // The receiving end of events channel owned by the vcpu side.
     event_receiver: Receiver<VcpuEvent>,
@@ -1122,6 +1124,7 @@ impl Vcpu {
             mmio_bus: None,
             exit_evt,
             mpidr: 0,
+            pending_hvf_timer_restore: None,
             event_receiver,
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
@@ -1514,7 +1517,7 @@ impl Vcpu {
         merge_hvf_state_into_kvm_state(&mut state, &hvf_state, capture_counter)?;
         let timer_state = hvf_timer_restore_state(&state);
         self.restore_state(state)?;
-        self.rearm_hvf_timer_state(timer_state)?;
+        self.pending_hvf_timer_restore = Some(timer_state);
         Ok(())
     }
 
@@ -1549,6 +1552,19 @@ impl Vcpu {
         if let Some(value) = timer.ctl {
             self.set_one_reg_u64(kvm_timer_ctl_id(), value)?;
         }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn rearm_pending_hvf_timer_state(&mut self) -> Result<()> {
+        if let Some(timer) = self.pending_hvf_timer_restore.take() {
+            self.rearm_hvf_timer_state(timer)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    fn rearm_pending_hvf_timer_state(&mut self) -> Result<()> {
         Ok(())
     }
 
@@ -1881,7 +1897,10 @@ impl Vcpu {
                 StateMachine::next(Self::paused)
             }
             Ok(VcpuEvent::RebaseTimer(delta_ticks)) => {
-                match self.rebase_timer(delta_ticks) {
+                match self
+                    .rebase_timer(delta_ticks)
+                    .and_then(|_| self.rearm_pending_hvf_timer_state())
+                {
                     Ok(()) => self
                         .response_sender
                         .send(VcpuResponse::TimerRebased)
@@ -2017,9 +2036,14 @@ struct HvfTimerRestoreState {
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn decode_hvf_vcpu_gic_state(
     bytes: &[u8],
-) -> std::result::Result<(Vec<(u16, u64)>, Vec<(u32, u64)>), bincode::Error> {
-    bincode::deserialize::<HvfVcpuStateCompat>(bytes)
-        .map(|state| (state.gic_icc_regs, state.gic_redist_regs))
+) -> std::result::Result<(Vec<(u16, u64)>, Vec<(u32, u64)>, Vec<(u16, u64)>), bincode::Error> {
+    bincode::deserialize::<HvfVcpuStateCompat>(bytes).map(|state| {
+        (
+            state.gic_icc_regs,
+            state.gic_redist_regs,
+            state.gic_ich_regs,
+        )
+    })
 }
 
 #[cfg(target_arch = "aarch64")]

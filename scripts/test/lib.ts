@@ -252,3 +252,68 @@ export async function diskUsageBytes(path: string): Promise<number> {
   const result = await run(["bash", "-lc", `du -sk ${quoteShell(path)} | awk '{print $1 * 1024}'`]);
   return Number(result.stdout.trim());
 }
+
+export async function cloneSparseImage(src: string, dest: string): Promise<void> {
+  async function allocatedIsAcceptable(path: string): Promise<boolean> {
+    const size = await fileSize(path);
+    if (size < 8 * 1024 * 1024 * 1024) {
+      return true;
+    }
+    const allocated = await diskUsageBytes(path);
+    return allocated <= size / 2;
+  }
+
+  await rm(dest, { force: true });
+  await mkdir(dirname(dest), { recursive: true });
+  const sparseCopyBin = resolve(Bun.env.LNX_BIN ?? join(repoRoot(), "target/debug/lnx"));
+  const sparse = await run([sparseCopyBin, "_sparse-copy", src, dest], {
+    timeoutMs: 600_000,
+    check: false,
+  });
+  if (sparse.status !== 0 || !(await allocatedIsAcceptable(dest))) {
+    throw new Error(
+      [
+        `failed to create sparse image copy: ${src} -> ${dest}`,
+        "Refusing to fall back to a byte-for-byte copy of a sparse VM image.",
+        sparse.stderr || sparse.stdout,
+      ].filter(Boolean).join("\n"),
+    );
+  }
+}
+
+export type HostHttpProbe = {
+  port: number;
+  token: string;
+  expected: string;
+  guestUrl: (host?: string) => string;
+  stop: () => void;
+};
+
+export function startHostHttpProbe(label: string): HostHttpProbe {
+  const token = `${label}-${crypto.randomUUID()}`;
+  const expected = `lnx-host-probe:${token}`;
+  const server = Bun.serve({
+    hostname: "0.0.0.0",
+    port: 0,
+    fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname === `/probe/${token}`) {
+        return new Response(expected, {
+          headers: { "content-type": "text/plain" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  return {
+    port: server.port,
+    token,
+    expected,
+    guestUrl(host = "host.containers.internal") {
+      return `http://${host}:${server.port}/probe/${token}`;
+    },
+    stop() {
+      server.stop(true);
+    },
+  };
+}

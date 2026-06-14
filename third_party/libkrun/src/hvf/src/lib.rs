@@ -21,6 +21,8 @@ use std::arch::asm;
 
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
+use std::io::Read;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -63,6 +65,7 @@ struct DirtyTracker {
 
 static DIRTY_TRACKER: LazyLock<Mutex<DirtyTracker>> =
     LazyLock::new(|| Mutex::new(DirtyTracker::default()));
+static DIRTY_FAULT_DEBUG_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 const TMR_CTL_ENABLE: u64 = 1 << 0;
 const TMR_CTL_IMASK: u64 = 1 << 1;
@@ -129,6 +132,22 @@ const EC_AA64_SMC: u64 = 0x17;
 const EC_SYSTEMREGISTERTRAP: u64 = 0x18;
 const EC_DATAABORT: u64 = 0x24;
 const EC_AA64_BKPT: u64 = 0x3c;
+
+const ARM_SMCCC_TRNG_VERSION: u64 = 0x8400_0050;
+const ARM_SMCCC_TRNG_FEATURES: u64 = 0x8400_0051;
+const ARM_SMCCC_TRNG_GET_UUID: u64 = 0x8400_0052;
+const ARM_SMCCC_TRNG_RND32: u64 = 0x8400_0053;
+const ARM_SMCCC_TRNG_RND64: u64 = 0xc400_0053;
+const ARM_SMCCC_TRNG_VERSION_1_0: u64 = 0x0001_0000;
+
+const TRNG_SUCCESS: u64 = 0;
+const TRNG_NOT_SUPPORTED: u64 = u64::MAX;
+const TRNG_INVALID_PARAMETER: u64 = u64::MAX - 1;
+const TRNG_NO_ENTROPY: u64 = u64::MAX - 2;
+const TRNG_MAX_BITS32: u64 = 96;
+const TRNG_MAX_BITS64: u64 = 192;
+
+const KVM_TRNG_UUID_RETVALS: [u64; 4] = [0x00e0_210d, 0xeb11_8443, 0x4452_7080, 0x4c5a_4e55];
 
 #[derive(Debug)]
 pub enum Error {
@@ -473,6 +492,12 @@ fn dirty_tracking_handle_write_fault(pa: u64) -> Result<bool, Error> {
                 (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
             )
         };
+        if DIRTY_FAULT_DEBUG_LOGS.fetch_add(1, Ordering::Relaxed) < 200 {
+            warn!(
+                "dirty.debug write_fault pa=0x{pa:x} region=0x{:x}+0x{:x} block_index={} block=0x{block_addr:x}+0x{block_size:x} ret={ret}",
+                region.guest_addr, region.size, block_index
+            );
+        }
         if ret != HV_SUCCESS {
             return Err(Error::MemoryMap);
         }
@@ -570,6 +595,28 @@ struct MmioRead {
     addr: u64,
     len: usize,
     srt: u32,
+}
+
+fn trng_random_words(num_bits: u64) -> std::io::Result<[u64; 3]> {
+    let mut bytes = [0u8; 24];
+    let byte_count = ((num_bits + 7) / 8) as usize;
+
+    if byte_count > 0 {
+        let mut random = std::fs::File::open("/dev/urandom")?;
+        random.read_exact(&mut bytes[..byte_count])?;
+
+        let remaining_bits = num_bits % 8;
+        if remaining_bits != 0 {
+            let mask = ((1u16 << remaining_bits) - 1) as u8;
+            bytes[byte_count - 1] &= mask;
+        }
+    }
+
+    Ok([
+        u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+        u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+    ])
 }
 
 pub struct HvfVcpu<'a> {
@@ -749,6 +796,13 @@ impl HvfVcpu<'_> {
         }
     }
 
+    fn write_smccc_retval(&self, x0: u64, x1: u64, x2: u64, x3: u64) -> Result<(), Error> {
+        self.write_reg(hv_reg_t_HV_REG_X0, x0)?;
+        self.write_reg(hv_reg_t_HV_REG_X1, x1)?;
+        self.write_reg(hv_reg_t_HV_REG_X2, x2)?;
+        self.write_reg(hv_reg_t_HV_REG_X3, x3)
+    }
+
     fn read_sys_reg(&self, reg: u16) -> Result<u64, Error> {
         let val: u64 = 0;
         let ret = unsafe { hv_vcpu_get_sys_reg(self.vcpuid, reg, &val as *const _ as *mut _) };
@@ -800,8 +854,77 @@ impl HvfVcpu<'_> {
         Some(duration)
     }
 
+    fn handle_trng_request(&self, func_id: u64) -> Result<VcpuExit<'_>, Error> {
+        match func_id {
+            ARM_SMCCC_TRNG_VERSION => {
+                self.write_smccc_retval(ARM_SMCCC_TRNG_VERSION_1_0, 0, 0, 0)?;
+            }
+            ARM_SMCCC_TRNG_FEATURES => {
+                let requested = self.read_reg(hv_reg_t_HV_REG_X1)?;
+                let status = match requested {
+                    ARM_SMCCC_TRNG_VERSION
+                    | ARM_SMCCC_TRNG_FEATURES
+                    | ARM_SMCCC_TRNG_GET_UUID
+                    | ARM_SMCCC_TRNG_RND32
+                    | ARM_SMCCC_TRNG_RND64 => TRNG_SUCCESS,
+                    _ => TRNG_NOT_SUPPORTED,
+                };
+                self.write_smccc_retval(status, 0, 0, 0)?;
+            }
+            ARM_SMCCC_TRNG_GET_UUID => {
+                self.write_smccc_retval(
+                    KVM_TRNG_UUID_RETVALS[0],
+                    KVM_TRNG_UUID_RETVALS[1],
+                    KVM_TRNG_UUID_RETVALS[2],
+                    KVM_TRNG_UUID_RETVALS[3],
+                )?;
+            }
+            ARM_SMCCC_TRNG_RND32 => {
+                self.handle_trng_rnd(TRNG_MAX_BITS32, true)?;
+            }
+            ARM_SMCCC_TRNG_RND64 => {
+                self.handle_trng_rnd(TRNG_MAX_BITS64, false)?;
+            }
+            _ => unreachable!(),
+        }
+
+        Ok(VcpuExit::PsciHandled)
+    }
+
+    fn handle_trng_rnd(&self, max_bits: u64, rnd32: bool) -> Result<(), Error> {
+        let num_bits = self.read_reg(hv_reg_t_HV_REG_X1)?;
+        if num_bits > max_bits {
+            return self.write_smccc_retval(TRNG_INVALID_PARAMETER, 0, 0, 0);
+        }
+
+        let words = match trng_random_words(num_bits) {
+            Ok(words) => words,
+            Err(err) => {
+                warn!("Failed to service SMCCC TRNG request: {err}");
+                return self.write_smccc_retval(TRNG_NO_ENTROPY, 0, 0, 0);
+            }
+        };
+
+        if rnd32 {
+            self.write_smccc_retval(
+                TRNG_SUCCESS,
+                words[1] & u32::MAX as u64,
+                (words[0] >> 32) & u32::MAX as u64,
+                words[0] & u32::MAX as u64,
+            )
+        } else {
+            self.write_smccc_retval(TRNG_SUCCESS, words[2], words[1], words[0])
+        }
+    }
+
     fn handle_psci_request(&self) -> Result<VcpuExit<'_>, Error> {
-        match self.read_reg(hv_reg_t_HV_REG_X0)? {
+        let func_id = self.read_reg(hv_reg_t_HV_REG_X0)?;
+        match func_id {
+            ARM_SMCCC_TRNG_VERSION
+            | ARM_SMCCC_TRNG_FEATURES
+            | ARM_SMCCC_TRNG_GET_UUID
+            | ARM_SMCCC_TRNG_RND32
+            | ARM_SMCCC_TRNG_RND64 => self.handle_trng_request(func_id),
             0x8400_0000 /* QEMU_PSCI_0_2_FN_PSCI_VERSION */ => {
                 self.write_reg(hv_reg_t_HV_REG_X0, 2)?;
                 Ok(VcpuExit::PsciHandled)
@@ -823,7 +946,11 @@ impl HvfVcpu<'_> {
                 self.write_reg(hv_reg_t_HV_REG_X0, 0)?;
                 Ok(VcpuExit::CpuOn(mpidr, entry, context_id))
             }
-            val => panic!("Unexpected val={val}")
+            val => {
+                warn!("Unhandled HVC/SMCCC/PSCI call 0x{val:x}; returning NOT_SUPPORTED");
+                self.write_reg(hv_reg_t_HV_REG_X0, TRNG_NOT_SUPPORTED)?;
+                Ok(VcpuExit::PsciHandled)
+            }
         }
     }
 

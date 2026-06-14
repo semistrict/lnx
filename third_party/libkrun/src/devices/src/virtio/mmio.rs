@@ -281,12 +281,17 @@ impl MmioTransport {
         self.interrupt
             .status()
             .store(st.interrupt_status as usize, Ordering::SeqCst);
-        // irq_line is set by the device manager from the FDT, not restored here.
+        if let Some(irq_line) = st.irq_line {
+            self.set_irq_line(irq_line);
+        }
     }
 
     pub fn replay_pending_interrupt(&self) {
-        if self.interrupt.status().load(Ordering::SeqCst) != 0 {
-            self.interrupt.event().write(1).unwrap();
+        let status = self.interrupt.status().load(Ordering::SeqCst) as u32;
+        if status != 0
+            && let Err(e) = self.interrupt.try_signal(status)
+        {
+            warn!("failed to replay pending interrupt status={status}: {e:?}");
         }
     }
 
@@ -304,6 +309,9 @@ impl MmioTransport {
         queue_states: &[QueueState],
     ) -> Result<(), String> {
         self.restore_state(st);
+        if queue_states.is_empty() && (self.device_status & device_status::DRIVER_OK) == 0 {
+            return Ok(());
+        }
         if queue_states.len() != self.queue_config.len() {
             return Err(format!(
                 "queue count mismatch: snapshot={} current={}",

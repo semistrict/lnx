@@ -241,6 +241,13 @@ pub trait VirtioDevice: AsAny + Send {
         Ok(())
     }
 
+    /// Called after restore has resumed vCPUs. Most devices have no work here,
+    /// but devices that must kick guest-visible restore events after the VM is
+    /// runnable can use this hook.
+    fn post_vcpu_restore(&mut self) -> Result<(), DeviceSnapshotError> {
+        Ok(())
+    }
+
     /// Serialize the device's snapshot. Must be called while the device is paused.
     fn serialize_state(&self) -> Result<DeviceSnapshot, DeviceSnapshotError> {
         Err(DeviceSnapshotError::Unsupported(

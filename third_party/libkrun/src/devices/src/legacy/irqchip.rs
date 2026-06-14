@@ -15,6 +15,28 @@ pub struct IrqChipDevice {
     inner: Box<dyn IrqChipT>,
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinuxGicDistRestorePhase {
+    Ctlr,
+    Shared,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug)]
+pub struct LinuxGicDistReg {
+    pub group: u32,
+    pub attr: u64,
+    pub value: u32,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct HvfGicDistReg {
+    pub offset: u32,
+    pub value: u64,
+}
+
 impl IrqChipDevice {
     pub fn new(irqchip: Box<dyn IrqChipT>) -> Self {
         Self { inner: irqchip }
@@ -46,8 +68,22 @@ impl IrqChipDevice {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn snapshot_distributor_state(&self) -> Result<Option<Vec<HvfGicDistReg>>, DeviceError> {
+        self.inner.snapshot_distributor_state()
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn restore_snapshot_state(&mut self, data: &[u8]) -> Result<(), DeviceError> {
         self.inner.restore_snapshot_state(data)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn restore_linux_gic_dist_state(
+        &mut self,
+        regs: &[LinuxGicDistReg],
+        phase: LinuxGicDistRestorePhase,
+    ) -> Result<(), DeviceError> {
+        self.inner.restore_linux_gic_dist_state(regs, phase)
     }
 
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -66,14 +102,20 @@ impl IrqChipDevice {
         vcpu_index: u64,
         icc_regs: &[(u16, u64)],
         redist_regs: &[(u32, u64)],
+        ich_regs: &[(u16, u64)],
     ) -> Result<(), DeviceError> {
         self.inner
-            .restore_macos_vcpu_gic_state(vcpu_index, icc_regs, redist_regs)
+            .restore_macos_vcpu_gic_state(vcpu_index, icc_regs, redist_regs, ich_regs)
     }
 
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     pub fn restore_macos_gic_dist_state(&mut self, data: &[u8]) -> Result<(), DeviceError> {
         self.inner.restore_macos_gic_dist_state(data)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub fn restore_hvf_gic_dist_regs(&mut self, regs: &[HvfGicDistReg]) -> Result<(), DeviceError> {
+        self.inner.restore_hvf_gic_dist_regs(regs)
     }
 
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -192,8 +234,24 @@ pub trait IrqChipT: BusDevice + GICDevice {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn snapshot_distributor_state(&self) -> Result<Option<Vec<HvfGicDistReg>>, DeviceError> {
+        Ok(None)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn restore_snapshot_state(&mut self, _data: &[u8]) -> Result<(), DeviceError> {
         Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn restore_linux_gic_dist_state(
+        &mut self,
+        _regs: &[LinuxGicDistReg],
+        _phase: LinuxGicDistRestorePhase,
+    ) -> Result<(), DeviceError> {
+        Err(DeviceError::FailedSignalingUsedQueue(
+            std::io::Error::other("irqchip does not support Linux/KVM GIC distributor restore"),
+        ))
     }
 
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -212,12 +270,18 @@ pub trait IrqChipT: BusDevice + GICDevice {
         _vcpu_index: u64,
         _icc_regs: &[(u16, u64)],
         _redist_regs: &[(u32, u64)],
+        _ich_regs: &[(u16, u64)],
     ) -> Result<(), DeviceError> {
         Ok(())
     }
 
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     fn restore_macos_gic_dist_state(&mut self, _data: &[u8]) -> Result<(), DeviceError> {
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    fn restore_hvf_gic_dist_regs(&mut self, _regs: &[HvfGicDistReg]) -> Result<(), DeviceError> {
         Ok(())
     }
 

@@ -40,8 +40,8 @@ WORKDIR /build
 COPY kernel-patches /kernel-patches
 RUN for patch in /kernel-patches/*.patch; do patch -p1 < "$patch"; done
 
-COPY scripts/test/kernel-gic-debug.patch /tmp/kernel-gic-debug.patch
-RUN patch -p1 < /tmp/kernel-gic-debug.patch
+COPY scripts/test/kernel-*-debug.patch /tmp/
+RUN for patch in /tmp/kernel-*-debug.patch; do patch -p1 < "$patch"; done
 
 COPY kernel.config .config
 RUN make olddefconfig && make -j$(nproc)
@@ -83,16 +83,24 @@ case "$engine" in
     fi
     source_work="$work/source"
     build_dir="$work/build"
+    make_extra=()
+    if [[ -n "${LNX_GIC_DEBUG_HOSTCFLAGS:-}" ]]; then
+      make_extra+=("HOSTCFLAGS=${LNX_GIC_DEBUG_HOSTCFLAGS}")
+    fi
     rm -rf "$source_work" "$build_dir"
     mkdir -p "$source_work" "$build_dir" "$(dirname "$out")"
     cp -a "$source_dir"/. "$source_work"/
-    for patch_file in "$repo_root"/kernel-patches/*.patch; do
+    if [[ -z "${LNX_GIC_DEBUG_SKIP_KERNEL_PATCHES:-}" ]]; then
+      for patch_file in "$repo_root"/kernel-patches/*.patch; do
+        patch -d "$source_work" -p1 < "$patch_file"
+      done
+    fi
+    for patch_file in "$repo_root"/scripts/test/kernel-*-debug.patch; do
       patch -d "$source_work" -p1 < "$patch_file"
     done
-    patch -d "$source_work" -p1 < "$repo_root/scripts/test/kernel-gic-debug.patch"
     cp "$repo_root/kernel.config" "$build_dir/.config"
-    "$make_cmd" -C "$source_work" O="$build_dir" ARCH=arm64 CROSS_COMPILE="$cross_compile" olddefconfig
-    "$make_cmd" -C "$source_work" O="$build_dir" ARCH=arm64 CROSS_COMPILE="$cross_compile" -j"$jobs" Image
+    "$make_cmd" -C "$source_work" O="$build_dir" ARCH=arm64 CROSS_COMPILE="$cross_compile" "${make_extra[@]}" olddefconfig
+    "$make_cmd" -C "$source_work" O="$build_dir" ARCH=arm64 CROSS_COMPILE="$cross_compile" "${make_extra[@]}" -j"$jobs" Image
     cp "$build_dir/arch/arm64/boot/Image" "$out"
     printf '%s\n' "$out"
     exit 0
@@ -137,10 +145,14 @@ else
   tar xf /usr/src/linux-source-7.0.0.tar.bz2 -C /tmp/lnx-gic-debug-kernel --strip-components=1
 fi
 cd /tmp/lnx-gic-debug-kernel
-for patch_file in "$LNX_REPO_ROOT"/kernel-patches/*.patch; do
+if [ -z "${LNX_GIC_DEBUG_SKIP_KERNEL_PATCHES:-}" ]; then
+  for patch_file in "$LNX_REPO_ROOT"/kernel-patches/*.patch; do
+    patch -p1 < "$patch_file"
+  done
+fi
+for patch_file in "$LNX_REPO_ROOT"/scripts/test/kernel-*-debug.patch; do
   patch -p1 < "$patch_file"
 done
-patch -p1 < "$LNX_REPO_ROOT/scripts/test/kernel-gic-debug.patch"
 cp "$LNX_REPO_ROOT/kernel.config" .config
 make olddefconfig
 jobs="$LNX_GIC_DEBUG_KERNEL_JOBS"

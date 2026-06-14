@@ -15,6 +15,8 @@ use user::{EXEC_HOME, EXEC_USER, ensure_exec_user};
 const AF_VSOCK: c_int = 40;
 const AF_UNIX: c_int = 1;
 const SOCK_STREAM: c_int = 1;
+const SOL_SOCKET: c_int = 1;
+const SO_RCVTIMEO: c_int = 20;
 const VMADDR_CID_HOST: u32 = 2;
 const AGENT_PORT: u32 = 10240;
 const SNAPSHOT_PORT: u32 = 10241;
@@ -63,6 +65,7 @@ const WANTS_DIR: &str = "/run/systemd/system/multi-user.target.wants";
 const WANTS_LINK: &str = "/run/systemd/system/multi-user.target.wants/lnx-agent.service";
 const WANTS_LINK_C: &[u8] =
     b"/newroot/run/systemd/system/multi-user.target.wants/lnx-agent.service\0";
+const SNAPSHOT_RESUME_READ_TIMEOUT_USECS: i64 = 500_000;
 
 enum ChannelInput {
     Data(Vec<u8>),
@@ -104,6 +107,12 @@ struct SockaddrUn {
 struct Timespec {
     tv_sec: i64,
     tv_nsec: i64,
+}
+
+#[repr(C)]
+struct Timeval {
+    tv_sec: i64,
+    tv_usec: i64,
 }
 
 #[repr(C)]
@@ -155,6 +164,13 @@ unsafe extern "C" {
     fn pipe(fds: *mut c_int) -> c_int;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn socket(domain: c_int, typ: c_int, protocol: c_int) -> c_int;
+    fn setsockopt(
+        fd: c_int,
+        level: c_int,
+        optname: c_int,
+        optval: *const c_void,
+        optlen: c_uint,
+    ) -> c_int;
     fn setsid() -> c_int;
     fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int;
     fn setgid(gid: c_uint) -> c_int;
@@ -703,7 +719,8 @@ fn run_pid1_supervisor() -> ! {
 }
 
 fn connect_vsock(port: u32) -> c_int {
-    for _ in 0..600 {
+    log(&format!("vsock.connect.begin port={port}"));
+    for attempt in 0..600 {
         let addr = vsock_addr(port);
         let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
         if fd < 0 {
@@ -718,7 +735,16 @@ fn connect_vsock(port: u32) -> c_int {
             )
         };
         if ret == 0 {
+            log(&format!(
+                "vsock.connect.success port={port} attempt={attempt} fd={fd}"
+            ));
             return fd;
+        }
+        if attempt == 0 || attempt == 599 || attempt % 50 == 49 {
+            log(&format!(
+                "vsock.connect.retry port={port} attempt={attempt} errno={}",
+                errno()
+            ));
         }
         unsafe {
             close(fd);
@@ -847,7 +873,27 @@ fn read_local_control_response(fd: c_int) -> c_int {
     }
 }
 
+fn set_snapshot_resume_read_timeout(fd: c_int) {
+    let timeout = Timeval {
+        tv_sec: SNAPSHOT_RESUME_READ_TIMEOUT_USECS / 1_000_000,
+        tv_usec: SNAPSHOT_RESUME_READ_TIMEOUT_USECS % 1_000_000,
+    };
+    if unsafe {
+        setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &timeout as *const Timeval as *const c_void,
+            size_of::<Timeval>() as c_uint,
+        )
+    } < 0
+    {
+        die("setsockopt(SO_RCVTIMEO)");
+    }
+}
+
 fn snapshot_resume_wait(fd: c_int) {
+    set_snapshot_resume_read_timeout(fd);
     let _ = write_all(fd, b"R");
     let mut buf = [0u8; 1];
     loop {
@@ -863,11 +909,10 @@ fn request_snapshot_and_reconnect() -> c_int {
     let fd = connect_vsock(SNAPSHOT_PORT);
     request_snapshot(fd);
     snapshot_resume_wait(fd);
-    let agent_fd = reconnect_after_snapshot_point();
     unsafe {
         close(fd);
     }
-    agent_fd
+    reconnect_after_snapshot_point()
 }
 
 fn reconnect_after_snapshot_point() -> c_int {
@@ -905,9 +950,11 @@ fn try_read_exact(fd: c_int, mut buf: &mut [u8]) -> bool {
                 }
                 continue;
             }
+            log(&format!("read_exact.error fd={fd} errno={err}"));
             return false;
         }
         if n == 0 {
+            log(&format!("read_exact.eof fd={fd}"));
             return false;
         }
         let tmp = buf;
@@ -1931,7 +1978,9 @@ fn run_channel_tcp(
 }
 
 fn agent_loop() {
+    log("agent.loop.start");
     let mut fd = connect_vsock(AGENT_PORT);
+    log(&format!("agent.loop.connected fd={fd}"));
     let agent_fd = Arc::new(Mutex::new(fd));
     let _ = write_message_locked(
         &agent_fd,
@@ -1943,10 +1992,12 @@ fn agent_loop() {
     loop {
         let message = read_message(fd);
         let Some(message) = message else {
+            log(&format!("agent.loop.read_closed fd={fd}; reconnecting"));
             unsafe {
                 close(fd);
             }
             fd = reconnect_after_snapshot_point();
+            log(&format!("agent.loop.reconnected fd={fd}"));
             if let Ok(mut shared) = agent_fd.lock() {
                 *shared = fd;
             }

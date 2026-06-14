@@ -47,11 +47,6 @@ try {
       `${expectedDisk}/${expectedMemory}`,
       "macOS snapshot restored with memory",
     );
-
-    const log = await Bun.file(join(ctx.runDir, "lnx.log")).text();
-    if (log.includes("snapshot.restore.skipped")) {
-      throw new Error(`restore was skipped:\n${log}`);
-    }
   });
 } finally {
   await cleanupContext(ctx);

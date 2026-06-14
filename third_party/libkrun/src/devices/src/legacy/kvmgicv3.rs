@@ -8,7 +8,7 @@ use std::io;
 use crate::Error as DeviceError;
 use crate::bus::BusDevice;
 use crate::legacy::gic::GICDevice;
-use crate::legacy::irqchip::IrqChipT;
+use crate::legacy::irqchip::{HvfGicDistReg, IrqChipT};
 
 use kvm_ioctls::{DeviceFd, Error, VmFd};
 use serde::{Deserialize, Serialize};
@@ -77,6 +77,8 @@ const GICD_ISENABLER: u32 = 0x0100;
 const GICD_ICENABLER: u32 = 0x0180;
 #[cfg(target_os = "linux")]
 const GICD_ISPENDR: u32 = 0x0200;
+#[cfg(target_os = "linux")]
+const GICD_ICPENDR: u32 = 0x0280;
 #[cfg(target_os = "linux")]
 const GICD_ISACTIVER: u32 = 0x0300;
 #[cfg(target_os = "linux")]
@@ -154,12 +156,33 @@ const ICC_IGRPEN0_EL1: u64 = vgic_sysreg(3, 0, 12, 12, 6);
 #[cfg(target_os = "linux")]
 const ICC_IGRPEN1_EL1: u64 = vgic_sysreg(3, 0, 12, 12, 7);
 #[cfg(target_os = "linux")]
+const ICH_AP0R_EL2: [u64; 4] = [
+    vgic_sysreg(3, 4, 12, 8, 0),
+    vgic_sysreg(3, 4, 12, 8, 1),
+    vgic_sysreg(3, 4, 12, 8, 2),
+    vgic_sysreg(3, 4, 12, 8, 3),
+];
+#[cfg(target_os = "linux")]
+const ICH_AP1R_EL2: [u64; 4] = [
+    vgic_sysreg(3, 4, 12, 9, 0),
+    vgic_sysreg(3, 4, 12, 9, 1),
+    vgic_sysreg(3, 4, 12, 9, 2),
+    vgic_sysreg(3, 4, 12, 9, 3),
+];
+#[cfg(target_os = "linux")]
+const ICH_HCR_EL2: u64 = vgic_sysreg(3, 4, 12, 11, 0);
+#[cfg(target_os = "linux")]
+const ICH_VMCR_EL2: u64 = vgic_sysreg(3, 4, 12, 11, 7);
+#[cfg(target_os = "linux")]
+const ICH_LR0_EL2: u64 = vgic_sysreg(3, 4, 12, 12, 0);
+#[cfg(target_os = "linux")]
+const ICH_LR8_EL2: u64 = vgic_sysreg(3, 4, 12, 13, 0);
+#[cfg(target_os = "linux")]
 const ICC_CTLR_EL1_CBPR_MASK: u64 = 1 << 0;
 #[cfg(target_os = "linux")]
 const ICC_CTLR_EL1_EOIMODE_MASK: u64 = 1 << 1;
 #[cfg(target_os = "linux")]
 const ICC_SRE_EL1_SRE: u64 = 1 << 0;
-#[cfg(target_os = "linux")]
 const ICC_BASE_SYSREGS: &[u64] = &[
     ICC_PMR_EL1,
     ICC_BPR0_EL1,
@@ -169,6 +192,8 @@ const ICC_BASE_SYSREGS: &[u64] = &[
     ICC_IGRPEN0_EL1,
     ICC_IGRPEN1_EL1,
 ];
+#[cfg(target_os = "linux")]
+const ICH_BASE_SYSREGS: &[u64] = &[ICH_VMCR_EL2, ICH_HCR_EL2];
 
 #[cfg(target_os = "linux")]
 const fn vgic_sysreg(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
@@ -187,10 +212,10 @@ fn icc_apr_count(icc_ctlr_el1: u64) -> usize {
 impl KvmGicV3 {
     pub fn new(vm: &VmFd, vcpu_count: u64) -> Result<Self, Error> {
         let dist_size = KVM_VGIC_V3_BASE_SIZE;
-        let dist_addr = arch::MMIO_MEM_START - dist_size;
         let redist_size = 2 * dist_size;
         let redists_size = redist_size * vcpu_count;
-        let redists_addr = dist_addr - redists_size;
+        let dist_addr = arch::MMIO_MEM_START - dist_size - redists_size;
+        let redists_addr = arch::MMIO_MEM_START - redists_size;
 
         let mut gic_device = kvm_bindings::kvm_create_device {
             type_: kvm_bindings::kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3,
@@ -367,6 +392,26 @@ impl KvmGicV3 {
     }
 
     #[cfg(target_os = "linux")]
+    fn read_optional_reg64(&self, group: u32, attr: u64) -> Option<DeviceReg64> {
+        let mut value = 0u64;
+        let mut kattr = kvm_bindings::kvm_device_attr {
+            group,
+            attr,
+            addr: &mut value as *mut u64 as u64,
+            flags: 0,
+        };
+        match unsafe { self.device_fd.get_device_attr(&mut kattr) } {
+            Ok(()) => Some(DeviceReg64 { group, attr, value }),
+            Err(e) => {
+                debug!(
+                    "snapshot save: skipping optional vgic64 group={group} attr=0x{attr:x}: {e}"
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn write_reg64(&self, reg: &DeviceReg64) -> Result<(), DeviceError> {
         let mut value = reg.value;
         let kattr = kvm_bindings::kvm_device_attr {
@@ -389,6 +434,7 @@ impl KvmGicV3 {
         cpu: u64,
         icc_regs: &[(u16, u64)],
         redist_regs: &[(u32, u64)],
+        ich_regs: &[(u16, u64)],
     ) -> Result<(), DeviceError> {
         let redist = kvm_bindings::KVM_DEV_ARM_VGIC_GRP_REDIST_REGS;
         let cpu_sysregs = kvm_bindings::KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS;
@@ -461,6 +507,13 @@ impl KvmGicV3 {
         // Active-priority registers are implementation state, not portable
         // architectural guest state. Leave KVM's fresh AP state in place so
         // pending wake interrupts are not filtered by stale HVF priorities.
+        for &(reg, value) in ich_regs {
+            self.write_reg64(&DeviceReg64 {
+                group: cpu_sysregs,
+                attr: Self::attr(u64::from(reg), cpu),
+                value,
+            })?;
+        }
 
         Ok(())
     }
@@ -476,9 +529,9 @@ impl KvmGicV3 {
             )
         };
         let dist = kvm_bindings::KVM_DEV_ARM_VGIC_GRP_DIST_REGS;
-        let nr_irqs = arch::aarch64::layout::IRQ_MAX - arch::aarch64::layout::IRQ_BASE + 1;
+        let max_irq = arch::aarch64::layout::IRQ_MAX;
 
-        for irq in (GIC_INTERNAL..nr_irqs).step_by(32) {
+        for irq in (GIC_INTERNAL..=max_irq).step_by(32) {
             let attr = Self::attr((GICD_IGROUPR + irq / 8).into(), 0);
             self.write_reg32(&DeviceReg32 {
                 group: dist,
@@ -487,7 +540,7 @@ impl KvmGicV3 {
             })?;
         }
 
-        for irq in GIC_INTERNAL..nr_irqs {
+        for irq in GIC_INTERNAL..=max_irq {
             let value = state
                 .as_ref()
                 .and_then(|state| state.gicd_irouter.get(irq as usize).copied())
@@ -505,7 +558,7 @@ impl KvmGicV3 {
             })?;
         }
 
-        for irq in (GIC_INTERNAL..nr_irqs).step_by(16) {
+        for irq in (GIC_INTERNAL..=max_irq).step_by(16) {
             self.write_reg32(&DeviceReg32 {
                 group: dist,
                 attr: Self::attr((GICD_ICFGR + irq / 4).into(), 0),
@@ -516,7 +569,7 @@ impl KvmGicV3 {
             })?;
         }
 
-        for irq in (GIC_INTERNAL..nr_irqs).step_by(4) {
+        for irq in (GIC_INTERNAL..=max_irq).step_by(4) {
             self.write_reg32(&DeviceReg32 {
                 group: dist,
                 attr: Self::attr((GICD_IPRIORITYR + irq).into(), 0),
@@ -524,7 +577,7 @@ impl KvmGicV3 {
             })?;
         }
 
-        for irq in (GIC_INTERNAL..nr_irqs).step_by(32) {
+        for irq in (GIC_INTERNAL..=max_irq).step_by(32) {
             let offset = GICD_ISENABLER + irq / 8;
             let reg = DeviceReg32 {
                 group: dist,
@@ -547,6 +600,128 @@ impl KvmGicV3 {
             value: linux_ctlr,
         })?;
 
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_hvf_gic_dist(&self, regs: &[HvfGicDistReg]) -> Result<(), DeviceError> {
+        self.restore_hvf_dist_exact(regs, GICD_STATUSR)?;
+
+        self.restore_hvf_dist_set_clear(regs, GICD_ISENABLER, GICD_ICENABLER, 0x80)?;
+        self.restore_hvf_dist_range(regs, GICD_IGROUPR, 0x80)?;
+        self.restore_hvf_dist_irouter(regs)?;
+        self.restore_hvf_dist_range(regs, GICD_ICFGR, 0x100)?;
+        self.restore_hvf_dist_set_clear(regs, GICD_ISPENDR, GICD_ICPENDR, 0x80)?;
+        self.restore_hvf_dist_set_clear(regs, GICD_ISACTIVER, GICD_ICACTIVER, 0x80)?;
+        self.restore_hvf_dist_range(regs, GICD_IPRIORITYR, 0x400)?;
+        self.restore_hvf_dist_kvm_ctlr(regs)?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_hvf_dist_kvm_ctlr(&self, regs: &[HvfGicDistReg]) -> Result<(), DeviceError> {
+        let enabled = regs
+            .iter()
+            .find(|reg| reg.offset == GICD_CTLR)
+            .map(|reg| (reg.value & 0x3) != 0)
+            .unwrap_or(true);
+        let value =
+            GICD_CTLR_ARE_NS | GICD_CTLR_DS | if enabled { GICD_CTLR_ENABLE_SS_G1 } else { 0 };
+        self.write_reg32(&DeviceReg32 {
+            group: kvm_bindings::KVM_DEV_ARM_VGIC_GRP_DIST_REGS,
+            attr: Self::attr(GICD_CTLR.into(), 0),
+            value,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_hvf_dist_exact(
+        &self,
+        regs: &[HvfGicDistReg],
+        wanted_offset: u32,
+    ) -> Result<(), DeviceError> {
+        let dist = kvm_bindings::KVM_DEV_ARM_VGIC_GRP_DIST_REGS;
+        for reg in regs.iter().filter(|reg| reg.offset == wanted_offset) {
+            self.write_reg32(&DeviceReg32 {
+                group: dist,
+                attr: Self::attr(u64::from(reg.offset), 0),
+                value: reg.value as u32,
+            })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_hvf_dist_range(
+        &self,
+        regs: &[HvfGicDistReg],
+        base: u32,
+        len: u32,
+    ) -> Result<(), DeviceError> {
+        let dist = kvm_bindings::KVM_DEV_ARM_VGIC_GRP_DIST_REGS;
+        for reg in regs
+            .iter()
+            .filter(|reg| Self::offset_in_range(u64::from(reg.offset), base, len))
+        {
+            self.write_reg32(&DeviceReg32 {
+                group: dist,
+                attr: Self::attr(u64::from(reg.offset), 0),
+                value: reg.value as u32,
+            })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_hvf_dist_set_clear(
+        &self,
+        regs: &[HvfGicDistReg],
+        set_base: u32,
+        clear_base: u32,
+        len: u32,
+    ) -> Result<(), DeviceError> {
+        let dist = kvm_bindings::KVM_DEV_ARM_VGIC_GRP_DIST_REGS;
+        for reg in regs
+            .iter()
+            .filter(|reg| Self::offset_in_range(u64::from(reg.offset), set_base, len))
+        {
+            let clear_offset = clear_base + (reg.offset - set_base);
+            let clear = DeviceReg32 {
+                group: dist,
+                attr: Self::attr(u64::from(clear_offset), 0),
+                value: u32::MAX,
+            };
+            self.write_reg32(&clear)?;
+            self.write_reg32(&DeviceReg32 {
+                group: dist,
+                attr: Self::attr(u64::from(reg.offset), 0),
+                value: reg.value as u32,
+            })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_hvf_dist_irouter(&self, regs: &[HvfGicDistReg]) -> Result<(), DeviceError> {
+        let dist = kvm_bindings::KVM_DEV_ARM_VGIC_GRP_DIST_REGS;
+        for reg in regs.iter().filter(|reg| {
+            Self::offset_in_range(u64::from(reg.offset), GICD_IROUTER, 0x2000)
+                && (reg.offset - GICD_IROUTER) % 8 == 0
+        }) {
+            let low = DeviceReg32 {
+                group: dist,
+                attr: Self::attr(u64::from(reg.offset), 0),
+                value: reg.value as u32,
+            };
+            let high = DeviceReg32 {
+                group: dist,
+                attr: Self::attr(u64::from(reg.offset + 4), 0),
+                value: (reg.value >> 32) as u32,
+            };
+            self.write_reg32(&low)?;
+            self.write_reg32(&high)?;
+        }
         Ok(())
     }
 
@@ -581,7 +756,7 @@ impl KvmGicV3 {
     fn save_snapshot(&self) -> Result<Vec<u8>, DeviceError> {
         let mut regs32 = Vec::new();
         let mut regs64 = Vec::new();
-        let nr_irqs = arch::aarch64::layout::IRQ_MAX - arch::aarch64::layout::IRQ_BASE + 1;
+        let max_irq = arch::aarch64::layout::IRQ_MAX;
 
         for offset in [GICD_CTLR, GICD_STATUSR] {
             regs32.push(self.read_reg32(
@@ -590,26 +765,26 @@ impl KvmGicV3 {
             )?);
         }
         for base in [GICD_IGROUPR, GICD_ISENABLER, GICD_ISPENDR, GICD_ISACTIVER] {
-            for irq in (GIC_INTERNAL..nr_irqs).step_by(32) {
+            for irq in (GIC_INTERNAL..=max_irq).step_by(32) {
                 regs32.push(self.read_reg32(
                     kvm_bindings::KVM_DEV_ARM_VGIC_GRP_DIST_REGS,
                     Self::attr((base + irq / 8).into(), 0),
                 )?);
             }
         }
-        for irq in (GIC_INTERNAL..nr_irqs).step_by(16) {
+        for irq in (GIC_INTERNAL..=max_irq).step_by(16) {
             regs32.push(self.read_reg32(
                 kvm_bindings::KVM_DEV_ARM_VGIC_GRP_DIST_REGS,
                 Self::attr((GICD_ICFGR + irq / 4).into(), 0),
             )?);
         }
-        for irq in (GIC_INTERNAL..nr_irqs).step_by(4) {
+        for irq in (GIC_INTERNAL..=max_irq).step_by(4) {
             regs32.push(self.read_reg32(
                 kvm_bindings::KVM_DEV_ARM_VGIC_GRP_DIST_REGS,
                 Self::attr((GICD_IPRIORITYR + irq).into(), 0),
             )?);
         }
-        for irq in GIC_INTERNAL..nr_irqs {
+        for irq in GIC_INTERNAL..=max_irq {
             let router = GICD_IROUTER + irq * 8;
             for offset in [router, router + 4] {
                 regs32.push(self.read_reg32(
@@ -618,7 +793,7 @@ impl KvmGicV3 {
                 )?);
             }
         }
-        for irq in (GIC_INTERNAL..nr_irqs).step_by(32) {
+        for irq in (GIC_INTERNAL..=max_irq).step_by(32) {
             regs32.push(self.read_reg32(
                 kvm_bindings::KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO,
                 Self::attr(irq.into(), 0)
@@ -676,6 +851,42 @@ impl KvmGicV3 {
                     kvm_bindings::KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS,
                     Self::attr(*reg, cpu),
                 )?);
+            }
+            for reg in ICH_BASE_SYSREGS {
+                if let Some(state) = self.read_optional_reg64(
+                    kvm_bindings::KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS,
+                    Self::attr(*reg, cpu),
+                ) {
+                    regs64.push(state);
+                }
+            }
+            for lr in 0..8 {
+                if let Some(state) = self.read_optional_reg64(
+                    kvm_bindings::KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS,
+                    Self::attr(ICH_LR0_EL2 + lr, cpu),
+                ) {
+                    regs64.push(state);
+                }
+            }
+            for lr in 0..8 {
+                if let Some(state) = self.read_optional_reg64(
+                    kvm_bindings::KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS,
+                    Self::attr(ICH_LR8_EL2 + lr, cpu),
+                ) {
+                    regs64.push(state);
+                }
+            }
+            for reg in ICH_AP0R_EL2
+                .iter()
+                .take(ap_count)
+                .chain(ICH_AP1R_EL2.iter().take(ap_count))
+            {
+                if let Some(state) = self.read_optional_reg64(
+                    kvm_bindings::KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS,
+                    Self::attr(*reg, cpu),
+                ) {
+                    regs64.push(state);
+                }
             }
         }
 
@@ -798,6 +1009,30 @@ impl KvmGicV3 {
                 })?;
             }
         }
+        for sysreg in ICH_BASE_SYSREGS {
+            self.restore_reg64_where(&snapshot.regs64, |reg| {
+                reg.group == cpu_sysregs && Self::offset(reg.attr) == *sysreg
+            })?;
+        }
+        for lr in 0..8 {
+            let sysreg = ICH_LR0_EL2 + lr;
+            self.restore_reg64_where(&snapshot.regs64, |reg| {
+                reg.group == cpu_sysregs && Self::offset(reg.attr) == sysreg
+            })?;
+        }
+        for lr in 0..8 {
+            let sysreg = ICH_LR8_EL2 + lr;
+            self.restore_reg64_where(&snapshot.regs64, |reg| {
+                reg.group == cpu_sysregs && Self::offset(reg.attr) == sysreg
+            })?;
+        }
+        for aprs in [ICH_AP0R_EL2, ICH_AP1R_EL2] {
+            for sysreg in aprs.iter().rev() {
+                self.restore_reg64_where(&snapshot.regs64, |reg| {
+                    reg.group == cpu_sysregs && Self::offset(reg.attr) == *sysreg
+                })?;
+            }
+        }
         Ok(())
     }
 }
@@ -847,13 +1082,18 @@ impl IrqChipT for KvmGicV3 {
         vcpu_index: u64,
         icc_regs: &[(u16, u64)],
         redist_regs: &[(u32, u64)],
+        ich_regs: &[(u16, u64)],
     ) -> Result<(), DeviceError> {
-        self.restore_macos_vcpu_gic(vcpu_index, icc_regs, redist_regs)
+        self.restore_macos_vcpu_gic(vcpu_index, icc_regs, redist_regs, ich_regs)
     }
 
     #[cfg(target_os = "linux")]
     fn restore_macos_gic_dist_state(&mut self, data: &[u8]) -> Result<(), DeviceError> {
         self.restore_macos_gic_dist(data)
+    }
+
+    fn restore_hvf_gic_dist_regs(&mut self, regs: &[HvfGicDistReg]) -> Result<(), DeviceError> {
+        self.restore_hvf_gic_dist(regs)
     }
 
     #[cfg(target_os = "linux")]

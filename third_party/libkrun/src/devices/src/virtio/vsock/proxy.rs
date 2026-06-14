@@ -96,6 +96,9 @@ pub trait Proxy: Send + AsRawFd {
     fn stream_listener_snapshot(&self) -> Option<StreamListenerSnapshot> {
         None
     }
+    fn stream_connection_ports(&self) -> Option<(u32, u32)> {
+        None
+    }
     fn shutdown(&mut self, _pkt: &VsockPacket) {}
     fn release(&mut self) -> ProxyUpdate;
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate;

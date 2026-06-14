@@ -333,6 +333,21 @@ impl Proxy for UnixProxy {
         self.status
     }
 
+    fn stream_connection_ports(&self) -> Option<(u32, u32)> {
+        let is_active = matches!(
+            self.status,
+            ProxyStatus::Connecting
+                | ProxyStatus::Connected
+                | ProxyStatus::WaitingCreditUpdate
+                | ProxyStatus::ReverseInit
+        );
+        if is_active && self.local_port != 0 && self.peer_port != 0 {
+            Some((self.local_port, self.peer_port))
+        } else {
+            None
+        }
+    }
+
     fn connect(&mut self, _pkt: &VsockPacket, _req: TsiConnectReq) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 

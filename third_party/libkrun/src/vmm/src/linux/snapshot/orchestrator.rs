@@ -56,6 +56,8 @@ enum RestoredVirtioMmioSection {
     Macos(MacosVirtioMmioSection),
 }
 
+const GIC_INTERNAL: u32 = 32;
+
 impl RestoredVirtioMmioSection {
     fn mmio_base(&self) -> u64 {
         match self {
@@ -69,6 +71,18 @@ impl RestoredVirtioMmioSection {
             Self::Linux(section) => &section.transport,
             Self::Macos(section) => &section.transport,
         }
+    }
+
+    fn transport_for_kvm(&self, live_irq: Option<u32>) -> MmioTransportState {
+        let mut transport = self.transport().clone();
+        if matches!(self, Self::Macos(_)) {
+            transport.irq_line = live_irq.or_else(|| {
+                transport
+                    .irq_line
+                    .and_then(|irq| irq.checked_sub(GIC_INTERNAL))
+            });
+        }
+        transport
     }
 
     fn device(&self) -> Option<&DeviceSnapshot> {
@@ -334,6 +348,27 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &SnapshotReader) -> Result<()
         }
     }
 
+    let mut restored_transports = Vec::new();
+    for (_, section, transport_arc) in pending_virtio_sections {
+        restore_virtio_section(&transport_arc, &section)?;
+        let device_name = {
+            let transport = transport_arc.lock().unwrap();
+            transport.locked_device().device_name().to_string()
+        };
+        restored_transports.push((device_name, transport_arc));
+    }
+
+    post_restore_devices(inputs)?;
+    for (device_type, transport) in &restored_transports {
+        if matches!(device_type.as_str(), "block" | "vsock") {
+            transport.lock().unwrap().replay_queue_notifications();
+        }
+    }
+    for (_, transport) in inputs.virtio_transports {
+        let transport = transport.lock().unwrap();
+        transport.replay_pending_interrupt();
+    }
+
     let timer_delta = restore_timer_delta(reader.format, meta.capture_counter);
     for (index, handle) in inputs.vcpu_handles.iter().enumerate() {
         handle
@@ -359,27 +394,6 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &SnapshotReader) -> Result<()
             }
         }
     }
-
-    let mut restored_transports = Vec::new();
-    for (_, section, transport_arc) in pending_virtio_sections {
-        restore_virtio_section(&transport_arc, &section)?;
-        let device_name = {
-            let transport = transport_arc.lock().unwrap();
-            transport.locked_device().device_name().to_string()
-        };
-        restored_transports.push((device_name, transport_arc));
-    }
-
-    post_restore_devices(inputs)?;
-    for (device_type, transport) in &restored_transports {
-        if matches!(device_type.as_str(), "block" | "vsock") {
-            transport.lock().unwrap().replay_queue_notifications();
-        }
-    }
-    for (_, transport) in inputs.virtio_transports {
-        let transport = transport.lock().unwrap();
-        transport.replay_pending_interrupt();
-    }
     Ok(())
 }
 
@@ -392,19 +406,31 @@ fn restore_macos_irqchip_state(
     let Some(irqchip) = inputs.irqchip else {
         return Ok(());
     };
-    let dist_bytes = reader.get_raw(SectionId::GicDist, 0).unwrap_or(&[]);
-    irqchip
-        .lock()
-        .unwrap()
-        .restore_macos_gic_dist_state(dist_bytes)
-        .map_err(|e| SnapshotError::DeviceRefused(format!("macOS irqchip restore: {e:?}")))?;
-    for index in 0..inputs.vcpu_handles.len() {
-        let bytes = reader.get_raw(SectionId::Vcpu, index as u32)?;
-        let (icc_regs, redist_regs) = decode_hvf_vcpu_gic_state(bytes)?;
+    if let Ok(regs) =
+        reader.get_bincode::<Vec<devices::legacy::HvfGicDistReg>>(SectionId::HvfGicDistRegs, 0)
+    {
         irqchip
             .lock()
             .unwrap()
-            .restore_macos_vcpu_gic_state(index as u64, &icc_regs, &redist_regs)
+            .restore_hvf_gic_dist_regs(&regs)
+            .map_err(|e| {
+                SnapshotError::DeviceRefused(format!("macOS HVF distributor restore: {e:?}"))
+            })?;
+    } else {
+        let dist_bytes = reader.get_raw(SectionId::GicDist, 0).unwrap_or(&[]);
+        irqchip
+            .lock()
+            .unwrap()
+            .restore_macos_gic_dist_state(dist_bytes)
+            .map_err(|e| SnapshotError::DeviceRefused(format!("macOS irqchip restore: {e:?}")))?;
+    }
+    for index in 0..inputs.vcpu_handles.len() {
+        let bytes = reader.get_raw(SectionId::Vcpu, index as u32)?;
+        let (icc_regs, redist_regs, ich_regs) = decode_hvf_vcpu_gic_state(bytes)?;
+        irqchip
+            .lock()
+            .unwrap()
+            .restore_macos_vcpu_gic_state(index as u64, &icc_regs, &redist_regs, &ich_regs)
             .map_err(|e| {
                 SnapshotError::DeviceRefused(format!("macOS vcpu {index} irqchip restore: {e:?}"))
             })?;
@@ -486,14 +512,15 @@ fn restore_virtio_section(
     let mmio_base = section.mmio_base();
     {
         let mut transport = transport_arc.lock().unwrap();
+        let transport_state = section.transport_for_kvm(transport.to_state().irq_line);
         if let Some(device_snap) = section.device() {
             transport
-                .restore_queues_and_activate(section.transport(), &device_snap.queues)
+                .restore_queues_and_activate(&transport_state, &device_snap.queues)
                 .map_err(|e| {
                     SnapshotError::DeviceRefused(format!("base=0x{mmio_base:x}: activate: {e}"))
                 })?;
         } else {
-            transport.restore_state(section.transport());
+            transport.restore_state(&transport_state);
         }
     }
     if let Some(device_snap) = section.device() {

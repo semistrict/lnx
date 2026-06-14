@@ -24,12 +24,16 @@ use std::time::{Duration, Instant};
 use log::info;
 
 use crossbeam_channel::RecvTimeoutError;
-use devices::legacy::{GicV3, GicV3State, IrqChip, VcpuList, VcpuListState};
+use devices::legacy::{
+    GicV3, GicV3State, IrqChip, LinuxGicDistReg, LinuxGicDistRestorePhase, VcpuList, VcpuListState,
+};
 use devices::virtio::{Descriptor, DeviceSnapshot, MmioTransport, MmioTransportState, QueueState};
 use serde::{Deserialize, Serialize};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
-use super::container::{SectionId, SnapshotWriter};
+use crate::vstate::KvmGicVcpuState;
+
+use super::container::{SectionId, SnapshotFormat, SnapshotWriter};
 use super::ram::{
     RamLayout, clone_and_patch_dirty_pages_img, clone_pages_image, patch_dirty_pages_img,
     write_full_pages_img,
@@ -75,6 +79,125 @@ pub struct VirtioMmioSection {
     /// transport state is still recorded so the guest driver sees the
     /// expected MMIO programming on resume.
     pub device: Option<DeviceSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LinuxVirtioMmioSection {
+    pub mmio_base: u64,
+    pub device_type: String,
+    pub transport: MmioTransportState,
+    pub device: Option<DeviceSnapshot>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct KvmGicV3SnapshotCompat {
+    vcpu_count: u64,
+    regs32: Vec<KvmDeviceReg32Compat>,
+    regs64: Vec<KvmDeviceReg64Compat>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct KvmDeviceReg32Compat {
+    group: u32,
+    attr: u64,
+    value: u32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct KvmDeviceReg64Compat {
+    group: u32,
+    attr: u64,
+    value: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RestoredLinuxGicState {
+    vcpus: Vec<KvmGicVcpuState>,
+    dist_regs: Vec<LinuxGicDistReg>,
+    pending_spis: Vec<u32>,
+}
+
+enum RestoredVirtioMmioSection {
+    Macos(VirtioMmioSection),
+    Linux(LinuxVirtioMmioSection),
+}
+
+const KVM_DEV_ARM_VGIC_GRP_DIST_REGS: u32 = 1;
+const KVM_DEV_ARM_VGIC_GRP_REDIST_REGS: u32 = 5;
+const KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS: u32 = 6;
+const KVM_DEV_ARM_VGIC_V3_MPIDR_SHIFT: u64 = 32;
+const KVM_DEV_ARM_VGIC_OFFSET_MASK: u64 = 0xffff_ffff;
+const GIC_INTERNAL: u32 = 32;
+const ICH_AP0R_EL2: [u64; 4] = [
+    kvm_vgic_sysreg(3, 4, 12, 8, 0),
+    kvm_vgic_sysreg(3, 4, 12, 8, 1),
+    kvm_vgic_sysreg(3, 4, 12, 8, 2),
+    kvm_vgic_sysreg(3, 4, 12, 8, 3),
+];
+const ICH_AP1R_EL2: [u64; 4] = [
+    kvm_vgic_sysreg(3, 4, 12, 9, 0),
+    kvm_vgic_sysreg(3, 4, 12, 9, 1),
+    kvm_vgic_sysreg(3, 4, 12, 9, 2),
+    kvm_vgic_sysreg(3, 4, 12, 9, 3),
+];
+const ICC_AP0R_EL1: [u64; 4] = [
+    kvm_vgic_sysreg(3, 0, 12, 8, 4),
+    kvm_vgic_sysreg(3, 0, 12, 8, 5),
+    kvm_vgic_sysreg(3, 0, 12, 8, 6),
+    kvm_vgic_sysreg(3, 0, 12, 8, 7),
+];
+const ICC_AP1R_EL1: [u64; 4] = [
+    kvm_vgic_sysreg(3, 0, 12, 9, 0),
+    kvm_vgic_sysreg(3, 0, 12, 9, 1),
+    kvm_vgic_sysreg(3, 0, 12, 9, 2),
+    kvm_vgic_sysreg(3, 0, 12, 9, 3),
+];
+const ICH_HCR_EL2: u64 = kvm_vgic_sysreg(3, 4, 12, 11, 0);
+const ICH_VMCR_EL2: u64 = kvm_vgic_sysreg(3, 4, 12, 11, 7);
+const ICH_LR0_EL2: u64 = kvm_vgic_sysreg(3, 4, 12, 12, 0);
+const ICH_LR8_EL2: u64 = kvm_vgic_sysreg(3, 4, 12, 13, 0);
+const GICD_ISPENDR: u32 = 0x0200;
+const GICR_SGI_BASE: u32 = 0x1_0000;
+const GICR_IGROUPR0: u32 = GICR_SGI_BASE + 0x0080;
+const GICR_ISENABLER0: u32 = GICR_SGI_BASE + 0x0100;
+const GICR_ISPENDR0: u32 = GICR_SGI_BASE + 0x0200;
+const GICR_ISACTIVER0: u32 = GICR_SGI_BASE + 0x0300;
+const GICR_IPRIORITYR: u32 = GICR_SGI_BASE + 0x0400;
+const GICR_ICFGR0: u32 = GICR_SGI_BASE + 0x0c00;
+const GICR_ICFGR1: u32 = GICR_SGI_BASE + 0x0c04;
+
+impl RestoredVirtioMmioSection {
+    fn mmio_base(&self) -> u64 {
+        match self {
+            Self::Macos(section) => section.mmio_base,
+            Self::Linux(section) => section.mmio_base,
+        }
+    }
+
+    fn transport(&self) -> &MmioTransportState {
+        match self {
+            Self::Macos(section) => &section.transport,
+            Self::Linux(section) => &section.transport,
+        }
+    }
+
+    fn transport_for_hvf(&self) -> MmioTransportState {
+        self.transport().clone()
+    }
+
+    fn device(&self) -> Option<&DeviceSnapshot> {
+        match self {
+            Self::Macos(section) => section.device.as_ref(),
+            Self::Linux(section) => section.device.as_ref(),
+        }
+    }
+
+    fn device_type_name(&self) -> String {
+        match self {
+            Self::Macos(section) => format!("virtio-{}", section.device_type),
+            Self::Linux(section) => section.device_type.clone(),
+        }
+    }
 }
 
 /// Inputs the orchestrator needs from the Vmm. Wired up in a dedicated method
@@ -123,6 +246,7 @@ where
         }
     };
     crate::timing_event("snapshot.capture.vcpus.paused");
+    let capture_mach_time = cntvct_el0();
 
     let prepatch_dir =
         match stop_prepatch_workers_for_capture(dir, inputs.guest_memory, inputs.ram_ranges) {
@@ -138,6 +262,7 @@ where
         dir,
         prepatch_dir.as_deref(),
         &vcpu_states,
+        capture_mach_time,
         paused_hook,
     );
     crate::timing_event("snapshot.capture.paused_work.done");
@@ -178,6 +303,7 @@ fn capture_paused<F>(
     dir: &Path,
     prepatch_dir: Option<&Path>,
     vcpu_states: &[Vec<u8>],
+    capture_mach_time: u64,
     paused_hook: F,
 ) -> Result<()>
 where
@@ -246,6 +372,14 @@ where
             .map_err(|e| SnapshotError::DeviceRefused(format!("irqchip snapshot: {e:?}")))?,
         None => None,
     };
+    let hvf_gic_dist_regs = match inputs.irqchip {
+        Some(irqchip) => irqchip
+            .lock()
+            .unwrap()
+            .snapshot_distributor_state()
+            .map_err(|e| SnapshotError::DeviceRefused(format!("irqchip dist snapshot: {e:?}")))?,
+        None => None,
+    };
     let gic_state = inputs.gic.map(|g| g.lock().unwrap().to_state());
     let vcpu_list_state = inputs.vcpu_list.to_state();
     crate::timing_event("snapshot.capture_paused.gic.done");
@@ -311,7 +445,7 @@ where
             virtio_bases: virtio_sections.iter().map(|s| s.mmio_base).collect(),
             vcpu_count: inputs.vcpu_handles.len() as u32,
             nested_enabled: inputs.nested_enabled,
-            capture_mach_time: cntvct_el0(),
+            capture_mach_time,
         };
 
         let mut writer = SnapshotWriter::new(total_ram, ram_base, meta.vcpu_count);
@@ -325,6 +459,9 @@ where
         }
         if let Some(hvf_gic) = hvf_gic_state {
             writer.add_raw(SectionId::HvfGic, 0, hvf_gic);
+        }
+        if let Some(hvf_gic_dist_regs) = hvf_gic_dist_regs {
+            writer.add_bincode(SectionId::HvfGicDistRegs, 0, &hvf_gic_dist_regs)?;
         }
         writer.add_bincode(SectionId::GicVcpu, 0, &vcpu_list_state)?;
         for (i, section) in virtio_sections.iter().enumerate() {
@@ -753,6 +890,12 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
     }
     crate::timing_event("snapshot.restore.config.checked");
 
+    let linux_gic = if reader.format == SnapshotFormat::Linux {
+        restore_linux_gic_state(reader, inputs.vcpu_handles.len())?
+    } else {
+        None
+    };
+
     // vCPUs were pre-paused by the builder (queue_initial_pause), so they're
     // already blocked at the top of their first loop iteration. Drain their
     // initial Paused responses before sending RestoreState.
@@ -783,7 +926,19 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
 
     // Restore GIC state.
     crate::timing_event("snapshot.restore.irqchip.begin");
-    if let Some(irqchip) = inputs.irqchip {
+    if let (Some(irqchip), Some(linux_gic)) = (inputs.irqchip, &linux_gic) {
+        irqchip
+            .lock()
+            .unwrap()
+            .restore_linux_gic_dist_state(&linux_gic.dist_regs, LinuxGicDistRestorePhase::Ctlr)
+            .map_err(|e| {
+                SnapshotError::DeviceRefused(format!("linux GIC distributor CTLR restore: {e:?}"))
+            })?;
+        crate::timing_event("snapshot.restore.linux_gic.dist_ctlr.done");
+    }
+    if reader.format == SnapshotFormat::Macos
+        && let Some(irqchip) = inputs.irqchip
+    {
         if let Ok(st) = reader.get_raw(SectionId::HvfGic, 0) {
             irqchip
                 .lock()
@@ -803,13 +958,60 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
     }
     crate::timing_event("snapshot.restore.gic.done");
 
-    // Push HvfVcpuState into each vcpu after the global GIC state is restored:
-    // the per-vCPU CPU-interface and ICH registers are owned by the vCPU
-    // thread and must be the final GIC state written for that vCPU.
+    if let Some(linux_gic) = &linux_gic {
+        for (i, h) in inputs.vcpu_handles.iter().enumerate() {
+            let redist_regs = linux_gic
+                .vcpus
+                .get(i)
+                .map(|state| state.redist_regs.clone())
+                .unwrap_or_default();
+            h.send_event(VcpuEvent::RestoreGicRedist(redist_regs))
+                .map_err(|e| {
+                    SnapshotError::Io(std::io::Error::other(format!(
+                        "send RestoreGicRedist: {e:?}"
+                    )))
+                })?;
+            match h
+                .response_receiver()
+                .recv_timeout(std::time::Duration::from_millis(VCPU_PAUSE_TIMEOUT_MS))
+            {
+                Ok(VcpuResponse::Restored) => {}
+                Ok(VcpuResponse::Error(s)) => {
+                    return Err(SnapshotError::Io(std::io::Error::other(format!(
+                        "vcpu {i}: redist restore: {s}"
+                    ))));
+                }
+                other => {
+                    return Err(SnapshotError::Io(std::io::Error::other(format!(
+                        "vcpu {i}: unexpected redist restore response {other:?}"
+                    ))));
+                }
+            }
+            crate::timing_event(&format!("snapshot.restore.linux_gic.redist.done index={i}"));
+        }
+    }
+
+    // QEMU's HVF VGIC restore writes GICD_CTLR first, then per-vCPU
+    // redistributor/ICC state, then the shared distributor state. Linux-origin
+    // snapshots follow the same order here so pending shared SPIs are routed
+    // after the target CPU interfaces are programmed.
     for (i, h) in inputs.vcpu_handles.iter().enumerate() {
         crate::timing_event(&format!("snapshot.restore.vcpu.state.begin index={i}"));
         let bytes = reader.get_raw(SectionId::Vcpu, i as u32)?.to_vec();
-        h.send_event(VcpuEvent::RestoreState(bytes)).map_err(|e| {
+        let event = match reader.format {
+            SnapshotFormat::Macos => VcpuEvent::RestoreState(bytes),
+            SnapshotFormat::Linux => VcpuEvent::RestoreKvmState {
+                state: bytes,
+                restore_counter: cntvct_el0(),
+                gic: linux_gic.as_ref().and_then(|gic| {
+                    gic.vcpus.get(i).cloned().map(|mut state| {
+                        state.redist_regs.clear();
+                        state
+                    })
+                }),
+            },
+        };
+        h.send_event(event).map_err(|e| {
             SnapshotError::Io(std::io::Error::other(format!("send RestoreState: {e:?}")))
         })?;
         match h
@@ -831,7 +1033,34 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
         crate::timing_event(&format!("snapshot.restore.vcpu.state.done index={i}"));
     }
 
-    let timer_delta = cntvct_el0().wrapping_sub(meta.capture_mach_time);
+    if let (Some(irqchip), Some(linux_gic)) = (inputs.irqchip, &linux_gic) {
+        irqchip
+            .lock()
+            .unwrap()
+            .restore_linux_gic_dist_state(&linux_gic.dist_regs, LinuxGicDistRestorePhase::Shared)
+            .map_err(|e| {
+                SnapshotError::DeviceRefused(format!("linux GIC distributor shared restore: {e:?}"))
+            })?;
+        crate::timing_event("snapshot.restore.linux_gic.dist_shared.done");
+    }
+
+    if let (Some(irqchip), Some(linux_gic)) = (inputs.irqchip, &linux_gic) {
+        for irq in &linux_gic.pending_spis {
+            irqchip
+                .lock()
+                .unwrap()
+                .set_irq(Some(*irq), None)
+                .map_err(|e| {
+                    SnapshotError::DeviceRefused(format!("linux GIC pending SPI {irq}: {e:?}"))
+                })?;
+        }
+    }
+    crate::timing_event("snapshot.restore.linux_gic.pending_spis.done");
+
+    let timer_delta = match reader.format {
+        SnapshotFormat::Macos => cntvct_el0().wrapping_sub(meta.capture_mach_time),
+        SnapshotFormat::Linux => 0,
+    };
     for (i, h) in inputs.vcpu_handles.iter().enumerate() {
         crate::timing_event(&format!("snapshot.restore.vcpu.timer.begin index={i}"));
         h.send_event(VcpuEvent::RebaseTimer(timer_delta))
@@ -863,14 +1092,15 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
 
     // Restore virtio devices — match by MMIO base, not by index, so out-of-scope
     // devices in the current ctx (e.g. virtio-balloon) don't shift the mapping.
+    let mut restored_transports = Vec::new();
     for i in 0..meta.virtio_bases.len() {
         crate::timing_event(&format!("snapshot.restore.virtio.begin index={i}"));
-        let section: VirtioMmioSection = reader.get_bincode(SectionId::VirtioMmio, i as u32)?;
+        let section = read_virtio_section(reader, i as u32)?;
         let transport_arc = inputs
             .virtio_transports
             .iter()
             .find_map(|(b, t)| {
-                if *b == section.mmio_base {
+                if *b == section.mmio_base() {
                     Some(t)
                 } else {
                     None
@@ -879,58 +1109,342 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
             .ok_or_else(|| {
                 SnapshotError::ConfigMismatch(format!(
                     "no virtio device at base 0x{:x} in current ctx",
-                    section.mmio_base
+                    section.mmio_base()
                 ))
             })?;
+        let transport_state = section.transport_for_hvf();
         {
             let mut transport = transport_arc.lock().unwrap();
-            if let Some(device_snap) = &section.device {
+            let live_device_name = transport.locked_device().device_name().to_string();
+            let snapshot_device_name = section.device_type_name();
+            crate::timing_event(&format!(
+                "snapshot.restore.virtio.match index={i} base=0x{:x} snapshot={} live={}",
+                section.mmio_base(),
+                snapshot_device_name,
+                live_device_name
+            ));
+            if reader.format == SnapshotFormat::Linux && live_device_name != snapshot_device_name {
+                return Err(SnapshotError::ConfigMismatch(format!(
+                    "virtio device mismatch base=0x{:x}: snapshot={} live={}",
+                    section.mmio_base(),
+                    snapshot_device_name,
+                    live_device_name
+                )));
+            }
+            if let Some(device_snap) = section.device() {
+                crate::timing_event(&format!(
+                    "snapshot.restore.virtio.transport_restore.begin index={i} base=0x{:x} queues={}",
+                    section.mmio_base(),
+                    device_snap.queues.len()
+                ));
                 transport
-                    .restore_queues_and_activate(&section.transport, &device_snap.queues)
+                    .restore_queues_and_activate(&transport_state, &device_snap.queues)
                     .map_err(|e| {
                         SnapshotError::DeviceRefused(format!(
                             "base=0x{:x}: activate: {e}",
-                            section.mmio_base
+                            section.mmio_base()
                         ))
                     })?;
+                crate::timing_event(&format!(
+                    "snapshot.restore.virtio.transport_restore.done index={i} base=0x{:x}",
+                    section.mmio_base()
+                ));
             } else {
-                transport.restore_state(&section.transport);
+                crate::timing_event(&format!(
+                    "snapshot.restore.virtio.transport_state.begin index={i} base=0x{:x}",
+                    section.mmio_base()
+                ));
+                transport.restore_state(&transport_state);
+                crate::timing_event(&format!(
+                    "snapshot.restore.virtio.transport_state.done index={i} base=0x{:x}",
+                    section.mmio_base()
+                ));
             }
         }
-        if let Some(device_snap) = &section.device {
+        if let Some(device_snap) = section.device() {
             let transport = transport_arc.lock().unwrap();
             let device_arc = transport.device();
             let mut device = device_arc.lock().unwrap();
+            crate::timing_event(&format!(
+                "snapshot.restore.virtio.device_pause.begin index={i} base=0x{:x}",
+                section.mmio_base()
+            ));
             if let Err(e) = device.pause() {
                 return Err(SnapshotError::DeviceRefused(format!(
                     "base=0x{:x}: pause: {e}",
-                    section.mmio_base
+                    section.mmio_base()
                 )));
             }
-            device.restore_state(device_snap).map_err(|e| {
+            crate::timing_event(&format!(
+                "snapshot.restore.virtio.device_restore.begin index={i} base=0x{:x}",
+                section.mmio_base()
+            ));
+            let restore_result = match section {
+                RestoredVirtioMmioSection::Macos(_) => device.restore_state(device_snap),
+                RestoredVirtioMmioSection::Linux(_) => device.restore_macos_state(device_snap),
+            };
+            restore_result.map_err(|e| {
                 SnapshotError::DeviceRefused(format!(
                     "base=0x{:x}: restore: {e}",
-                    section.mmio_base
+                    section.mmio_base()
                 ))
             })?;
-            device.resume().map_err(|e| {
-                SnapshotError::DeviceRefused(format!("base=0x{:x}: resume: {e}", section.mmio_base))
+            crate::timing_event(&format!(
+                "snapshot.restore.virtio.device_resume.begin index={i} base=0x{:x}",
+                section.mmio_base()
+            ));
+            device.resume_after_restore().map_err(|e| {
+                SnapshotError::DeviceRefused(format!(
+                    "base=0x{:x}: resume: {e}",
+                    section.mmio_base()
+                ))
             })?;
+            crate::timing_event(&format!(
+                "snapshot.restore.virtio.device_resume.done index={i} base=0x{:x}",
+                section.mmio_base()
+            ));
         }
+        let device_name = {
+            let transport = transport_arc.lock().unwrap();
+            transport.locked_device().device_name().to_string()
+        };
+        restored_transports.push((device_name, transport_arc.clone()));
         transport_arc.lock().unwrap().replay_pending_interrupt();
         crate::timing_event(&format!(
             "snapshot.restore.virtio.done index={i} base=0x{:x}",
-            section.mmio_base
+            section.mmio_base()
         ));
     }
 
+    post_restore_devices(inputs)?;
+    for (_, transport) in &restored_transports {
+        transport.lock().unwrap().replay_queue_notifications();
+    }
     for (_, transport) in inputs.virtio_transports {
         transport.lock().unwrap().replay_pending_interrupt();
     }
     crate::timing_event("snapshot.restore.interrupts.replayed");
     info!("snapshot restore: complete");
     crate::timing_event("snapshot.restore.complete");
-    start_prepatch_worker(&reader.dir, inputs.guest_memory, inputs.ram_ranges);
 
     Ok(())
+}
+
+fn post_restore_devices(inputs: &CaptureInputs<'_>) -> Result<()> {
+    for (base, transport_arc) in inputs.virtio_transports {
+        let transport = transport_arc.lock().unwrap();
+        let device_arc = transport.device();
+        let mut device = device_arc.lock().unwrap();
+        device.post_restore().map_err(|e| {
+            SnapshotError::DeviceRefused(format!("base=0x{base:x}: post restore: {e}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn restore_linux_gic_state(
+    reader: &super::SnapshotReader,
+    configured_vcpus: usize,
+) -> Result<Option<RestoredLinuxGicState>> {
+    let bytes = match reader.get_raw(SectionId::HvfGic, 0) {
+        Ok(bytes) => bytes,
+        Err(SnapshotError::SectionMissing { .. }) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let snapshot: KvmGicV3SnapshotCompat = bincode::deserialize(bytes)?;
+    if snapshot.vcpu_count != configured_vcpus as u64 {
+        return Err(SnapshotError::ConfigMismatch(format!(
+            "linux GIC vcpu_count {} != configured {}",
+            snapshot.vcpu_count, configured_vcpus
+        )));
+    }
+
+    let mut restored = RestoredLinuxGicState {
+        vcpus: vec![KvmGicVcpuState::default(); configured_vcpus],
+        dist_regs: Vec::new(),
+        pending_spis: Vec::new(),
+    };
+
+    for reg in &snapshot.regs64 {
+        if reg.group != KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS {
+            continue;
+        }
+        let vcpu = kvm_gic_attr_mpidr(reg.attr) as usize;
+        if let Some(state) = restored.vcpus.get_mut(vcpu) {
+            let offset = kvm_gic_attr_offset(reg.attr);
+            if let Some(hvf_reg) = kvm_cpu_sysreg_to_hvf_ich_reg(offset) {
+                state.ich_regs.push((hvf_reg, reg.value));
+            } else if !kvm_cpu_sysreg_is_icc_apr(offset) {
+                state.icc_regs.push((offset as u16, reg.value));
+            }
+        }
+    }
+
+    for reg in &snapshot.regs32 {
+        let offset = kvm_gic_attr_offset(reg.attr) as u32;
+        if reg.group == KVM_DEV_ARM_VGIC_GRP_REDIST_REGS {
+            let vcpu = kvm_gic_attr_mpidr(reg.attr) as usize;
+            if let (Some(state), Some(hvf_reg)) = (
+                restored.vcpus.get_mut(vcpu),
+                kvm_redist_offset_to_hvf_reg(offset),
+            ) {
+                state.redist_regs.push((hvf_reg, u64::from(reg.value)));
+            }
+        }
+
+        if reg.group == KVM_DEV_ARM_VGIC_GRP_DIST_REGS {
+            restored.dist_regs.push(LinuxGicDistReg {
+                group: reg.group,
+                attr: reg.attr,
+                value: reg.value,
+            });
+            collect_pending_spis(offset, reg.value, &mut restored.pending_spis);
+        }
+    }
+
+    restored.pending_spis.sort_unstable();
+    restored.pending_spis.dedup();
+    Ok(Some(restored))
+}
+
+fn kvm_gic_attr_offset(attr: u64) -> u64 {
+    attr & KVM_DEV_ARM_VGIC_OFFSET_MASK
+}
+
+fn kvm_gic_attr_mpidr(attr: u64) -> u64 {
+    attr >> KVM_DEV_ARM_VGIC_V3_MPIDR_SHIFT
+}
+
+const fn kvm_vgic_sysreg(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
+    (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2
+}
+
+fn kvm_cpu_sysreg_to_hvf_ich_reg(offset: u64) -> Option<u16> {
+    let is_ich_apr = ICH_AP0R_EL2
+        .iter()
+        .chain(ICH_AP1R_EL2.iter())
+        .any(|&reg| reg == offset);
+    let is_ich_lr = (ICH_LR0_EL2..ICH_LR0_EL2 + 8).contains(&offset)
+        || (ICH_LR8_EL2..ICH_LR8_EL2 + 8).contains(&offset);
+    if offset == ICH_VMCR_EL2 || offset == ICH_HCR_EL2 || is_ich_lr || is_ich_apr {
+        u16::try_from(offset).ok()
+    } else {
+        None
+    }
+}
+
+fn kvm_cpu_sysreg_is_icc_apr(offset: u64) -> bool {
+    ICC_AP0R_EL1
+        .iter()
+        .chain(ICC_AP1R_EL1.iter())
+        .any(|&reg| reg == offset)
+}
+
+fn kvm_redist_offset_to_hvf_reg(offset: u32) -> Option<u32> {
+    match offset {
+        GICR_IGROUPR0 | GICR_ISENABLER0 | GICR_ISPENDR0 | GICR_ISACTIVER0 | GICR_ICFGR0
+        | GICR_ICFGR1 => Some(offset),
+        offset if (GICR_IPRIORITYR..GICR_IPRIORITYR + 32).contains(&offset) => Some(offset),
+        _ => None,
+    }
+}
+
+fn collect_pending_spis(offset: u32, value: u32, pending: &mut Vec<u32>) {
+    if !(GICD_ISPENDR..GICD_ISPENDR + 0x80).contains(&offset) {
+        return;
+    }
+    let base_irq = (offset - GICD_ISPENDR) * 8;
+    for bit in 0..32 {
+        if (value & (1 << bit)) == 0 {
+            continue;
+        }
+        let irq = base_irq + bit;
+        if (GIC_INTERNAL..=arch::aarch64::layout::IRQ_MAX).contains(&irq) {
+            pending.push(irq);
+        }
+    }
+}
+
+fn read_virtio_section(
+    reader: &super::SnapshotReader,
+    index: u32,
+) -> Result<RestoredVirtioMmioSection> {
+    match reader.format {
+        SnapshotFormat::Macos => reader
+            .get_bincode(SectionId::VirtioMmio, index)
+            .map(RestoredVirtioMmioSection::Macos),
+        SnapshotFormat::Linux => reader
+            .get_bincode(SectionId::VirtioMmio, index)
+            .map(RestoredVirtioMmioSection::Linux),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transport_state() -> MmioTransportState {
+        MmioTransportState {
+            features_select: 1,
+            acked_features_select: 2,
+            queue_select: 3,
+            device_status: 4,
+            config_generation: 5,
+            shm_region_select: 6,
+            interrupt_status: 7,
+            irq_line: Some(40),
+        }
+    }
+
+    #[test]
+    fn linux_transport_for_hvf_preserves_guest_irq_line() {
+        let section = LinuxVirtioMmioSection {
+            mmio_base: 0x1000_0000,
+            device_type: "block".to_string(),
+            transport: transport_state(),
+            device: None,
+        };
+        let restored = RestoredVirtioMmioSection::Linux(section);
+
+        assert_eq!(restored.transport_for_hvf().irq_line, Some(40));
+    }
+
+    #[test]
+    fn reads_linux_virtio_section_with_string_device_type() {
+        let dir = std::env::temp_dir().join(format!(
+            "lnx-macos-linux-virtio-section-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let section = LinuxVirtioMmioSection {
+            mmio_base: 0x1000_0000,
+            device_type: "block".to_string(),
+            transport: transport_state(),
+            device: None,
+        };
+        let mut writer = SnapshotWriter::new(0x4000_0000, 0x8000_0000, 1);
+        writer
+            .add_bincode(SectionId::VirtioMmio, 0, &section)
+            .expect("add virtio");
+        writer.write_to_dir(&dir).expect("write");
+
+        let path = dir.join("vmstate.bin");
+        let mut bytes = std::fs::read(&path).expect("read vmstate");
+        bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
+        std::fs::write(&path, bytes).expect("rewrite vmstate");
+
+        let reader = super::super::SnapshotReader::open(&dir).expect("open");
+        let decoded = read_virtio_section(&reader, 0).expect("decode");
+        match decoded {
+            RestoredVirtioMmioSection::Linux(decoded) => {
+                assert_eq!(decoded.mmio_base, section.mmio_base);
+                assert_eq!(decoded.device_type, "block");
+                assert_eq!(decoded.transport.device_status, 4);
+            }
+            RestoredVirtioMmioSection::Macos(_) => panic!("expected linux section"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

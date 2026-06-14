@@ -96,6 +96,9 @@ enum Command {
     #[command(name = "_oci-build")]
     HiddenOciBuild(HiddenOciBuildArgs),
     #[command(hide = true)]
+    #[command(name = "_sparse-copy")]
+    HiddenSparseCopy(HiddenSparseCopyArgs),
+    #[command(hide = true)]
     #[command(name = "_vm-owner")]
     HiddenVmOwner(HiddenVmOwnerArgs),
 }
@@ -181,15 +184,18 @@ struct HiddenOciBuildArgs {
 }
 
 #[derive(Debug, Args)]
+struct HiddenSparseCopyArgs {
+    source: PathBuf,
+    dest: PathBuf,
+}
+
+#[derive(Debug, Args)]
 struct HiddenVmOwnerArgs {
     #[arg(long)]
     cwd: PathBuf,
 
     #[arg(long)]
     restore: Option<PathBuf>,
-
-    #[arg(long)]
-    skip_memory_restore: bool,
 
     #[arg(long)]
     no_host_shares: bool,
@@ -314,6 +320,9 @@ impl Cli {
                 initialize_vm_instance(layout, cpus, memory_mib, nested_kvm, no_host_shares)
             }
             Some(Command::HiddenOciBuild(args)) => crate::oci::build_rootfs(&args.staging),
+            Some(Command::HiddenSparseCopy(args)) => {
+                crate::sparse_copy::clone_or_copy_file(&args.source, &args.dest)
+            }
             Some(Command::HiddenVmOwner(args)) => runner::run_owner(runner::RunConfig {
                 layout,
                 command: Vec::new(),
@@ -322,7 +331,6 @@ impl Cli {
                 memory_mib,
                 nested_kvm,
                 restore_snapshot: args.restore,
-                skip_memory_restore: args.skip_memory_restore,
                 forwards,
                 snapshot_output: None,
                 run_as_root: false,
@@ -616,7 +624,6 @@ fn run_guest(
         memory_mib,
         nested_kvm,
         restore_snapshot,
-        skip_memory_restore: false,
         forwards,
         run_as_root,
         snapshot_output: None,
@@ -713,7 +720,6 @@ fn initialize_vm_instance(
         memory_mib,
         nested_kvm,
         restore_snapshot: None,
-        skip_memory_restore: false,
         forwards: Vec::new(),
         snapshot_output: Some(layout.snapshot_dir.join("latest")),
         run_as_root: false,
@@ -1022,7 +1028,6 @@ fn create_checkpoint(
             memory_mib,
             nested_kvm: false,
             restore_snapshot,
-            skip_memory_restore: false,
             forwards,
             snapshot_output: Some(path.clone()),
             run_as_root: false,
@@ -1126,7 +1131,6 @@ fn create_internal_fork_checkpoint(
             memory_mib,
             nested_kvm: false,
             restore_snapshot,
-            skip_memory_restore: false,
             forwards,
             snapshot_output: Some(path.clone()),
             run_as_root: false,

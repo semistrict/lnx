@@ -13,10 +13,12 @@ const MAGIC: [u8; 8] = *b"LKRNSS01";
 //   1: initial full-RAM capture
 //   2: virtio-fs sections carry the FUSE server state; v1 snapshots restore
 //      to a server with an empty inode table and must not be accepted
+//   3: KVM GIC distributor/redistributor MMIO layout changed; v2 snapshots
+//      encode device state against the old layout and must not be accepted
 // Bump this whenever a section payload changes shape so stale snapshots are
 // skipped at the pre-flight header check instead of failing mid-restore.
 // Keep in sync with SNAPSHOT_VMSTATE_SUPPORTED_VERSIONS in lnx's src/runner.rs.
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const MACOS_VERSION: u32 = 1;
 const HEADER_LEN: usize = 40;
 const TOC_ENTRY_LEN: usize = 56;
@@ -33,6 +35,7 @@ pub enum SectionId {
     GicVcpu = 4,
     VirtioMmio = 5,
     HvfGic = 6,
+    HvfGicDistRegs = 7,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

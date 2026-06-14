@@ -585,17 +585,23 @@ pub fn build_microvm(
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let mut initial_dirty_ranges = payload_config.written_ranges.clone();
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let mut restoring_linux_snapshot = false;
 
     // Snapshot restore mode (macOS arm64): replace the freshly initialized
     // RAM with the captured pages.img contents before HVF maps guest memory.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if let Some(snap_path) = &vm_resources.snapshot_restore_path {
         use crate::macos::snapshot::{
-            SectionId, container::SnapshotReader, orchestrator::MetaSection, ram::restore_pages_img,
+            SectionId,
+            container::{SnapshotFormat, SnapshotReader},
+            orchestrator::MetaSection,
+            ram::restore_pages_img,
         };
         crate::timing_event("build_microvm.snapshot.reader.open.begin");
         let reader = SnapshotReader::open(snap_path)
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("snapshot open: {e}")))?;
+        restoring_linux_snapshot = reader.format == SnapshotFormat::Linux;
         crate::timing_event("build_microvm.snapshot.reader.open.done");
         let meta: MetaSection = reader
             .get_bincode(SectionId::Meta, 0)
@@ -1011,6 +1017,7 @@ pub fn build_microvm(
             serial_devices,
             event_manager,
             _shutdown_efd,
+            restoring_linux_snapshot,
         )?;
         crate::timing_event("build_microvm.legacy_devices.attached");
     }
@@ -1090,6 +1097,10 @@ pub fn build_microvm(
         not(all(target_os = "macos", target_arch = "aarch64"))
     ))]
     attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
+    #[cfg(all(not(feature = "tee"), target_os = "macos", target_arch = "aarch64"))]
+    if restoring_linux_snapshot {
+        attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
+    }
     #[cfg(not(feature = "tee"))]
     {
         #[cfg(all(feature = "vhost-user", target_os = "linux"))]
@@ -2191,6 +2202,7 @@ fn attach_legacy_devices(
     serial: Vec<Arc<Mutex<Serial>>>,
     event_manager: &mut EventManager,
     shutdown_efd: Option<EventFd>,
+    restoring_linux_snapshot: bool,
 ) -> Result<(), StartMicrovmError> {
     for s in serial {
         mmio_device_manager
@@ -2209,7 +2221,7 @@ fn attach_legacy_devices(
         .map_err(Error::RegisterMMIODevice)
         .map_err(StartMicrovmError::Internal)?;
 
-    if let Some(shutdown_efd) = shutdown_efd {
+    if !restoring_linux_snapshot && let Some(shutdown_efd) = shutdown_efd {
         mmio_device_manager
             .register_mmio_gpio(vm, intc.clone(), event_manager, shutdown_efd)
             .map_err(Error::RegisterMMIODevice)
@@ -2701,10 +2713,7 @@ fn attach_unixsock_vsock_device(
     Ok(())
 }
 
-#[cfg(all(
-    not(feature = "tee"),
-    not(all(target_os = "macos", target_arch = "aarch64"))
-))]
+#[cfg(not(feature = "tee"))]
 fn attach_balloon_device(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,

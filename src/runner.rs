@@ -36,11 +36,11 @@ const INTERRUPT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(all(test, target_os = "macos"))]
 const SNAPSHOT_VMSTATE_NATIVE_VERSION: u32 = 1;
 #[cfg(all(test, not(target_os = "macos")))]
-const SNAPSHOT_VMSTATE_NATIVE_VERSION: u32 = 2;
+const SNAPSHOT_VMSTATE_NATIVE_VERSION: u32 = 3;
 #[cfg(target_os = "macos")]
-const SNAPSHOT_VMSTATE_SUPPORTED_VERSIONS: &[u32] = &[1];
+const SNAPSHOT_VMSTATE_SUPPORTED_VERSIONS: &[u32] = &[1, 3];
 #[cfg(not(target_os = "macos"))]
-const SNAPSHOT_VMSTATE_SUPPORTED_VERSIONS: &[u32] = &[2, 1];
+const SNAPSHOT_VMSTATE_SUPPORTED_VERSIONS: &[u32] = &[3, 1];
 
 // Owner exit status meaning "the VM failed to start with a restore
 // configured"; the client retries the spawn with a cold boot.
@@ -56,7 +56,7 @@ const OWNER_BOOT_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_AGENT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(90);
 const ROOTFS_BACKEND_ENV: &str = "LNX_ROOTFS_BACKEND";
 #[cfg_attr(
-    not(all(target_os = "linux", target_arch = "aarch64")),
+    any(not(all(target_os = "linux", target_arch = "aarch64")), not(test)),
     allow(dead_code)
 )]
 const MACOS_VMSTATE_VERSION: u32 = 1;
@@ -77,10 +77,6 @@ pub struct RunConfig {
     pub memory_mib: u32,
     pub nested_kvm: bool,
     pub restore_snapshot: Option<PathBuf>,
-    /// Cold-boot from the snapshot's rootfs but skip the memory restore. Set
-    /// by the client when a previous owner's memory restore was refused, so
-    /// the retry keeps the disk while dropping the unusable memory image.
-    pub skip_memory_restore: bool,
     pub forwards: Vec<PortForward>,
     pub snapshot_output: Option<PathBuf>,
     pub run_as_root: bool,
@@ -215,11 +211,8 @@ pub fn run_owner(config: RunConfig) -> Result<()> {
     };
     let vm = match start_vm(&config, &run_log, &broker_socket, idle) {
         Ok(vm) => vm,
-        // A snapshot the devices refuse (topology drift, corrupt sections)
-        // must not strand the instance: hand the decision to the client,
-        // which respawns the owner for a cold boot. Only genuine memory-
-        // restore refusals get this treatment — an unrelated boot failure
-        // surfaces as a normal error so the client reports it.
+        // Keep restore refusals distinct from unrelated boot failures so
+        // the client can report a hard memory-restore failure.
         Err(e) if e.downcast_ref::<RestoreRefused>().is_some() => {
             run_log.line(format!("owner.start.restore_failed error={e:#}"));
             drop(bootstrap_lock);
@@ -469,54 +462,43 @@ fn start_vm(
     let shares_stamp_path = config.layout.run_dir.join("shares.stamp");
     fs::write(&shares_stamp_path, &shares_stamp)
         .with_context(|| format!("write {}", shares_stamp_path.display()))?;
-    let restore_snapshot = if config.skip_memory_restore {
-        // A prior owner's memory restore was refused; keep the snapshot's
-        // rootfs (via requested_restore_snapshot) but boot cold.
-        timings.event("snapshot.restore.skipped.memory_refused");
-        run_log.line("snapshot.restore.skipped reason=memory_refused");
-        None
-    } else if config
-        .restore_snapshot
-        .as_ref()
-        .is_some_and(|snapshot| !snapshot_initramfs_is_compatible(snapshot, &initramfs_stamp))
-    {
-        timings.event("snapshot.restore.skipped.agent_changed");
-        run_log.line("snapshot.restore.skipped reason=agent_changed");
-        None
-    } else if let Some(reason) = config
-        .restore_snapshot
-        .as_ref()
-        .and_then(|snapshot| snapshot_shares_incompatibility(snapshot, &shares_stamp))
-    {
-        timings.event(&format!("snapshot.restore.skipped.{reason}"));
-        run_log.line(format!("snapshot.restore.skipped reason={reason}"));
-        None
-    } else if let Some(snapshot) = &config.restore_snapshot {
+    let restore_snapshot = if let Some(snapshot) = &config.restore_snapshot {
+        if !snapshot_initramfs_is_compatible(snapshot, &initramfs_stamp) {
+            bail!(
+                "snapshot initramfs stamp does not match the current lnx agent: {}",
+                snapshot.join("initramfs.stamp").display()
+            );
+        }
+        if let Some(reason) = snapshot_shares_incompatibility(snapshot, &shares_stamp) {
+            bail!(
+                "snapshot host-share/network stamp is incompatible ({reason}): {}",
+                snapshot.join("shares.stamp").display()
+            );
+        }
         match snapshot_vm_config(snapshot) {
             Ok(Some(snapshot_config))
                 if !snapshot_config.matches(config.cpus, config.memory_mib) =>
             {
-                timings.event("snapshot.restore.skipped.config_mismatch");
-                run_log.line(format!(
-                    "snapshot.restore.skipped reason=config_mismatch snapshot_cpus={} configured_cpus={} snapshot_memory_mib={} configured_memory_mib={}",
+                bail!(
+                    "snapshot VM config mismatch: snapshot_cpus={} configured_cpus={} snapshot_memory_mib={} configured_memory_mib={}",
                     snapshot_config.vcpu_count,
                     config.cpus,
                     snapshot_config.memory_mib(),
                     config.memory_mib
-                ));
-                None
+                );
             }
-            Ok(_) => config.restore_snapshot.clone(),
+            Ok(_) => Some(snapshot.clone()),
             Err(e) => {
-                timings.event("snapshot.restore.skipped.unreadable_header");
-                run_log.line(format!(
-                    "snapshot.restore.skipped reason=unreadable_header error={e:#}"
-                ));
-                None
+                return Err(e).with_context(|| {
+                    format!(
+                        "read snapshot header from {}",
+                        snapshot.join("vmstate.bin").display()
+                    )
+                });
             }
         }
     } else {
-        config.restore_snapshot.clone()
+        None
     };
     if let Some(snapshot) = &requested_restore_snapshot {
         log_snapshot_summary(&run_log, "snapshot.requested", snapshot);
@@ -581,6 +563,8 @@ fn start_vm(
     }
     let mut kernel_cmdline =
         format!("console=hvc0 reboot=k panic=1 root={root_device} rw rootfstype=ext4");
+    #[cfg(target_arch = "aarch64")]
+    kernel_cmdline.push_str(" arm64.nopauth");
     if matches!(rootfs_backend, RootfsBackend::Pmem) {
         kernel_cmdline.push_str(" rootflags=dax");
     }
@@ -861,7 +845,7 @@ struct RunLog {
 
 struct SnapshotVmConfig {
     #[cfg_attr(
-        not(all(target_os = "linux", target_arch = "aarch64")),
+        any(not(all(target_os = "linux", target_arch = "aarch64")), not(test)),
         allow(dead_code)
     )]
     version: u32,
@@ -879,7 +863,7 @@ impl SnapshotVmConfig {
     }
 
     #[cfg_attr(
-        not(all(target_os = "linux", target_arch = "aarch64")),
+        any(not(all(target_os = "linux", target_arch = "aarch64")), not(test)),
         allow(dead_code)
     )]
     fn is_macos_format(&self) -> bool {
@@ -1170,26 +1154,7 @@ fn snapshot_vm_config(snapshot: &Path) -> Result<Option<SnapshotVmConfig>> {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-fn configure_snapshot_restore_compat(restore_snapshot: Option<&Path>, run_log: &RunLog) {
-    let needs_macos_irqfd_compat = restore_snapshot
-        .and_then(|snapshot| snapshot_vm_config(snapshot).ok().flatten())
-        .is_some_and(|config| config.is_macos_format());
-
-    if needs_macos_irqfd_compat {
-        // libkrun's KVM device manager registers aarch64 irqfds with Linux's
-        // native GSI numbering by default. macOS snapshots encode virtio
-        // devices as SPI-relative interrupts, so restore needs the matching
-        // registration mode before device realization.
-        unsafe {
-            std::env::set_var("LNX_KVM_IRQFD_MACOS_SPI", "1");
-        }
-        run_log.line("snapshot.restore.macos_irqfd_compat enabled");
-    } else {
-        unsafe {
-            std::env::remove_var("LNX_KVM_IRQFD_MACOS_SPI");
-        }
-    }
-}
+fn configure_snapshot_restore_compat(_restore_snapshot: Option<&Path>, _run_log: &RunLog) {}
 
 #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
 fn configure_snapshot_restore_compat(_restore_snapshot: Option<&Path>, _run_log: &RunLog) {}
@@ -1322,11 +1287,15 @@ fn start_gvproxy(run_dir: &Path) -> Result<Gvproxy> {
     }
 
     let socket = run_dir.join("gvproxy.sock");
+    let api_socket = run_dir.join("gvproxy-api.sock");
     let log = run_dir.join("gvproxy.log");
     let _ = fs::remove_file(&socket);
+    let _ = fs::remove_file(&api_socket);
     let log_file = fs::File::create(&log).with_context(|| format!("create {}", log.display()))?;
     let ssh_port = unused_local_port().context("find unused localhost port for gvproxy ssh")?;
     let child = Command::new(&gvproxy)
+        .arg("--listen")
+        .arg(format!("unix://{}", api_socket.display()))
         .arg("--listen-vfkit")
         .arg(format!("unixgram:{}", socket.display()))
         .arg("--ssh-port")
@@ -1862,21 +1831,35 @@ fn run_broker_owner(
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "false".to_string())
     ));
-    let mut agent_stream =
-        match accept_agent_hello(&listener, agent_timeout, &timings, &run_log, &vm_error_rx) {
-            Ok(stream) => stream,
-            Err(e) => {
-                run_log.line(format!("agent.accept.error {e:#}"));
-                log_console_tail(&run_log, &console_log);
-                let e = e.context(console_hint(&console_log));
-                // A restored guest that never reconnects means the devices
-                // refused the memory image; tag it so the client retries cold.
-                if restore_snapshot.is_some() {
-                    return Err(e.context(RestoreRefused));
-                }
-                return Err(e);
+    let restore_snapshot_unblocker = if restore_snapshot.is_some() {
+        Some(spawn_restore_snapshot_unblocker(
+            &snapshot_listener,
+            agent_timeout,
+            Arc::clone(&timings),
+            Arc::clone(&run_log),
+        )?)
+    } else {
+        None
+    };
+    let accept_result =
+        accept_agent_hello(&listener, agent_timeout, &timings, &run_log, &vm_error_rx);
+    if let Some(unblocker) = restore_snapshot_unblocker {
+        unblocker.stop(&run_log);
+    }
+    let mut agent_stream = match accept_result {
+        Ok(stream) => stream,
+        Err(e) => {
+            run_log.line(format!("agent.accept.error {e:#}"));
+            log_console_tail(&run_log, &console_log);
+            let e = e.context(console_hint(&console_log));
+            // A restored guest that never reconnects means the devices
+            // refused the memory image; tag it so the client retries cold.
+            if restore_snapshot.is_some() {
+                return Err(e.context(RestoreRefused));
             }
-        };
+            return Err(e);
+        }
+    };
     write_message(
         &mut agent_stream,
         &Message::Hello {
@@ -2220,9 +2203,6 @@ fn spawn_owner_process(config: &RunConfig, run_log: &RunLog) -> Result<Child> {
     if let Some(snapshot) = &config.restore_snapshot {
         command.arg("--restore").arg(snapshot);
     }
-    if config.skip_memory_restore {
-        command.arg("--skip-memory-restore");
-    }
     command
         .stdin(Stdio::null())
         .stdout(log.try_clone().context("clone owner log handle")?)
@@ -2242,9 +2222,8 @@ fn run_broker_client_awaiting_owner(
     layout: &Layout,
     run_log: &RunLog,
 ) -> Result<i32> {
-    let mut deadline = Instant::now() + OWNER_BOOT_TIMEOUT;
+    let deadline = Instant::now() + OWNER_BOOT_TIMEOUT;
     let mut last = None;
-    let mut owner_config = config.clone();
     while Instant::now() < deadline {
         if INTERRUPTED.load(Ordering::SeqCst) {
             return Ok(130);
@@ -2266,18 +2245,7 @@ fn run_broker_client_awaiting_owner(
             // owner, so keep retrying until that one's broker comes up.
             if status.success() {
                 run_log.line("owner.exited.early status=0 retry=spawn");
-                *owner = spawn_owner_process(&owner_config, run_log)?;
-            } else if status.code() == Some(EXIT_RESTORE_FAILED)
-                && owner_config.restore_snapshot.is_some()
-                && !owner_config.skip_memory_restore
-            {
-                // Keep the snapshot's rootfs but drop the memory image, and
-                // give the cold boot a fresh deadline so a slow restore that
-                // burned the agent-accept timeout doesn't starve it.
-                run_log.line("snapshot.restore.skipped reason=start_failed retry=cold_boot");
-                owner_config.skip_memory_restore = true;
-                deadline = Instant::now() + OWNER_BOOT_TIMEOUT;
-                *owner = spawn_owner_process(&owner_config, run_log)?;
+                *owner = spawn_owner_process(config, run_log)?;
             } else {
                 run_log.line(format!("owner.exited.early status={status}"));
                 bail!(
@@ -2644,6 +2612,135 @@ fn handle_forward_connection(
     Ok(())
 }
 
+struct RestoreSnapshotUnblocker {
+    cancel: Arc<AtomicBool>,
+    handle: thread::JoinHandle<()>,
+}
+
+impl RestoreSnapshotUnblocker {
+    fn stop(self, run_log: &RunLog) {
+        self.cancel.store(true, Ordering::SeqCst);
+        if self.handle.join().is_err() {
+            run_log.line("snapshot.restore.unblock.thread_panicked");
+        }
+    }
+}
+
+fn spawn_restore_snapshot_unblocker(
+    listener: &UnixListener,
+    timeout: Duration,
+    timings: Arc<TimingLog>,
+    run_log: Arc<RunLog>,
+) -> Result<RestoreSnapshotUnblocker> {
+    let listener = listener
+        .try_clone()
+        .context("clone snapshot listener for restore unblocker")?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let thread_cancel = Arc::clone(&cancel);
+    let handle = thread::spawn(move || {
+        if let Err(e) =
+            unblock_restore_snapshot_wait(listener, timeout, &thread_cancel, &timings, &run_log)
+        {
+            run_log.line(format!("snapshot.restore.unblock.error {e:#}"));
+        }
+    });
+    Ok(RestoreSnapshotUnblocker { cancel, handle })
+}
+
+fn unblock_restore_snapshot_wait(
+    listener: UnixListener,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    timings: &TimingLog,
+    run_log: &RunLog,
+) -> Result<()> {
+    listener
+        .set_nonblocking(true)
+        .context("set restore snapshot listener nonblocking")?;
+    timings.event("snapshot.restore.unblock.begin");
+    run_log.line(format!(
+        "snapshot.restore.unblock.begin timeout_ms={}",
+        timeout.as_millis()
+    ));
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if cancel.load(Ordering::SeqCst) {
+            timings.event("snapshot.restore.unblock.cancelled");
+            run_log.line("snapshot.restore.unblock.cancelled");
+            return Ok(());
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                timings.event("snapshot.restore.unblock.accepted");
+                run_log.line("snapshot.restore.unblock.accepted");
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(250)))
+                    .context("set restore snapshot stream read timeout")?;
+                let mut frame_type = [0u8; 1];
+                match stream.read_exact(&mut frame_type) {
+                    Ok(()) => match read_u32(&mut stream) {
+                        Ok(len) => run_log.line(format!(
+                            "snapshot.restore.unblock.frame type={} len={len}",
+                            frame_type[0]
+                        )),
+                        Err(e) => {
+                            run_log.line(format!("snapshot.restore.unblock.frame_len_error {e:#}"))
+                        }
+                    },
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            ErrorKind::WouldBlock
+                                | ErrorKind::TimedOut
+                                | ErrorKind::UnexpectedEof
+                                | ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        run_log.line(format!(
+                            "snapshot.restore.unblock.frame_unavailable kind={:?}",
+                            e.kind()
+                        ));
+                    }
+                    Err(e) => run_log.line(format!("snapshot.restore.unblock.frame_error {e:#}")),
+                }
+                let mut ready = [0u8; 1];
+                match stream.read_exact(&mut ready) {
+                    Ok(()) => {
+                        run_log.line(format!("snapshot.restore.unblock.ready byte={}", ready[0]))
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            ErrorKind::WouldBlock
+                                | ErrorKind::TimedOut
+                                | ErrorKind::UnexpectedEof
+                                | ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        run_log.line(format!(
+                            "snapshot.restore.unblock.ready_unavailable kind={:?}",
+                            e.kind()
+                        ));
+                    }
+                    Err(e) => run_log.line(format!("snapshot.restore.unblock.ready_error {e:#}")),
+                }
+                let _ = stream.shutdown(Shutdown::Both);
+                timings.event("snapshot.restore.unblock.closed");
+                run_log.line("snapshot.restore.unblock.closed");
+                return Ok(());
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e).context("accept restore snapshot wait connection"),
+        }
+    }
+    timings.event("snapshot.restore.unblock.timeout");
+    run_log.line("snapshot.restore.unblock.timeout");
+    Ok(())
+}
+
 fn accept_unix(listener: &UnixListener, timeout: Duration) -> Result<UnixStream> {
     accept_unix_with_progress(listener, timeout, None, None)
 }
@@ -3002,19 +3099,7 @@ fn seed_incremental_snapshot(
 
 #[cfg(target_os = "macos")]
 fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let c_src = CString::new(src.as_os_str().as_bytes())?;
-    let c_dst = CString::new(dst.as_os_str().as_bytes())?;
-    if unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) } == 0 {
-        return Ok(());
-    }
-    fs::copy(src, dst).with_context(|| format!("copy {} to {}", src.display(), dst.display()))?;
-    Ok(())
+    crate::sparse_copy::clone_or_copy_file(src, dst)
 }
 
 #[cfg(not(target_os = "macos"))]

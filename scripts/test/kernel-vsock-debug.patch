@@ -1,0 +1,104 @@
+--- a/net/vmw_vsock/virtio_transport.c
++++ b/net/vmw_vsock/virtio_transport.c
+@@ -23,6 +23,32 @@ static struct workqueue_struct *virtio_vsock_workqueue;
+ static struct virtio_vsock __rcu *the_virtio_vsock;
+ static DEFINE_MUTEX(the_virtio_vsock_mutex); /* protects the_virtio_vsock */
+ static struct virtio_transport virtio_transport; /* forward declaration */
++
++static atomic_t lnx_vsock_debug_budget = ATOMIC_INIT(256);
++
++static bool lnx_vsock_debug_take(void)
++{
++	int old;
++
++	do {
++		old = atomic_read(&lnx_vsock_debug_budget);
++		if (old <= 0)
++			return false;
++	} while (atomic_cmpxchg(&lnx_vsock_debug_budget, old, old - 1) != old);
++
++	return true;
++}
++
++#define lnx_vsock_debug(fmt, ...)					\
++	do {								\
++		if (lnx_vsock_debug_take())				\
++			pr_err("lnx-vsock-debug " fmt, ##__VA_ARGS__);	\
++	} while (0)
++
++static u32 lnx_vsock_event_id(const struct virtio_vsock_event *event, unsigned int len)
++{
++	return len >= sizeof(*event) ? le32_to_cpu(event->id) : 0xffffffff;
++}
+ 
+ struct virtio_vsock {
+ 	struct virtio_device *vdev;
+@@ -409,6 +434,16 @@ static void virtio_vsock_event_fill(struct virtio_vsock *vsock)
+ 
+ static void virtio_vsock_reset_sock(struct sock *sk)
+ {
++	struct vsock_sock *vsk = vsock_sk(sk);
++
++	lnx_vsock_debug("reset_sock sk=%p state=%u type=%u err=%d local=%u:%u remote=%u:%u transport=%ps\n",
++			sk, sk->sk_state, sk->sk_type, sk->sk_err,
++			vsk->local_addr.svm_cid,
++			vsk->local_addr.svm_port,
++			vsk->remote_addr.svm_cid,
++			vsk->remote_addr.svm_port,
++			vsk->transport);
++
+ 	/* vmci_transport.c doesn't take sk_lock here either.  At least we're
+ 	 * under vsock_table_lock so the sock cannot disappear while we're
+ 	 * executing.
+@@ -435,12 +470,16 @@ static void virtio_vsock_event_handle(struct virtio_vsock *vsock,
+ 				      struct virtio_vsock_event *event)
+ {
+ 	switch (le32_to_cpu(event->id)) {
+ 	case VIRTIO_VSOCK_EVENT_TRANSPORT_RESET:
++		lnx_vsock_debug("event_handle transport_reset guest_cid_before=%llu\n",
++				vsock->guest_cid);
+ 		virtio_vsock_update_guest_cid(vsock);
+ 		vsock_for_each_connected_socket(&virtio_transport.transport,
+ 						virtio_vsock_reset_sock);
++		lnx_vsock_debug("event_handle transport_reset done guest_cid_after=%llu\n",
++				vsock->guest_cid);
+ 		break;
+ 	}
+ }
+ 
+ static void virtio_transport_event_work(struct work_struct *work)
+@@ -453,6 +492,8 @@ static void virtio_transport_event_work(struct work_struct *work)
+ 
+ 	mutex_lock(&vsock->event_lock);
+ 
++	lnx_vsock_debug("event_work enter event_run=%u guest_cid=%llu\n",
++			vsock->event_run, vsock->guest_cid);
+ 	if (!vsock->event_run)
+ 		goto out;
+ 
+@@ -462,6 +503,9 @@ static void virtio_transport_event_work(struct work_struct *work)
+ 
+ 		virtqueue_disable_cb(vq);
+ 		while ((event = virtqueue_get_buf(vq, &len)) != NULL) {
++			lnx_vsock_debug("event_work got event=%p len=%u id=%u\n",
++					event, len, lnx_vsock_event_id(event, len));
++
+ 			if (len == sizeof(*event))
+ 				virtio_vsock_event_handle(vsock, event);
+ 
+@@ -469,6 +513,7 @@ static void virtio_transport_event_work(struct work_struct *work)
+ 		}
+ 	} while (!virtqueue_enable_cb(vq));
+ 
++	lnx_vsock_debug("event_work exit\n");
+ 	virtqueue_kick(vsock->vqs[VSOCK_VQ_EVENT]);
+ 
+ out:
+@@ -480,6 +525,7 @@ static void virtio_vsock_event_done(struct virtqueue *vq)
+ {
+ 	struct virtio_vsock *vsock = vq->vdev->priv;
+ 
++	lnx_vsock_debug("event_done vq=%p vsock=%p\n", vq, vsock);
+ 	if (!vsock)
+ 		return;
+ 

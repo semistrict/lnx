@@ -241,6 +241,37 @@ impl VsockMuxer {
             .collect()
     }
 
+    pub fn stream_connection_ports(&self) -> Vec<(u32, u32)> {
+        self.proxy_map
+            .read()
+            .unwrap()
+            .values()
+            .filter_map(|proxy| proxy.lock().unwrap().stream_connection_ports())
+            .collect()
+    }
+
+    pub fn queue_stream_resets(&self, connections: &[(u32, u32)]) -> bool {
+        let mut queued_any = false;
+        let mut rxq = self.rxq.lock().unwrap();
+        for &(local_port, peer_port) in connections {
+            if local_port == 0 || peer_port == 0 {
+                continue;
+            }
+            let queued = rxq.push(MuxerRx::Reset {
+                local_port,
+                peer_port,
+            });
+            if queued {
+                queued_any = true;
+            } else {
+                warn!(
+                    "failed to queue restored vsock reset local_port={local_port} peer_port={peer_port}"
+                );
+            }
+        }
+        queued_any
+    }
+
     pub fn restore_stream_listeners(
         &self,
         listeners: &[StreamListenerSnapshot],

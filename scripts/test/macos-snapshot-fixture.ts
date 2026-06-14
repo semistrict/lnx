@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import {
   assertContains,
   assertEq,
+  cloneSparseImage,
   cleanupContext,
   defaultContext,
   prepareContext,
@@ -72,16 +73,6 @@ async function checkpointPathByName(imageDir: string, name: string): Promise<str
   throw new Error(`checkpoint not found: ${name}`);
 }
 
-async function cloneOrCopy(src: string, dest: string) {
-  const cloned = await run(["cp", "-c", src, dest], {
-    timeoutMs: 180_000,
-    check: false,
-  });
-  if (cloned.status !== 0) {
-    await run(["cp", src, dest], { timeoutMs: 180_000 });
-  }
-}
-
 try {
   await prepareContext(ctx);
   await rm(output, { recursive: true, force: true });
@@ -116,6 +107,9 @@ try {
 import subprocess
 import time
 from pathlib import Path
+
+if "arm64.nopauth" not in Path("/proc/cmdline").read_text():
+    raise SystemExit("portable snapshot source missing arm64.nopauth")
 
 subprocess.run(["sudo", "tee", "/root/lnx-cross-host-disk"], input=b"macos-disk", stdout=subprocess.DEVNULL, check=True)
 subprocess.run(["sudo", "tee", "/run/lnx-cross-host-memory"], input=b"macos-memory", stdout=subprocess.DEVNULL, check=True)
@@ -204,8 +198,8 @@ print("mac-source-after", flush=True)
   assertContains(sharesStamp, "net=gvproxy", "source snapshot uses portable gvproxy backing");
 
   await mkdir(output, { recursive: true });
-  await cloneOrCopy(join(snapshot, "rootfs.ext4"), join(output, "rootfs.ext4"));
-  await cloneOrCopy(join(snapshot, "pages.img"), join(output, "pages.img"));
+  await cloneSparseImage(join(snapshot, "rootfs.ext4"), join(output, "rootfs.ext4"));
+  await cloneSparseImage(join(snapshot, "pages.img"), join(output, "pages.img"));
   for (const file of ["vmstate.bin", "shares.stamp", "initramfs.stamp"]) {
     await run(["cp", join(snapshot, file), join(output, file)], { timeoutMs: 180_000 });
   }

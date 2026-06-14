@@ -357,6 +357,79 @@ impl HvfVcpu<'_> {
         let _ = Self::raw_set_gic_redist_reg(vcpuid, reg, value);
     }
 
+    fn restore_gic_redist_exact(vcpuid: hv_vcpu_t, regs: &[(u32, u64)], wanted: u32) {
+        for &(reg, val) in regs {
+            if reg == wanted {
+                Self::restore_gic_redist_reg(vcpuid, reg, val);
+            }
+        }
+    }
+
+    fn restore_gic_redist_range(vcpuid: hv_vcpu_t, regs: &[(u32, u64)], base: u32, len: u32) {
+        for &(reg, val) in regs {
+            if (base..base + len).contains(&reg) {
+                Self::restore_gic_redist_reg(vcpuid, reg, val);
+            }
+        }
+    }
+
+    fn is_ordered_gic_redist_reg(reg: u32) -> bool {
+        let priority_base =
+            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_IPRIORITYR0 as u32;
+        matches!(
+            reg,
+            x if x == hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_IGROUPR0 as u32
+                || x == hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISENABLER0 as u32
+                || x == hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ICFGR0 as u32
+                || x == hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ICFGR1 as u32
+                || x == hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0 as u32
+                || x == hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISACTIVER0 as u32
+                || (priority_base..priority_base + 32).contains(&x)
+        )
+    }
+
+    fn restore_gic_icc_reg(vcpuid: hv_vcpu_t, reg: u16, value: u64) {
+        if !Self::raw_set_gic_icc_reg(vcpuid, reg, value) {
+            debug!("snapshot restore: skipping GIC ICC reg 0x{reg:x}");
+        }
+    }
+
+    fn restore_gic_icc_exact(vcpuid: hv_vcpu_t, regs: &[(u16, u64)], wanted: u16) {
+        for &(reg, val) in regs {
+            if reg == wanted {
+                Self::restore_gic_icc_reg(vcpuid, reg, val);
+            }
+        }
+    }
+
+    fn restore_gic_icc_regs(vcpuid: hv_vcpu_t, regs: &[(u16, u64)]) {
+        let ordered = [
+            hv_gic_icc_reg_t_HV_GIC_ICC_REG_SRE_EL1 as u16,
+            hv_gic_icc_reg_t_HV_GIC_ICC_REG_CTLR_EL1 as u16,
+            hv_gic_icc_reg_t_HV_GIC_ICC_REG_IGRPEN0_EL1 as u16,
+            hv_gic_icc_reg_t_HV_GIC_ICC_REG_IGRPEN1_EL1 as u16,
+            hv_gic_icc_reg_t_HV_GIC_ICC_REG_PMR_EL1 as u16,
+            hv_gic_icc_reg_t_HV_GIC_ICC_REG_BPR0_EL1 as u16,
+            hv_gic_icc_reg_t_HV_GIC_ICC_REG_BPR1_EL1 as u16,
+            hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP0R0_EL1 as u16 + 3,
+            hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP0R0_EL1 as u16 + 2,
+            hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP0R0_EL1 as u16 + 1,
+            hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP0R0_EL1 as u16,
+            hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP1R0_EL1 as u16 + 3,
+            hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP1R0_EL1 as u16 + 2,
+            hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP1R0_EL1 as u16 + 1,
+            hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP1R0_EL1 as u16,
+        ];
+        for wanted in ordered {
+            Self::restore_gic_icc_exact(vcpuid, regs, wanted);
+        }
+        for &(reg, val) in regs {
+            if !ordered.contains(&reg) {
+                Self::restore_gic_icc_reg(vcpuid, reg, val);
+            }
+        }
+    }
+
     fn raw_set_sys_reg(vcpuid: hv_vcpu_t, reg: u16, value: u64) -> Result<(), Error> {
         let ret = unsafe { hv_vcpu_set_sys_reg(vcpuid, reg as hv_sys_reg_t, value) };
         if ret != HV_SUCCESS {
@@ -486,14 +559,8 @@ impl HvfVcpu<'_> {
             Self::raw_set_fp(id, i as hv_simd_fp_reg_t, v)?;
         }
 
-        for &(reg, val) in &st.gic_redist_regs {
-            Self::restore_gic_redist_reg(id, reg, val);
-        }
-        for &(reg, val) in &st.gic_icc_regs {
-            if !Self::raw_set_gic_icc_reg(id, reg, val) {
-                debug!("snapshot restore: skipping GIC ICC reg 0x{reg:x}");
-            }
-        }
+        self.restore_gic_redist_regs(&st.gic_redist_regs)?;
+        Self::restore_gic_icc_regs(id, &st.gic_icc_regs);
         for &(reg, val) in &st.gic_ich_regs {
             if !Self::raw_set_gic_ich_reg(id, reg, val) {
                 debug!("snapshot restore: skipping GIC ICH reg 0x{reg:x}");
@@ -521,6 +588,54 @@ impl HvfVcpu<'_> {
         let _ = vcpu_set_vtimer_mask(id, false);
         self.vtimer_masked = false;
 
+        Ok(())
+    }
+
+    pub fn restore_gic_redist_regs(&mut self, regs: &[(u32, u64)]) -> Result<(), Error> {
+        let id = self.vcpuid;
+        Self::restore_gic_redist_exact(
+            id,
+            regs,
+            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_IGROUPR0 as u32,
+        );
+        Self::restore_gic_redist_exact(
+            id,
+            regs,
+            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISENABLER0 as u32,
+        );
+        // Configuration must be restored before pending bits so level/edge
+        // state is interpreted the same way as it was at capture.
+        Self::restore_gic_redist_exact(
+            id,
+            regs,
+            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ICFGR0 as u32,
+        );
+        Self::restore_gic_redist_exact(
+            id,
+            regs,
+            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ICFGR1 as u32,
+        );
+        Self::restore_gic_redist_exact(
+            id,
+            regs,
+            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0 as u32,
+        );
+        Self::restore_gic_redist_exact(
+            id,
+            regs,
+            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISACTIVER0 as u32,
+        );
+        Self::restore_gic_redist_range(
+            id,
+            regs,
+            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_IPRIORITYR0 as u32,
+            32,
+        );
+        for &(reg, val) in regs {
+            if !Self::is_ordered_gic_redist_reg(reg) {
+                Self::restore_gic_redist_reg(id, reg, val);
+            }
+        }
         Ok(())
     }
 

@@ -84,11 +84,11 @@ const MMIO_LEN: u64 = 0x1000;
 
 #[cfg(target_arch = "aarch64")]
 fn irqfd_pin_for_guest_irq(irq: u32) -> u32 {
-    if std::env::var_os("LNX_KVM_IRQFD_MACOS_SPI").is_some() {
-        irq.saturating_sub(arch::aarch64::layout::IRQ_BASE)
-    } else {
-        irq
-    }
+    // KVM irqfd routes use the guest-visible IRQ number. macOS snapshot
+    // restores normalize saved distributor state elsewhere, but translating
+    // runtime irqfds to SPI-relative IDs sends virtio interrupts to the wrong
+    // line after restore.
+    irq
 }
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -366,22 +366,6 @@ mod tests {
     use vm_memory::{GuestAddress, GuestMemoryMmap};
 
     const QUEUE_CONFIG: &[QueueConfig] = &[QueueConfig::new(64)];
-    #[cfg(target_arch = "aarch64")]
-    static MACOS_IRQFD_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[cfg(target_arch = "aarch64")]
-    struct MacosIrqfdEnvGuard;
-
-    #[cfg(target_arch = "aarch64")]
-    impl Drop for MacosIrqfdEnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: tests using this guard hold MACOS_IRQFD_ENV_LOCK, so
-            // this process environment mutation is serialized.
-            unsafe {
-                std::env::remove_var("LNX_KVM_IRQFD_MACOS_SPI");
-            }
-        }
-    }
 
     impl MMIODeviceManager {
         fn register_virtio_device(
@@ -541,34 +525,10 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn irqfd_pin_uses_guest_irq_by_default() {
-        let _guard = MACOS_IRQFD_ENV_LOCK.lock().unwrap();
-        // SAFETY: this test serializes access to the process environment for
-        // this internal switch.
-        unsafe {
-            std::env::remove_var("LNX_KVM_IRQFD_MACOS_SPI");
-        }
-
+    fn irqfd_pin_uses_guest_irq() {
         assert_eq!(
             irqfd_pin_for_guest_irq(arch::aarch64::layout::IRQ_BASE + 7),
             arch::aarch64::layout::IRQ_BASE + 7
-        );
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn irqfd_pin_translates_macos_spi_to_kvm_irqfd_pin() {
-        let _guard = MACOS_IRQFD_ENV_LOCK.lock().unwrap();
-        // SAFETY: this test serializes access to the process environment for
-        // this internal switch.
-        unsafe {
-            std::env::set_var("LNX_KVM_IRQFD_MACOS_SPI", "1");
-        }
-        let _env_guard = MacosIrqfdEnvGuard;
-
-        assert_eq!(
-            irqfd_pin_for_guest_irq(arch::aarch64::layout::IRQ_BASE + 7),
-            7
         );
     }
 
