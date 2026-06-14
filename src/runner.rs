@@ -30,17 +30,9 @@ const SNAPSHOT_PORT: u32 = 10241;
 const CONTROL_PORT: u32 = 10242;
 const FRAME_SNAPSHOT: u8 = b'K';
 const INTERRUPT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
-// Accepted vmstate.bin container versions. The macOS and Linux snapshot
-// containers version independently; keep in sync with VERSION in
-// third_party/libkrun/src/vmm/src/{macos,linux}/snapshot/container.rs.
-#[cfg(all(test, target_os = "macos"))]
-const SNAPSHOT_VMSTATE_NATIVE_VERSION: u32 = 1;
-#[cfg(all(test, not(target_os = "macos")))]
-const SNAPSHOT_VMSTATE_NATIVE_VERSION: u32 = 3;
-#[cfg(target_os = "macos")]
-const SNAPSHOT_VMSTATE_SUPPORTED_VERSIONS: &[u32] = &[1, 3];
-#[cfg(not(target_os = "macos"))]
-const SNAPSHOT_VMSTATE_SUPPORTED_VERSIONS: &[u32] = &[3, 1];
+// Accepted vmstate.bin container version. Source backend lives in the META
+// section, not in the header version.
+const SNAPSHOT_VMSTATE_VERSION: u32 = 4;
 
 // Owner exit status meaning "the VM failed to start with a restore
 // configured"; the client retries the spawn with a cold boot.
@@ -53,14 +45,10 @@ const DEFAULT_OWNER_IDLE_TTL: Duration = Duration::from_secs(5);
 // that spawned it ever connects.
 const MIN_OWNER_IDLE_TTL: Duration = Duration::from_millis(250);
 const OWNER_BOOT_TIMEOUT: Duration = Duration::from_secs(120);
+const FORWARD_OWNER_SLOT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_AGENT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(90);
 const ROOTFS_BACKEND_ENV: &str = "LNX_ROOTFS_BACKEND";
-#[cfg_attr(
-    any(not(all(target_os = "linux", target_arch = "aarch64")), not(test)),
-    allow(dead_code)
-)]
-const MACOS_VMSTATE_VERSION: u32 = 1;
-
+const RESTORE_ENTROPY_BYTES: usize = 64;
 static SIGNAL_INIT: Once = Once::new();
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
@@ -133,16 +121,20 @@ pub fn run(config: RunConfig) -> Result<i32> {
         config.layout.run_dir.join("gvproxy.log").display()
     ));
     let broker_socket = config.layout.run_dir.join("broker.sock");
-    if let Some(status) = run_existing_broker_client(
-        &broker_socket,
-        &config.command,
-        &config.cwd,
-        config.run_as_root,
-        config.no_host_shares,
-        Some(&run_log),
-    )? {
-        run_log.line(format!("run.done status={status}"));
-        return Ok(status);
+    if config.forwards.is_empty() {
+        if let Some(status) = run_existing_broker_client(
+            &broker_socket,
+            &config.command,
+            &config.cwd,
+            config.run_as_root,
+            config.no_host_shares,
+            Some(&run_log),
+        )? {
+            run_log.line(format!("run.done status={status}"));
+            return Ok(status);
+        }
+    } else {
+        wait_for_forward_owner_slot(&config.layout, &run_log)?;
     }
     if config.snapshot_output.is_some() {
         // Checkpoint and vm-init runs need the snapshot written before they
@@ -168,6 +160,45 @@ pub fn run(config: RunConfig) -> Result<i32> {
     };
     run_log.line(format!("run.done status={status}"));
     Ok(status)
+}
+
+fn wait_for_forward_owner_slot(layout: &Layout, run_log: &RunLog) -> Result<()> {
+    let lock_path = layout.run_dir.join("bootstrap.lock.d");
+    let start = Instant::now();
+    let mut logged_wait = false;
+    while lock_path.exists() {
+        if !logged_wait {
+            run_log.line(format!(
+                "forward.owner_slot.wait lock={} timeout_ms={}",
+                lock_path.display(),
+                FORWARD_OWNER_SLOT_TIMEOUT.as_millis()
+            ));
+            logged_wait = true;
+        }
+        if start.elapsed() > FORWARD_OWNER_SLOT_TIMEOUT {
+            bail!(
+                "--forward requires starting a fresh VM owner, but an existing owner is still running for instance {}; wait for it to checkpoint and exit before retrying",
+                layout.instance
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+fn acquire_bootstrap_for_forward(lock_path: &Path, run_log: &RunLog) -> Result<BootstrapLock> {
+    match BootstrapLock::try_acquire(lock_path)? {
+        Some(lock) => {
+            run_log.line(format!(
+                "bootstrap.lock.acquired path={} forward=true",
+                lock_path.display()
+            ));
+            Ok(lock)
+        }
+        None => bail!(
+            "--forward requires starting a fresh VM owner, but another owner started for this instance"
+        ),
+    }
 }
 
 pub fn run_owner(config: RunConfig) -> Result<()> {
@@ -228,28 +259,35 @@ pub fn run_owner(config: RunConfig) -> Result<()> {
 }
 
 fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBuf) -> Result<i32> {
-    let bootstrap_lock = match acquire_bootstrap_or_run_client(
-        &config.layout.run_dir.join("bootstrap.lock.d"),
-        &broker_socket,
-        &config.command,
-        &config.cwd,
-        config.run_as_root,
-        config.no_host_shares,
-        &run_log,
-    )? {
-        BootstrapOutcome::Lock(lock) => lock,
-        BootstrapOutcome::Status(status) => return Ok(status),
+    let lock_path = config.layout.run_dir.join("bootstrap.lock.d");
+    let bootstrap_lock = if config.forwards.is_empty() {
+        match acquire_bootstrap_or_run_client(
+            &lock_path,
+            &broker_socket,
+            &config.command,
+            &config.cwd,
+            config.run_as_root,
+            config.no_host_shares,
+            &run_log,
+        )? {
+            BootstrapOutcome::Lock(lock) => lock,
+            BootstrapOutcome::Status(status) => return Ok(status),
+        }
+    } else {
+        acquire_bootstrap_for_forward(&lock_path, &run_log)?
     };
-    if let Some(status) = run_existing_broker_client(
-        &broker_socket,
-        &config.command,
-        &config.cwd,
-        config.run_as_root,
-        config.no_host_shares,
-        Some(&run_log),
-    )? {
-        drop(bootstrap_lock);
-        return Ok(status);
+    if config.forwards.is_empty() {
+        if let Some(status) = run_existing_broker_client(
+            &broker_socket,
+            &config.command,
+            &config.cwd,
+            config.run_as_root,
+            config.no_host_shares,
+            Some(&run_log),
+        )? {
+            drop(bootstrap_lock);
+            return Ok(status);
+        }
     }
     if broker_socket.exists() {
         run_log.line(format!(
@@ -292,6 +330,15 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
     drop(vm.network);
     drop(bootstrap_lock);
     Ok(status)
+}
+
+fn fresh_restore_entropy() -> Result<Vec<u8>> {
+    let mut entropy = vec![0u8; RESTORE_ENTROPY_BYTES];
+    fs::File::open("/dev/urandom")
+        .context("open host /dev/urandom for restore entropy")?
+        .read_exact(&mut entropy)
+        .context("read host restore entropy")?;
+    Ok(entropy)
 }
 
 struct VmHandles {
@@ -520,7 +567,11 @@ fn start_vm(
         control_socket.display(),
         broker_socket.display()
     ));
-    KrunContext::set_log_level(2)?;
+    let krun_log_level = std::env::var("LNX_KRUN_LOG_LEVEL")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(2);
+    KrunContext::set_log_level(krun_log_level)?;
     let ctx = Arc::new(KrunContext::create()?);
     ctx.set_console_output(&config.layout.console_log)?;
     ctx.set_vm_config(config.cpus, config.memory_mib)?;
@@ -861,14 +912,6 @@ impl SnapshotVmConfig {
     fn matches(&self, cpus: u8, memory_mib: u32) -> bool {
         self.vcpu_count == cpus as u32 && self.memory_mib() == memory_mib as u64
     }
-
-    #[cfg_attr(
-        any(not(all(target_os = "linux", target_arch = "aarch64")), not(test)),
-        allow(dead_code)
-    )]
-    fn is_macos_format(&self) -> bool {
-        self.version == MACOS_VMSTATE_VERSION
-    }
 }
 
 struct TimingState {
@@ -1140,7 +1183,7 @@ fn snapshot_vm_config(snapshot: &Path) -> Result<Option<SnapshotVmConfig>> {
         bail!("bad snapshot magic in {}", path.display());
     }
     let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
-    if !SNAPSHOT_VMSTATE_SUPPORTED_VERSIONS.contains(&version) {
+    if version != SNAPSHOT_VMSTATE_VERSION {
         bail!(
             "unsupported snapshot version {version} in {}",
             path.display()
@@ -1877,7 +1920,13 @@ fn run_broker_owner(
             .set_read_timeout(Some(DEFAULT_AGENT_ACCEPT_TIMEOUT))
             .context("set restore-sync read timeout")?;
         let sync_result = (|| -> Result<()> {
-            write_message(&mut agent_stream, &Message::RestoreSync { channel_id })?;
+            write_message(
+                &mut agent_stream,
+                &Message::RestoreSync {
+                    channel_id,
+                    entropy: fresh_restore_entropy()?,
+                },
+            )?;
             loop {
                 match read_message(&mut agent_stream)? {
                     Message::RestoreSynced { channel_id: id } if id == channel_id => return Ok(()),
@@ -3263,7 +3312,7 @@ mod tests {
     fn write_vmstate_header(snapshot: &Path, memory_bytes: u64, vcpu_count: u32) {
         write_vmstate_header_with_version(
             snapshot,
-            SNAPSHOT_VMSTATE_NATIVE_VERSION,
+            SNAPSHOT_VMSTATE_VERSION,
             memory_bytes,
             vcpu_count,
         );
@@ -3289,28 +3338,12 @@ mod tests {
             .expect("read config")
             .expect("config present");
 
-        assert_eq!(config.version, SNAPSHOT_VMSTATE_NATIVE_VERSION);
+        assert_eq!(config.version, SNAPSHOT_VMSTATE_VERSION);
         assert_eq!(config.vcpu_count, 2);
         assert_eq!(config.memory_mib(), 4096);
         assert!(config.matches(2, 4096));
         assert!(!config.matches(1, 4096));
         assert!(!config.matches(2, 8192));
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn snapshot_vm_config_accepts_macos_vmstate_on_linux() {
-        let temp = TempDir::new("snapshot-header-macos");
-        write_vmstate_header_with_version(temp.path(), 1, 2 * 1024 * 1024 * 1024, 4);
-
-        let config = snapshot_vm_config(temp.path())
-            .expect("read config")
-            .expect("config present");
-
-        assert_eq!(config.version, 1);
-        assert!(config.is_macos_format());
-        assert_eq!(config.vcpu_count, 4);
-        assert_eq!(config.memory_mib(), 2048);
     }
 
     #[test]
@@ -3323,10 +3356,10 @@ mod tests {
             shares_stamp_content(
                 Path::new("/Users/ramon"),
                 Some(Path::new("/tmp/build")),
-                "net=vmnet:prefix=24:gateway=192.168.106.1",
+                "net=vmnet:prefix=24:gateway=192.168.106.0",
                 false,
             ),
-            "host-share-cache=dax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\ncwd=/tmp/build\nnet=vmnet:prefix=24:gateway=192.168.106.1\n"
+            "host-share-cache=dax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\ncwd=/tmp/build\nnet=vmnet:prefix=24:gateway=192.168.106.0\n"
         );
         assert_eq!(
             shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", true),
@@ -3368,7 +3401,7 @@ mod tests {
         let renetworked = shares_stamp_content(
             Path::new("/Users/ramon"),
             None,
-            "net=vmnet:prefix=24:gateway=192.168.106.1",
+            "net=vmnet:prefix=24:gateway=192.168.106.0",
             false,
         );
         assert_eq!(
@@ -3440,7 +3473,7 @@ mod tests {
 
         let mut header = [0u8; 40];
         header[0..8].copy_from_slice(b"LKRNSS01");
-        header[8..12].copy_from_slice(&(SNAPSHOT_VMSTATE_NATIVE_VERSION + 97).to_le_bytes());
+        header[8..12].copy_from_slice(&(SNAPSHOT_VMSTATE_VERSION + 97).to_le_bytes());
         fs::write(temp.path().join("vmstate.bin"), header).expect("write bad version");
         assert!(snapshot_vm_config(temp.path()).is_err());
     }

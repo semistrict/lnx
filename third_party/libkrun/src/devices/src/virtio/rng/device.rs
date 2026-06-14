@@ -1,6 +1,8 @@
 use rand::{TryRngCore, rngs::OsRng};
 use utils::eventfd::EventFd;
-use vm_memory::{Address, Bytes, GuestMemoryMmap};
+#[cfg(target_os = "macos")]
+use vm_memory::Address;
+use vm_memory::{Bytes, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceSnapshot, DeviceSnapshotError, DeviceState,

@@ -38,7 +38,10 @@ RUN mkdir /build && \
 WORKDIR /build
 
 COPY kernel-patches /kernel-patches
-RUN for patch in /kernel-patches/*.patch; do patch -p1 < "$patch"; done
+ARG LNX_GIC_DEBUG_SKIP_KERNEL_PATCHES=
+RUN if [ -z "$LNX_GIC_DEBUG_SKIP_KERNEL_PATCHES" ]; then \
+      for patch in /kernel-patches/*.patch; do patch -p1 < "$patch"; done; \
+    fi
 
 COPY scripts/test/kernel-*-debug.patch /tmp/
 RUN for patch in /tmp/kernel-*-debug.patch; do patch -p1 < "$patch"; done
@@ -99,14 +102,20 @@ case "$engine" in
       patch -d "$source_work" -p1 < "$patch_file"
     done
     cp "$repo_root/kernel.config" "$build_dir/.config"
-    "$make_cmd" -C "$source_work" O="$build_dir" ARCH=arm64 CROSS_COMPILE="$cross_compile" "${make_extra[@]}" olddefconfig
-    "$make_cmd" -C "$source_work" O="$build_dir" ARCH=arm64 CROSS_COMPILE="$cross_compile" "${make_extra[@]}" -j"$jobs" Image
+    make_base=("$make_cmd" -C "$source_work" O="$build_dir" ARCH=arm64 CROSS_COMPILE="$cross_compile")
+    if [[ ${#make_extra[@]} -gt 0 ]]; then
+      make_base+=("${make_extra[@]}")
+    fi
+    "${make_base[@]}" olddefconfig
+    "${make_base[@]}" -j"$jobs" Image
     cp "$build_dir/arch/arm64/boot/Image" "$out"
     printf '%s\n' "$out"
     exit 0
     ;;
   docker)
-    docker buildx build --platform linux/arm64 -f "$dockerfile" -t "$image" --load "$repo_root"
+    docker buildx build --platform linux/arm64 -f "$dockerfile" -t "$image" \
+      --build-arg LNX_GIC_DEBUG_SKIP_KERNEL_PATCHES="${LNX_GIC_DEBUG_SKIP_KERNEL_PATCHES:-}" \
+      --load "$repo_root"
     ;;
   podman)
     podman build --platform linux/arm64 -f "$dockerfile" -t "$image" "$repo_root"

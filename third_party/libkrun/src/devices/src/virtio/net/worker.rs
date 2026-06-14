@@ -17,7 +17,9 @@ use std::thread;
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+#[cfg(target_os = "macos")]
+use vm_memory::Address;
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 /// Queue cursors + backend handed back to the device when the worker stops.
 pub struct NetWorkerStopResult {
@@ -43,6 +45,9 @@ pub struct NetWorker {
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
+
+    rx_queue_armed: bool,
+    tx_queue_armed: bool,
 }
 
 impl NetWorker {
@@ -53,6 +58,7 @@ impl NetWorker {
         mem: GuestMemoryMmap,
         _vnet_features: u64,
         cfg_backend: VirtioNetBackend,
+        queues_armed: bool,
     ) -> Result<Self, ConnectError> {
         let backend = match cfg_backend {
             VirtioNetBackend::UnixstreamFd(fd) => {
@@ -79,7 +85,7 @@ impl NetWorker {
             }
         };
 
-        Self::from_parts(rx_q, tx_q, interrupt, mem, backend)
+        Self::from_parts(rx_q, tx_q, interrupt, mem, backend, queues_armed)
     }
 
     /// Construct a worker from an existing backend handle. Used on resume.
@@ -89,6 +95,7 @@ impl NetWorker {
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
         backend: Box<dyn NetBackend + Send>,
+        queues_armed: bool,
     ) -> Result<Self, ConnectError> {
         let stop_fd = EventFd::new(EFD_NONBLOCK).map_err(ConnectError::Io)?;
         Ok(Self {
@@ -108,6 +115,9 @@ impl NetWorker {
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
+
+            rx_queue_armed: queues_armed,
+            tx_queue_armed: queues_armed,
         })
     }
 
@@ -237,6 +247,7 @@ impl NetWorker {
         if let Err(e) = self.rx_q.event.read() {
             log::error!("Failed to get rx event from queue: {e:?}");
         }
+        self.rx_queue_armed = true;
         if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
             error!("error disabling queue notifications: {e:?}");
         }
@@ -249,6 +260,7 @@ impl NetWorker {
     }
 
     pub(crate) fn process_tx_queue_event(&mut self) {
+        self.tx_queue_armed = true;
         match self.tx_q.event.read() {
             Ok(_) => self.process_tx_loop(),
             Err(e) => {
@@ -258,6 +270,9 @@ impl NetWorker {
     }
 
     pub(crate) fn process_backend_socket_readable(&mut self) {
+        if !self.rx_queue_armed {
+            return;
+        }
         if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
             error!("error disabling queue notifications: {e:?}");
         }
@@ -270,6 +285,9 @@ impl NetWorker {
     }
 
     pub(crate) fn process_backend_socket_writeable(&mut self) {
+        if !self.tx_queue_armed {
+            return;
+        }
         match self
             .backend
             .try_finish_write(VNET_HDR_LEN, &self.tx_frame_buf[..self.tx_frame_len])
@@ -326,6 +344,9 @@ impl NetWorker {
     }
 
     fn process_tx_loop(&mut self) {
+        if !self.tx_queue_armed {
+            return;
+        }
         loop {
             self.tx_q.queue.disable_notification(&self.mem).unwrap();
 

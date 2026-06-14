@@ -42,7 +42,7 @@ try {
   await testStep("Linux snapshot restores disk and memory on macOS", async () => {
     const hostProbe = startHostHttpProbe("linux-macos");
     const vmstate = await Bun.file(join(fixture, "vmstate.bin")).arrayBuffer();
-    assertEq(new DataView(vmstate).getUint32(8, true), 3, "source snapshot is Linux vmstate v3");
+    assertEq(new DataView(vmstate).getUint32(8, true), 4, "source snapshot is shared vmstate v4");
 
     try {
       const restored = await lnx(

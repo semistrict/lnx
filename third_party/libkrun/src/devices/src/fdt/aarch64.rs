@@ -12,7 +12,7 @@ use std::{io, result};
 use crate::DeviceType;
 use crate::legacy::IrqChip;
 use crate::legacy::gic::GICDevice;
-use arch::aarch64::layout::{GTIMER_HYP, GTIMER_PHYS, GTIMER_SEC, GTIMER_VIRT};
+use arch::aarch64::layout::{GTIMER_HYP, GTIMER_PHYS, GTIMER_SEC, GTIMER_VIRT, IRQ_BASE};
 use arch::{ArchMemoryInfo, InitrdConfig};
 use vm_fdt::{Error as FdtError, FdtWriter};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryError, GuestMemoryMmap};
@@ -38,6 +38,10 @@ const GIC_FDT_IRQ_TYPE_PPI: u32 = 1;
 
 // From https://elixir.bootlin.com/linux/v4.9.62/source/include/dt-bindings/interrupt-controller/irq.h#L17
 const IRQ_TYPE_EDGE_RISING: u32 = 1;
+
+fn gic_spi_irq_cell(irq: u32) -> u32 {
+    irq - IRQ_BASE
+}
 const IRQ_TYPE_LEVEL_HI: u32 = 4;
 
 /// Trait for devices to be added to the Flattened Device Tree.
@@ -309,12 +313,9 @@ fn create_virtio_node<T: DeviceInfoForFDT + Clone + Debug>(
     dev_info: &T,
 ) -> Result<()> {
     let device_reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
-    #[cfg(target_os = "linux")]
-    let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq(), IRQ_TYPE_EDGE_RISING]);
-    #[cfg(target_os = "macos")]
     let irq = generate_prop32(&[
         GIC_FDT_IRQ_TYPE_SPI,
-        dev_info.irq() - 32,
+        gic_spi_irq_cell(dev_info.irq()),
         IRQ_TYPE_EDGE_RISING,
     ]);
 
@@ -333,12 +334,9 @@ fn create_serial_node<T: DeviceInfoForFDT + Clone + Debug>(
     dev_info: &T,
 ) -> Result<()> {
     let serial_reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
-    #[cfg(target_os = "linux")]
-    let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq(), IRQ_TYPE_EDGE_RISING]);
-    #[cfg(target_os = "macos")]
     let irq = generate_prop32(&[
         GIC_FDT_IRQ_TYPE_SPI,
-        dev_info.irq() - 32,
+        gic_spi_irq_cell(dev_info.irq()),
         IRQ_TYPE_EDGE_RISING,
     ]);
 
@@ -360,10 +358,11 @@ fn create_rtc_node<T: DeviceInfoForFDT + Clone + Debug>(
 ) -> Result<()> {
     let compatible = b"arm,pl031\0arm,primecell\0";
     let rtc_reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
-    #[cfg(target_os = "linux")]
-    let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq(), IRQ_TYPE_LEVEL_HI]);
-    #[cfg(target_os = "macos")]
-    let irq = generate_prop32(&[GIC_FDT_IRQ_TYPE_SPI, dev_info.irq() - 32, IRQ_TYPE_LEVEL_HI]);
+    let irq = generate_prop32(&[
+        GIC_FDT_IRQ_TYPE_SPI,
+        gic_spi_irq_cell(dev_info.irq()),
+        IRQ_TYPE_LEVEL_HI,
+    ]);
     let rtc_node = fdt.begin_node(&format!("rtc@{:x}", dev_info.addr()))?;
     fdt.property("compatible", compatible)?;
     fdt.property("reg", &rtc_reg_prop)?;
@@ -384,7 +383,7 @@ fn create_gpio_node<T: DeviceInfoForFDT + Clone + Debug>(
     let gpio_reg_prop = generate_prop64(&[dev_info.addr(), dev_info.length()]);
     let irq = generate_prop32(&[
         GIC_FDT_IRQ_TYPE_SPI,
-        dev_info.irq() - 32,
+        gic_spi_irq_cell(dev_info.irq()),
         IRQ_TYPE_EDGE_RISING,
     ]);
 

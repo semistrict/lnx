@@ -1,5 +1,5 @@
 import { createServer } from "node:net";
-import { assertContains, assertEq, cleanupContext, defaultContext, lnx, prepareContext, run, skip, sleep, spawn, testStep } from "./lib";
+import { assertContains, assertEq, cleanupContext, cleanupInstance, defaultContext, lnx, prepareContext, run, skip, sleep, spawn, testStep, waitForOwnerExit } from "./lib";
 
 const ctx = defaultContext("browser-snapshot");
 const forkName = `${ctx.instance}-browser-fork`;
@@ -25,13 +25,13 @@ async function waitForCdp(port: number): Promise<string> {
   let lastError = "";
   for (let i = 0; i < 90; i++) {
     try {
-      const response = await fetch(listUrl);
+      const response = await fetch(listUrl, { headers: { Connection: "close" } });
       if (response.ok) {
         const targets = await response.json() as Array<{ type?: string; webSocketDebuggerUrl?: string }>;
         const page = targets.find((target) => target.type === "page" && target.webSocketDebuggerUrl);
         if (page?.webSocketDebuggerUrl) return page.webSocketDebuggerUrl;
       }
-      const created = await fetch(newUrl, { method: "PUT" });
+      const created = await fetch(newUrl, { method: "PUT", headers: { Connection: "close" } });
       if (created.ok) {
         const target = await created.json() as { webSocketDebuggerUrl?: string };
         if (target.webSocketDebuggerUrl) return target.webSocketDebuggerUrl;
@@ -147,10 +147,16 @@ try {
   await run(["rm", "-rf", `${ctx.base}/instances/${forkName}`, `${ctx.base}/instances/${forkName}`], { check: false });
 
   await testStep("install stock browser stack", async () => {
+    await lnx(ctx, [
+      "bash",
+      "-lc",
+      "if [ -s /etc/apt/sources.list ] && [ -s /etc/apt/sources.list.d/ubuntu.sources ]; then sudo mv /etc/apt/sources.list /etc/apt/sources.list.lnx-disabled; fi",
+    ], { timeoutMs: 120_000 });
     await lnx(ctx, ["sudo", "apt-get", "update"], { timeoutMs: 300_000 });
     await lnx(ctx, ["bash", "-lc", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y snapd squashfs-tools cage wayvnc novnc websockify"], { timeoutMs: 600_000 });
     await lnx(ctx, ["sudo", "systemctl", "enable", "--now", "snapd.socket"], { timeoutMs: 120_000 });
     await lnx(ctx, ["bash", "-lc", "sudo systemctl start snapd.service || true"], { timeoutMs: 120_000 });
+    await lnx(ctx, ["sudo", "timeout", "300s", "snap", "wait", "system", "seed.loaded"], { timeoutMs: 360_000 });
     await lnx(ctx, ["sudo", "snap", "install", "chromium"], { timeoutMs: 900_000 });
     const version = await lnx(ctx, ["/snap/bin/chromium", "--version"], { timeoutMs: 120_000 });
     assertContains(version.stdout, "Chromium", "snap chromium installed");
@@ -182,6 +188,7 @@ pkill websockify 2>/dev/null || true
 pkill cage 2>/dev/null || true
 pkill chromium 2>/dev/null || true
 rm -f "$XDG_RUNTIME_DIR"/wayland-*.lock "$XDG_RUNTIME_DIR"/wayland-[0-9] /tmp/lnx-cage.log /tmp/lnx-wayvnc.log /tmp/lnx-websockify.log
+rm -f /tmp/lnx-browser-test-done
 trap 'pkill wayvnc 2>/dev/null || true; pkill websockify 2>/dev/null || true; pkill cage 2>/dev/null || true' EXIT
 cage -- /snap/bin/chromium --no-sandbox --disable-gpu --disable-dev-shm-usage --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir=/tmp/lnx-browser-profile --ozone-platform=wayland --window-size=1280,800 https://example.com >/tmp/lnx-cage.log 2>&1 &
 for i in $(seq 1 100); do
@@ -223,7 +230,7 @@ sudo systemctl restart lnx-browser-test.service
 for i in $(seq 1 30); do
   if curl -fsS http://127.0.0.1:6080/vnc.html | grep -i novnc >/dev/null && curl -fsS http://127.0.0.1:9222/json/version | grep -i webSocketDebuggerUrl >/dev/null; then
     echo LNX_BROWSER_READY
-    sleep 120
+    while [ ! -e /tmp/lnx-browser-test-done ]; do sleep 0.2; done
     exit 0
   fi
   sleep 1
@@ -234,14 +241,21 @@ exit 1
 `,
     ]);
     let checkpointCreated = false;
+    let ownerReady = false;
     try {
       await waitForProcessOutput(owner, "LNX_BROWSER_READY", 240_000);
+      ownerReady = true;
       await interactWithBrowserOverCdp(cdpPort);
       assertEq((await run([ctx.lnxBin, "--instance", ctx.instance, "checkpoint", "-m", "browser-ready"], { timeoutMs: 240_000 })).stdout, "browser-ready", "browser checkpoint");
       checkpointCreated = true;
     } finally {
+      if (ownerReady) {
+        await run([ctx.lnxBin, "--instance", ctx.instance, "touch", "/tmp/lnx-browser-test-done"], { timeoutMs: 120_000, check: false }).catch(() => {});
+        await Promise.race([owner.exited.catch(() => {}), sleep(10_000)]);
+      }
       owner.kill("SIGTERM");
       await owner.exited.catch(() => {});
+      await waitForOwnerExit(ctx, 90_000);
     }
     assertEq(checkpointCreated, true, "browser checkpoint created");
   });
@@ -253,7 +267,7 @@ exit 1
   });
 } finally {
   await cleanupContext(ctx);
-  await run(["rm", "-rf", `${ctx.base}/instances/${forkName}`, `${ctx.base}/instances/${forkName}`], { check: false });
+  await cleanupInstance(ctx, forkName);
 }
 
 process.exit(0);

@@ -4,7 +4,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use utils::eventfd::EventFd;
-use vm_memory::{Address, Bytes, GuestMemoryMmap};
+#[cfg(target_os = "macos")]
+use vm_memory::Address;
+use vm_memory::{Bytes, GuestMemoryMmap};
 
 use super::defs;
 use super::defs::uapi;

@@ -1,7 +1,9 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_ulong, c_void};
+use std::fmt;
 use std::io::{Error, Read, Write};
 use std::mem::size_of;
 use std::net::{Shutdown, TcpStream};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +26,8 @@ const EINTR: c_int = 4;
 const EAGAIN: c_int = 11;
 const ECHILD: c_int = 10;
 const EIO: c_int = 5;
+const EINVAL: c_int = 22;
+const ENOTTY: c_int = 25;
 const F_GETFD: c_int = 1;
 const F_SETFD: c_int = 2;
 const F_GETFL: c_int = 3;
@@ -41,6 +45,9 @@ const POLLHUP: i16 = 0x0010;
 const POLLNVAL: i16 = 0x0020;
 const TIOCSCTTY: c_ulong = 0x540e;
 const TIOCSWINSZ: c_ulong = 0x5414;
+// From Linux <linux/random.h>: _IOW('R', 0x03, int[2]) and _IO('R', 0x07).
+const RNDADDENTROPY: c_ulong = 0x4008_5203;
+const RNDRESEEDCRNG: c_ulong = 0x5207;
 const CLOCK_REALTIME: c_int = 0;
 const MS_RDONLY: c_ulong = 1;
 const MS_BIND: c_ulong = 4096;
@@ -60,12 +67,15 @@ const OLD_SERVICE_PATH: &str = "/etc/systemd/system/lnx-agent.service";
 const OLD_WANTS_LINK: &str = "/etc/systemd/system/multi-user.target.wants/lnx-agent.service";
 const CONTROL_SOCKET: &str = "/run/lnx-agent.sock";
 const CONTROL_SOCKET_ENV: &str = "LNX_CONTROL_SOCKET";
+const VMSTATE_RESEED_MARKER: &str = "/run/lnx-vmstate-reseed";
 const SERVICE_PATH: &str = "/run/systemd/system/lnx-agent.service";
 const WANTS_DIR: &str = "/run/systemd/system/multi-user.target.wants";
 const WANTS_LINK: &str = "/run/systemd/system/multi-user.target.wants/lnx-agent.service";
 const WANTS_LINK_C: &[u8] =
     b"/newroot/run/systemd/system/multi-user.target.wants/lnx-agent.service\0";
 const SNAPSHOT_RESUME_READ_TIMEOUT_USECS: i64 = 500_000;
+const RESTORE_ENTROPY_MIN_BYTES: usize = 32;
+const RESTORE_ENTROPY_MAX_BYTES: usize = 1024;
 
 enum ChannelInput {
     Data(Vec<u8>),
@@ -130,6 +140,14 @@ struct PollFd {
     revents: i16,
 }
 
+#[repr(C)]
+struct RandPoolInfo {
+    entropy_count: c_int,
+    buf_size: c_int,
+    // The kernel treats this as a flexible byte payload after the two ints.
+    buf: [u8; RESTORE_ENTROPY_MAX_BYTES],
+}
+
 unsafe extern "C" {
     fn accept(fd: c_int, addr: *mut Sockaddr, len: *mut c_uint) -> c_int;
     fn bind(fd: c_int, addr: *const Sockaddr, len: c_uint) -> c_int;
@@ -189,16 +207,23 @@ fn errno() -> c_int {
     Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        log_line(format_args!($($arg)*));
+    }};
+}
+
 fn die(msg: &str) -> ! {
-    log(&format!("{msg}: {}", Error::last_os_error()));
+    log!("{msg}: {}", Error::last_os_error());
     unsafe { _exit(125) }
 }
 
-fn log(msg: &str) {
-    write_all(STDERR_FILENO, b"lnx-agent: ");
-    write_all(STDERR_FILENO, msg.as_bytes());
-    write_all(STDERR_FILENO, b"\n");
-    let _ = fs::write("/dev/kmsg", format!("lnx-agent: {msg}\n"));
+fn log_line(args: fmt::Arguments<'_>) {
+    let mut line = String::from("lnx-agent: ");
+    let _ = fmt::write(&mut line, args);
+    line.push('\n');
+    write_all(STDERR_FILENO, line.as_bytes());
+    let _ = fs::write("/dev/kmsg", line);
 }
 
 fn cstr(bytes: &[u8]) -> *const c_char {
@@ -243,7 +268,66 @@ fn mount_host_shares() {
     }
 }
 
-fn restore_sync_guest_caches() -> Result<(), String> {
+fn restore_sync_guest_entropy(entropy: &[u8]) -> Result<(), String> {
+    if entropy.len() < RESTORE_ENTROPY_MIN_BYTES {
+        return Err(format!(
+            "restore entropy too short: {} bytes, need at least {RESTORE_ENTROPY_MIN_BYTES}",
+            entropy.len()
+        ));
+    }
+    if entropy.len() > RESTORE_ENTROPY_MAX_BYTES {
+        return Err(format!(
+            "restore entropy too large: {} bytes, max {RESTORE_ENTROPY_MAX_BYTES}",
+            entropy.len()
+        ));
+    }
+
+    let random = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/random")
+        .map_err(|e| format!("open /dev/random after restore: {e}"))?;
+    let mut info = RandPoolInfo {
+        entropy_count: (entropy.len() * 8)
+            .try_into()
+            .map_err(|_| "restore entropy bit count overflows int".to_string())?,
+        buf_size: entropy
+            .len()
+            .try_into()
+            .map_err(|_| "restore entropy size overflows int".to_string())?,
+        buf: [0; RESTORE_ENTROPY_MAX_BYTES],
+    };
+    info.buf[..entropy.len()].copy_from_slice(entropy);
+
+    if unsafe {
+        ioctl(
+            random.as_raw_fd(),
+            RNDADDENTROPY,
+            &info as *const RandPoolInfo,
+        )
+    } < 0
+    {
+        return Err(format!(
+            "RNDADDENTROPY after restore: {}",
+            Error::last_os_error()
+        ));
+    }
+
+    if unsafe { ioctl(random.as_raw_fd(), RNDRESEEDCRNG, 0) } < 0 {
+        let err = Error::last_os_error();
+        match err.raw_os_error() {
+            Some(EINVAL) | Some(ENOTTY) => {}
+            _ => return Err(format!("RNDRESEEDCRNG after restore: {err}")),
+        }
+    }
+
+    fs::write(VMSTATE_RESEED_MARKER, b"ok\n")
+        .map_err(|e| format!("write {VMSTATE_RESEED_MARKER}: {e}"))?;
+    Ok(())
+}
+
+fn restore_sync_guest_caches(entropy: &[u8]) -> Result<(), String> {
+    restore_sync_guest_entropy(entropy)?;
     unsafe {
         sync();
     }
@@ -406,7 +490,7 @@ fn init_mode() -> ! {
     };
     let root_device = env::var("LNX_ROOT_DEVICE").unwrap_or_else(|_| "/dev/pmem0".to_string());
     if !wait_for_path(&root_device) {
-        log(&format!("timed out waiting for {root_device}"));
+        log!("timed out waiting for {root_device}");
     }
     let root_device =
         CString::new(root_device).unwrap_or_else(|_| CString::new("/dev/pmem0").unwrap());
@@ -455,7 +539,7 @@ fn init_mode() -> ! {
         ("/lnxctl", format!("/newroot{LNXCTL_PATH}")),
     ] {
         if let Err(e) = fs::write(&target, []) {
-            log(&format!("create bind target {target}: {e}"));
+            log!("create bind target {target}: {e}");
             unsafe { _exit(125) }
         }
         let source = CString::new(source).unwrap();
@@ -473,31 +557,33 @@ fn init_mode() -> ! {
             die("bind mount lnx payload");
         }
         if let Err(e) = fs::set_permissions(&target, fs::Permissions::from_mode(0o755)) {
-            log(&format!("chmod bind target {target}: {e}"));
+            log!("chmod bind target {target}: {e}");
             unsafe { _exit(125) }
         }
     }
     let lnxctl_link = CString::new(format!("/newroot{OLD_LNXCTL_PATH}")).unwrap();
     let _ = unsafe { symlink(cstr(b"/run/lnx/lnxctl\0"), lnxctl_link.as_ptr()) };
 
-    let unit = "[Unit]\n\
-Description=lnx guest agent\n\
-After=basic.target\n\
-Before=multi-user.target\n\
-\n\
-[Service]\n\
-Type=simple\n\
-ExecStart=/run/lnx/lnx-agent --agent 10240\n\
-Environment=LNX_CONTROL_SOCKET=/run/lnx-agent.sock\n\
-StandardOutput=journal+console\n\
-StandardError=journal+console\n\
-Restart=always\n\
-RestartSec=1\n\
-\n\
-[Install]\n\
-WantedBy=multi-user.target\n";
+    let unit = concat!(
+        "[Unit]\n",
+        "Description=lnx guest agent\n",
+        "After=basic.target\n",
+        "Before=multi-user.target\n",
+        "\n",
+        "[Service]\n",
+        "Type=simple\n",
+        "ExecStart=/run/lnx/lnx-agent --agent 10240\n",
+        "Environment=LNX_CONTROL_SOCKET=/run/lnx-agent.sock\n",
+        "StandardOutput=journal+console\n",
+        "StandardError=journal+console\n",
+        "Restart=always\n",
+        "RestartSec=1\n",
+        "\n",
+        "[Install]\n",
+        "WantedBy=multi-user.target\n",
+    );
     if let Err(e) = fs::write(format!("/newroot{SERVICE_PATH}"), unit) {
-        log(&format!("write lnx-agent.service: {e}"));
+        log!("write lnx-agent.service: {e}");
         unsafe { _exit(125) }
     }
     let _ = fs::remove_file(format!("/newroot{WANTS_LINK}"));
@@ -598,14 +684,12 @@ WantedBy=multi-user.target\n";
         // systemd reads the unit installed above and supervises the agent.
         Some(init) if init_is_systemd(&init) => exec_init(&init),
         Some(init) => {
-            log(&format!(
-                "image init {init} is not systemd; supervising agent directly"
-            ));
+            log!("image init {init} is not systemd; supervising agent directly");
             spawn_agent_supervisor();
             exec_init(&init)
         }
         None => {
-            log("image ships no init; lnx-agent stays pid 1");
+            log!("image ships no init; lnx-agent stays pid 1");
             run_pid1_supervisor()
         }
     }
@@ -689,10 +773,7 @@ fn spawn_agent_supervisor() {
             unsafe {
                 waitpid(agent, &mut status, 0);
             }
-            log(&format!(
-                "agent exited status={}; restarting",
-                exit_status(status)
-            ));
+            log!("agent exited status={}; restarting", exit_status(status));
         }
         unsafe {
             usleep(1_000_000);
@@ -719,7 +800,7 @@ fn run_pid1_supervisor() -> ! {
 }
 
 fn connect_vsock(port: u32) -> c_int {
-    log(&format!("vsock.connect.begin port={port}"));
+    log!("vsock.connect.begin port={port}");
     for attempt in 0..600 {
         let addr = vsock_addr(port);
         let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
@@ -735,16 +816,14 @@ fn connect_vsock(port: u32) -> c_int {
             )
         };
         if ret == 0 {
-            log(&format!(
-                "vsock.connect.success port={port} attempt={attempt} fd={fd}"
-            ));
+            log!("vsock.connect.success port={port} attempt={attempt} fd={fd}");
             return fd;
         }
         if attempt == 0 || attempt == 599 || attempt % 50 == 49 {
-            log(&format!(
+            log!(
                 "vsock.connect.retry port={port} attempt={attempt} errno={}",
                 errno()
-            ));
+            );
         }
         unsafe {
             close(fd);
@@ -893,26 +972,37 @@ fn set_snapshot_resume_read_timeout(fd: c_int) {
 }
 
 fn snapshot_resume_wait(fd: c_int) {
+    log!("snapshot_resume_wait.begin fd={fd}");
     set_snapshot_resume_read_timeout(fd);
-    let _ = write_all(fd, b"R");
+    let ready_written = write_all(fd, b"R");
+    log!("snapshot_resume_wait.ready_written fd={fd} ok={ready_written}");
     let mut buf = [0u8; 1];
     loop {
         let n = unsafe { read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
         if n < 0 && errno() == EINTR {
             continue;
         }
+        log!(
+            "snapshot_resume_wait.read_done fd={fd} n={n} errno={}",
+            errno()
+        );
         break;
     }
 }
 
 fn request_snapshot_and_reconnect() -> c_int {
+    log!("snapshot_reconnect.begin");
     let fd = connect_vsock(SNAPSHOT_PORT);
+    log!("snapshot_reconnect.snapshot_connected fd={fd}");
     request_snapshot(fd);
     snapshot_resume_wait(fd);
+    log!("snapshot_reconnect.snapshot_wait_done fd={fd}");
     unsafe {
         close(fd);
     }
-    reconnect_after_snapshot_point()
+    let fd = reconnect_after_snapshot_point();
+    log!("snapshot_reconnect.agent_connected fd={fd}");
+    fd
 }
 
 fn reconnect_after_snapshot_point() -> c_int {
@@ -950,11 +1040,11 @@ fn try_read_exact(fd: c_int, mut buf: &mut [u8]) -> bool {
                 }
                 continue;
             }
-            log(&format!("read_exact.error fd={fd} errno={err}"));
+            log!("read_exact.error fd={fd} errno={err}");
             return false;
         }
         if n == 0 {
-            log(&format!("read_exact.eof fd={fd}"));
+            log!("read_exact.eof fd={fd}");
             return false;
         }
         let tmp = buf;
@@ -1335,21 +1425,21 @@ fn log_child_probe(channel_id: u64, pid: c_int) {
         .lines()
         .find(|line| line.starts_with("nonvoluntary_ctxt_switches:"))
         .unwrap_or("nonvoluntary_ctxt_switches: ?");
-    log(&format!(
+    log!(
         "channel.pipe.child_probe channel={channel_id:016x} pid={pid} comm={} wchan={} {} {} {}",
         comm.trim(),
         wchan.trim(),
         state,
         voluntary,
         nonvoluntary
-    ));
+    );
 }
 
 fn send_status(agent_fd: &Arc<Mutex<c_int>>, channel_id: u64, status: c_int) {
-    log(&format!(
+    log!(
         "channel.status.send channel={channel_id:016x} status={}",
         exit_status(status)
-    ));
+    );
     let _ = write_message_locked(
         agent_fd,
         &Message::ExitStatus {
@@ -1609,17 +1699,17 @@ fn run_channel_pty(
             let waited = unsafe { waitpid(pid, &mut status, WNOHANG) };
             if waited == pid || (waited < 0 && errno() == ECHILD) {
                 child_exited = true;
-                log(&format!(
+                log!(
                     "channel.pipe.child_exited channel={channel_id:016x} waited={waited} status={}",
                     exit_status(status)
-                ));
+                );
             } else if waited < 0 {
                 status = 127 << 8;
                 child_exited = true;
-                log(&format!(
+                log!(
                     "channel.pipe.wait_error channel={channel_id:016x} errno={}",
                     errno()
-                ));
+                );
             }
         }
         if child_exited {
@@ -1717,9 +1807,7 @@ fn run_channel_pipe(
         }
         exec_failed(child_exec.argv_ptrs[0]);
     }
-    log(&format!(
-        "channel.pipe.spawned channel={channel_id:016x} pid={pid}"
-    ));
+    log!("channel.pipe.spawned channel={channel_id:016x} pid={pid}");
     unsafe {
         close(stdin_pipe[0]);
         close(stdout_pipe[1]);
@@ -1729,10 +1817,10 @@ fn run_channel_pipe(
     let stdout_read = stdout_pipe[0];
     let stderr_read = stderr_pipe[0];
     if !set_nonblocking(stdout_read) || !set_nonblocking(stderr_read) {
-        log(&format!(
+        log!(
             "channel.pipe.nonblocking_failed channel={channel_id:016x} errno={}",
             errno()
-        ));
+        );
     }
     let control_fd = listen_unix(&control_socket);
     let mut pending_control_fd = -1;
@@ -1779,10 +1867,10 @@ fn run_channel_pipe(
             match input {
                 ChannelInput::Data(bytes) if stdin_write >= 0 => {
                     if !write_all(stdin_write, &bytes) {
-                        log(&format!(
+                        log!(
                             "channel.pipe.stdin.write_failed channel={channel_id:016x} errno={}",
                             errno()
-                        ));
+                        );
                         unsafe {
                             close(stdin_write);
                         }
@@ -1823,9 +1911,7 @@ fn run_channel_pipe(
             }
         }
         if eof_requested.swap(false, Ordering::SeqCst) && stdin_write >= 0 {
-            log(&format!(
-                "channel.pipe.stdin.eof_latched channel={channel_id:016x}"
-            ));
+            log!("channel.pipe.stdin.eof_latched channel={channel_id:016x}");
             unsafe {
                 close(stdin_write);
             }
@@ -1978,9 +2064,9 @@ fn run_channel_tcp(
 }
 
 fn agent_loop() {
-    log("agent.loop.start");
+    log!("agent.loop.start");
     let mut fd = connect_vsock(AGENT_PORT);
-    log(&format!("agent.loop.connected fd={fd}"));
+    log!("agent.loop.connected fd={fd}");
     let agent_fd = Arc::new(Mutex::new(fd));
     let _ = write_message_locked(
         &agent_fd,
@@ -1992,12 +2078,12 @@ fn agent_loop() {
     loop {
         let message = read_message(fd);
         let Some(message) = message else {
-            log(&format!("agent.loop.read_closed fd={fd}; reconnecting"));
+            log!("agent.loop.read_closed fd={fd}; reconnecting");
             unsafe {
                 close(fd);
             }
             fd = reconnect_after_snapshot_point();
-            log(&format!("agent.loop.reconnected fd={fd}"));
+            log!("agent.loop.reconnected fd={fd}");
             if let Ok(mut shared) = agent_fd.lock() {
                 *shared = fd;
             }
@@ -2078,26 +2164,20 @@ fn agent_loop() {
             Message::Data { channel_id, bytes } => {
                 if let Some((_, state)) = channels.iter().find(|(id, _)| *id == channel_id) {
                     if state.tx.send(ChannelInput::Data(bytes)).is_err() {
-                        log(&format!(
-                            "channel.data.send_failed channel={channel_id:016x}"
-                        ));
+                        log!("channel.data.send_failed channel={channel_id:016x}");
                     }
                 } else {
-                    log(&format!(
-                        "channel.data.no_channel channel={channel_id:016x}"
-                    ));
+                    log!("channel.data.no_channel channel={channel_id:016x}");
                 }
             }
             Message::Eof { channel_id } => {
                 if let Some((_, state)) = channels.iter().find(|(id, _)| *id == channel_id) {
                     state.eof_requested.store(true, Ordering::SeqCst);
                     if state.tx.send(ChannelInput::Eof).is_err() {
-                        log(&format!(
-                            "channel.eof.send_failed channel={channel_id:016x}"
-                        ));
+                        log!("channel.eof.send_failed channel={channel_id:016x}");
                     }
                 } else {
-                    log(&format!("channel.eof.no_channel channel={channel_id:016x}"));
+                    log!("channel.eof.no_channel channel={channel_id:016x}");
                 }
             }
             Message::WindowResize {
@@ -2125,7 +2205,10 @@ fn agent_loop() {
                     let _ = state.tx.send(ChannelInput::SnapshotFailed);
                 }
             }
-            Message::RestoreSync { channel_id } => match restore_sync_guest_caches() {
+            Message::RestoreSync {
+                channel_id,
+                entropy,
+            } => match restore_sync_guest_caches(&entropy) {
                 Ok(()) => {
                     let _ = write_message_locked(&agent_fd, &Message::RestoreSynced { channel_id });
                 }

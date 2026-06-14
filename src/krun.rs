@@ -113,6 +113,7 @@ impl Context {
         self.set_host_virtiofs_write_allowlist_cstr(&tag, write_allowlist)
     }
 
+    #[allow(dead_code)]
     pub fn set_host_virtiofs_write_allowlist(&self, tag: &str, paths: &[String]) -> Result<()> {
         let tag = CString::new(tag)?;
         self.set_host_virtiofs_write_allowlist_cstr(&tag, paths)

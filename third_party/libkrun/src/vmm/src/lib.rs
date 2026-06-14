@@ -30,6 +30,8 @@ mod linux;
 use crate::linux::vstate;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "aarch64"))]
+mod snapshot_metadata;
 mod terminal;
 pub mod worker;
 
@@ -410,6 +412,15 @@ impl Vmm {
                 .map_err(|e| format!("base=0x{base:x}: post vcpu restore: {e}"))?;
         }
         Ok(())
+    }
+
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
+    pub fn replay_restore_notifications(&mut self) {
+        for (_, transport) in self.mmio_device_manager.virtio_transports() {
+            let transport = transport.lock().unwrap();
+            transport.replay_queue_notifications();
+            transport.replay_pending_interrupt();
+        }
     }
 
     #[cfg(target_os = "macos")]

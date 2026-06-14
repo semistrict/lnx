@@ -15,29 +15,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use hvf::DirtyBlock;
-use serde::{Deserialize, Serialize};
 use vm_memory::mmap::{GuestRegionMmap, MmapRegionBuilder};
 use vm_memory::{
     Address, Bytes, FileOffset, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
 };
 
+pub use crate::snapshot_metadata::{RamLayout, RamRegion};
+
 use super::{Result, SnapshotError, pages_img_path, snapshot_sync_enabled};
-
-/// Description of one guest memory region as preserved in the snapshot.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RamRegion {
-    pub guest_addr: u64,
-    pub size: u64,
-    /// Offset within `pages.img`.
-    pub file_offset: u64,
-}
-
-/// Snapshot of the guest's memory layout. The actual page contents live in
-/// the sibling pages.img file.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RamLayout {
-    pub regions: Vec<RamRegion>,
-}
 
 pub fn write_full_pages_img(
     mem: &GuestMemoryMmap,

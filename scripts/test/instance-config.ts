@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertContains,
@@ -53,6 +53,10 @@ try {
   });
 
   await testStep("explicit flags override persisted settings", async () => {
+    const mismatch = await lnx(ctx, ["--cpus", "2", "nproc"], { check: false });
+    assertEq(mismatch.status === 0, false, "incompatible snapshot rejects restore");
+    assertContains(mismatch.stderr, "snapshot VM config mismatch", "snapshot mismatch is explicit");
+    await rm(join(ctx.snapshotDir, "latest"), { recursive: true, force: true });
     assertEq(
       (await lnx(ctx, ["--cpus", "2", "nproc"])).stdout,
       "2",
@@ -85,7 +89,7 @@ try {
     assertEq(inspect.memory_mib, 2048, "inspect effective memory");
     assertEq(inspect.settings.cpus, 1, "inspect persisted cpus");
     assertEq(inspect.settings.memory_mib, 2048, "inspect persisted memory");
-    assertEq(inspect.image, "release:images-v0.2.0", "inspect image source");
+    assertEq(inspect.image, "release:images-v0.4.0", "inspect image source");
     assertEq(inspect.checkpoints, 0, "inspect checkpoint count");
     assertEq(inspect.rootfs, ctx.imageDir + "/rootfs.ext4", "inspect rootfs path");
     assertEq(typeof inspect.created, "string", "inspect created timestamp");

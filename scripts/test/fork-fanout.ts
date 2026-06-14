@@ -1,4 +1,3 @@
-import { join } from "node:path";
 import { cleanupContext, cleanupInstance, defaultContext, lnx, prepareContext, run, assertEq, testStep } from "./lib";
 
 const ctx = defaultContext("fork-fanout");
@@ -32,6 +31,29 @@ try {
         assertEq(read.stdout, "base/base-memory", `fork ${i} restored base`);
         await run([ctx.lnxBin, "--instance", fork, "bash", "-lc", `printf fork-${i} | sudo tee /root/fanout-marker >/dev/null`]);
       }),
+    );
+    const entropyReads = await Promise.all(
+      forks.map((fork) =>
+        run([
+          ctx.lnxBin,
+          "--instance",
+          fork,
+          "bash",
+          "-lc",
+          String.raw`test -s /run/lnx-vmstate-reseed
+python3 - <<'PY'
+import hashlib
+import os
+
+print(hashlib.sha256(os.getrandom(64) + open("/dev/urandom", "rb").read(64)).hexdigest())
+PY`,
+        ]),
+      ),
+    );
+    assertEq(
+      new Set(entropyReads.map((read) => read.stdout)).size,
+      forks.length,
+      "fork restore entropy probes are unique",
     );
     const source = await lnx(ctx, ["sudo", "cat", "/root/fanout-marker"]);
     assertEq(source.stdout, "base", "source checkpoint clone not mutated by forks");

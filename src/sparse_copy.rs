@@ -133,7 +133,7 @@ fn is_large_sparse_image(len: u64, allocated: u64) -> bool {
     len >= LARGE_SPARSE_IMAGE_BYTES && allocated <= len / 2
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn cloned_destination_is_sparse_safe(path: &Path, len: u64) -> Result<bool> {
     let allocated = fs::metadata(path)
         .with_context(|| format!("stat {}", path.display()))?

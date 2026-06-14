@@ -30,6 +30,7 @@ pub(crate) struct WritableAllowlistFs<T> {
 }
 
 impl<T: FileSystem<Inode = Inode, Handle = Handle>> WritableAllowlistFs<T> {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn new(inner: T, allowlist: Arc<RwLock<Vec<PathBuf>>>) -> Self {
         Self {
             inner,

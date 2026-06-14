@@ -260,7 +260,7 @@ try {
     }
   }
   const vmstate = await Bun.file(join(snapshot, "vmstate.bin")).arrayBuffer();
-  assertEq(new DataView(vmstate).getUint32(8, true), 3, "source snapshot is Linux vmstate v3");
+  assertEq(new DataView(vmstate).getUint32(8, true), 4, "source snapshot is shared vmstate v4");
   const sharesStamp = await Bun.file(join(snapshot, "shares.stamp")).text();
   assertContains(sharesStamp, "host-shares=disabled-v1", "source snapshot has host shares disabled");
   assertContains(sharesStamp, "net=gvproxy", "source snapshot uses portable gvproxy backing");

@@ -247,7 +247,17 @@ impl VsockMuxer {
             .unwrap()
             .values()
             .filter_map(|proxy| proxy.lock().unwrap().stream_connection_ports())
+            .filter(|(local_port, _)| self.should_snapshot_stream_connection(*local_port))
             .collect()
+    }
+
+    fn should_snapshot_stream_connection(&self, local_port: u32) -> bool {
+        !matches!(
+            self.unix_ipc_port_map
+                .as_ref()
+                .and_then(|ipc_map| ipc_map.get(&local_port)),
+            Some((_, false))
+        )
     }
 
     pub fn queue_stream_resets(&self, connections: &[(u32, u32)]) -> bool {
@@ -906,5 +916,25 @@ impl VsockMuxer {
             _ => warn!("stream: unhandled op={}", pkt.op()),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_resets_skip_runtime_unix_connectors() {
+        let mut ipc_map = HashMap::new();
+        ipc_map.insert(10240, (PathBuf::from("/tmp/lnx-agent.sock"), false));
+        ipc_map.insert(10241, (PathBuf::from("/tmp/lnx-snapshot.sock"), false));
+        ipc_map.insert(10443, (PathBuf::from("/tmp/listener.sock"), true));
+
+        let muxer = VsockMuxer::new(3, None, Some(ipc_map), TsiFlags::empty());
+
+        assert!(!muxer.should_snapshot_stream_connection(10240));
+        assert!(!muxer.should_snapshot_stream_connection(10241));
+        assert!(muxer.should_snapshot_stream_connection(10443));
+        assert!(muxer.should_snapshot_stream_connection(55555));
     }
 }

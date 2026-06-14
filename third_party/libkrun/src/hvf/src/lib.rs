@@ -493,7 +493,7 @@ fn dirty_tracking_handle_write_fault(pa: u64) -> Result<bool, Error> {
             )
         };
         if DIRTY_FAULT_DEBUG_LOGS.fetch_add(1, Ordering::Relaxed) < 200 {
-            warn!(
+            debug!(
                 "dirty.debug write_fault pa=0x{pa:x} region=0x{:x}+0x{:x} block_index={} block=0x{block_addr:x}+0x{block_size:x} ret={ret}",
                 region.guest_addr, region.size, block_index
             );

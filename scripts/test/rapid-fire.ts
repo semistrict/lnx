@@ -45,6 +45,7 @@ try {
     assertEq(existsSync(join(ctx.runDir, "broker.sock")), false, "broker exits after the grace period");
     assertEq(existsSync(join(ctx.snapshotDir, "latest", "vmstate.bin")), true, "suspend wrote the snapshot");
     assertEq((await lnx(ctx, ["cat", "/tmp/rapid-fire"])).stdout, "marker", "snapshot captured pre-suspend state");
+    assertEq((await lnx(ctx, ["cat", "/run/lnx-vmstate-reseed"])).stdout, "ok", "ordinary restore reseeded guest rng");
     await waitForVmSuspend(ctx, 120_000);
   });
 } finally {

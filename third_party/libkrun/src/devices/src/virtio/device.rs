@@ -235,6 +235,14 @@ pub trait VirtioDevice: AsAny + Send {
         self.resume()
     }
 
+    /// Prepare for the provisional activation used while restoring queues.
+    ///
+    /// Some asynchronous backends can receive host-side events immediately on
+    /// activation. During restore, the transport queues are available before
+    /// the device payload is rewound, so those backends must defer queue work
+    /// until the caller applies the captured device state.
+    fn prepare_restore_activation(&mut self) {}
+
     /// Finalize restore after all devices, irqchip, and vCPUs have had their
     /// captured state applied.
     fn post_restore(&mut self) -> Result<(), DeviceSnapshotError> {

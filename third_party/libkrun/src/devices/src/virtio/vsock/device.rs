@@ -440,7 +440,7 @@ impl VirtioDevice for Vsock {
         if self.muxer.has_pending_rx() {
             raise_irq |= self.process_stream_rx();
         }
-        if wrote_reset_event {
+        if wrote_reset_event || self.pending_transport_reset {
             self.restore_kick_pending = true;
         }
         let after_rx = self.rx_queue_restore_state();
@@ -458,7 +458,8 @@ impl VirtioDevice for Vsock {
     }
 
     fn post_vcpu_restore(&mut self) -> Result<(), DeviceSnapshotError> {
-        if !self.restore_kick_pending {
+        let wrote_reset_event = self.process_transport_reset_event();
+        if !self.restore_kick_pending && !wrote_reset_event {
             return Ok(());
         }
         self.restore_kick_pending = false;

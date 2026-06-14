@@ -26,17 +26,22 @@ use log::info;
 use crossbeam_channel::RecvTimeoutError;
 use devices::legacy::{
     GicV3, GicV3State, IrqChip, LinuxGicDistReg, LinuxGicDistRestorePhase, VcpuList, VcpuListState,
+    gic::GICDevice,
 };
 use devices::virtio::{Descriptor, DeviceSnapshot, MmioTransport, MmioTransportState, QueueState};
 use serde::{Deserialize, Serialize};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
+pub(crate) use crate::snapshot_metadata::MetaSection;
+use crate::snapshot_metadata::{
+    self, GUEST_ARCH_AARCH64, GicTopology, PAUTH_POLICY_NOPAUTH, SOURCE_BACKEND_HVF,
+    SnapshotFormat, TOPOLOGY_HASH_VERSION, VirtioTopology,
+};
 use crate::vstate::KvmGicVcpuState;
 
-use super::container::{SectionId, SnapshotFormat, SnapshotWriter};
+use super::container::{SectionId, SnapshotWriter};
 use super::ram::{
-    RamLayout, clone_and_patch_dirty_pages_img, clone_pages_image, patch_dirty_pages_img,
-    write_full_pages_img,
+    clone_and_patch_dirty_pages_img, clone_pages_image, patch_dirty_pages_img, write_full_pages_img,
 };
 use super::{Result, SnapshotError};
 
@@ -52,20 +57,6 @@ static PREPATCH_WORKERS: LazyLock<Mutex<HashMap<PathBuf, PrepatchWorker>>> =
 struct PrepatchWorker {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
-}
-
-/// Top-level meta section: layout + acked-features-ish per-device summary
-/// (the per-device payloads carry the device-specific detail).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MetaSection {
-    pub ram: RamLayout,
-    /// MMIO base addresses, in registration order. The orchestrator emits
-    /// one VirtioMmio section per entry with `index = position in this list`.
-    pub virtio_bases: Vec<u64>,
-    pub vcpu_count: u32,
-    pub nested_enabled: bool,
-    /// `CNTVCT_EL0` at capture, for timer re-arm on restore.
-    pub capture_mach_time: u64,
 }
 
 /// Snapshot of a single virtio-mmio device: transport-side state + the
@@ -219,6 +210,131 @@ fn cntvct_el0() -> u64 {
         fn mach_absolute_time() -> u64;
     }
     unsafe { mach_absolute_time() }
+}
+
+fn topology_hash_for(
+    ram_ranges: &[(u64, u64)],
+    vcpu_count: u32,
+    nested_enabled: bool,
+    gic: Option<&GicTopology>,
+    virtio: &[VirtioTopology],
+) -> [u8; 32] {
+    snapshot_metadata::compute_topology_hash(ram_ranges, vcpu_count, nested_enabled, gic, virtio)
+}
+
+fn gic_topology(inputs: &CaptureInputs<'_>) -> Option<GicTopology> {
+    inputs.irqchip.map(|irqchip| {
+        let irqchip = irqchip.lock().unwrap();
+        GicTopology {
+            compatibility: irqchip.fdt_compatibility(),
+            version: irqchip.version(),
+            maint_irq: irqchip.fdt_maint_irq(),
+            vcpu_count: irqchip.vcpu_count(),
+            properties: irqchip.device_properties(),
+        }
+    })
+}
+
+fn virtio_topology(inputs: &CaptureInputs<'_>) -> Vec<VirtioTopology> {
+    inputs
+        .virtio_transports
+        .iter()
+        .map(|(base, transport_arc)| {
+            let transport = transport_arc.lock().unwrap();
+            VirtioTopology {
+                mmio_base: *base,
+                device_name: transport.locked_device().device_name().to_string(),
+            }
+        })
+        .collect()
+}
+
+fn validate_snapshot_meta(
+    inputs: &CaptureInputs<'_>,
+    meta: &MetaSection,
+) -> Result<SnapshotFormat> {
+    let source_format = meta.source_format().ok_or_else(|| {
+        SnapshotError::ConfigMismatch(format!(
+            "unsupported snapshot source backend {}",
+            meta.source_backend
+        ))
+    })?;
+    if meta.vcpu_count != inputs.vcpu_handles.len() as u32 {
+        return Err(SnapshotError::ConfigMismatch(format!(
+            "snapshot vcpu_count {} != configured {}",
+            meta.vcpu_count,
+            inputs.vcpu_handles.len()
+        )));
+    }
+    if meta.nested_enabled != inputs.nested_enabled {
+        return Err(SnapshotError::ConfigMismatch(
+            "nested_enabled differs between snapshot and current ctx".into(),
+        ));
+    }
+    if meta.guest_arch != GUEST_ARCH_AARCH64 {
+        return Err(SnapshotError::ConfigMismatch(format!(
+            "snapshot guest_arch {} != {GUEST_ARCH_AARCH64}",
+            meta.guest_arch
+        )));
+    }
+    if meta.pauth_policy != PAUTH_POLICY_NOPAUTH {
+        return Err(SnapshotError::ConfigMismatch(format!(
+            "snapshot pauth policy {} != {PAUTH_POLICY_NOPAUTH}",
+            meta.pauth_policy
+        )));
+    }
+    if meta.topology_hash_version != TOPOLOGY_HASH_VERSION {
+        return Err(SnapshotError::ConfigMismatch(format!(
+            "snapshot topology hash version {} != {TOPOLOGY_HASH_VERSION}",
+            meta.topology_hash_version
+        )));
+    }
+    let snapshot_ranges = snapshot_metadata::ram_ranges_from_layout(&meta.ram);
+    let snapshot_hash = topology_hash_for(
+        &snapshot_ranges,
+        meta.vcpu_count,
+        meta.nested_enabled,
+        meta.gic_topology.as_ref(),
+        &meta.virtio_topology,
+    );
+    if meta.topology_hash != snapshot_hash {
+        return Err(SnapshotError::ConfigMismatch(format!(
+            "snapshot topology hash {} does not match snapshot metadata {}",
+            snapshot_metadata::hash_hex(&meta.topology_hash),
+            snapshot_metadata::hash_hex(&snapshot_hash)
+        )));
+    }
+    let current_gic = gic_topology(inputs);
+    let current_virtio = virtio_topology(inputs);
+    let current_hash = topology_hash_for(
+        inputs.ram_ranges,
+        inputs.vcpu_handles.len() as u32,
+        inputs.nested_enabled,
+        current_gic.as_ref(),
+        &current_virtio,
+    );
+    if meta.topology_hash != current_hash {
+        return Err(SnapshotError::ConfigMismatch(format!(
+            "snapshot topology hash {} differs from current VM {}; snapshot {}; current {}",
+            snapshot_metadata::hash_hex(&meta.topology_hash),
+            snapshot_metadata::hash_hex(&current_hash),
+            snapshot_metadata::topology_summary(
+                &snapshot_ranges,
+                meta.vcpu_count,
+                meta.nested_enabled,
+                meta.gic_topology.as_ref(),
+                &meta.virtio_topology
+            ),
+            snapshot_metadata::topology_summary(
+                inputs.ram_ranges,
+                inputs.vcpu_handles.len() as u32,
+                inputs.nested_enabled,
+                current_gic.as_ref(),
+                &current_virtio
+            )
+        )));
+    }
+    Ok(source_format)
 }
 
 /// Capture a complete snapshot into a staging directory, then publish it to `dir`.
@@ -440,12 +556,28 @@ where
             }
         }
 
+        let gic_topology = gic_topology(inputs);
+        let virtio_topology = virtio_topology(inputs);
+        let topology_hash = topology_hash_for(
+            inputs.ram_ranges,
+            inputs.vcpu_handles.len() as u32,
+            inputs.nested_enabled,
+            gic_topology.as_ref(),
+            &virtio_topology,
+        );
         let meta = MetaSection {
             ram,
             virtio_bases: virtio_sections.iter().map(|s| s.mmio_base).collect(),
             vcpu_count: inputs.vcpu_handles.len() as u32,
             nested_enabled: inputs.nested_enabled,
-            capture_mach_time,
+            source_backend: SOURCE_BACKEND_HVF.to_string(),
+            capture_timer_counter: capture_mach_time,
+            topology_hash_version: TOPOLOGY_HASH_VERSION,
+            topology_hash,
+            gic_topology,
+            virtio_topology,
+            guest_arch: GUEST_ARCH_AARCH64.to_string(),
+            pauth_policy: PAUTH_POLICY_NOPAUTH.to_string(),
         };
 
         let mut writer = SnapshotWriter::new(total_ram, ram_base, meta.vcpu_count);
@@ -523,6 +655,7 @@ fn prepatch_dir(dir: &Path) -> PathBuf {
     }
 }
 
+#[allow(dead_code)]
 fn start_prepatch_worker(dir: &Path, mem: &GuestMemoryMmap, ram_ranges: &[(u64, u64)]) {
     if !prepatch_enabled() || !dir.join(super::PAGES_IMG).exists() {
         return;
@@ -876,21 +1009,10 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
         meta.ram.regions.iter().map(|r| r.size).sum::<u64>(),
         meta.virtio_bases.len()
     );
-    if meta.vcpu_count != inputs.vcpu_handles.len() as u32 {
-        return Err(SnapshotError::ConfigMismatch(format!(
-            "snapshot vcpu_count {} != configured {}",
-            meta.vcpu_count,
-            inputs.vcpu_handles.len()
-        )));
-    }
-    if meta.nested_enabled != inputs.nested_enabled {
-        return Err(SnapshotError::ConfigMismatch(
-            "nested_enabled differs between snapshot and current ctx".into(),
-        ));
-    }
+    let source_format = validate_snapshot_meta(inputs, &meta)?;
     crate::timing_event("snapshot.restore.config.checked");
 
-    let linux_gic = if reader.format == SnapshotFormat::Linux {
+    let linux_gic = if source_format == SnapshotFormat::Linux {
         restore_linux_gic_state(reader, inputs.vcpu_handles.len())?
     } else {
         None
@@ -936,7 +1058,7 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
             })?;
         crate::timing_event("snapshot.restore.linux_gic.dist_ctlr.done");
     }
-    if reader.format == SnapshotFormat::Macos
+    if source_format == SnapshotFormat::Macos
         && let Some(irqchip) = inputs.irqchip
     {
         if let Ok(st) = reader.get_raw(SectionId::HvfGic, 0) {
@@ -998,7 +1120,7 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
     for (i, h) in inputs.vcpu_handles.iter().enumerate() {
         crate::timing_event(&format!("snapshot.restore.vcpu.state.begin index={i}"));
         let bytes = reader.get_raw(SectionId::Vcpu, i as u32)?.to_vec();
-        let event = match reader.format {
+        let event = match source_format {
             SnapshotFormat::Macos => VcpuEvent::RestoreState(bytes),
             SnapshotFormat::Linux => VcpuEvent::RestoreKvmState {
                 state: bytes,
@@ -1057,8 +1179,8 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
     }
     crate::timing_event("snapshot.restore.linux_gic.pending_spis.done");
 
-    let timer_delta = match reader.format {
-        SnapshotFormat::Macos => cntvct_el0().wrapping_sub(meta.capture_mach_time),
+    let timer_delta = match source_format {
+        SnapshotFormat::Macos => cntvct_el0().wrapping_sub(meta.capture_timer_counter),
         SnapshotFormat::Linux => 0,
     };
     for (i, h) in inputs.vcpu_handles.iter().enumerate() {
@@ -1090,12 +1212,12 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
     enable_dirty_tracking(inputs)?;
     crate::timing_event("snapshot.restore.dirty_tracking.done");
 
-    // Restore virtio devices — match by MMIO base, not by index, so out-of-scope
-    // devices in the current ctx (e.g. virtio-balloon) don't shift the mapping.
+    // Restore virtio devices by MMIO base rather than by vector index so
+    // optional devices cannot shift the mapping.
     let mut restored_transports = Vec::new();
     for i in 0..meta.virtio_bases.len() {
         crate::timing_event(&format!("snapshot.restore.virtio.begin index={i}"));
-        let section = read_virtio_section(reader, i as u32)?;
+        let section = read_virtio_section(reader, source_format, i as u32)?;
         let transport_arc = inputs
             .virtio_transports
             .iter()
@@ -1123,7 +1245,7 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
                 snapshot_device_name,
                 live_device_name
             ));
-            if reader.format == SnapshotFormat::Linux && live_device_name != snapshot_device_name {
+            if source_format == SnapshotFormat::Linux && live_device_name != snapshot_device_name {
                 return Err(SnapshotError::ConfigMismatch(format!(
                     "virtio device mismatch base=0x{:x}: snapshot={} live={}",
                     section.mmio_base(),
@@ -1367,9 +1489,10 @@ fn collect_pending_spis(offset: u32, value: u32, pending: &mut Vec<u32>) {
 
 fn read_virtio_section(
     reader: &super::SnapshotReader,
+    source_format: SnapshotFormat,
     index: u32,
 ) -> Result<RestoredVirtioMmioSection> {
-    match reader.format {
+    match source_format {
         SnapshotFormat::Macos => reader
             .get_bincode(SectionId::VirtioMmio, index)
             .map(RestoredVirtioMmioSection::Macos),
@@ -1429,13 +1552,8 @@ mod tests {
             .expect("add virtio");
         writer.write_to_dir(&dir).expect("write");
 
-        let path = dir.join("vmstate.bin");
-        let mut bytes = std::fs::read(&path).expect("read vmstate");
-        bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
-        std::fs::write(&path, bytes).expect("rewrite vmstate");
-
         let reader = super::super::SnapshotReader::open(&dir).expect("open");
-        let decoded = read_virtio_section(&reader, 0).expect("decode");
+        let decoded = read_virtio_section(&reader, SnapshotFormat::Linux, 0).expect("decode");
         match decoded {
             RestoredVirtioMmioSection::Linux(decoded) => {
                 assert_eq!(decoded.mmio_base, section.mmio_base);

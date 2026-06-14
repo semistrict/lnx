@@ -7,7 +7,7 @@
 //
 // Header (40 bytes):
 //   magic        [u8; 8]   = b"LKRNSS01"
-//   version      u32       = 1 (macOS) or 3 (Linux)
+//   version      u32       = current shared vmstate container version
 //   num_sections u32
 //   ram_size     u64
 //   ram_base     u64
@@ -24,15 +24,16 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use sha2::{Digest, Sha256};
+
+use crate::snapshot_metadata::VMSTATE_VERSION;
 
 use super::{Result, SnapshotError, snapshot_sync_enabled, vmstate_path};
 
 const MAGIC: [u8; 8] = *b"LKRNSS01";
-const VERSION: u32 = 1;
-const LINUX_VERSION: u32 = 3;
+const VERSION: u32 = VMSTATE_VERSION;
 const HEADER_LEN: usize = 40;
 const TOC_ENTRY_LEN: usize = 56;
 
@@ -46,12 +47,6 @@ pub enum SectionId {
     VirtioMmio = 5,
     HvfGic = 6,
     HvfGicDistRegs = 7,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SnapshotFormat {
-    Macos,
-    Linux,
 }
 
 #[derive(Clone, Debug)]
@@ -83,7 +78,7 @@ impl Header {
             return Err(SnapshotError::BadMagic);
         }
         let version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        if version != VERSION && version != LINUX_VERSION {
+        if version != VERSION {
             return Err(SnapshotError::BadVersion(version));
         }
         let num_sections = u32::from_le_bytes(buf[12..16].try_into().unwrap());
@@ -230,8 +225,6 @@ impl SnapshotWriter {
 pub struct SnapshotReader {
     #[allow(dead_code)]
     pub header: Header,
-    pub format: SnapshotFormat,
-    pub dir: PathBuf,
     sections: HashMap<(u32, u32), Vec<u8>>,
 }
 
@@ -276,18 +269,7 @@ impl SnapshotReader {
             sections.insert((entry.id, entry.index), buf);
         }
 
-        let format = if header.version == LINUX_VERSION {
-            SnapshotFormat::Linux
-        } else {
-            SnapshotFormat::Macos
-        };
-
-        Ok(SnapshotReader {
-            header,
-            format,
-            dir: dir.to_path_buf(),
-            sections,
-        })
+        Ok(SnapshotReader { header, sections })
     }
 
     pub fn get_raw(&self, id: SectionId, index: u32) -> Result<&[u8]> {
@@ -362,30 +344,12 @@ mod tests {
         w.write_to_dir(&tmp).unwrap();
 
         let r = SnapshotReader::open(&tmp).unwrap();
-        assert_eq!(r.format, SnapshotFormat::Macos);
         assert_eq!(r.header.vcpu_count, 2);
         let d0r: Dummy = r.get_bincode(SectionId::Vcpu, 0).unwrap();
         let d1r: Dummy = r.get_bincode(SectionId::Vcpu, 1).unwrap();
         assert_eq!(d0, d0r);
         assert_eq!(d1, d1r);
         assert_eq!(r.get_raw(SectionId::Meta, 0).unwrap(), &[0xaa, 0xbb, 0xcc]);
-    }
-
-    #[test]
-    fn linux_version_is_tagged_as_linux_format() {
-        let tmp = tempdir();
-        let mut w = SnapshotWriter::new(0x2000_0000, 0x4000_0000, 1);
-        w.add_raw(SectionId::Meta, 0, vec![0xaa, 0xbb]);
-        w.write_to_dir(&tmp).unwrap();
-
-        let p = vmstate_path(&tmp);
-        let mut bytes = std::fs::read(&p).unwrap();
-        bytes[8..12].copy_from_slice(&LINUX_VERSION.to_le_bytes());
-        std::fs::write(&p, &bytes).unwrap();
-
-        let r = SnapshotReader::open(&tmp).unwrap();
-        assert_eq!(r.header.version, LINUX_VERSION);
-        assert_eq!(r.format, SnapshotFormat::Linux);
     }
 
     #[test]

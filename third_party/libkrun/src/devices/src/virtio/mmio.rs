@@ -336,6 +336,7 @@ impl MmioTransport {
         if (self.device_status & device_status::DRIVER_OK) != 0
             && !self.locked_device().is_activated()
         {
+            self.locked_device().prepare_restore_activation();
             self.activate();
         }
         Ok(())

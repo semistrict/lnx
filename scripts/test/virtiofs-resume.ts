@@ -27,6 +27,10 @@ async function cleanupDirs() {
   await rm(outsideCwd, { recursive: true, force: true });
 }
 
+async function discardLatestSnapshot() {
+  await rm(join(ctx.snapshotDir, "latest"), { recursive: true, force: true });
+}
+
 async function waitForSourceReady(): Promise<void> {
   const deadline = Date.now() + 120_000;
   while (Date.now() < deadline) {
@@ -114,6 +118,7 @@ finally:
 
   await testStep("restored outside-home virtiofs sees host edits after prior guest read", async () => {
     await waitForVmSuspend(ctx);
+    await discardLatestSnapshot();
     await write(join(outsideCwd, "outside-host-edited.txt"), "outside-before\n");
 
     const before = await lnx(ctx, ["cat", "outside-host-edited.txt"], {
@@ -134,6 +139,7 @@ finally:
 
   await testStep("open virtiofs fd and mmap survive fork restore", async () => {
     await waitForVmSuspend(ctx);
+    await discardLatestSnapshot();
 
     const owner = spawnLnx(
       ctx,

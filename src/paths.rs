@@ -22,26 +22,38 @@ impl Layout {
         kernel: Option<PathBuf>,
         rootfs: Option<PathBuf>,
     ) -> Result<Self> {
-        let base = match std::env::var_os("LNX_BASE") {
-            Some(path) => PathBuf::from(path),
-            None => {
-                let home = dirs::home_dir().context("could not resolve home directory")?;
-                home.join(".lnx")
-            }
-        };
+        let home = dirs::home_dir().context("could not resolve home directory")?;
+        Ok(Self::resolve_with_env(
+            instance,
+            kernel,
+            rootfs,
+            std::env::var_os("LNX_BASE").map(PathBuf::from),
+            std::env::var_os("LNX_RUN_BASE").map(PathBuf::from),
+            home,
+        ))
+    }
+
+    fn resolve_with_env(
+        instance: &str,
+        kernel: Option<PathBuf>,
+        rootfs: Option<PathBuf>,
+        base_env: Option<PathBuf>,
+        run_base_env: Option<PathBuf>,
+        home: PathBuf,
+    ) -> Self {
+        let base = base_env.unwrap_or_else(|| home.join(".lnx"));
         let instance_dir = base.join("instances").join(instance);
         let snapshot_dir = instance_dir.join("memory-snapshots");
         let checkpoint_dir = instance_dir.join("checkpoints");
         let vm_initialized = instance_dir.join("vm-initialized");
-        let run_dir = std::env::var_os("LNX_RUN_BASE")
-            .map(PathBuf::from)
+        let run_dir = run_base_env
             .map(|base| base.join("instances").join(instance))
             .unwrap_or_else(|| instance_dir.clone());
         let kernel = kernel.unwrap_or_else(|| base.join("vmlinuz"));
         let rootfs = rootfs.unwrap_or_else(|| instance_dir.join("rootfs.ext4"));
         let console_log = run_dir.join("console.log");
 
-        Ok(Self {
+        Self {
             base,
             instance: instance.to_string(),
             kernel,
@@ -52,7 +64,7 @@ impl Layout {
             vm_initialized,
             run_dir,
             console_log,
-        })
+        }
     }
 }
 
@@ -62,9 +74,9 @@ mod tests {
 
     #[test]
     fn resolve_builds_per_instance_paths() {
-        let layout = Layout::resolve("dev", None, None).expect("resolve layout");
+        let home = PathBuf::from("/Users/test");
+        let layout = Layout::resolve_with_env("dev", None, None, None, None, home.clone());
 
-        let home = dirs::home_dir().expect("home dir");
         assert_eq!(layout.base, home.join(".lnx"));
         assert_eq!(layout.instance, "dev");
         assert_eq!(layout.kernel, home.join(".lnx").join("vmlinuz"));
@@ -119,13 +131,14 @@ mod tests {
     #[test]
     fn resolve_honors_lnx_base_env() {
         let base = std::env::temp_dir().join(format!("lnx-base-test-{}", std::process::id()));
-        unsafe {
-            std::env::set_var("LNX_BASE", &base);
-        }
-        let layout = Layout::resolve("envbase", None, None).expect("layout");
-        unsafe {
-            std::env::remove_var("LNX_BASE");
-        }
+        let layout = Layout::resolve_with_env(
+            "envbase",
+            None,
+            None,
+            Some(base.clone()),
+            None,
+            PathBuf::from("/Users/test"),
+        );
 
         assert_eq!(layout.base, base);
         assert_eq!(layout.kernel, layout.base.join("vmlinuz"));
@@ -144,15 +157,14 @@ mod tests {
         let base = std::env::temp_dir().join(format!("lnx-base-test-{}", std::process::id()));
         let run_base =
             std::env::temp_dir().join(format!("lnx-run-base-test-{}", std::process::id()));
-        unsafe {
-            std::env::set_var("LNX_BASE", &base);
-            std::env::set_var("LNX_RUN_BASE", &run_base);
-        }
-        let layout = Layout::resolve("dev", None, None).expect("resolve layout");
-        unsafe {
-            std::env::remove_var("LNX_BASE");
-            std::env::remove_var("LNX_RUN_BASE");
-        }
+        let layout = Layout::resolve_with_env(
+            "dev",
+            None,
+            None,
+            Some(base.clone()),
+            Some(run_base.clone()),
+            PathBuf::from("/Users/test"),
+        );
 
         assert_eq!(layout.instance_dir, base.join("instances/dev"));
         assert_eq!(

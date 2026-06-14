@@ -11,7 +11,7 @@ use crate::{descriptor, init, paths::Layout};
 /// Import an OCI image as an instance rootfs.
 ///
 /// Layers are pulled host-side over the registry v2 protocol, but the
-/// filesystem is assembled inside the default builder VM: only a Linux root
+/// filesystem is assembled inside a private builder VM: only a Linux root
 /// can preserve ownership, modes, and device nodes, and the guest kernel's
 /// 16 KiB pages match the 16 KiB-block ext4 the managed rootfs layout
 /// requires. The built image lands back on the host through the cwd share.
@@ -22,9 +22,6 @@ pub fn import_image(layout: &Layout, reference: &str, kernel: Option<&Path>) -> 
             layout.instance,
             layout.rootfs.display()
         );
-    }
-    if layout.instance == "default" {
-        bail!("the default instance is the import builder; import into a named instance");
     }
     match kernel {
         Some(kernel) => init::install_kernel(layout, kernel)?,
@@ -41,7 +38,8 @@ pub fn import_image(layout: &Layout, reference: &str, kernel: Option<&Path>) -> 
         if layers.is_empty() {
             bail!("image has no layers");
         }
-        build_rootfs(&staging)?;
+        let builder_instance = format!("{}-oci-builder", layout.instance);
+        build_rootfs_with_instance(&staging, &builder_instance)?;
         publish_rootfs(layout, &staging, reference)
     })();
     let _ = fs::remove_dir_all(&staging);
@@ -263,7 +261,7 @@ fn curl(args: &[&str]) -> Result<String> {
 }
 
 /// Unpack the layers (whiteouts included) and build the 64 GiB 16 KiB-block
-/// ext4 inside the default builder VM, writing the result into the staging
+/// ext4 inside a private builder VM, writing the result into the staging
 /// dir, which the builder sees as its cwd share.
 const BUILD_SCRIPT: &str = r#"
 set -eu
@@ -299,12 +297,21 @@ echo BUILD_OK
 "#;
 
 pub fn build_rootfs(staging: &Path) -> Result<()> {
-    eprintln!("oci: building rootfs in the default builder VM");
+    let builder_instance = std::env::var("LNX_OCI_BUILDER_INSTANCE")
+        .unwrap_or_else(|_| format!("oci-builder-{}", std::process::id()));
+    build_rootfs_with_instance(staging, &builder_instance)
+}
+
+fn build_rootfs_with_instance(staging: &Path, builder_instance: &str) -> Result<()> {
+    eprintln!("oci: building rootfs in builder VM {builder_instance}");
     let exe = std::env::current_exe().context("current executable")?;
+    let builder_layout = Layout::resolve(builder_instance, None, None)
+        .with_context(|| format!("resolve builder instance {builder_instance}"))?;
+    cleanup_builder_instance(&builder_layout);
     // Only root can preserve ownership and device nodes while unpacking.
     let output = Command::new(exe)
         .arg("--instance")
-        .arg("default")
+        .arg(builder_instance)
         .arg("--root")
         .arg("bash")
         .arg("-lc")
@@ -312,6 +319,7 @@ pub fn build_rootfs(staging: &Path) -> Result<()> {
         .current_dir(staging)
         .output()
         .context("run builder VM")?;
+    cleanup_builder_instance(&builder_layout);
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() || !stdout.contains("BUILD_OK") {
         bail!(
@@ -322,6 +330,13 @@ pub fn build_rootfs(staging: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn cleanup_builder_instance(layout: &Layout) {
+    let _ = fs::remove_dir_all(&layout.run_dir);
+    if layout.run_dir != layout.instance_dir {
+        let _ = fs::remove_dir_all(&layout.instance_dir);
+    }
 }
 
 fn publish_rootfs(layout: &Layout, staging: &Path, reference: &str) -> Result<()> {

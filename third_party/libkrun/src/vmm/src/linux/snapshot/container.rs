@@ -6,20 +6,23 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
+use crate::snapshot_metadata::VMSTATE_VERSION;
+
 use super::{Result, SnapshotError, snapshot_sync_enabled, vmstate_path};
 
 const MAGIC: [u8; 8] = *b"LKRNSS01";
-// Version history (Linux container; the macOS container versions separately):
+// Version history:
 //   1: initial full-RAM capture
 //   2: virtio-fs sections carry the FUSE server state; v1 snapshots restore
 //      to a server with an empty inode table and must not be accepted
 //   3: KVM GIC distributor/redistributor MMIO layout changed; v2 snapshots
 //      encode device state against the old layout and must not be accepted
+//   4: shared macOS/Linux container version; source backend moved into META
+//      along with explicit topology and PAuth policy metadata.
 // Bump this whenever a section payload changes shape so stale snapshots are
 // skipped at the pre-flight header check instead of failing mid-restore.
-// Keep in sync with SNAPSHOT_VMSTATE_SUPPORTED_VERSIONS in lnx's src/runner.rs.
-const VERSION: u32 = 3;
-const MACOS_VERSION: u32 = 1;
+// Keep in sync with SNAPSHOT_VMSTATE_VERSION in lnx's src/runner.rs.
+const VERSION: u32 = VMSTATE_VERSION;
 const HEADER_LEN: usize = 40;
 const TOC_ENTRY_LEN: usize = 56;
 
@@ -36,12 +39,6 @@ pub enum SectionId {
     VirtioMmio = 5,
     HvfGic = 6,
     HvfGicDistRegs = 7,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SnapshotFormat {
-    Linux,
-    Macos,
 }
 
 #[derive(Clone, Debug)]
@@ -72,7 +69,7 @@ impl Header {
             return Err(SnapshotError::BadMagic);
         }
         let version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        if version != VERSION && version != MACOS_VERSION {
+        if version != VERSION {
             return Err(SnapshotError::BadVersion(version));
         }
         let num_sections = u32::from_le_bytes(buf[12..16].try_into().unwrap());
@@ -209,7 +206,6 @@ impl SnapshotWriter {
 pub struct SnapshotReader {
     #[allow(dead_code)]
     pub header: Header,
-    pub format: SnapshotFormat,
     sections: HashMap<(u32, u32), Vec<u8>>,
 }
 
@@ -276,17 +272,7 @@ impl SnapshotReader {
             sections.insert((entry.id, entry.index), buf);
         }
 
-        let format = if header.version == MACOS_VERSION {
-            SnapshotFormat::Macos
-        } else {
-            SnapshotFormat::Linux
-        };
-
-        Ok(Self {
-            header,
-            format,
-            sections,
-        })
+        Ok(Self { header, sections })
     }
 
     pub fn get_raw(&self, id: SectionId, index: u32) -> Result<&[u8]> {
@@ -327,7 +313,6 @@ mod tests {
 
         let reader = SnapshotReader::open(&dir).expect("open");
         assert_eq!(reader.header.version, VERSION);
-        assert_eq!(reader.format, SnapshotFormat::Linux);
         assert_eq!(reader.header.ram_size, 0x4000_0000);
         assert_eq!(reader.header.ram_base, 0x8000_0000);
         assert_eq!(reader.header.vcpu_count, 2);
@@ -342,29 +327,6 @@ mod tests {
             reader.get_raw(SectionId::HvfGic, 0),
             Err(SnapshotError::SectionMissing { .. })
         ));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn macos_version_is_tagged_as_macos_format() {
-        let dir = std::env::temp_dir().join(format!("lnx-vmstate-macos-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-
-        let mut writer = SnapshotWriter::new(0x2000_0000, 0x8000_0000, 1);
-        writer
-            .add_bincode(SectionId::Meta, 0, &("meta".to_string(), 1u64))
-            .expect("add meta");
-        writer.write_to_dir(&dir).expect("write");
-
-        let path = vmstate_path(&dir);
-        let mut bytes = std::fs::read(&path).expect("read vmstate");
-        bytes[8..12].copy_from_slice(&MACOS_VERSION.to_le_bytes());
-        std::fs::write(&path, bytes).expect("rewrite vmstate");
-
-        let reader = SnapshotReader::open(&dir).expect("open");
-        assert_eq!(reader.header.version, MACOS_VERSION);
-        assert_eq!(reader.format, SnapshotFormat::Macos);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

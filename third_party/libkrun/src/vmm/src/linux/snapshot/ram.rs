@@ -3,25 +3,14 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use vm_memory::mmap::{GuestRegionMmap, MmapRegionBuilder};
 use vm_memory::{
     Address, Bytes, FileOffset, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
 };
 
+pub use crate::snapshot_metadata::{RamLayout, RamRegion};
+
 use super::{Result, SnapshotError, pages_img_path, snapshot_sync_enabled};
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RamRegion {
-    pub guest_addr: u64,
-    pub size: u64,
-    pub file_offset: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RamLayout {
-    pub regions: Vec<RamRegion>,
-}
 
 pub fn write_full_pages_img(
     mem: &GuestMemoryMmap,

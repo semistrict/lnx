@@ -472,6 +472,28 @@ function waitForInnerOwnerScript(): string[] {
   ];
 }
 
+function stopInnerOwnerScript(): string[] {
+  return [
+    "stop_inner_owner() {",
+    '  run_base="${LNX_RUN_BASE:-$LNX_BASE}"',
+    '  pidfile="$run_base/instances/$1/bootstrap.lock.d/owner.pid"',
+    '  [ -e "$pidfile" ] || return 0',
+    '  pid="$(tr -cd "0-9" <"$pidfile" || true)"',
+    '  [ -n "$pid" ] || return 0',
+    '  [ -d "/proc/$pid" ] || return 0',
+    '  for child in $(pgrep -P "$pid" 2>/dev/null || true); do',
+    '    kill "$child" 2>/dev/null || true',
+    "  done",
+    '  kill "$pid" 2>/dev/null || true',
+    "  for _ in $(seq 1 200); do",
+    '    [ ! -d "/proc/$pid" ] && return 0',
+    "    sleep 0.05",
+    "  done",
+    '  kill -KILL "$pid" 2>/dev/null || true',
+    "}",
+  ];
+}
+
 async function waitForOuterExit(instance: string) {
   await waitForOwnerExit(
     {
@@ -669,6 +691,8 @@ async function runInnerViaOuter(
     runBase?: string;
     innerTimeoutMs?: number;
     timeoutMs?: number;
+    waitForInnerOwnerExit?: boolean;
+    brokerIdleTtlMs?: number;
     checkpointWhileRunning?: {
       name: string;
       readyNeedle: string;
@@ -676,6 +700,9 @@ async function runInnerViaOuter(
     };
   } = {},
 ) {
+  const waitForInnerOwnerExit = options.waitForInnerOwnerExit ?? true;
+  const brokerIdleTtlMs =
+    options.brokerIdleTtlMs ?? (waitForInnerOwnerExit ? 250 : 600_000);
   const before = (await innerOwnerCounts(innerBase, innerInstance)).dones;
   const runBaseExport = options.runBase
     ? [`export LNX_RUN_BASE=${quoteShell(options.runBase)}`]
@@ -685,6 +712,9 @@ async function runInnerViaOuter(
     Bun.env.LNX_NESTED_KVM_TRACE_VERBOSE === "1"
       ? "kvm_entry kvm_exit kvm_userspace_exit kvm_mmio kvm_mmio_emulate kvm_ack_irq kvm_wfx_arm64 kvm_timer_update_irq kvm_timer_restore_state kvm_timer_save_state kvm_vcpu_wakeup vgic_update_irq_pending kvm_set_irq kvm_irq_line kvm_timer_hrtimer_expire"
       : "kvm_wfx_arm64 kvm_timer_update_irq kvm_timer_restore_state kvm_timer_save_state kvm_vcpu_wakeup vgic_update_irq_pending kvm_set_irq kvm_irq_line kvm_timer_hrtimer_expire";
+  const krunLogLevelExport = Bun.env.LNX_NESTED_KRUN_LOG_LEVEL
+    ? [`export LNX_KRUN_LOG_LEVEL=${quoteShell(Bun.env.LNX_NESTED_KRUN_LOG_LEVEL)}`]
+    : [];
   const sharedInnerDir = join(innerBase, "instances", innerInstance);
   const tracePath = join(sharedInnerDir, "kvm-trace.log");
   const traceHelpers = traceKvm
@@ -810,10 +840,12 @@ async function runInnerViaOuter(
     '  trap \'[ -z "${mac_host_relay_pid:-}" ] || kill "$mac_host_relay_pid" 2>/dev/null || true\' EXIT',
     "fi",
     "export LNX_ROOTFS_BACKEND=block",
-    "export LNX_BROKER_IDLE_TTL_MS=250",
+    `export LNX_BROKER_IDLE_TTL_MS=${quoteShell(String(brokerIdleTtlMs))}`,
+    ...krunLogLevelExport,
     ...traceSetup,
     ...stageNestedToolsScript(),
     ...waitForInnerOwnerScript(),
+    ...stopInnerOwnerScript(),
     ...runInnerCommand,
     "copy_inner_logs",
     'if [ "$inner_status" -ne 0 ]; then',
@@ -821,10 +853,14 @@ async function runInnerViaOuter(
     "  dump_inner_logs",
     '  exit "$inner_status"',
     "fi",
-    'if ! wait_for_inner_owner_exit "$inner_instance"; then',
-    "  dump_inner_logs",
-    "  exit 1",
-    "fi",
+    ...(waitForInnerOwnerExit
+      ? [
+          'if ! wait_for_inner_owner_exit "$inner_instance"; then',
+          "  dump_inner_logs",
+          "  exit 1",
+          "fi",
+        ]
+      : ['stop_inner_owner "$inner_instance"']),
     "copy_inner_logs",
   ].join("\n");
   const result = await outerLnx(
@@ -832,7 +868,9 @@ async function runInnerViaOuter(
     ["--root", ...outerVmArgs, "bash", "-lc", script],
     { cwd, timeoutMs: options.timeoutMs ?? 300_000 },
   );
-  await waitForInnerOwnerDone(innerBase, innerInstance, before);
+  if (waitForInnerOwnerExit) {
+    await waitForInnerOwnerDone(innerBase, innerInstance, before);
+  }
   await waitForOuterExit(outer);
   return result;
 }
@@ -928,6 +966,7 @@ try {
         extraInstances.push(sourceInstance);
         const sourceCtx = instanceContext(sourceInstance);
         const checkpointName = "macos-linux-live";
+        const sourceKernelArgs = ["--kernel", innerKernel];
         await cleanupInstance(ctx, sourceInstance);
 
         const source = spawn(
@@ -935,6 +974,7 @@ try {
             ctx.lnxBin,
             "--instance",
             sourceInstance,
+            ...sourceKernelArgs,
             "--no-host-shares",
             "--memory-mib",
             "512",
@@ -987,6 +1027,7 @@ print("mac-source-after", flush=True)
               ctx.lnxBin,
               "--instance",
               sourceInstance,
+              ...sourceKernelArgs,
               "--no-host-shares",
               "checkpoint",
               "-m",
@@ -1012,6 +1053,7 @@ print("mac-source-after", flush=True)
               ctx.lnxBin,
               "--instance",
               sourceInstance,
+              ...sourceKernelArgs,
               "--no-host-shares",
               "sudo",
               "sh",
@@ -1072,8 +1114,8 @@ print("mac-source-after", flush=True)
       ).arrayBuffer();
       assertEq(
         new DataView(vmstate).getUint32(8, true),
-        1,
-        "source snapshot is macOS vmstate v1",
+        4,
+        "source snapshot is shared vmstate v4",
       );
       const sharesStamp = await Bun.file(join(snapshot, "shares.stamp")).text();
       assertContains(
@@ -1201,6 +1243,7 @@ print("mac-source-after", flush=True)
               Bun.env.LNX_NESTED_MACOS_LINUX_INNER_TIMEOUT_MS ?? 90_000,
             ),
             timeoutMs: 300_000,
+            waitForInnerOwnerExit: Boolean(exportSnapshot),
           },
         );
         assertContains(

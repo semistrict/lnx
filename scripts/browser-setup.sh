@@ -93,6 +93,12 @@ done
 snap version >/dev/null
 log "snapd is ready"
 
+log "waiting for snap seed"
+if ! sudo timeout "${LNX_BROWSER_SETUP_SNAP_SEED_TIMEOUT:-300s}" snap wait system seed.loaded; then
+  snap changes >&2 || true
+  exit 1
+fi
+
 if ! snap list chromium >/dev/null 2>&1; then
   log "installing snap Chromium"
   sudo snap install chromium

@@ -29,6 +29,7 @@ try {
     await lnx(ctx, ["bash", "-lc", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y snapd squashfs-tools"], { timeoutMs: 300_000 });
     await lnx(ctx, ["sudo", "systemctl", "enable", "--now", "snapd.socket"]);
     await lnx(ctx, ["bash", "-lc", "sudo systemctl start snapd.service || true"]);
+    await lnx(ctx, ["sudo", "timeout", "300s", "snap", "wait", "system", "seed.loaded"], { timeoutMs: 360_000 });
     const version = await lnx(ctx, ["snap", "version"]);
     assertContains(version.stdout, "snapd", "snapd version");
     await lnx(ctx, ["sudo", "snap", "install", "hello-world"], { timeoutMs: 600_000 });

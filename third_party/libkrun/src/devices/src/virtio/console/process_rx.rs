@@ -2,7 +2,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{io, thread};
 
-use vm_memory::{Address, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion};
+#[cfg(target_os = "macos")]
+use vm_memory::Address;
+use vm_memory::{GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion};
 
 use crate::virtio::console::console_control::ConsoleControl;
 use crate::virtio::console::port_io::PortInput;

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +63,7 @@ pub enum Message {
     },
     RestoreSync {
         channel_id: u64,
+        entropy: Vec<u8>,
     },
     RestoreSynced {
         channel_id: u64,
@@ -118,5 +119,17 @@ mod tests {
                 version: PROTOCOL_VERSION
             }
         );
+    }
+
+    #[test]
+    fn restore_sync_carries_entropy() {
+        let message = Message::RestoreSync {
+            channel_id: 7,
+            entropy: vec![1, 2, 3, 4],
+        };
+        let encoded = postcard::to_allocvec(&message).expect("encode");
+        let decoded: Message = postcard::from_bytes(&encoded).expect("decode");
+
+        assert_eq!(decoded, message);
     }
 }

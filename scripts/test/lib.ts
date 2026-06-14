@@ -83,7 +83,20 @@ export async function waitForVmSuspend(ctx: TestContext, timeoutMs = 60_000): Pr
 }
 
 export async function cleanupInstance(ctx: TestContext, instance: string): Promise<void> {
-  await rm(join(ctx.base, "instances", instance), { recursive: true, force: true });
+  const imageDir = join(ctx.base, "instances", instance);
+  const runBase = Bun.env.LNX_RUN_BASE ?? ctx.base;
+  const runDir = join(runBase, "instances", instance);
+  await waitForOwnerExit({
+    ...ctx,
+    instance,
+    imageDir,
+    runDir,
+    snapshotDir: join(imageDir, "memory-snapshots"),
+  }).catch(() => {});
+  await rm(imageDir, { recursive: true, force: true });
+  if (runDir !== imageDir) {
+    await rm(runDir, { recursive: true, force: true });
+  }
 }
 
 export async function prepareContext(ctx: TestContext): Promise<void> {

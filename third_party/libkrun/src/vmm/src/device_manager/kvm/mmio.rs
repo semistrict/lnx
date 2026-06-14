@@ -84,11 +84,9 @@ const MMIO_LEN: u64 = 0x1000;
 
 #[cfg(target_arch = "aarch64")]
 fn irqfd_pin_for_guest_irq(irq: u32) -> u32 {
-    // KVM irqfd routes use the guest-visible IRQ number. macOS snapshot
-    // restores normalize saved distributor state elsewhere, but translating
-    // runtime irqfds to SPI-relative IDs sends virtio interrupts to the wrong
-    // line after restore.
-    irq
+    // KVM's aarch64 irqfd API expects SPI-relative pins. Device metadata keeps
+    // guest-visible IRQ IDs so it matches the GIC state we snapshot.
+    irq - arch::aarch64::layout::IRQ_BASE
 }
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -525,10 +523,10 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn irqfd_pin_uses_guest_irq() {
+    fn irqfd_pin_uses_spi_relative_irq() {
         assert_eq!(
             irqfd_pin_for_guest_irq(arch::aarch64::layout::IRQ_BASE + 7),
-            arch::aarch64::layout::IRQ_BASE + 7
+            7
         );
     }
 

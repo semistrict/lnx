@@ -1,10 +1,12 @@
+#[cfg(target_os = "macos")]
+use std::os::fd::FromRawFd;
 use std::{
     collections::HashMap,
     ffi::CString,
     fs,
     io::{BufReader, ErrorKind, Read, Write},
     net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket},
-    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
     os::unix::{
         ffi::OsStrExt,
         net::{UnixListener, UnixStream},
@@ -664,7 +666,8 @@ impl NetworkService {
         let subnet = u32::from(network.subnet());
         let broadcast = subnet | !u32::from(crate::vmnet::mask_for_prefix(network.prefix()));
         let used: std::collections::HashSet<Ipv4Addr> = allocations.values().copied().collect();
-        // .0 is the network, .1 the host-side gateway, the last the broadcast.
+        // vmnet uses .0 as the host-side gateway; keep .1 reserved so
+        // existing allocations and route stamps stay conservative.
         let ip = match (subnet + 2..broadcast)
             .map(Ipv4Addr::from)
             .find(|candidate| !used.contains(candidate))
@@ -907,7 +910,7 @@ pub fn request_network_attachment(
         .context("attach response missing ip")?
         .parse()
         .context("parse attach ip")?;
-    let gateway: Ipv4Addr = json_field(body, "gateway")
+    let reported_gateway: Ipv4Addr = json_field(body, "gateway")
         .context("attach response missing gateway")?
         .parse()
         .context("parse attach gateway")?;
@@ -915,6 +918,7 @@ pub fn request_network_attachment(
         .context("attach response missing prefix")?
         .parse()
         .context("parse attach prefix")?;
+    let gateway = gateway_for_assigned_ip(ip, prefix).unwrap_or(reported_gateway);
     // No further reads; keep the stream solely as a liveness signal.
     let _ = stream.set_read_timeout(None);
     Ok(Some(NetworkAttachment {
@@ -924,6 +928,16 @@ pub fn request_network_attachment(
         gateway,
         keepalive: stream,
     }))
+}
+
+#[cfg(target_os = "macos")]
+fn gateway_for_assigned_ip(ip: Ipv4Addr, prefix: u8) -> Option<Ipv4Addr> {
+    if !(8..=29).contains(&prefix) {
+        return None;
+    }
+    let mask = u32::from(crate::vmnet::mask_for_prefix(prefix));
+    let subnet = Ipv4Addr::from(u32::from(ip) & mask);
+    Some(crate::vmnet::gateway_for_subnet(subnet))
 }
 
 fn run_daemon(config: Config) -> Result<()> {
@@ -2150,6 +2164,23 @@ mod tests {
         );
         assert_eq!(
             attach_instance_from_request("GET /status HTTP/1.1\r\n\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn derives_vmnet_gateway_from_assigned_ip() {
+        assert_eq!(
+            gateway_for_assigned_ip(Ipv4Addr::new(192, 168, 106, 207), 24),
+            Some(Ipv4Addr::new(192, 168, 106, 0))
+        );
+        assert_eq!(
+            gateway_for_assigned_ip(Ipv4Addr::new(10, 42, 19, 10), 16),
+            Some(Ipv4Addr::new(10, 42, 0, 0))
+        );
+        assert_eq!(
+            gateway_for_assigned_ip(Ipv4Addr::new(10, 0, 0, 2), 31),
             None
         );
     }

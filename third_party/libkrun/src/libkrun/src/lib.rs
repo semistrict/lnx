@@ -3275,6 +3275,8 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                 return -libc::EINVAL;
             }
         }
+        _vmm.lock().unwrap().replay_restore_notifications();
+        vmm::timing_event("start_enter.restore.notifications_replayed");
         if let Err(e) = _vmm.lock().unwrap().resume_after_restore() {
             error!("snapshot restore resume failed: {e}");
             return -libc::EINVAL;

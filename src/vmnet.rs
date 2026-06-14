@@ -144,10 +144,11 @@ pub fn mask_for_prefix(prefix: u8) -> Ipv4Addr {
     Ipv4Addr::from(u32::MAX << (32 - u32::from(prefix)))
 }
 
-/// The second address of the range is reserved for the host and acts as the
-/// NAT gateway and DNS proxy for the guests.
+/// vmnet assigns the subnet address itself to the host bridge. Although that
+/// looks odd for a traditional IPv4 subnet, it is the NAT gateway and DNS
+/// proxy address guests must use.
 pub fn gateway_for_subnet(subnet: Ipv4Addr) -> Ipv4Addr {
-    Ipv4Addr::from(u32::from(subnet) + 1)
+    subnet
 }
 
 pub struct Network {
@@ -162,8 +163,7 @@ impl Network {
     /// the underlying objects are intentionally never released.
     pub fn create(subnet: Ipv4Addr, prefix: u8) -> Result<Network> {
         let mask = mask_for_prefix(prefix);
-        // vmnet reserves the first, second, and last addresses in this subnet.
-        // The second address becomes the host-side gateway.
+        // vmnet uses the subnet address itself as the host-side gateway.
         let subnet_addr = in_addr(subnet);
         let mask_addr = libc::in_addr {
             s_addr: u32::from(mask).to_be(),
@@ -635,16 +635,16 @@ mod tests {
         assert_eq!(mask_for_prefix(16), Ipv4Addr::new(255, 255, 0, 0));
         assert_eq!(
             gateway_for_subnet(Ipv4Addr::new(192, 168, 106, 0)),
-            Ipv4Addr::new(192, 168, 106, 1)
+            Ipv4Addr::new(192, 168, 106, 0)
         );
     }
 
     #[test]
-    fn vmnet_configuration_uses_network_address() {
+    fn vmnet_configuration_uses_gateway_network_address() {
         let subnet = Ipv4Addr::new(192, 168, 106, 0);
         let gateway = gateway_for_subnet(subnet);
 
         assert_eq!(in_addr(subnet).s_addr, u32::from(subnet).to_be());
-        assert_ne!(in_addr(subnet).s_addr, u32::from(gateway).to_be());
+        assert_eq!(in_addr(subnet).s_addr, u32::from(gateway).to_be());
     }
 }

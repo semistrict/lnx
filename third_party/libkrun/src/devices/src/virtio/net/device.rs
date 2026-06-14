@@ -86,6 +86,7 @@ pub struct Net {
 
     worker_thread: Option<(JoinHandle<NetWorkerStopResult>, EventFd)>,
     paused: Option<NetWorkerStopResult>,
+    quiesce_on_next_activate: bool,
 }
 
 impl Net {
@@ -119,6 +120,7 @@ impl Net {
 
             worker_thread: None,
             paused: None,
+            quiesce_on_next_activate: false,
         })
     }
 
@@ -198,8 +200,10 @@ impl VirtioDevice for Net {
             mem.clone(),
             self.acked_features,
             self.cfg_backend.clone(),
+            !self.quiesce_on_next_activate,
         ) {
             Ok(worker) => {
+                self.quiesce_on_next_activate = false;
                 let stop_fd = worker.stop_fd().try_clone().map_err(|err| {
                     error!("dup net stop_fd: {err}");
                     ActivateError::BadActivate
@@ -210,6 +214,7 @@ impl VirtioDevice for Net {
                 Ok(())
             }
             Err(err) => {
+                self.quiesce_on_next_activate = false;
                 error!(
                     "Error activating virtio-net ({}) backend: {err:?}",
                     self.id()
@@ -252,8 +257,9 @@ impl VirtioDevice for Net {
                 ));
             }
         };
-        let worker = NetWorker::from_parts(stop.rx_q, stop.tx_q, interrupt, mem, stop.backend)
-            .map_err(|e| DeviceSnapshotError::Invalid(format!("net resume: {e:?}")))?;
+        let worker =
+            NetWorker::from_parts(stop.rx_q, stop.tx_q, interrupt, mem, stop.backend, true)
+                .map_err(|e| DeviceSnapshotError::Invalid(format!("net resume: {e:?}")))?;
         let stop_fd = worker
             .stop_fd()
             .try_clone()
@@ -261,6 +267,10 @@ impl VirtioDevice for Net {
         let handle = worker.run();
         self.worker_thread = Some((handle, stop_fd));
         Ok(())
+    }
+
+    fn prepare_restore_activation(&mut self) {
+        self.quiesce_on_next_activate = true;
     }
 
     fn serialize_state(&self) -> std::result::Result<DeviceSnapshot, DeviceSnapshotError> {
@@ -412,5 +422,20 @@ mod tests {
         let paused = net.paused.as_ref().expect("paused net worker");
         assert_eq!(paused.rx_q.queue.to_state().next_avail, rx.next_avail);
         assert_eq!(paused.tx_q.queue.to_state().next_used, tx.next_used);
+    }
+
+    #[test]
+    fn prepare_restore_activation_quiesces_next_activate() {
+        let mut net = Net::new(
+            "net".to_string(),
+            VirtioNetBackend::UnixstreamPath(PathBuf::from("/unused")),
+            [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+            0,
+        )
+        .expect("net");
+
+        net.prepare_restore_activation();
+
+        assert!(net.quiesce_on_next_activate);
     }
 }
