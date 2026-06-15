@@ -78,6 +78,7 @@ enum Command {
     Checkpoint(CheckpointArgs),
     Checkpoints,
     Fork(ForkArgs),
+    Server(ServerArgs),
     Ingress(IngressArgs),
     Instances(InstancesArgs),
     #[command(about = "Persist per-instance settings, like: set cpus=4 memory-mib=8192")]
@@ -137,6 +138,42 @@ struct ForkArgs {
     checkpoint: Option<String>,
 
     instance: String,
+}
+
+#[derive(Debug, Args)]
+struct ServerArgs {
+    #[arg(long, default_value = "127.0.0.1:7777")]
+    listen: String,
+
+    #[command(subcommand)]
+    command: Option<ServerCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServerCommand {
+    #[command(about = "Transfer this instance to an lnx server")]
+    Push(ServerPushArgs),
+}
+
+#[derive(Debug, Args)]
+struct ServerPushArgs {
+    #[arg(help = "Server URL, like http://host:7777")]
+    url: String,
+
+    #[arg(long, help = "Import under a different instance name on the server")]
+    target_instance: Option<String>,
+
+    #[arg(long, help = "Replace an existing target instance")]
+    replace: bool,
+
+    #[arg(long, help = "Ask the server to start the imported instance")]
+    start: bool,
+
+    #[arg(long, help = "Idle TTL for the server-started VM owner")]
+    idle_ttl_ms: Option<u64>,
+
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -292,6 +329,24 @@ impl Cli {
                 explicit_rootfs,
                 no_host_shares,
             ),
+            Some(Command::Server(args)) => match args.command {
+                Some(ServerCommand::Push(push)) => crate::server::push(crate::server::PushConfig {
+                    source: layout,
+                    url: push.url,
+                    target_instance: push.target_instance.unwrap_or(instance),
+                    replace: push.replace,
+                    start: push.start,
+                    idle_ttl_ms: push.idle_ttl_ms,
+                    command: push.command,
+                }),
+                None => crate::server::serve(crate::server::ServeConfig {
+                    listen: args.listen,
+                    cpus,
+                    memory_mib,
+                    nested_kvm,
+                    no_host_shares,
+                }),
+            },
             Some(Command::Ingress(args)) => {
                 let config = ingress::load_config()?;
                 match args.command {

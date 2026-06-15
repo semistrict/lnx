@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { createServer } from "node:net";
 
 type CommandResult = {
   status: number;
@@ -51,6 +52,7 @@ const statePath = expandHome(env("LNX_AWS_STATE", `~/.lnx/aws/${name}-${region}.
 const tagKey = "LnxRole";
 const tagValue = "arm-metal-test";
 const heartbeatMs = numberEnv("LNX_AWS_HEARTBEAT_MS", 5 * 60 * 1000);
+const lnxServerPort = numberEnv("LNX_AWS_SERVER_PORT", 7777);
 const networkCidr = env("LNX_AWS_VPC_CIDR", "10.88.0.0/16");
 const ubuntuAmiParameter = "/aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id";
 
@@ -172,9 +174,8 @@ async function syncAndRun(remoteCommand: string): Promise<void> {
 async function putSnapshot(args: string[]): Promise<void> {
   const localArg = args[0];
   if (!localArg) {
-    throw new Error("usage: bun run aws:arm:snapshot-put -- <local-snapshot-dir> [remote-snapshot-dir]");
+    throw new Error("usage: bun run aws:arm:snapshot-put -- <local-snapshot-dir> [remote-instance]");
   }
-  await requireTool("python3");
 
   const localSnapshot = resolve(localArg);
   if (!existsSync(localSnapshot)) {
@@ -184,25 +185,31 @@ async function putSnapshot(args: string[]): Promise<void> {
   if (!localStat.isDirectory()) {
     throw new Error(`local snapshot path is not a directory: ${localSnapshot}`);
   }
-  const remoteSnapshot = args[1] ?? `~/lnx-snapshots/${basename(localSnapshot)}`;
+  const remoteInstance = remoteSandboxInstance(args[1] ?? basename(localSnapshot));
   const state = await requireRunningState();
 
   await waitForSsh(state);
   await withLeaseHeartbeat(state, async () => {
     await remote(state, "cloud-init status --wait >/dev/null 2>&1 || true", { quiet: false });
     await installIdleStopScripts(state);
-    await remote(state, "command -v python3 >/dev/null");
-    await transferSparseDirectory(state, localSnapshot, remoteSnapshot);
+    await syncRepo(state);
+    await ensureRemoteLnxServer(state);
+    await withLnxServerTunnel(state, async (url) => {
+      await pushSnapshotSandbox(localSnapshot, remoteInstance, url);
+    });
   });
+  const remoteSnapshot = `~/.lnx/instances/${remoteInstance}/memory-snapshots/latest`;
   console.log(`snapshot: ${localSnapshot}`);
+  console.log(`instance: ${remoteInstance}`);
   console.log(`remote: ${remoteSnapshot}`);
 }
 
 async function counterProof(args: string[]): Promise<void> {
   const localSnapshot = resolve(args[0] ?? join(repoRoot, "target", "aws-counter-fixture-v8"));
-  const remoteSnapshot = args[1] ?? `~/lnx-snapshots/${basename(localSnapshot)}`;
+  const remoteInstance = remoteSandboxInstance(args[1] ?? basename(localSnapshot));
+  const remoteSnapshot = `~/.lnx/instances/${remoteInstance}/memory-snapshots/latest`;
 
-  await putSnapshot([localSnapshot, remoteSnapshot]);
+  await putSnapshot([localSnapshot, remoteInstance]);
   await syncAndRun(counterProofRemoteCommand(remoteSnapshot));
 }
 
@@ -218,18 +225,19 @@ export CC_LINUX="\${CC_LINUX:-aarch64-linux-musl-gcc -isystem $linux_headers}"
 cargo build
 snapshot_dir=${snapshotExpr}
 proof_dir="$snapshot_dir-proof"
+restore_instance_dir="$HOME/.lnx/instances/lnx-aws-counter-restore"
+restore_snapshot_dir="$restore_instance_dir/memory-snapshots/latest"
 work_dir="$HOME/lnx-snapshots/work-counter-proof"
 rm -rf "$work_dir"
 mkdir -p "$work_dir"
 cp --sparse=always "$snapshot_dir/rootfs.ext4" "$work_dir/rootfs.ext4"
 rm -rf "$proof_dir"
+rm -rf "$restore_snapshot_dir"
 stat -c 'remote-snapshot %n size=%s blocks=%b block_size=%B' "$snapshot_dir"/rootfs.ext4 "$snapshot_dir"/pages.img
 set +e
-LNX_RESTORE_PROOF_SNAPSHOT_DIR="$proof_dir" \\
-LNX_RESTORE_PROOF_SNAPSHOT_DELAY_MS=250 \\
 LNX_INGRESS_STATE_DIR=/tmp/lnx-disabled-ingress \\
 LNX_ROOTFS_BACKEND=block \\
-LNX_AGENT_TIMEOUT_MS=5000 \\
+LNX_AGENT_TIMEOUT_MS=30000 \\
 LNX_KRUN_LOG_LEVEL=4 \\
 ./target/debug/lnx \\
   --instance lnx-aws-counter-restore \\
@@ -242,7 +250,13 @@ LNX_KRUN_LOG_LEVEL=4 \\
 restore_status=$?
 set -e
 printf 'RESTORE_EXIT=%s\\n' "$restore_status"
-python3 - "$snapshot_dir/pages.img" "$proof_dir/pages.img" <<'PY'
+for _ in $(seq 1 300); do
+  if test -e "$restore_snapshot_dir/pages.img"; then
+    break
+  fi
+  sleep 0.1
+done
+python3 - "$snapshot_dir/pages.img" "$restore_snapshot_dir/pages.img" <<'PY'
 import mmap
 import struct
 import sys
@@ -890,39 +904,111 @@ async function syncRepo(state: State): Promise<void> {
   }
 }
 
-async function transferSparseDirectory(
-  state: State,
-  localSnapshot: string,
-  remoteSnapshot: string,
-): Promise<void> {
+async function ensureRemoteLnxServer(state: State): Promise<void> {
+  await remote(
+    state,
+    `export PATH="$HOME/.cargo/bin:$HOME/.bun/bin:$PATH"
+cd "$HOME/${state.remoteDir}"
+linux_headers="$HOME/.lnx-musl-linux-headers"
+mkdir -p "$linux_headers"
+ln -sfn /usr/include/linux "$linux_headers/linux"
+ln -sfn /usr/include/asm-generic "$linux_headers/asm-generic"
+ln -sfn /usr/include/aarch64-linux-gnu/asm "$linux_headers/asm"
+export CC_LINUX="\${CC_LINUX:-aarch64-linux-musl-gcc -isystem $linux_headers}"
+cargo build
+mkdir -p "$HOME/.lnx/server"
+if test -s "$HOME/.lnx/server/pid"; then
+  old_pid="$(cat "$HOME/.lnx/server/pid")"
+  kill "$old_pid" >/dev/null 2>&1 || true
+  for _ in $(seq 1 20); do
+    if ! kill -0 "$old_pid" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.1
+  done
+fi
+nohup ./target/debug/lnx server --listen 127.0.0.1:${lnxServerPort} >"$HOME/.lnx/server/server.log" 2>&1 &
+printf '%s\\n' "$!" >"$HOME/.lnx/server/pid"
+for _ in $(seq 1 120); do
+  if curl -fsS --max-time 2 http://127.0.0.1:${lnxServerPort}/v1/health >/dev/null 2>&1; then
+    exit 0
+  fi
+  sleep 1
+done
+cat "$HOME/.lnx/server/server.log" >&2 || true
+exit 1`,
+    { quiet: false },
+  );
+}
+
+async function withLnxServerTunnel<T>(state: State, fn: (url: string) => Promise<T>): Promise<T> {
   const instance = await describeInstance(state.instanceId);
   const host = instanceHost(instance);
-  const tempDir = await mkdtemp(join(tmpdir(), "lnx-sparse-transfer-"));
-  const senderPath = join(tempDir, "sparse-send.py");
-  const receiverPath = join(tempDir, "sparse-receive.py");
-  const remoteReceiver = `/tmp/lnx-sparse-receive-${process.pid}-${Date.now()}.py`;
+  const localPort = await freeTcpPort();
+  const tunnel = Bun.spawn(
+    [
+      "ssh",
+      ...sshOptions(state),
+      "-N",
+      "-L",
+      `${localPort}:127.0.0.1:${lnxServerPort}`,
+      `${state.sshUser}@${host}`,
+    ],
+    { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+  );
+  const url = `http://127.0.0.1:${localPort}`;
 
   try {
-    await writeFile(senderPath, sparseSenderScript(), { mode: 0o700 });
-    await writeFile(receiverPath, sparseReceiverScript(), { mode: 0o700 });
-    await remote(
-      state,
-      `cat > ${shellQuote(remoteReceiver)} <<'PY'\n${await readFile(receiverPath, "utf8")}PY\nchmod 0700 ${shellQuote(remoteReceiver)}`,
-    );
-    await pipeCommandToCommand(
-      ["python3", senderPath, localSnapshot],
-      ["ssh", ...sshOptions(state), `${state.sshUser}@${host}`, "python3", remoteReceiver, remoteSnapshot],
-    );
+    await waitForHttp(`${url}/v1/health`, tunnel);
+    return await fn(url);
   } finally {
-    await remote(state, `rm -f ${shellQuote(remoteReceiver)}`, { check: false }).catch(() => {});
-    await rm(tempDir, { recursive: true, force: true });
+    tunnel.kill("SIGTERM");
+    await tunnel.exited.catch(() => {});
   }
 }
 
-async function pipeCommandToCommand(sourceArgs: string[], destArgs: string[]): Promise<void> {
-  const sourceCommand = sourceArgs.map(shellQuote).join(" ");
-  const destCommand = destArgs.map(shellQuote).join(" ");
-  await passthrough(["/bin/bash", "-lc", `set -o pipefail\n${sourceCommand} | ${destCommand}`]);
+async function pushSnapshotSandbox(localSnapshot: string, remoteInstance: string, serverUrl: string): Promise<void> {
+  await run(["bun", "run", "build"], { passthrough: true });
+  const tempBase = await mkdtemp(join(tmpdir(), "lnx-server-snapshot-"));
+  const instanceDir = join(tempBase, "instances", remoteInstance);
+  const latest = join(instanceDir, "memory-snapshots", "latest");
+  try {
+    await mkdir(latest, { recursive: true });
+    await cloneSparseImage(join(localSnapshot, "rootfs.ext4"), join(instanceDir, "rootfs.ext4"));
+    await run(["ln", join(instanceDir, "rootfs.ext4"), join(latest, "rootfs.ext4")]);
+    await cloneSparseImage(join(localSnapshot, "pages.img"), join(latest, "pages.img"));
+    for (const file of ["vmstate.bin", "shares.stamp", "initramfs.stamp", "checkpoint.meta"]) {
+      const src = join(localSnapshot, file);
+      if (existsSync(src)) {
+        await run(["cp", src, join(latest, file)]);
+      }
+    }
+    await writeFile(join(instanceDir, "vm-initialized"), "1\n");
+    await writeFile(
+      join(instanceDir, "lnx.json"),
+      `${JSON.stringify({ name: remoteInstance, image: `server-import:${basename(localSnapshot)}` }, null, 2)}\n`,
+    );
+    const localKernel = join(homedir(), ".lnx", "vmlinuz");
+    if (existsSync(localKernel)) {
+      await cloneSparseImage(localKernel, join(tempBase, "vmlinuz"));
+    }
+    await passthrough(
+      [
+        join(repoRoot, "target", "debug", "lnx"),
+        "--instance",
+        remoteInstance,
+        "server",
+        "push",
+        serverUrl,
+        "--target-instance",
+        remoteInstance,
+        "--replace",
+      ],
+      { env: { LNX_BASE: tempBase } },
+    );
+  } finally {
+    await rm(tempBase, { recursive: true, force: true });
+  }
 }
 
 async function writeGitSyncList(): Promise<string> {
@@ -1137,253 +1223,6 @@ systemctl enable --now lnx-metal-idle-stop.timer
 `;
 }
 
-function sparseSenderScript(): string {
-  return `#!/usr/bin/env python3
-import errno
-import json
-import os
-import stat
-import sys
-
-CHUNK = 8 * 1024 * 1024
-LARGE_SPARSE = 8 * 1024 * 1024 * 1024
-root = os.path.abspath(sys.argv[1])
-out = sys.stdout.buffer
-
-def send(obj):
-    out.write(json.dumps(obj, separators=(",", ":")).encode("utf-8") + b"\\n")
-
-def read_exact(fd, offset, size):
-    chunks = []
-    remaining = size
-    while remaining:
-        chunk = os.pread(fd, remaining, offset)
-        if not chunk:
-            raise RuntimeError(f"short read at offset {offset}")
-        chunks.append(chunk)
-        offset += len(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
-
-def send_chunk(rel, offset, data):
-    if not any(data):
-        return 0
-    send({"type": "data", "path": rel, "offset": offset, "size": len(data)})
-    out.write(data)
-    return len(data)
-
-def scan_file(fd, rel, size):
-    sent = 0
-    offset = 0
-    while offset < size:
-        want = min(CHUNK, size - offset)
-        data = read_exact(fd, offset, want)
-        sent += send_chunk(rel, offset, data)
-        offset += want
-    return sent
-
-def copy_extents(fd, rel, size, allocated):
-    if size == 0:
-        return 0
-    sparse_source = allocated > 0 and allocated <= size // 2
-    if not hasattr(os, "SEEK_DATA") or not hasattr(os, "SEEK_HOLE"):
-        if sparse_source or size >= LARGE_SPARSE:
-            raise RuntimeError(f"{rel}: SEEK_DATA/SEEK_HOLE unavailable for sparse image")
-        return scan_file(fd, rel, size)
-
-    sent = 0
-    offset = 0
-    while offset < size:
-        try:
-            data_start = os.lseek(fd, offset, os.SEEK_DATA)
-        except OSError as exc:
-            if exc.errno == errno.ENXIO:
-                break
-            if exc.errno in (errno.EINVAL, errno.ENOTSUP):
-                if sparse_source or size >= LARGE_SPARSE:
-                    raise RuntimeError(f"{rel}: sparse extents unavailable for sparse image") from exc
-                return scan_file(fd, rel, size)
-            raise
-        data_end = min(os.lseek(fd, data_start, os.SEEK_HOLE), size)
-        if sparse_source and data_start == 0 and data_end == size:
-            raise RuntimeError(f"{rel}: filesystem reported one full-file data extent for sparse source")
-        pos = data_start
-        while pos < data_end:
-            want = min(CHUNK, data_end - pos)
-            chunk = read_exact(fd, pos, want)
-            sent += send_chunk(rel, pos, chunk)
-            pos += want
-        offset = data_end
-    return sent
-
-if not os.path.isdir(root):
-    raise SystemExit(f"not a directory: {root}")
-
-for dirpath, dirnames, filenames in os.walk(root):
-    dirnames.sort()
-    filenames.sort()
-    for name in filenames:
-        path = os.path.join(dirpath, name)
-        st = os.lstat(path)
-        if not stat.S_ISREG(st.st_mode):
-            raise SystemExit(f"snapshot contains non-regular file: {path}")
-        rel = os.path.relpath(path, root).replace(os.sep, "/")
-        allocated = getattr(st, "st_blocks", 0) * 512
-        send({
-            "type": "file",
-            "path": rel,
-            "mode": stat.S_IMODE(st.st_mode),
-            "size": st.st_size,
-            "allocated": allocated,
-        })
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            sent = copy_extents(fd, rel, st.st_size, allocated)
-        finally:
-            os.close(fd)
-        send({"type": "end_file", "path": rel})
-        print(f"sent {rel} size={st.st_size} allocated={allocated} data={sent}", file=sys.stderr)
-
-send({"type": "done"})
-out.flush()
-`;
-}
-
-function sparseReceiverScript(): string {
-  return `#!/usr/bin/env python3
-import json
-import os
-import shutil
-import sys
-
-LARGE_SPARSE = 8 * 1024 * 1024 * 1024
-CHUNK = 8 * 1024 * 1024
-dest = os.path.abspath(os.path.expanduser(sys.argv[1]))
-parent = os.path.dirname(dest)
-tmp = f"{dest}.next-{os.getpid()}"
-backup = f"{dest}.old-{os.getpid()}"
-inp = sys.stdin.buffer
-files = {}
-finished = False
-
-def remove_any(path):
-    if not os.path.exists(path) and not os.path.islink(path):
-        return
-    if os.path.isdir(path) and not os.path.islink(path):
-        shutil.rmtree(path)
-    else:
-        os.unlink(path)
-
-def safe_path(rel):
-    if os.path.isabs(rel):
-        raise RuntimeError(f"absolute snapshot path rejected: {rel}")
-    normalized = os.path.normpath(rel)
-    if normalized == ".." or normalized.startswith("../"):
-        raise RuntimeError(f"escaping snapshot path rejected: {rel}")
-    return normalized.replace("\\\\", "/")
-
-def read_message():
-    line = inp.readline()
-    if not line:
-        raise RuntimeError("unexpected EOF reading sparse transfer metadata")
-    return json.loads(line)
-
-def read_exact(size):
-    chunks = []
-    remaining = size
-    while remaining:
-        chunk = inp.read(min(CHUNK, remaining))
-        if not chunk:
-            raise RuntimeError("unexpected EOF reading sparse transfer data")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
-
-try:
-    os.makedirs(parent, exist_ok=True)
-    remove_any(tmp)
-    os.makedirs(tmp)
-
-    while True:
-        msg = read_message()
-        msg_type = msg.get("type")
-        if msg_type == "done":
-            break
-        rel = safe_path(msg["path"])
-        path = os.path.join(tmp, rel)
-        if msg_type == "file":
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            handle = open(path, "w+b", buffering=0)
-            handle.truncate(int(msg["size"]))
-            files[rel] = {
-                "handle": handle,
-                "size": int(msg["size"]),
-                "allocated": int(msg.get("allocated", 0)),
-                "mode": int(msg.get("mode", 0o600)),
-                "data": 0,
-            }
-        elif msg_type == "data":
-            entry = files[rel]
-            size = int(msg["size"])
-            offset = int(msg["offset"])
-            data = read_exact(size)
-            handle = entry["handle"]
-            handle.seek(offset)
-            handle.write(data)
-            entry["data"] += size
-        elif msg_type == "end_file":
-            entry = files.pop(rel)
-            entry["handle"].close()
-            os.chmod(path, entry["mode"])
-            st = os.stat(path)
-            dest_allocated = getattr(st, "st_blocks", 0) * 512
-            source_allocated = entry["allocated"]
-            source_has_holes = entry["data"] < entry["size"]
-            source_reported_sparse = source_allocated < entry["size"]
-            must_remain_sparse = entry["size"] >= LARGE_SPARSE and (
-                source_has_holes or source_reported_sparse
-            )
-            if must_remain_sparse:
-                allowed = max(
-                    entry["data"] * 2,
-                    source_allocated * 2,
-                    entry["data"] + 512 * 1024 * 1024,
-                    source_allocated + 512 * 1024 * 1024,
-                )
-                if dest_allocated > allowed:
-                    raise RuntimeError(
-                        f"{rel}: destination is too dense: source_allocated={source_allocated} "
-                        f"sent_data={entry['data']} dest_allocated={dest_allocated} size={entry['size']}"
-                    )
-            print(
-                f"received {rel} size={entry['size']} allocated={dest_allocated} data={entry['data']}",
-                file=sys.stderr,
-            )
-        else:
-            raise RuntimeError(f"unknown sparse transfer message: {msg_type}")
-
-    for rel, entry in list(files.items()):
-        entry["handle"].close()
-        raise RuntimeError(f"unfinished file in sparse transfer: {rel}")
-
-    remove_any(backup)
-    if os.path.exists(dest) or os.path.islink(dest):
-        os.rename(dest, backup)
-    os.rename(tmp, dest)
-    remove_any(backup)
-    finished = True
-    print(f"installed sparse snapshot {dest}", file=sys.stderr)
-finally:
-    if not finished:
-        for entry in files.values():
-            try:
-                entry["handle"].close()
-            except Exception:
-                pass
-        remove_any(tmp)
-`;
-}
-
 async function requireStateOrSetup(): Promise<State> {
   const state = await loadState().catch(() => null);
   if (state) {
@@ -1504,6 +1343,55 @@ async function requireTool(tool: string): Promise<void> {
   }
 }
 
+async function freeTcpPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (typeof address === "object" && address) {
+        const port = address.port;
+        server.close(() => resolve(port));
+      } else {
+        server.close(() => reject(new Error("could not allocate local TCP port")));
+      }
+    });
+  });
+}
+
+async function waitForHttp(url: string, tunnel: ReturnType<typeof Bun.spawn>): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  let lastError = "";
+  while (Date.now() < deadline) {
+    const exited = await Promise.race([
+      tunnel.exited.then(() => true).catch(() => true),
+      sleep(0).then(() => false),
+    ]);
+    if (exited) {
+      const stderr = await new Response(tunnel.stderr).text().catch(() => "");
+      throw new Error(`SSH tunnel exited before ${url} became ready: ${stderr}`);
+    }
+    const result = await run(["curl", "-fsS", "--max-time", "2", url], { check: false });
+    if (result.status === 0) {
+      return;
+    }
+    lastError = result.stderr || result.stdout;
+    await sleep(250);
+  }
+  throw new Error(`timed out waiting for ${url}: ${lastError}`);
+}
+
+async function cloneSparseImage(src: string, dest: string): Promise<void> {
+  await mkdir(dirname(dest), { recursive: true });
+  const result = await run([join(repoRoot, "target", "debug", "lnx"), "_sparse-copy", src, dest], {
+    timeoutMs: 600_000,
+    check: false,
+  });
+  if (result.status !== 0) {
+    throw new Error(`failed to sparse-copy ${src} to ${dest}\n${result.stderr || result.stdout}`);
+  }
+}
+
 async function awsJson<T>(args: string[]): Promise<T> {
   const result = await aws([...args, "--output", "json"]);
   return JSON.parse(result.stdout) as T;
@@ -1515,17 +1403,18 @@ async function aws(args: string[], options: { check?: boolean } = {}): Promise<C
 
 async function passthrough(
   args: string[],
-  options: { stdin?: string; check?: boolean } = {},
+  options: { stdin?: string; check?: boolean; env?: Record<string, string | undefined> } = {},
 ): Promise<CommandResult> {
   return run(args, { ...options, passthrough: true });
 }
 
 async function run(
   args: string[],
-  options: { stdin?: string; check?: boolean; passthrough?: boolean } = {},
+  options: { stdin?: string; check?: boolean; passthrough?: boolean; env?: Record<string, string | undefined>; timeoutMs?: number } = {},
 ): Promise<CommandResult> {
   const proc = Bun.spawn(args, {
     cwd: repoRoot,
+    env: { ...Bun.env, ...options.env },
     stdin: options.stdin === undefined ? "ignore" : "pipe",
     stdout: options.passthrough ? "inherit" : "pipe",
     stderr: options.passthrough ? "inherit" : "pipe",
@@ -1534,8 +1423,22 @@ async function run(
     await proc.stdin.write(options.stdin);
     proc.stdin.end();
   }
+  let timeout: Timer | undefined;
+  const exited = options.timeoutMs
+    ? Promise.race([
+        proc.exited,
+        new Promise<number>((_, reject) => {
+          timeout = setTimeout(() => {
+            proc.kill("SIGKILL");
+            reject(new Error(`timeout after ${options.timeoutMs}ms: ${args.join(" ")}`));
+          }, options.timeoutMs);
+        }),
+      ])
+    : proc.exited;
   const [status, stdout, stderr] = await Promise.all([
-    proc.exited,
+    exited.finally(() => {
+      if (timeout) clearTimeout(timeout);
+    }),
     options.passthrough ? Promise.resolve("") : new Response(proc.stdout).text(),
     options.passthrough ? Promise.resolve("") : new Response(proc.stderr).text(),
   ]);
@@ -1567,6 +1470,15 @@ function normalizeRegion(value: string): string {
   return value === "us-east1" ? "us-east-1" : value;
 }
 
+function remoteSandboxInstance(value: string): string {
+  const name = basename(value.replace(/\/+$/, "")) || "snapshot";
+  const sanitized = name.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  if (!sanitized) {
+    return "lnx-remote-snapshot";
+  }
+  return sanitized.startsWith("lnx-remote-") ? sanitized : `lnx-remote-${sanitized}`;
+}
+
 function subnetCidr(index: number): string {
   const match = /^(\d+)\.(\d+)\.0\.0\/16$/.exec(networkCidr);
   if (!match) {
@@ -1594,8 +1506,8 @@ function usage(): void {
   console.log(`usage:
   bun run aws:arm:setup
   bun run aws:arm:run -- '<command>'
-  bun run aws:arm:counter-proof -- [local-snapshot-dir] [remote-snapshot-dir]
-  bun run aws:arm:snapshot-put -- <local-snapshot-dir> [remote-snapshot-dir]
+  bun run aws:arm:counter-proof -- [local-snapshot-dir] [remote-instance]
+  bun run aws:arm:snapshot-put -- <local-snapshot-dir> [remote-instance]
   bun run aws:arm:status
   bun run aws:arm:start
   bun run aws:arm:stop
@@ -1616,6 +1528,7 @@ environment:
   LNX_AWS_SSH_CIDR        allowed SSH CIDR, defaults to current public IP /32
   LNX_AWS_SSH_PUBLIC_KEY  public key to import, defaults to ~/.ssh/id_ed25519.pub
   LNX_AWS_SSH_KEY         private key for SSH, defaults to matching private key
+  LNX_AWS_SERVER_PORT     remote localhost lnx server port, defaults to 7777
   LNX_AWS_SUBNET_ID       optional subnet override
   LNX_AWS_AMI_ID          optional Ubuntu arm64 AMI override
 `);

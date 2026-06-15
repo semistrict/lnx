@@ -88,6 +88,8 @@ import subprocess
 subprocess.run(["sudo", "sh", "-c", "printf 41 >/run/lnx-memory-counter"], check=True)
 busy = subprocess.Popen(
     ["python3", "-c", r"""
+import time
+
 marker = b"LNXAWSCOUNTERv8\0"
 buf = bytearray(4096)
 buf[:len(marker)] = marker
@@ -96,6 +98,7 @@ buf[len(marker):len(marker) + 8] = i.to_bytes(8, "little")
 while True:
     i += 1
     buf[len(marker):len(marker) + 8] = i.to_bytes(8, "little")
+    time.sleep(0.001)
 """],
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
@@ -104,6 +107,7 @@ while True:
 )
 print(f"busy-pid={busy.pid}", flush=True)
 print("counter-ready", flush=True)
+subprocess.run(["sleep", "1"], check=True)
 subprocess.run(["lnxctl", "snapshot-exit"], check=True)
 print("snapshot-exit-ready", flush=True)
 `);
