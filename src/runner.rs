@@ -3116,10 +3116,31 @@ fn serve_snapshot(
         bail!("bad snapshot request");
     }
     timings.event(&format!("snapshot.request.read full={force_full}"));
+    let mut ready_stream;
     let mut ready = [0u8; 1];
     stream
-        .read_exact(&mut ready)
-        .context("read snapshot ready")?;
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .context("set snapshot ready read timeout")?;
+    match stream.read_exact(&mut ready) {
+        Ok(()) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::UnexpectedEof
+            ) =>
+        {
+            ready_stream = accept_unix(&listener, Duration::from_secs(30))
+                .context("accept snapshot ready reconnect")?;
+            ready_stream
+                .set_nonblocking(false)
+                .context("set snapshot ready stream blocking")?;
+            ready_stream
+                .read_exact(&mut ready)
+                .context("read snapshot ready reconnect")?;
+        }
+        Err(e) => return Err(e).context("read snapshot ready"),
+    }
+    let _ = stream.set_read_timeout(None);
     if ready[0] != b'R' {
         bail!("bad snapshot ready");
     }

@@ -284,6 +284,20 @@ impl VsockMuxer {
         queued_any
     }
 
+    pub fn drop_stream_connections(&self) {
+        let mut proxy_map = self.proxy_map.write().unwrap();
+        let ids: Vec<_> = proxy_map
+            .iter()
+            .filter_map(|(id, proxy)| proxy.lock().unwrap().stream_connection_ports().map(|_| *id))
+            .collect();
+        for id in ids {
+            if let Some(proxy) = proxy_map.remove(&id) {
+                let fd = proxy.lock().unwrap().as_raw_fd();
+                self.update_polling(id, fd, EventSet::empty());
+            }
+        }
+    }
+
     pub fn restore_stream_listeners(
         &self,
         listeners: &[StreamListenerSnapshot],
@@ -947,6 +961,7 @@ mod tests {
         id: u64,
         local_port: u32,
         peer_port: u32,
+        active_stream: bool,
     }
 
     impl AsRawFd for SnapshotTestProxy {
@@ -1000,7 +1015,8 @@ mod tests {
         }
 
         fn stream_connection_ports(&self) -> Option<(u32, u32)> {
-            Some((self.local_port, self.peer_port))
+            self.active_stream
+                .then_some((self.local_port, self.peer_port))
         }
 
         fn release(&mut self) -> ProxyUpdate {
@@ -1028,6 +1044,7 @@ mod tests {
                     id: 1,
                     local_port: 10240,
                     peer_port: 55500,
+                    active_stream: true,
                 })),
             );
             proxies.insert(
@@ -1036,6 +1053,7 @@ mod tests {
                     id: 2,
                     local_port: 10241,
                     peer_port: 55501,
+                    active_stream: true,
                 })),
             );
             proxies.insert(
@@ -1044,6 +1062,7 @@ mod tests {
                     id: 3,
                     local_port: 10443,
                     peer_port: 55502,
+                    active_stream: true,
                 })),
             );
         }
@@ -1052,5 +1071,37 @@ mod tests {
         assert!(ports.contains(&(10240, 55500)));
         assert!(ports.contains(&(10241, 55501)));
         assert!(ports.contains(&(10443, 55502)));
+    }
+
+    #[test]
+    fn drop_stream_connections_preserves_non_stream_proxies() {
+        let muxer = VsockMuxer::new(3, None, None, TsiFlags::empty());
+        {
+            let mut proxies = muxer.proxy_map.write().unwrap();
+            proxies.insert(
+                1,
+                Mutex::new(Box::new(SnapshotTestProxy {
+                    id: 1,
+                    local_port: 10240,
+                    peer_port: 55500,
+                    active_stream: true,
+                })),
+            );
+            proxies.insert(
+                2,
+                Mutex::new(Box::new(SnapshotTestProxy {
+                    id: 2,
+                    local_port: 0,
+                    peer_port: 0,
+                    active_stream: false,
+                })),
+            );
+        }
+
+        muxer.drop_stream_connections();
+
+        let proxies = muxer.proxy_map.read().unwrap();
+        assert!(!proxies.contains_key(&1));
+        assert!(proxies.contains_key(&2));
     }
 }

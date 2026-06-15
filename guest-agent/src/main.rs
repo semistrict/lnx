@@ -799,9 +799,9 @@ fn run_pid1_supervisor() -> ! {
     }
 }
 
-fn connect_vsock(port: u32) -> c_int {
+fn try_connect_vsock(port: u32, attempts: usize) -> c_int {
     log!("vsock.connect.begin port={port}");
-    for attempt in 0..600 {
+    for attempt in 0..attempts {
         let addr = vsock_addr(port);
         let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
         if fd < 0 {
@@ -819,7 +819,7 @@ fn connect_vsock(port: u32) -> c_int {
             log!("vsock.connect.success port={port} attempt={attempt} fd={fd}");
             return fd;
         }
-        if attempt == 0 || attempt == 599 || attempt % 50 == 49 {
+        if attempt == 0 || attempt + 1 == attempts || attempt % 50 == 49 {
             log!(
                 "vsock.connect.retry port={port} attempt={attempt} errno={}",
                 errno()
@@ -831,6 +831,14 @@ fn connect_vsock(port: u32) -> c_int {
         unsafe {
             usleep(100_000);
         }
+    }
+    -1
+}
+
+fn connect_vsock(port: u32) -> c_int {
+    let fd = try_connect_vsock(port, 600);
+    if fd >= 0 {
+        return fd;
     }
     die("connect(vsock)")
 }
@@ -995,8 +1003,19 @@ fn request_snapshot_and_reconnect() -> c_int {
     let fd = connect_vsock(SNAPSHOT_PORT);
     log!("snapshot_reconnect.snapshot_connected fd={fd}");
     request_snapshot(fd);
-    snapshot_resume_wait(fd);
-    log!("snapshot_reconnect.snapshot_wait_done fd={fd}");
+    let resume_fd = try_connect_vsock(SNAPSHOT_PORT, 20);
+    if resume_fd >= 0 {
+        log!("snapshot_reconnect.resume_connected fd={resume_fd}");
+        snapshot_resume_wait(resume_fd);
+        log!("snapshot_reconnect.snapshot_wait_done fd={resume_fd}");
+        unsafe {
+            close(resume_fd);
+        }
+    } else {
+        log!("snapshot_reconnect.resume_fallback fd={fd}");
+        snapshot_resume_wait(fd);
+        log!("snapshot_reconnect.snapshot_wait_done fd={fd}");
+    }
     unsafe {
         close(fd);
     }

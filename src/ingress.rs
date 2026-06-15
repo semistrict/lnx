@@ -26,7 +26,7 @@ use anyhow::{Context, Result, bail};
 use lnx_protocol::Message;
 use rustls::{
     ServerConfig as TlsServerConfig, ServerConnection,
-    crypto::aws_lc_rs::sign::any_supported_type,
+    crypto::ring::sign::any_supported_type,
     pki_types::CertificateDer,
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,

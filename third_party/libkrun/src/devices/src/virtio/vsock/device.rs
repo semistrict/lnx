@@ -545,6 +545,7 @@ impl VirtioDevice for Vsock {
             .map(|reset| (reset.local_port, reset.peer_port))
             .collect();
         let queued_stream_reset = self.muxer.queue_stream_resets(&stream_resets);
+        self.muxer.drop_stream_connections();
         self.pending_transport_reset = body.transport_reset || queued_stream_reset;
         Ok(())
     }
