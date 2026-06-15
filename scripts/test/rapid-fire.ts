@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
   assertEq,
@@ -15,13 +15,22 @@ import {
 delete Bun.env.LNX_BROKER_IDLE_TTL_MS;
 
 const ctx = defaultContext("rapid-fire");
+const latestVmstate = join(ctx.snapshotDir, "latest", "vmstate.bin");
 
 try {
   await prepareContext(ctx);
 
+  await testStep("initialize VM instance", async () => {
+    assertEq((await lnx(ctx, ["true"], { env: { LNX_BROKER_IDLE_TTL_MS: "0" } })).status, 0, "vm init status");
+    await waitForVmSuspend(ctx, 120_000);
+    assertEq(existsSync(latestVmstate), true, "initial snapshot exists");
+  });
+
   await testStep("client exits before the post-command snapshot", async () => {
+    const beforeMtime = statSync(latestVmstate).mtimeMs;
     assertEq((await lnx(ctx, ["echo", "cold"])).stdout, "cold", "cold exec");
-    assertEq(existsSync(join(ctx.snapshotDir, "latest", "vmstate.bin")), false, "snapshot deferred past client exit");
+    const afterMtime = statSync(latestVmstate).mtimeMs;
+    assertEq(afterMtime, beforeMtime, "snapshot deferred past client exit");
     assertEq(existsSync(join(ctx.runDir, "broker.sock")), true, "broker stays up for the grace period");
   });
 

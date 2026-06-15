@@ -1319,12 +1319,10 @@ impl Drop for Gvproxy {
 }
 
 fn start_gvproxy(run_dir: &Path) -> Result<Gvproxy> {
-    let gvproxy = std::env::var_os("GVPROXY_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/opt/homebrew/opt/podman/libexec/podman/gvproxy"));
+    let gvproxy = resolve_gvproxy_path();
     if !gvproxy.exists() {
         bail!(
-            "gvproxy not found at {}. Install podman with Homebrew or set GVPROXY_PATH.",
+            "gvproxy not found at {}. Install gvproxy or set GVPROXY_PATH.",
             gvproxy.display()
         );
     }
@@ -1354,6 +1352,27 @@ fn start_gvproxy(run_dir: &Path) -> Result<Gvproxy> {
     wait_for_path(&socket, Duration::from_secs(30))
         .with_context(|| format!("gvproxy did not create {}", socket.display()))?;
     Ok(Gvproxy { socket, child })
+}
+
+fn resolve_gvproxy_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("GVPROXY_PATH") {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = find_on_path("gvproxy") {
+        return path;
+    }
+    PathBuf::from("/opt/homebrew/opt/podman/libexec/podman/gvproxy")
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&paths) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn unused_local_port() -> Result<u16> {
@@ -1884,6 +1903,9 @@ fn run_broker_owner(
     } else {
         None
     };
+    if restore_snapshot.is_some() {
+        maybe_spawn_restore_proof_snapshotter(Arc::clone(&ctx), Arc::clone(&run_log));
+    }
     let accept_result =
         accept_agent_hello(&listener, agent_timeout, &timings, &run_log, &vm_error_rx);
     if let Some(unblocker) = restore_snapshot_unblocker {
@@ -2187,6 +2209,43 @@ fn run_broker_owner(
             Err(e) => owner_log.line(format!("snapshot.error {e:#}")),
         }
     }))
+}
+
+fn maybe_spawn_restore_proof_snapshotter(ctx: Arc<KrunContext>, run_log: Arc<RunLog>) {
+    let Some(path) = std::env::var_os("LNX_RESTORE_PROOF_SNAPSHOT_DIR").map(PathBuf::from) else {
+        return;
+    };
+    let delay = std::env::var("LNX_RESTORE_PROOF_SNAPSHOT_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(250));
+    run_log.line(format!(
+        "restore.proof_snapshot.scheduled path={} delay_ms={}",
+        path.display(),
+        delay.as_millis()
+    ));
+    thread::spawn(move || {
+        thread::sleep(delay);
+        run_log.line(format!(
+            "restore.proof_snapshot.begin path={}",
+            path.display()
+        ));
+        match ctx.snapshot(&path) {
+            Ok(()) => {
+                run_log.line(format!(
+                    "restore.proof_snapshot.done path={}",
+                    path.display()
+                ));
+            }
+            Err(e) => {
+                run_log.line(format!(
+                    "restore.proof_snapshot.error path={} error={e:#}",
+                    path.display()
+                ));
+            }
+        }
+    });
 }
 
 fn broker_idle_ttl() -> Duration {

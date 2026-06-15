@@ -129,16 +129,23 @@ pub fn push_packet(
     queue_mutex: &Arc<Mutex<VirtQueue>>,
     mem: &GuestMemoryMmap,
 ) {
+    let rx_summary = format!("{rx:?}");
     let mut queue = queue_mutex.lock().unwrap();
     if let Some(head) = queue.pop(mem) {
         if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
             rx_to_pkt(cid, rx, &mut pkt);
             if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len()) {
                 error!("failed to add used elements to the queue: {e:?}");
+            } else {
+                debug!(
+                    "vsock.rx.delivered head={} used_len={} rx={rx_summary}",
+                    head.index,
+                    pkt.hdr().len() as u32 + pkt.len()
+                );
             }
         }
     } else {
-        error!("couldn't push pkt to queue, adding it to rxq");
+        error!("couldn't push pkt to queue, adding it to rxq: {rx_summary}");
         drop(queue);
         rxq_mutex.lock().unwrap().push(rx);
     }
@@ -242,22 +249,16 @@ impl VsockMuxer {
     }
 
     pub fn stream_connection_ports(&self) -> Vec<(u32, u32)> {
+        // Include runtime unix connectors too. Their host-side FDs are not
+        // serializable, but the guest stream must still receive an explicit
+        // reset after restore so agents reconnect instead of waiting forever
+        // on a dead host endpoint.
         self.proxy_map
             .read()
             .unwrap()
             .values()
             .filter_map(|proxy| proxy.lock().unwrap().stream_connection_ports())
-            .filter(|(local_port, _)| self.should_snapshot_stream_connection(*local_port))
             .collect()
-    }
-
-    fn should_snapshot_stream_connection(&self, local_port: u32) -> bool {
-        !matches!(
-            self.unix_ipc_port_map
-                .as_ref()
-                .and_then(|ipc_map| ipc_map.get(&local_port)),
-            Some((_, false))
-        )
     }
 
     pub fn queue_stream_resets(&self, connections: &[(u32, u32)]) -> bool {
@@ -267,6 +268,7 @@ impl VsockMuxer {
             if local_port == 0 || peer_port == 0 {
                 continue;
             }
+            debug!("queue restored stream reset local_port={local_port} peer_port={peer_port}");
             let queued = rxq.push(MuxerRx::Reset {
                 local_port,
                 peer_port,
@@ -365,19 +367,29 @@ impl VsockMuxer {
     }
 
     pub(crate) fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> super::Result<()> {
-        debug!("recv_stream_pkt");
         if self.rxq.lock().unwrap().is_empty() {
             return Err(VsockError::NoData);
         }
 
         if let Some(rx) = self.rxq.lock().unwrap().pop() {
             rx_to_pkt(self.cid, rx, pkt);
+            debug!(
+                "recv_stream_pkt src_cid={} dst_cid={} src_port={} dst_port={} op={} type={} len={}",
+                pkt.src_cid(),
+                pkt.dst_cid(),
+                pkt.src_port(),
+                pkt.dst_port(),
+                pkt.op(),
+                pkt.type_(),
+                pkt.len()
+            );
         }
 
         Ok(())
     }
 
     fn push_packet(&self, rx: MuxerRx) {
+        let rx_summary = format!("{rx:?}");
         let mem = match self.mem.as_ref() {
             Some(m) => m,
             None => {
@@ -400,10 +412,16 @@ impl VsockMuxer {
                 if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
                 {
                     error!("failed to add used elements to the queue: {e:?}");
+                } else {
+                    debug!(
+                        "vsock.rx.delivered head={} used_len={} rx={rx_summary}",
+                        head.index,
+                        pkt.hdr().len() as u32 + pkt.len()
+                    );
                 }
             }
         } else {
-            error!("couldn't push pkt to queue, adding it to rxq");
+            error!("couldn't push pkt to queue, adding it to rxq: {rx_summary}");
             drop(queue);
             self.rxq.lock().unwrap().push(rx);
         }
@@ -921,20 +939,118 @@ impl VsockMuxer {
 
 #[cfg(test)]
 mod tests {
+    use super::super::packet::{TsiAcceptReq, TsiListenReq, TsiSendtoAddr};
+    use super::super::proxy::ProxyStatus;
     use super::*;
 
+    struct SnapshotTestProxy {
+        id: u64,
+        local_port: u32,
+        peer_port: u32,
+    }
+
+    impl AsRawFd for SnapshotTestProxy {
+        fn as_raw_fd(&self) -> RawFd {
+            -1
+        }
+    }
+
+    impl Proxy for SnapshotTestProxy {
+        fn id(&self) -> u64 {
+            self.id
+        }
+
+        fn status(&self) -> ProxyStatus {
+            ProxyStatus::Connected
+        }
+
+        fn connect(&mut self, _pkt: &VsockPacket, _req: TsiConnectReq) -> ProxyUpdate {
+            ProxyUpdate::default()
+        }
+
+        fn getpeername(&mut self, _pkt: &VsockPacket) {}
+
+        fn sendmsg(&mut self, _pkt: &VsockPacket) -> ProxyUpdate {
+            ProxyUpdate::default()
+        }
+
+        fn sendto_addr(&mut self, _req: TsiSendtoAddr) -> ProxyUpdate {
+            ProxyUpdate::default()
+        }
+
+        fn listen(
+            &mut self,
+            _pkt: &VsockPacket,
+            _req: TsiListenReq,
+            _host_port_map: &Option<HashMap<u16, u16>>,
+        ) -> ProxyUpdate {
+            ProxyUpdate::default()
+        }
+
+        fn accept(&mut self, _req: TsiAcceptReq) -> ProxyUpdate {
+            ProxyUpdate::default()
+        }
+
+        fn update_peer_credit(&mut self, _pkt: &VsockPacket) -> ProxyUpdate {
+            ProxyUpdate::default()
+        }
+
+        fn process_op_response(&mut self, _pkt: &VsockPacket) -> ProxyUpdate {
+            ProxyUpdate::default()
+        }
+
+        fn stream_connection_ports(&self) -> Option<(u32, u32)> {
+            Some((self.local_port, self.peer_port))
+        }
+
+        fn release(&mut self) -> ProxyUpdate {
+            ProxyUpdate::default()
+        }
+
+        fn process_event(&mut self, _evset: EventSet) -> ProxyUpdate {
+            ProxyUpdate::default()
+        }
+    }
+
     #[test]
-    fn snapshot_resets_skip_runtime_unix_connectors() {
+    fn snapshot_resets_include_runtime_unix_connectors() {
         let mut ipc_map = HashMap::new();
         ipc_map.insert(10240, (PathBuf::from("/tmp/lnx-agent.sock"), false));
         ipc_map.insert(10241, (PathBuf::from("/tmp/lnx-snapshot.sock"), false));
         ipc_map.insert(10443, (PathBuf::from("/tmp/listener.sock"), true));
 
         let muxer = VsockMuxer::new(3, None, Some(ipc_map), TsiFlags::empty());
+        {
+            let mut proxies = muxer.proxy_map.write().unwrap();
+            proxies.insert(
+                1,
+                Mutex::new(Box::new(SnapshotTestProxy {
+                    id: 1,
+                    local_port: 10240,
+                    peer_port: 55500,
+                })),
+            );
+            proxies.insert(
+                2,
+                Mutex::new(Box::new(SnapshotTestProxy {
+                    id: 2,
+                    local_port: 10241,
+                    peer_port: 55501,
+                })),
+            );
+            proxies.insert(
+                3,
+                Mutex::new(Box::new(SnapshotTestProxy {
+                    id: 3,
+                    local_port: 10443,
+                    peer_port: 55502,
+                })),
+            );
+        }
 
-        assert!(!muxer.should_snapshot_stream_connection(10240));
-        assert!(!muxer.should_snapshot_stream_connection(10241));
-        assert!(muxer.should_snapshot_stream_connection(10443));
-        assert!(muxer.should_snapshot_stream_connection(55555));
+        let ports = muxer.stream_connection_ports();
+        assert!(ports.contains(&(10240, 55500)));
+        assert!(ports.contains(&(10241, 55501)));
+        assert!(ports.contains(&(10443, 55502)));
     }
 }

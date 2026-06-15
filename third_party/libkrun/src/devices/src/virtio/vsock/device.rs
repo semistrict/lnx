@@ -130,6 +130,13 @@ impl Vsock {
             have_used = true;
             if let Err(e) = queue_rx.add_used(mem, head.index, used_len) {
                 error!("failed to add used elements to the queue: {e:?}");
+            } else {
+                debug!(
+                    "vsock.rx.add_used head={} used_len={} pending_rx={}",
+                    head.index,
+                    used_len,
+                    self.muxer.has_pending_rx()
+                );
             }
         }
 
@@ -434,13 +441,9 @@ impl VirtioDevice for Vsock {
             "vsock.restore.post_restore.begin pending_rx={} rxq={before_rx:?} interrupt={before_interrupt:?}",
             self.muxer.has_pending_rx()
         );
-        let wrote_reset_event = self.process_transport_reset_event();
-        let mut raise_irq = wrote_reset_event;
+        let mut raise_irq = false;
         raise_irq |= self.process_stream_tx();
-        if self.muxer.has_pending_rx() {
-            raise_irq |= self.process_stream_rx();
-        }
-        if wrote_reset_event || self.pending_transport_reset {
+        if self.pending_transport_reset || self.muxer.has_pending_rx() {
             self.restore_kick_pending = true;
         }
         let after_rx = self.rx_queue_restore_state();
@@ -459,7 +462,12 @@ impl VirtioDevice for Vsock {
 
     fn post_vcpu_restore(&mut self) -> Result<(), DeviceSnapshotError> {
         let wrote_reset_event = self.process_transport_reset_event();
-        if !self.restore_kick_pending && !wrote_reset_event {
+        let mut raise_irq = wrote_reset_event;
+        raise_irq |= self.process_stream_tx();
+        if self.muxer.has_pending_rx() {
+            raise_irq |= self.process_stream_rx();
+        }
+        if !self.restore_kick_pending && !raise_irq {
             return Ok(());
         }
         self.restore_kick_pending = false;

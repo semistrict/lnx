@@ -226,6 +226,14 @@ impl Context {
         )
     }
 
+    pub fn snapshot(&self, path: &Path) -> Result<()> {
+        let path = cstring_path(path)?;
+        call(
+            unsafe { libkrun::krun_snapshot(self.id, path.as_ptr()) },
+            "krun_snapshot",
+        )
+    }
+
     pub fn snapshot_with_file_copy(
         &self,
         path: &Path,

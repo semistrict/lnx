@@ -15,6 +15,7 @@ use std::io;
 use std::ops::Range;
 
 use std::os::unix::io::RawFd;
+use std::os::unix::thread::JoinHandleExt;
 
 #[cfg(target_arch = "x86_64")]
 use std::env;
@@ -955,6 +956,8 @@ pub struct Vcpu {
     mpidr: u64,
     #[cfg(target_arch = "aarch64")]
     pending_hvf_timer_restore: Option<HvfTimerRestoreState>,
+    #[cfg(target_arch = "aarch64")]
+    restore_debug_exits_remaining: u32,
 
     // The receiving end of events channel owned by the vcpu side.
     event_receiver: Receiver<VcpuEvent>,
@@ -1125,6 +1128,7 @@ impl Vcpu {
             exit_evt,
             mpidr: 0,
             pending_hvf_timer_restore: None,
+            restore_debug_exits_remaining: 0,
             event_receiver,
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
@@ -1513,11 +1517,25 @@ impl Vcpu {
     fn restore_hvf_state(&mut self, bytes: &[u8], capture_counter: u64) -> Result<()> {
         let hvf_state = bincode::deserialize::<HvfVcpuStateCompat>(bytes)
             .map_err(|_| Error::VcpuUnhandledKvmExit)?;
+        debug!(
+            "hvf.restore.input pc=0x{:x} cpsr=0x{:x} sysregs={} gic_icc={} gic_redist={} gic_ich={} vtimer_offset=0x{:x} capture_counter=0x{:x}",
+            hvf_state.pc,
+            hvf_state.cpsr,
+            hvf_state.sysregs.len(),
+            hvf_state.gic_icc_regs.len(),
+            hvf_state.gic_redist_regs.len(),
+            hvf_state.gic_ich_regs.len(),
+            hvf_state.vtimer_offset,
+            capture_counter
+        );
         let mut state = self.save_state()?;
         merge_hvf_state_into_kvm_state(&mut state, &hvf_state, capture_counter)?;
         let timer_state = hvf_timer_restore_state(&state);
         self.restore_state(state)?;
+        self.reapply_hvf_core_state_after_mp_state(&hvf_state)?;
+        self.log_hvf_restore_readback();
         self.pending_hvf_timer_restore = Some(timer_state);
+        self.restore_debug_exits_remaining = 64;
         Ok(())
     }
 
@@ -1542,7 +1560,36 @@ impl Vcpu {
     }
 
     #[cfg(target_arch = "aarch64")]
+    fn reapply_hvf_core_state_after_mp_state(&self, hvf: &HvfVcpuStateCompat) -> Result<()> {
+        if std::env::var_os("KRUN_REAPPLY_HVF_CORE_AFTER_MP_STATE").is_none() {
+            return Ok(());
+        }
+        self.set_one_reg_u64(core_user_pc_id(), hvf.pc)?;
+        self.set_one_reg_u64(core_user_pstate_id(), hvf.cpsr)?;
+        for &(reg, value) in &hvf.sysregs {
+            match reg {
+                reg if reg == hvf_sys_reg(3, 0, 4, 1, 0) => {
+                    self.set_one_reg_u64(core_user_sp_id(), value)?
+                }
+                reg if reg == hvf_sys_reg(3, 4, 4, 1, 0) => {
+                    self.set_one_reg_u64(core_sp_el1_id(), value)?
+                }
+                reg if reg == hvf_sys_reg(3, 0, 4, 0, 0) => {
+                    self.set_one_reg_u64(core_spsr_id(0), value)?
+                }
+                reg if reg == hvf_sys_reg(3, 0, 4, 0, 1) => {
+                    self.set_one_reg_u64(core_elr_el1_id(), value)?
+                }
+                _ => {}
+            }
+        }
+        debug!("hvf.restore.reapply_core_after_mp_state");
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
     fn rearm_hvf_timer_state(&self, timer: HvfTimerRestoreState) -> Result<()> {
+        let timer = rearmed_hvf_timer_state(timer);
         if let Some(value) = timer.cnt {
             self.set_one_reg_u64(kvm_timer_counter_id(), value)?;
         }
@@ -1559,6 +1606,7 @@ impl Vcpu {
     fn rearm_pending_hvf_timer_state(&mut self) -> Result<()> {
         if let Some(timer) = self.pending_hvf_timer_restore.take() {
             self.rearm_hvf_timer_state(timer)?;
+            self.log_hvf_restore_readback();
         }
         Ok(())
     }
@@ -1566,6 +1614,78 @@ impl Vcpu {
     #[cfg(not(target_arch = "aarch64"))]
     fn rearm_pending_hvf_timer_state(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn log_hvf_restore_readback(&self) {
+        let regs = vec![
+            ("x0", core_user_reg_id(0)),
+            ("x1", core_user_reg_id(1)),
+            ("x2", core_user_reg_id(2)),
+            ("x3", core_user_reg_id(3)),
+            ("x4", core_user_reg_id(4)),
+            ("x5", core_user_reg_id(5)),
+            ("x6", core_user_reg_id(6)),
+            ("x7", core_user_reg_id(7)),
+            ("x8", core_user_reg_id(8)),
+            ("x9", core_user_reg_id(9)),
+            ("x29", core_user_reg_id(29)),
+            ("x30", core_user_reg_id(30)),
+            ("pc", core_user_pc_id()),
+            ("pstate", core_user_pstate_id()),
+            ("sp_el0", core_user_sp_id()),
+            ("sp_el1", core_sp_el1_id()),
+            ("sys_sp_el0", arm64_sys_reg_id(3, 0, 4, 1, 0)),
+            ("currentel", arm64_sys_reg_id(3, 0, 4, 2, 2)),
+            ("spsel", arm64_sys_reg_id(3, 0, 4, 2, 0)),
+            ("elr_el1", core_elr_el1_id()),
+            ("spsr_el1", core_spsr_id(0)),
+            ("esr_el1", arm64_sys_reg_id(3, 0, 5, 2, 0)),
+            ("far_el1", arm64_sys_reg_id(3, 0, 6, 0, 0)),
+            ("sctlr_el1", arm64_sys_reg_id(3, 0, 1, 0, 0)),
+            ("ttbr0_el1", arm64_sys_reg_id(3, 0, 2, 0, 0)),
+            ("ttbr1_el1", arm64_sys_reg_id(3, 0, 2, 0, 1)),
+            ("tcr_el1", arm64_sys_reg_id(3, 0, 2, 0, 2)),
+            ("mair_el1", arm64_sys_reg_id(3, 0, 10, 2, 0)),
+            ("amair_el1", arm64_sys_reg_id(3, 0, 10, 3, 0)),
+            ("contextidr_el1", arm64_sys_reg_id(3, 0, 13, 0, 1)),
+            ("tpidr_el0", arm64_sys_reg_id(3, 3, 13, 0, 2)),
+            ("tpidrro_el0", arm64_sys_reg_id(3, 3, 13, 0, 3)),
+            ("tpidr_el1", arm64_sys_reg_id(3, 0, 13, 0, 4)),
+            ("vbar_el1", arm64_sys_reg_id(3, 0, 12, 0, 0)),
+            ("cntv_ctl", kvm_timer_ctl_id()),
+            ("cntv_cval", kvm_timer_cval_id()),
+            ("cntv_cnt", kvm_timer_counter_id()),
+        ];
+        let esr_el1 = self.get_one_reg_u64(arm64_sys_reg_id(3, 0, 5, 2, 0));
+        let summary = regs
+            .iter()
+            .map(|(name, id)| {
+                self.get_one_reg_u64(*id)
+                    .map(|value| format!("{name}=0x{value:x}"))
+                    .unwrap_or_else(|| format!("{name}=<missing>"))
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let esr_summary = esr_el1
+            .map(decode_esr_el1_summary)
+            .unwrap_or_else(|| "esr=<missing>".to_string());
+        debug!("hvf.restore.readback {summary} {esr_summary}");
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    fn log_hvf_restore_readback(&self) {}
+
+    #[cfg(target_arch = "aarch64")]
+    fn log_restore_debug_exit(&mut self, exit: std::fmt::Arguments<'_>) {
+        if self.restore_debug_exits_remaining == 0 {
+            return;
+        }
+        debug!(
+            "hvf.restore.kvm_run.exit vcpu={} remaining={} {exit}",
+            self.id, self.restore_debug_exits_remaining
+        );
+        self.restore_debug_exits_remaining -= 1;
     }
 
     /// Re-arm deadlines that are measured against the host-advancing physical
@@ -1627,6 +1747,14 @@ impl Vcpu {
             if self.kernel_enomem_workaround {
                 thread::sleep(Duration::from_millis(5));
             }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if self.restore_debug_exits_remaining > 0 {
+            debug!(
+                "hvf.restore.kvm_run.enter vcpu={} remaining={}",
+                self.id, self.restore_debug_exits_remaining
+            );
         }
 
         match self.fd.run() {
@@ -1697,36 +1825,56 @@ impl Vcpu {
                     }
                 }
                 VcpuExit::MmioRead(addr, data) => {
+                    let len = data.len();
                     if let Some(ref mmio_bus) = self.mmio_bus {
                         mmio_bus.read(0, addr, data);
                     }
+                    #[cfg(target_arch = "aarch64")]
+                    self.log_restore_debug_exit(format_args!("MmioRead addr=0x{addr:x} len={len}"));
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::MmioWrite(addr, data) => {
+                    let len = data.len();
                     if let Some(ref mmio_bus) = self.mmio_bus {
                         mmio_bus.write(0, addr, data);
                     }
+                    #[cfg(target_arch = "aarch64")]
+                    self.log_restore_debug_exit(format_args!(
+                        "MmioWrite addr=0x{addr:x} len={len}"
+                    ));
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::Hlt => {
+                    #[cfg(target_arch = "aarch64")]
+                    self.log_restore_debug_exit(format_args!("Hlt"));
                     info!("Received KVM_EXIT_HLT signal");
                     Ok(VcpuEmulation::Stopped)
                 }
                 VcpuExit::Shutdown => {
+                    #[cfg(target_arch = "aarch64")]
+                    self.log_restore_debug_exit(format_args!("Shutdown"));
                     info!("Received KVM_EXIT_SHUTDOWN signal");
                     Ok(VcpuEmulation::Stopped)
                 }
                 // Documentation specifies that below kvm exits are considered
                 // errors.
                 VcpuExit::FailEntry(reason, vcpu) => {
+                    #[cfg(target_arch = "aarch64")]
+                    self.log_restore_debug_exit(format_args!(
+                        "FailEntry reason={reason} vcpu={vcpu}"
+                    ));
                     error!("Received KVM_EXIT_FAIL_ENTRY signal: reason={reason}, vcpu={vcpu}");
                     Err(Error::VcpuUnhandledKvmExit)
                 }
                 VcpuExit::InternalError => {
+                    #[cfg(target_arch = "aarch64")]
+                    self.log_restore_debug_exit(format_args!("InternalError"));
                     error!("Received KVM_EXIT_INTERNAL_ERROR signal");
                     Err(Error::VcpuUnhandledKvmExit)
                 }
                 VcpuExit::SystemEvent(event, _reason) => {
+                    #[cfg(target_arch = "aarch64")]
+                    self.log_restore_debug_exit(format_args!("SystemEvent event={event}"));
                     match event {
                         KVM_SYSTEM_EVENT_SHUTDOWN => {
                             info!("Received KVM_SYSTEM_EVENT_SHUTDOWN")
@@ -1748,6 +1896,13 @@ impl Vcpu {
             Err(ref e) => match e.errno() {
                 libc::EAGAIN => Ok(VcpuEmulation::Handled),
                 libc::EINTR => {
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        self.log_restore_debug_exit(format_args!("EINTR"));
+                        if self.restore_debug_exits_remaining > 0 {
+                            self.log_hvf_restore_readback();
+                        }
+                    }
                     self.fd.set_kvm_immediate_exit(0);
                     // Notify that this KVM_RUN was interrupted.
                     Ok(VcpuEmulation::Interrupted)
@@ -2034,6 +2189,9 @@ struct HvfTimerRestoreState {
 }
 
 #[cfg(target_arch = "aarch64")]
+const HVF_EXPIRED_TIMER_REARM_TICKS: u64 = 10_000_000;
+
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn decode_hvf_vcpu_gic_state(
     bytes: &[u8],
 ) -> std::result::Result<(Vec<(u16, u64)>, Vec<(u32, u64)>, Vec<(u16, u64)>), bincode::Error> {
@@ -2089,6 +2247,7 @@ fn reg_u64(state: &VcpuState, id: u64) -> Option<u64> {
 
 #[cfg(target_arch = "aarch64")]
 fn apply_hvf_sysreg(state: &mut VcpuState, reg: u16, value: u64) -> Result<()> {
+    let value = sanitize_hvf_control_sysreg_for_kvm(reg, value);
     match reg {
         reg if reg == hvf_sys_reg(3, 0, 4, 0, 0) => {
             replace_optional_reg_u64(state, core_spsr_id(0), value)
@@ -2100,14 +2259,51 @@ fn apply_hvf_sysreg(state: &mut VcpuState, reg: u16, value: u64) -> Result<()> {
             replace_optional_reg_u64(state, core_user_sp_id(), value)
         }
         reg if reg == hvf_sys_reg(3, 4, 4, 1, 0) => {
+            if std::env::var_os("KRUN_SKIP_HVF_SP_EL1_RESTORE").is_some() {
+                debug!("hvf.restore.skip_sysreg reg=0x{reg:x} name=sp_el1 value=0x{value:x}");
+                return Ok(());
+            }
             replace_optional_reg_u64(state, core_sp_el1_id(), value)
         }
         reg if reg == hvf_sys_reg(3, 3, 14, 3, 2) => {
             replace_optional_reg_u64(state, kvm_timer_cval_id(), value)
         }
-        reg if hvf_sysreg_is_read_only_identity(reg) => Ok(()),
+        reg if hvf_sysreg_is_host_derived(reg) => Ok(()),
         reg => replace_optional_reg_u64(state, hvf_sysreg_to_kvm_reg_id(reg), value),
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn sanitize_hvf_control_sysreg_for_kvm(reg: u16, value: u64) -> u64 {
+    if std::env::var_os("KRUN_SANITIZE_HVF_CONTROL_SYSREGS").is_none() {
+        return value;
+    }
+
+    let sanitized = sanitize_hvf_control_sysreg_value(reg, value);
+    if sanitized != value {
+        debug!(
+            "hvf.restore.sanitize_sysreg reg=0x{reg:x} value=0x{value:x} sanitized=0x{sanitized:x}"
+        );
+    }
+    sanitized
+}
+
+#[cfg(target_arch = "aarch64")]
+fn sanitize_hvf_control_sysreg_value(reg: u16, value: u64) -> u64 {
+    match reg {
+        reg if reg == hvf_sys_reg(3, 0, 1, 0, 0) => value & u64::from(u32::MAX),
+        reg if reg == hvf_sys_reg(3, 0, 2, 0, 2) => value & 0x0000_ffff_ffff_ffff,
+        _ => value,
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn decode_esr_el1_summary(esr: u64) -> String {
+    let ec = (esr >> 26) & 0x3f;
+    let il = (esr >> 25) & 0x1;
+    let iss = esr & 0x01ff_ffff;
+    let dfsc = iss & 0x3f;
+    format!("esr_ec=0x{ec:x} esr_il={il} esr_iss=0x{iss:x} esr_dfsc=0x{dfsc:x}")
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2131,6 +2327,30 @@ fn hvf_timer_restore_state(state: &VcpuState) -> HvfTimerRestoreState {
         ctl: reg_u64(state, kvm_timer_ctl_id()),
         cval: reg_u64(state, kvm_timer_cval_id()),
         cnt: reg_u64(state, kvm_timer_counter_id()),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn rearmed_hvf_timer_state(timer: HvfTimerRestoreState) -> HvfTimerRestoreState {
+    let needs_slack = matches!(
+        (timer.cval, timer.cnt, timer.ctl),
+        (Some(cval), Some(cnt), Some(ctl))
+            if (ctl & TMR_CTL_ENABLE) != 0
+                && cval.wrapping_sub(cnt) <= HVF_EXPIRED_TIMER_REARM_TICKS
+    );
+    HvfTimerRestoreState {
+        cval: match (timer.cval, timer.cnt) {
+            (Some(_), Some(cnt)) if needs_slack => {
+                Some(cnt.wrapping_add(HVF_EXPIRED_TIMER_REARM_TICKS))
+            }
+            _ => timer.cval,
+        },
+        ctl: if needs_slack {
+            timer.ctl.map(|ctl| ctl & !TMR_CTL_ISTATUS)
+        } else {
+            timer.ctl
+        },
+        cnt: timer.cnt,
     }
 }
 
@@ -2256,13 +2476,21 @@ const fn hvf_sys_reg(op0: u16, op1: u16, crn: u16, crm: u16, op2: u16) -> u16 {
 }
 
 #[cfg(target_arch = "aarch64")]
-fn hvf_sysreg_is_read_only_identity(reg: u16) -> bool {
+fn hvf_sysreg_is_host_derived(reg: u16) -> bool {
     (hvf_sysreg_op0(reg) == 3
         && hvf_sysreg_op1(reg) == 0
         && hvf_sysreg_crn(reg) == 0
         && hvf_sysreg_crm(reg) < 8)
         || reg == hvf_sys_reg(3, 4, 0, 0, 0)
         || reg == hvf_sys_reg(3, 4, 0, 0, 5)
+        || reg == hvf_sys_reg(3, 0, 1, 0, 1)
+        || reg == hvf_sys_reg(3, 4, 1, 0, 1)
+        || reg == hvf_sys_reg(3, 0, 0, 0, 1)
+        || reg == hvf_sys_reg(3, 0, 0, 0, 7)
+        || reg == hvf_sys_reg(3, 2, 0, 0, 0)
+        || reg == hvf_sys_reg(3, 3, 0, 0, 0)
+        || reg == hvf_sys_reg(3, 3, 0, 0, 7)
+        || (hvf_sysreg_op0(reg) == 3 && hvf_sysreg_op1(reg) == 1 && hvf_sysreg_crn(reg) == 15)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2380,6 +2608,22 @@ pub struct VcpuHandle {
     vcpu_thread: Option<thread::JoinHandle<()>>,
 }
 
+pub struct VcpuKicker {
+    pthread: usize,
+}
+
+impl VcpuKicker {
+    pub fn kick(&self) -> Result<()> {
+        let pthread = self.pthread as libc::pthread_t;
+        let rc = unsafe { libc::pthread_kill(pthread, sigrtmin() + VCPU_RTSIG_OFFSET) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(Error::SignalVcpu(utils::errno::Error::new(rc)))
+        }
+    }
+}
+
 impl VcpuHandle {
     pub fn new(
         event_sender: Sender<VcpuEvent>,
@@ -2399,6 +2643,10 @@ impl VcpuHandle {
             .send(event)
             .expect("event sender channel closed on vcpu end.");
         // Kick the vcpu so it picks up the message.
+        self.kick()
+    }
+
+    pub fn kick(&self) -> Result<()> {
         self.vcpu_thread
             .as_ref()
             // Safe to unwrap since constructor make this 'Some'.
@@ -2406,6 +2654,12 @@ impl VcpuHandle {
             .kill(sigrtmin() + VCPU_RTSIG_OFFSET)
             .map_err(Error::SignalVcpu)?;
         Ok(())
+    }
+
+    pub fn try_clone_kicker(&self) -> Option<VcpuKicker> {
+        self.vcpu_thread.as_ref().map(|handle| VcpuKicker {
+            pthread: handle.as_pthread_t() as usize,
+        })
     }
 
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
@@ -2490,6 +2744,7 @@ mod tests {
         let writable_sysreg = hvf_sys_reg(3, 0, 1, 0, 0);
         let readonly_id_sysreg = hvf_sys_reg(3, 0, 0, 1, 0);
         let readonly_el2_id_sysreg = hvf_sys_reg(3, 4, 0, 0, 5);
+        let host_derived_sysreg = hvf_sys_reg(3, 0, 1, 0, 1);
         let hvf_cntv_cval = hvf_sys_reg(3, 3, 14, 3, 2);
         let kvm_timer_cval = kvm_timer_cval_id();
         let kvm_timer_counter = kvm_timer_counter_id();
@@ -2510,6 +2765,7 @@ mod tests {
             one_reg_u64(hvf_sysreg_to_kvm_reg_id(writable_sysreg), 0),
             one_reg_u64(hvf_sysreg_to_kvm_reg_id(readonly_id_sysreg), 0xfeed),
             one_reg_u64(hvf_sysreg_to_kvm_reg_id(readonly_el2_id_sysreg), 0xbeef),
+            one_reg_u64(hvf_sysreg_to_kvm_reg_id(host_derived_sysreg), 0xcafe),
             one_reg_u64(kvm_timer_cval, 0),
             one_reg_u64(kvm_timer_counter, 0x9999),
         ]);
@@ -2529,6 +2785,7 @@ mod tests {
                 (writable_sysreg, 0x1111),
                 (readonly_id_sysreg, 0x2222),
                 (readonly_el2_id_sysreg, 0xaaaa),
+                (host_derived_sysreg, 0xbbbb),
                 (hvf_sys_reg(3, 0, 4, 0, 0), 0x3333),
                 (hvf_sys_reg(3, 0, 4, 0, 1), 0x4444),
                 (hvf_sys_reg(3, 0, 4, 1, 0), 0x5555),
@@ -2581,6 +2838,10 @@ mod tests {
             reg_bytes(&state, hvf_sysreg_to_kvm_reg_id(readonly_el2_id_sysreg)),
             &0xbeefu64.to_le_bytes()
         );
+        assert_eq!(
+            reg_bytes(&state, hvf_sysreg_to_kvm_reg_id(host_derived_sysreg)),
+            &0xcafeu64.to_le_bytes()
+        );
         assert_eq!(reg_bytes(&state, core_spsr_id(0)), &0x3333u64.to_le_bytes());
         assert_eq!(
             reg_bytes(&state, core_elr_el1_id()),
@@ -2602,6 +2863,23 @@ mod tests {
         assert_eq!(
             state.mp_state.map(|state| state.mp_state),
             Some(KVM_MP_STATE_RUNNABLE)
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn hvf_control_sysreg_sanitizer_masks_kvm_host_normalized_bits() {
+        assert_eq!(
+            sanitize_hvf_control_sysreg_value(hvf_sys_reg(3, 0, 1, 0, 0), 0x20000183474d99d),
+            0x3474d99d
+        );
+        assert_eq!(
+            sanitize_hvf_control_sysreg_value(hvf_sys_reg(3, 0, 2, 0, 2), 0x51000727551b511),
+            0x727551b511
+        );
+        assert_eq!(
+            sanitize_hvf_control_sysreg_value(hvf_sys_reg(3, 0, 12, 0, 0), 0xffffc00080010800),
+            0xffffc00080010800
         );
     }
 
@@ -2629,6 +2907,38 @@ mod tests {
         };
 
         assert!(merge_hvf_state_into_kvm_state(&mut state, &hvf, 0).is_err());
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn hvf_timer_rearm_moves_expired_comparator_and_clears_pending_status() {
+        let timer = HvfTimerRestoreState {
+            ctl: Some(TMR_CTL_ENABLE | TMR_CTL_ISTATUS),
+            cval: Some(0x1000),
+            cnt: Some(0x1001),
+        };
+
+        let rearmed = rearmed_hvf_timer_state(timer);
+
+        assert_eq!(rearmed.cval, Some(0x1001 + HVF_EXPIRED_TIMER_REARM_TICKS));
+        assert_eq!(rearmed.ctl, Some(TMR_CTL_ENABLE));
+        assert_eq!(rearmed.cnt, Some(0x1001));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn hvf_timer_rearm_moves_near_deadline_before_it_expires() {
+        let timer = HvfTimerRestoreState {
+            ctl: Some(TMR_CTL_ENABLE),
+            cval: Some(0x1001 + HVF_EXPIRED_TIMER_REARM_TICKS - 1),
+            cnt: Some(0x1001),
+        };
+
+        let rearmed = rearmed_hvf_timer_state(timer);
+
+        assert_eq!(rearmed.cval, Some(0x1001 + HVF_EXPIRED_TIMER_REARM_TICKS));
+        assert_eq!(rearmed.ctl, Some(TMR_CTL_ENABLE));
+        assert_eq!(rearmed.cnt, Some(0x1001));
     }
 
     // Auxiliary function being used throughout the tests.

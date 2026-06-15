@@ -463,6 +463,15 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &SnapshotReader) -> Result<()
                     .map_err(|e| SnapshotError::DeviceRefused(format!("irqchip restore: {e:?}")))?;
             }
         }
+    } else if std::env::var_os("KRUN_SKIP_LINUX_MACOS_GIC_RESTORE").is_some() {
+        crate::timing_event("snapshot.restore.macos_gic.env_skipped");
+    } else if !macos_snapshot_has_cpu_interface_state(inputs, reader)? {
+        // Older macOS snapshots may not carry ICC_* CPU-interface state. In
+        // that case, replaying distributor/redistributor state alone can
+        // strand pending interrupts behind a reset CPU interface. Current
+        // macOS snapshots do carry ICC regs, so they take the full GIC replay
+        // path below, matching the working machinen vmstate policy.
+        crate::timing_event("snapshot.restore.macos_gic.skipped");
     } else {
         restore_macos_irqchip_state(inputs, reader, meta.capture_timer_counter)?;
         restore_macos_virtio_irq_types(inputs, &pending_virtio_sections)?;
@@ -542,6 +551,29 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &SnapshotReader) -> Result<()
         }
     }
     Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn macos_snapshot_has_cpu_interface_state(
+    inputs: &CaptureInputs<'_>,
+    reader: &SnapshotReader,
+) -> Result<bool> {
+    for index in 0..inputs.vcpu_handles.len() {
+        let bytes = reader.get_raw(SectionId::Vcpu, index as u32)?;
+        let (icc_regs, _, _) = decode_hvf_vcpu_gic_state(bytes)?;
+        if !icc_regs.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn macos_snapshot_has_cpu_interface_state(
+    _inputs: &CaptureInputs<'_>,
+    _reader: &SnapshotReader,
+) -> Result<bool> {
+    Ok(false)
 }
 
 #[cfg(target_arch = "aarch64")]

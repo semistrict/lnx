@@ -1059,6 +1059,7 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
         crate::timing_event("snapshot.restore.linux_gic.dist_ctlr.done");
     }
     if source_format == SnapshotFormat::Macos
+        && std::env::var_os("KRUN_SKIP_MACOS_GIC_RESTORE").is_none()
         && let Some(irqchip) = inputs.irqchip
     {
         if let Ok(st) = reader.get_raw(SectionId::HvfGic, 0) {

@@ -99,6 +99,85 @@
  	struct virtio_vsock *vsock = vq->vdev->priv;
  
 +	lnx_vsock_debug("event_done vq=%p vsock=%p\n", vq, vsock);
- 	if (!vsock)
- 		return;
+	if (!vsock)
+		return;
+
+--- a/net/vmw_vsock/virtio_transport_common.c
++++ b/net/vmw_vsock/virtio_transport_common.c
+@@ -12,6 +12,7 @@
+ #include <linux/ctype.h>
+ #include <linux/list.h>
+ #include <linux/virtio_vsock.h>
++#include <linux/atomic.h>
+ #include <uapi/linux/vsockmon.h>
  
+ #include <net/sock.h>
+@@ -27,6 +28,27 @@
+ static void virtio_transport_cancel_close_work(struct vsock_sock *vsk,
+ 					       bool cancel_timeout);
+ static s64 virtio_transport_has_space(struct virtio_vsock_sock *vvs);
++
++static atomic_t lnx_vsock_common_debug_budget = ATOMIC_INIT(256);
++
++static bool lnx_vsock_common_debug_take(void)
++{
++	int old;
++
++	do {
++		old = atomic_read(&lnx_vsock_common_debug_budget);
++		if (old <= 0)
++			return false;
++	} while (atomic_cmpxchg(&lnx_vsock_common_debug_budget, old, old - 1) != old);
++
++	return true;
++}
++
++#define lnx_vsock_common_debug(fmt, ...)				\
++	do {								\
++		if (lnx_vsock_common_debug_take())			\
++			pr_err("lnx-vsock-common " fmt, ##__VA_ARGS__);	\
++	} while (0)
+ 
+ static const struct virtio_transport *
+ virtio_transport_get_ops(struct vsock_sock *vsk)
+@@ -1248,6 +1268,12 @@ static void virtio_transport_do_close(struct vsock_sock *vsk,
+ {
+ 	struct sock *sk = sk_vsock(vsk);
+ 
++	lnx_vsock_common_debug("do_close sk=%p state=%u err=%d local=%u:%u remote=%u:%u cancel_timeout=%u has_data=%lld\n",
++			       sk, sk->sk_state, sk->sk_err,
++			       vsk->local_addr.svm_cid, vsk->local_addr.svm_port,
++			       vsk->remote_addr.svm_cid, vsk->remote_addr.svm_port,
++			       cancel_timeout, (long long)vsock_stream_has_data(vsk));
++
+ 	sock_set_flag(sk, SOCK_DONE);
+ 	vsk->peer_shutdown = SHUTDOWN_MASK;
+ 	if (vsock_stream_has_data(vsk) <= 0)
+@@ -1463,6 +1489,11 @@ virtio_transport_recv_connected(struct sock *sk,
+ 		if (le32_to_cpu(virtio_vsock_hdr(skb)->flags))
+ 			sk->sk_state_change(sk);
+ 		break;
+ 	case VIRTIO_VSOCK_OP_RST:
++		lnx_vsock_common_debug("recv_connected rst sk=%p state=%u err=%d src=%llu:%u dst=%llu:%u len=%u\n",
++				       sk, sk->sk_state, sk->sk_err,
++				       le64_to_cpu(hdr->src_cid), le32_to_cpu(hdr->src_port),
++				       le64_to_cpu(hdr->dst_cid), le32_to_cpu(hdr->dst_port),
++				       le32_to_cpu(hdr->len));
+ 		virtio_transport_do_close(vsk, true);
+ 		break;
+ 	default:
+@@ -1665,8 +1696,14 @@ void virtio_transport_recv_pkt(struct virtio_transport *t,
+ 
+ 	/* Check if sk has been closed or assigned to another transport before
+ 	 * lock_sock (note: listener sockets are not assigned to any transport)
+ 	 */
+ 	if (sock_flag(sk, SOCK_DONE) ||
+ 	    (sk->sk_state != TCP_LISTEN && vsk->transport != &t->transport)) {
++		lnx_vsock_common_debug("recv_pkt ignored sk=%p state=%u done=%u transport=%ps expected=%ps op=%u src=%llu:%u dst=%llu:%u\n",
++				       sk, sk->sk_state, sock_flag(sk, SOCK_DONE),
++				       vsk->transport, &t->transport, le16_to_cpu(hdr->op),
++				       le64_to_cpu(hdr->src_cid), le32_to_cpu(hdr->src_port),
++				       le64_to_cpu(hdr->dst_cid), le32_to_cpu(hdr->dst_port));
+ 		(void)virtio_transport_reset_no_sock(t, skb);
+ 		release_sock(sk);
+ 		sock_put(sk);

@@ -91,7 +91,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await cleanupContext(ctx);
-});
+}, 120_000);
 
 test("repeated restore loop tracks latency and snapshot size drift", async () => {
   await maybe("repeated restore loop", async () => {

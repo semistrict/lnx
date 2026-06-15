@@ -680,9 +680,44 @@ impl Vmm {
         crate::timing_event("snapshot.restore.resume_vcpus.begin");
         self.resume_vcpus().map_err(|e| format!("{e:?}"))?;
         crate::timing_event("snapshot.restore.resume_vcpus.done");
+        maybe_start_restore_debug_kicks(&self.vcpus_handles);
         self.post_vcpu_restore_devices()?;
         Ok(())
     }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn maybe_start_restore_debug_kicks(handles: &[VcpuHandle]) {
+    let Ok(count) = std::env::var("KRUN_HVF_RESTORE_DEBUG_KICKS") else {
+        return;
+    };
+    let count = count.parse::<usize>().unwrap_or(0);
+    if count == 0 {
+        return;
+    }
+    let interval_ms = std::env::var("KRUN_HVF_RESTORE_DEBUG_KICK_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1000);
+    let handles = handles
+        .iter()
+        .filter_map(|handle| handle.try_clone_kicker())
+        .collect::<Vec<_>>();
+    if handles.is_empty() {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("hvf-restore-debug-kicks".to_string())
+        .spawn(move || {
+            for round in 0..count {
+                std::thread::sleep(Duration::from_millis(interval_ms));
+                crate::timing_event(&format!("snapshot.restore.debug_kick.{round}"));
+                for handle in &handles {
+                    let _ = handle.kick();
+                }
+            }
+        })
+        .ok();
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
