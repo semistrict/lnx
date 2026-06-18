@@ -17,7 +17,7 @@ use axum::{
         Path as AxumPath, State,
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
@@ -29,6 +29,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::{checkpoints, descriptor, paths::Layout, runner, sparse_copy};
 
+#[cfg(feature = "server-ui")]
 include!(concat!(env!("OUT_DIR"), "/lnx_server_ui_assets.rs"));
 
 #[cfg(test)]
@@ -262,8 +263,6 @@ async fn serve_async(config: ServeConfig) -> Result<()> {
         no_host_shares: config.no_host_shares,
     });
     let app = Router::new()
-        .route("/", get(ui_index))
-        .route("/assets/{*path}", get(ui_asset))
         .route("/v1/health", get(health))
         .route("/v1/instances", get(list_instances))
         .route("/v1/instances/{instance}/start", post(start_instance))
@@ -275,6 +274,10 @@ async fn serve_async(config: ServeConfig) -> Result<()> {
         .route("/v2/uploads/{session}/commit", post(commit_cas_upload))
         .route("/v2/uploads/{session}", delete(abort_cas_upload))
         .with_state(state);
+    #[cfg(feature = "server-ui")]
+    let app = app
+        .route("/", get(ui_index))
+        .route("/assets/{*path}", get(ui_asset));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("listen on {addr}"))?;
@@ -289,14 +292,17 @@ async fn health() -> Json<ApiMessage<'static>> {
     })
 }
 
+#[cfg(feature = "server-ui")]
 async fn ui_index() -> std::result::Result<Response, ApiError> {
     serve_ui_asset("/index.html")
 }
 
+#[cfg(feature = "server-ui")]
 async fn ui_asset(AxumPath(path): AxumPath<String>) -> std::result::Result<Response, ApiError> {
     serve_ui_asset(&format!("/assets/{path}"))
 }
 
+#[cfg(feature = "server-ui")]
 fn serve_ui_asset(path: &str) -> std::result::Result<Response, ApiError> {
     let asset = SERVER_UI_ASSETS
         .iter()
@@ -307,7 +313,7 @@ fn serve_ui_asset(path: &str) -> std::result::Result<Response, ApiError> {
         })?;
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, asset.mime)
+        .header(axum::http::header::CONTENT_TYPE, asset.mime)
         .body(Body::from(asset.bytes))
         .map_err(ApiError::internal)
 }

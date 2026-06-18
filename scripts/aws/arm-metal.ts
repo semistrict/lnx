@@ -55,6 +55,7 @@ const tagValue = "arm-metal-test";
 const heartbeatMs = numberEnv("LNX_AWS_HEARTBEAT_MS", 5 * 60 * 1000);
 const lnxServerPort = numberEnv("LNX_AWS_SERVER_PORT", 7777);
 const tunnelPort = numberEnv("LNX_AWS_TUNNEL_PORT", 7777);
+const awsServerUi = boolEnv("LNX_AWS_SERVER_UI", false);
 const networkCidr = env("LNX_AWS_VPC_CIDR", "10.88.0.0/16");
 const ubuntuAmiParameter = "/aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id";
 
@@ -943,6 +944,7 @@ async function syncRepo(state: State): Promise<void> {
 }
 
 async function ensureRemoteLnxServer(state: State): Promise<void> {
+  const serverUiFeature = awsServerUi ? "--features server-ui" : "";
   await remote(
     state,
     `export PATH="$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.local/share/pnpm:$PATH"
@@ -953,7 +955,7 @@ ln -sfn /usr/include/linux "$linux_headers/linux"
 ln -sfn /usr/include/asm-generic "$linux_headers/asm-generic"
 ln -sfn /usr/include/aarch64-linux-gnu/asm "$linux_headers/asm"
 export CC_LINUX="\${CC_LINUX:-aarch64-linux-musl-gcc -isystem $linux_headers}"
-cargo build
+cargo build ${serverUiFeature}
 mkdir -p "$HOME/.lnx/server"
 if test -s "$HOME/.lnx/server/pid"; then
   old_pid="$(cat "$HOME/.lnx/server/pid")"
@@ -1647,6 +1649,14 @@ function numberEnv(key: string, fallback: number): number {
   return parsed;
 }
 
+function boolEnv(key: string, fallback: boolean): boolean {
+  const value = process.env[key];
+  if (!value) {
+    return fallback;
+  }
+  return ["1", "true", "yes", "on"].includes(value.toLowerCase());
+}
+
 function normalizeRegion(value: string): string {
   return value === "us-east1" ? "us-east-1" : value;
 }
@@ -1712,6 +1722,7 @@ environment:
   LNX_AWS_SSH_KEY         private key for SSH, defaults to matching private key
   LNX_AWS_SERVER_PORT     remote localhost lnx server port, defaults to 7777
   LNX_AWS_TUNNEL_PORT     local lnx server tunnel port, defaults to 7777
+  LNX_AWS_SERVER_UI       build and embed the server web UI when set to 1/true
   LNX_AWS_DATA_XFS_GIB    sparse loopback XFS image size for ~/.lnx, defaults to 160
   LNX_AWS_SUBNET_ID       optional subnet override
   LNX_AWS_AMI_ID          optional Ubuntu arm64 AMI override

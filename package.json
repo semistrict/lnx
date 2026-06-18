@@ -3,7 +3,9 @@
   "type": "module",
   "scripts": {
     "build": "CC_LINUX=${CC_LINUX:-/opt/homebrew/bin/aarch64-linux-musl-gcc} cargo build && codesign --entitlements entitlements.plist --force -s - target/debug/lnx",
+    "build:server-ui": "CC_LINUX=${CC_LINUX:-/opt/homebrew/bin/aarch64-linux-musl-gcc} cargo build --features server-ui && codesign --entitlements entitlements.plist --force -s - target/debug/lnx",
     "release": "CC_LINUX=${CC_LINUX:-/opt/homebrew/bin/aarch64-linux-musl-gcc} cargo build --release && codesign --entitlements entitlements.plist --force -s - target/release/lnx",
+    "release:server-ui": "CC_LINUX=${CC_LINUX:-/opt/homebrew/bin/aarch64-linux-musl-gcc} cargo build --release --features server-ui && codesign --entitlements entitlements.plist --force -s - target/release/lnx",
     "install": "bun run release && mkdir -p ${INSTALL_BIN:-$HOME/.cargo/bin} && install -m 755 target/release/lnx ${INSTALL_BIN:-$HOME/.cargo/bin}/lnx",
     "check": "CC_LINUX=${CC_LINUX:-/opt/homebrew/bin/aarch64-linux-musl-gcc} cargo check",
     "test": "LIBCLANG_PATH=${LIBCLANG_PATH:-/opt/homebrew/opt/llvm/lib} DYLD_LIBRARY_PATH=${DYLD_LIBRARY_PATH:-/opt/homebrew/opt/llvm/lib} CC_LINUX=${CC_LINUX:-/opt/homebrew/bin/aarch64-linux-musl-gcc} CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER=\"bun $PWD/scripts/test/codesign-runner.ts\" cargo test --workspace",

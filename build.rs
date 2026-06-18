@@ -8,9 +8,11 @@ fn main() {
     for path in &tracked_paths {
         println!("cargo:rerun-if-changed={}", path.display());
     }
-    let server_ui_paths = tracked_server_ui_paths();
-    for path in &server_ui_paths {
-        println!("cargo:rerun-if-changed={}", path.display());
+    if server_ui_enabled() {
+        let server_ui_paths = tracked_server_ui_paths();
+        for path in &server_ui_paths {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
     }
     println!("cargo:rerun-if-env-changed=LNX_AGENT_TARGET_DIR");
     println!("cargo:rerun-if-env-changed=LNX_AGENT_TARGET");
@@ -20,7 +22,9 @@ fn main() {
 
     let source_stamp = source_stamp(&tracked_paths);
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-    build_server_ui(&out_dir);
+    if server_ui_enabled() {
+        build_server_ui(&out_dir);
+    }
     let agent = out_dir.join("lnx-agent");
     let agent_target_dir = env::var_os("LNX_AGENT_TARGET_DIR")
         .map(PathBuf::from)
@@ -71,6 +75,10 @@ fn main() {
 
     println!("cargo:rustc-env=LNX_AGENT={}", agent.display());
     println!("cargo:rustc-env=LNX_AGENT_SOURCE_STAMP={source_stamp}");
+}
+
+fn server_ui_enabled() -> bool {
+    env::var_os("CARGO_FEATURE_SERVER_UI").is_some()
 }
 
 fn tracked_source_paths() -> Vec<PathBuf> {

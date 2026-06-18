@@ -11,6 +11,10 @@ members = [
     "lnx-protocol",
 ]
 
+[features]
+default = []
+server-ui = []
+
 [[bin]]
 name = "lnx"
 path = "src/main.rs"
