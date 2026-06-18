@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, OpenOptions},
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     net::{Shutdown, TcpListener, TcpStream},
@@ -1240,7 +1240,38 @@ fn shares_stamp_content(
     content
 }
 
-fn snapshot_shares_incompatibility(snapshot_path: &Path, current: &str) -> Option<&'static str> {
+pub fn snapshot_shares_incompatibility_for_import(
+    snapshot_path: &Path,
+    cwd: &Path,
+    no_host_shares: bool,
+) -> Result<Option<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (snapshot_path, cwd, no_host_shares);
+        // macOS may restore through vmnet when ingress is available, and the
+        // vmnet stamp is allocated by the ingress daemon at VM start time.
+        // Keep import validation conservative there and let start perform the
+        // definitive restore check.
+        Ok(None)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let host_home = host_home_for_cwd(cwd)?;
+        let outside_home_cwd = (!cwd.starts_with(&host_home)).then(|| cwd.to_path_buf());
+        let shares_stamp = shares_stamp_content(
+            &host_home,
+            outside_home_cwd.as_deref(),
+            "net=gvproxy",
+            no_host_shares,
+        );
+        Ok(snapshot_shares_incompatibility(
+            snapshot_path,
+            &shares_stamp,
+        ))
+    }
+}
+
+fn snapshot_shares_incompatibility(snapshot_path: &Path, current: &str) -> Option<String> {
     match fs::read_to_string(snapshot_path.join("shares.stamp")) {
         Ok(stamp) if stamp == current => None,
         Ok(stamp)
@@ -1248,15 +1279,72 @@ fn snapshot_shares_incompatibility(snapshot_path: &Path, current: &str) -> Optio
                 line == HOST_SHARE_CACHE_STAMP || line == HOST_SHARES_DISABLED_STAMP
             }) =>
         {
-            Some("host_share_cache_policy")
+            Some("host_share_cache_policy: snapshot was created before host-share cache policy was recorded".to_string())
         }
-        Ok(_) => Some("share_mismatch"),
+        Ok(stamp) => Some(describe_shares_stamp_mismatch(&stamp, current)),
         // Missing stamps predate the host-share cache-policy stamp. Do not
         // memory-restore them: the guest may hold stale page-cache, inode-size,
         // or dentry state for host-owned files.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some("host_share_cache_policy"),
-        Err(_) => Some("share_mismatch"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(
+            "host_share_cache_policy: snapshot has no host-share/network compatibility stamp"
+                .to_string(),
+        ),
+        Err(e) => Some(format!("shares_stamp_unreadable: {e}")),
     }
+}
+
+fn describe_shares_stamp_mismatch(snapshot: &str, current: &str) -> String {
+    let snapshot_fields = parse_shares_stamp(snapshot);
+    let current_fields = parse_shares_stamp(current);
+    let mut mismatches = Vec::new();
+
+    let snapshot_disabled = snapshot_fields.contains_key("host-shares");
+    let current_disabled = current_fields.contains_key("host-shares");
+    if snapshot_disabled != current_disabled {
+        mismatches.push(format!(
+            "host-shares: snapshot={} current={}",
+            if snapshot_disabled {
+                "disabled"
+            } else {
+                "enabled"
+            },
+            if current_disabled {
+                "disabled"
+            } else {
+                "enabled"
+            }
+        ));
+    }
+
+    for key in ["host-share-cache", "home", "cwd", "net"] {
+        let snapshot_value = snapshot_fields
+            .get(key)
+            .map(String::as_str)
+            .unwrap_or("<absent>");
+        let current_value = current_fields
+            .get(key)
+            .map(String::as_str)
+            .unwrap_or("<absent>");
+        if snapshot_value != current_value {
+            mismatches.push(format!(
+                "{key}: snapshot={snapshot_value} current={current_value}"
+            ));
+        }
+    }
+
+    if mismatches.is_empty() {
+        "share_mismatch: snapshot and current stamps differ only in unrecognized fields".to_string()
+    } else {
+        format!("share_mismatch: {}", mismatches.join("; "))
+    }
+}
+
+fn parse_shares_stamp(stamp: &str) -> BTreeMap<String, String> {
+    stamp
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
 }
 
 fn initramfs_stamp_key(path: &Path) -> Option<String> {
@@ -3457,7 +3545,10 @@ mod tests {
         // unsafe host-file cache state, so it must not memory-restore.
         assert_eq!(
             snapshot_shares_incompatibility(temp.path(), &current),
-            Some("host_share_cache_policy")
+            Some(
+                "host_share_cache_policy: snapshot has no host-share/network compatibility stamp"
+                    .to_string()
+            )
         );
 
         fs::write(temp.path().join("shares.stamp"), &current).expect("write stamp");
@@ -3467,14 +3558,17 @@ mod tests {
         fs::write(temp.path().join("shares.stamp"), legacy_cache_policy).expect("write stamp");
         assert_eq!(
             snapshot_shares_incompatibility(temp.path(), &current),
-            Some("host_share_cache_policy")
+            Some(
+                "host_share_cache_policy: snapshot was created before host-share cache policy was recorded"
+                    .to_string()
+            )
         );
 
         let drifted = shares_stamp_content(Path::new("/home/ramon"), None, "net=gvproxy", false);
         fs::write(temp.path().join("shares.stamp"), &current).expect("write stamp");
         assert_eq!(
             snapshot_shares_incompatibility(temp.path(), &drifted),
-            Some("share_mismatch")
+            Some("share_mismatch: home: snapshot=/Users/ramon current=/home/ramon".to_string())
         );
 
         // The same shares on a different network backing must not restore.
@@ -3486,7 +3580,10 @@ mod tests {
         );
         assert_eq!(
             snapshot_shares_incompatibility(temp.path(), &renetworked),
-            Some("share_mismatch")
+            Some(
+                "share_mismatch: net: snapshot=gvproxy current=vmnet:prefix=24:gateway=192.168.106.0"
+                    .to_string()
+            )
         );
 
         let disabled = shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", true);
@@ -3498,13 +3595,19 @@ mod tests {
 
         assert_eq!(
             snapshot_shares_incompatibility(temp.path(), &current),
-            Some("share_mismatch")
+            Some(
+                "share_mismatch: host-shares: snapshot=disabled current=enabled; host-share-cache: snapshot=<absent> current=dax+keep-cache+writeback+restore-sync-v1; home: snapshot=<absent> current=/Users/ramon"
+                    .to_string()
+            )
         );
 
         fs::write(temp.path().join("shares.stamp"), &current).expect("write stamp");
         assert_eq!(
             snapshot_shares_incompatibility(temp.path(), &disabled),
-            Some("share_mismatch")
+            Some(
+                "share_mismatch: host-shares: snapshot=enabled current=disabled; host-share-cache: snapshot=dax+keep-cache+writeback+restore-sync-v1 current=<absent>; home: snapshot=/Users/ramon current=<absent>"
+                    .to_string()
+            )
         );
     }
 

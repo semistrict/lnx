@@ -43,6 +43,7 @@ const instanceType = env("LNX_AWS_INSTANCE_TYPE", "c6g.metal");
 const idleSeconds = numberEnv("LNX_AWS_IDLE_SECONDS", 3600);
 const stopWaitSeconds = numberEnv("LNX_AWS_STOP_WAIT_SECONDS", 10 * 60);
 const volumeGiB = numberEnv("LNX_AWS_VOLUME_GIB", 200);
+const dataXfsGiB = numberEnv("LNX_AWS_DATA_XFS_GIB", 160);
 const sshUser = env("LNX_AWS_SSH_USER", "ubuntu");
 const sshPublicKeyPath = expandHome(env("LNX_AWS_SSH_PUBLIC_KEY", "~/.ssh/id_ed25519.pub"));
 const privateKeyPath = expandHome(env("LNX_AWS_SSH_KEY", sshPublicKeyPath.replace(/\.pub$/, "")));
@@ -53,6 +54,7 @@ const tagKey = "LnxRole";
 const tagValue = "arm-metal-test";
 const heartbeatMs = numberEnv("LNX_AWS_HEARTBEAT_MS", 5 * 60 * 1000);
 const lnxServerPort = numberEnv("LNX_AWS_SERVER_PORT", 7777);
+const tunnelPort = numberEnv("LNX_AWS_TUNNEL_PORT", 7777);
 const networkCidr = env("LNX_AWS_VPC_CIDR", "10.88.0.0/16");
 const ubuntuAmiParameter = "/aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id";
 
@@ -72,6 +74,9 @@ try {
       break;
     case "snapshot-put":
       await putSnapshot(commandArgs);
+      break;
+    case "tunnel":
+      await tunnel();
       break;
     case "status":
       await status();
@@ -165,6 +170,8 @@ async function syncAndRun(remoteCommand: string): Promise<void> {
   await withLeaseHeartbeat(state, async () => {
     await remote(state, "cloud-init status --wait >/dev/null 2>&1 || true", { quiet: false });
     await installIdleStopScripts(state);
+    await ensureRemotePnpm(state);
+    await ensureRemoteXfsDataRoot(state);
     await remote(state, `mkdir -p ${shellQuote(state.remoteDir)} && sudo /usr/local/bin/lnx-metal-touch ${idleSeconds}`);
     await syncRepo(state);
     await runRemoteCommand(state, remoteCommand);
@@ -192,6 +199,8 @@ async function putSnapshot(args: string[]): Promise<void> {
   await withLeaseHeartbeat(state, async () => {
     await remote(state, "cloud-init status --wait >/dev/null 2>&1 || true", { quiet: false });
     await installIdleStopScripts(state);
+    await ensureRemotePnpm(state);
+    await ensureRemoteXfsDataRoot(state);
     await syncRepo(state);
     await ensureRemoteLnxServer(state);
     await withLnxServerTunnel(state, async (url) => {
@@ -215,7 +224,7 @@ async function counterProof(args: string[]): Promise<void> {
 
 function counterProofRemoteCommand(remoteSnapshot: string): string {
   const snapshotExpr = remoteSnapshotShellExpr(remoteSnapshot);
-  return `export PATH="$HOME/.cargo/bin:$HOME/.bun/bin:$PATH"
+  return `export PATH="$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.local/share/pnpm:$PATH"
 linux_headers="$HOME/.lnx-musl-linux-headers"
 mkdir -p "$linux_headers"
 ln -sfn /usr/include/linux "$linux_headers/linux"
@@ -227,10 +236,11 @@ snapshot_dir=${snapshotExpr}
 proof_dir="$snapshot_dir-proof"
 restore_instance_dir="$HOME/.lnx/instances/lnx-aws-counter-restore"
 restore_snapshot_dir="$restore_instance_dir/memory-snapshots/latest"
-work_dir="$HOME/lnx-snapshots/work-counter-proof"
+work_dir="$HOME/.lnx/work/counter-proof"
 rm -rf "$work_dir"
 mkdir -p "$work_dir"
-cp --sparse=always "$snapshot_dir/rootfs.ext4" "$work_dir/rootfs.ext4"
+test "$(stat -f -c %T "$HOME/.lnx")" = "xfs"
+./target/debug/lnx _sparse-copy "$snapshot_dir/rootfs.ext4" "$work_dir/rootfs.ext4"
 rm -rf "$proof_dir"
 rm -rf "$restore_snapshot_dir"
 stat -c 'remote-snapshot %n size=%s blocks=%b block_size=%B' "$snapshot_dir"/rootfs.ext4 "$snapshot_dir"/pages.img
@@ -355,6 +365,34 @@ async function start(): Promise<void> {
   const refreshedState = await stateFromInstance(instance);
   await saveState(refreshedState);
   printInstance("started", instance, refreshedState);
+}
+
+async function tunnel(): Promise<void> {
+  await requireTool("aws");
+  await requireTool("ssh");
+  await requireTool("rsync");
+  await assertAwsCredentials();
+
+  const state = await requireStateOrSetup();
+  const instance = await ensureInstanceRunning(state);
+  const refreshedState = await stateFromInstance(instance);
+  await saveState(refreshedState);
+  printInstance("tunnel", instance, refreshedState);
+
+  await waitForSsh(refreshedState);
+  await withLeaseHeartbeat(refreshedState, async () => {
+    await remote(refreshedState, "cloud-init status --wait >/dev/null 2>&1 || true", { quiet: false });
+    await installIdleStopScripts(refreshedState);
+    await ensureRemotePnpm(refreshedState);
+    await ensureRemoteXfsDataRoot(refreshedState);
+    await remote(
+      refreshedState,
+      `mkdir -p ${shellQuote(refreshedState.remoteDir)} && sudo /usr/local/bin/lnx-metal-touch ${idleSeconds}`,
+    );
+    await syncRepo(refreshedState);
+    await ensureRemoteLnxServer(refreshedState);
+    await holdLnxServerTunnel(refreshedState);
+  });
 }
 
 async function terminate(): Promise<void> {
@@ -907,7 +945,7 @@ async function syncRepo(state: State): Promise<void> {
 async function ensureRemoteLnxServer(state: State): Promise<void> {
   await remote(
     state,
-    `export PATH="$HOME/.cargo/bin:$HOME/.bun/bin:$PATH"
+    `export PATH="$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.local/share/pnpm:$PATH"
 cd "$HOME/${state.remoteDir}"
 linux_headers="$HOME/.lnx-musl-linux-headers"
 mkdir -p "$linux_headers"
@@ -927,7 +965,7 @@ if test -s "$HOME/.lnx/server/pid"; then
     sleep 0.1
   done
 fi
-nohup ./target/debug/lnx server --listen 127.0.0.1:${lnxServerPort} >"$HOME/.lnx/server/server.log" 2>&1 &
+nohup env LNX_ROOTFS_BACKEND=block ./target/debug/lnx --no-host-shares server --listen 127.0.0.1:${lnxServerPort} >"$HOME/.lnx/server/server.log" 2>&1 &
 printf '%s\\n' "$!" >"$HOME/.lnx/server/pid"
 for _ in $(seq 1 120); do
   if curl -fsS --max-time 2 http://127.0.0.1:${lnxServerPort}/v1/health >/dev/null 2>&1; then
@@ -962,6 +1000,46 @@ async function withLnxServerTunnel<T>(state: State, fn: (url: string) => Promise
     await waitForHttp(`${url}/v1/health`, tunnel);
     return await fn(url);
   } finally {
+    tunnel.kill("SIGTERM");
+    await tunnel.exited.catch(() => {});
+  }
+}
+
+async function holdLnxServerTunnel(state: State): Promise<void> {
+  const instance = await describeInstance(state.instanceId);
+  const host = instanceHost(instance);
+  const tunnel = Bun.spawn(
+    [
+      "ssh",
+      ...sshOptions(state),
+      "-N",
+      "-L",
+      `${tunnelPort}:127.0.0.1:${lnxServerPort}`,
+      `${state.sshUser}@${host}`,
+    ],
+    { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+  );
+  let stopping = false;
+  const stopTunnel = () => {
+    stopping = true;
+    tunnel.kill("SIGTERM");
+  };
+  process.on("SIGINT", stopTunnel);
+  process.on("SIGTERM", stopTunnel);
+  try {
+    const url = `http://127.0.0.1:${tunnelPort}`;
+    await waitForHttp(`${url}/v1/health`, tunnel);
+    console.log(`lnx server: ${url}`);
+    console.log(`lease heartbeat: every ${Math.round(heartbeatMs / 1000)}s; Ctrl-C closes the tunnel`);
+    const stderr = new Response(tunnel.stderr).text().catch(() => "");
+    const status = await tunnel.exited;
+    const error = await stderr;
+    if (!stopping && status !== 0) {
+      throw new Error(`SSH tunnel exited with status ${status}: ${error}`);
+    }
+  } finally {
+    process.off("SIGINT", stopTunnel);
+    process.off("SIGTERM", stopTunnel);
     tunnel.kill("SIGTERM");
     await tunnel.exited.catch(() => {});
   }
@@ -1080,6 +1158,100 @@ async function installIdleStopScripts(state: State): Promise<void> {
   await remote(state, `sudo bash -s <<'ROOT'\n${idleStopInstallScript()}\nROOT`, { quiet: false });
 }
 
+async function ensureRemotePnpm(state: State): Promise<void> {
+  await remote(
+    state,
+    `export PATH="$HOME/.bun/bin:$HOME/.local/share/pnpm:$PATH"
+wait_for_apt() {
+  for _ in $(seq 1 120); do
+    if ! sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  sudo fuser -v /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock || true
+  return 1
+}
+node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+if test "$node_major" -lt 22; then
+  wait_for_apt
+  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+  wait_for_apt
+  sudo apt-get update
+  wait_for_apt
+  sudo apt-get install -y nodejs
+fi
+pnpm_major="$(pnpm --version 2>/dev/null | cut -d. -f1 || echo 0)"
+if test "$pnpm_major" != "10"; then
+  if ! command -v bun >/dev/null 2>&1; then
+    curl -fsSL https://bun.sh/install | bash
+    export PATH="$HOME/.bun/bin:$PATH"
+  fi
+  bun install -g pnpm@10.33.0
+fi
+pnpm --version`,
+    { quiet: false },
+  );
+}
+
+async function ensureRemoteXfsDataRoot(state: State): Promise<void> {
+  await remote(
+    state,
+    `export DEBIAN_FRONTEND=noninteractive
+if ! command -v mkfs.xfs >/dev/null 2>&1; then
+  while sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; do
+    sleep 1
+  done
+  sudo apt-get update
+  while sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; do
+    sleep 1
+  done
+  sudo apt-get install -y xfsprogs
+fi
+data_dir="$HOME/.lnx"
+image="$HOME/.lnx-data-xfs.img"
+size_gib="${dataXfsGiB}"
+mkdir -p "$data_dir"
+fstype="$(findmnt -T "$data_dir" -n -o FSTYPE 2>/dev/null || true)"
+if test "$fstype" = "xfs"; then
+  stat -f -c 'lnx-data-fs path=%n type=%T' "$data_dir"
+  exit 0
+fi
+if mountpoint -q "$data_dir"; then
+  echo "lnx data directory is mounted as $fstype, expected xfs: $data_dir" >&2
+  exit 1
+fi
+staging=""
+if find "$data_dir" -mindepth 1 -maxdepth 1 | read -r _; then
+  staging="$HOME/.lnx-pre-xfs.$(date +%s)"
+  rm -rf "$staging"
+  mv "$data_dir" "$staging"
+  mkdir -p "$data_dir"
+fi
+if ! test -e "$image"; then
+  truncate -s "\${size_gib}G" "$image"
+fi
+if ! sudo blkid -o value -s TYPE "$image" 2>/dev/null | grep -qx xfs; then
+  sudo mkfs.xfs -f -m reflink=1 "$image"
+fi
+if ! sudo awk -v m="$data_dir" '$2 == m && $3 == "xfs" { found = 1 } END { exit found ? 0 : 1 }' /etc/fstab; then
+  printf '%s %s xfs loop,nofail,defaults 0 0\\n' "$image" "$data_dir" | sudo tee -a /etc/fstab >/dev/null
+fi
+sudo mount -o loop "$image" "$data_dir"
+sudo chown "${state.sshUser}:${state.sshUser}" "$data_dir"
+if test -n "$staging"; then
+  printf 'lnx-data-old-tree=%s\\n' "$staging"
+fi
+touch "$data_dir/.lnx-xfs-ready"
+test "$(stat -f -c %T "$data_dir")" = "xfs"
+if command -v xfs_info >/dev/null 2>&1; then
+  xfs_info "$data_dir" | grep -q 'reflink=1'
+fi
+stat -f -c 'lnx-data-fs path=%n type=%T' "$data_dir"`,
+    { quiet: false },
+  );
+}
+
 async function remote(
   state: State,
   script: string,
@@ -1143,6 +1315,7 @@ apt-get install -y \\
   qemu-utils \\
   rsync \\
   unzip \\
+  xfsprogs \\
   zstd
 
 systemctl enable --now docker || true
@@ -1156,6 +1329,14 @@ fi
 
 if ! command -v bun >/dev/null 2>&1; then
   su - ${sshUser} -c 'curl -fsSL https://bun.sh/install | bash'
+fi
+node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+if test "$node_major" -lt 22; then
+  curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+  apt-get install -y nodejs
+fi
+if ! su - ${sshUser} -c 'PATH="$HOME/.bun/bin:$HOME/.local/share/pnpm:$PATH" test "$(pnpm --version 2>/dev/null | cut -d. -f1 || echo 0)" = 10'; then
+  su - ${sshUser} -c 'PATH="$HOME/.bun/bin:$PATH" bun install -g pnpm@10.33.0'
 fi
 if ! su - ${sshUser} -c 'command -v rustup >/dev/null 2>&1'; then
   su - ${sshUser} -c 'curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal'
@@ -1508,6 +1689,7 @@ function usage(): void {
   bun run aws:arm:run -- '<command>'
   bun run aws:arm:counter-proof -- [local-snapshot-dir] [remote-instance]
   bun run aws:arm:snapshot-put -- <local-snapshot-dir> [remote-instance]
+  bun run aws:arm:tunnel
   bun run aws:arm:status
   bun run aws:arm:start
   bun run aws:arm:stop
@@ -1529,6 +1711,8 @@ environment:
   LNX_AWS_SSH_PUBLIC_KEY  public key to import, defaults to ~/.ssh/id_ed25519.pub
   LNX_AWS_SSH_KEY         private key for SSH, defaults to matching private key
   LNX_AWS_SERVER_PORT     remote localhost lnx server port, defaults to 7777
+  LNX_AWS_TUNNEL_PORT     local lnx server tunnel port, defaults to 7777
+  LNX_AWS_DATA_XFS_GIB    sparse loopback XFS image size for ~/.lnx, defaults to 160
   LNX_AWS_SUBNET_ID       optional subnet override
   LNX_AWS_AMI_ID          optional Ubuntu arm64 AMI override
 `);

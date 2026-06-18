@@ -46,6 +46,7 @@
     "aws:arm:run": "bun scripts/aws/arm-metal.ts run",
     "aws:arm:counter-proof": "bun scripts/aws/arm-metal.ts counter-proof",
     "aws:arm:snapshot-put": "bun scripts/aws/arm-metal.ts snapshot-put",
+    "aws:arm:tunnel": "bun scripts/aws/arm-metal.ts tunnel",
     "aws:arm:status": "bun scripts/aws/arm-metal.ts status",
     "aws:arm:start": "bun scripts/aws/arm-metal.ts start",
     "aws:arm:stop": "bun scripts/aws/arm-metal.ts stop",

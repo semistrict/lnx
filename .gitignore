@@ -26,3 +26,7 @@
 
 # Nested build artifacts
 /guest-agent/target/
+
+# Server web UI
+/server-ui/dist/
+/server-ui/node_modules/
