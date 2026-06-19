@@ -9,47 +9,7 @@ on:
 
 jobs:
   build:
-    runs-on: depot-macos-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Set up Depot CLI
-        uses: depot/setup-action@v1
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-musl
-
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Install Linux musl cross compiler
-        run: brew install FiloSottile/musl-cross/musl-cross
-
-      - name: Build release binary
-        run: CC_LINUX=/opt/homebrew/bin/aarch64-linux-musl-gcc depot cargo build --release
-
-      - name: Codesign release binary
-        run: codesign --entitlements entitlements.plist --force -s - target/release/lnx
-
-      - name: Package artifact
-        run: |
-          mkdir -p dist
-          cp target/release/lnx dist/lnx
-          tar -C dist -czf lnx-macos-arm64.tar.gz lnx
-          shasum -a 256 lnx-macos-arm64.tar.gz > lnx-macos-arm64.tar.gz.sha256
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: lnx-macos-arm64
-          path: |
-            lnx-macos-arm64.tar.gz
-            lnx-macos-arm64.tar.gz.sha256
-
-  build-github-macos:
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
 
@@ -64,6 +24,18 @@ jobs:
       - name: Build release binary
         run: CC_LINUX=/opt/homebrew/bin/aarch64-linux-musl-gcc cargo build --release
 
+      - name: Build Linux helper binary
+        run: |
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=/opt/homebrew/bin/aarch64-linux-musl-gcc \
+            CC_LINUX=/opt/homebrew/bin/aarch64-linux-musl-gcc \
+            cargo build --release --target aarch64-unknown-linux-musl
+
+      - name: Download Linux gvproxy helper
+        run: |
+          curl -fL -o target/gvproxy-linux-arm64 \
+            https://github.com/containers/gvisor-tap-vsock/releases/download/v0.8.9/gvproxy-linux-arm64
+          chmod +x target/gvproxy-linux-arm64
+
       - name: Codesign release binary
         run: codesign --entitlements entitlements.plist --force -s - target/release/lnx
 
@@ -71,13 +43,15 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/lnx dist/lnx
-          tar -C dist -czf lnx-macos-arm64-github.tar.gz lnx
-          shasum -a 256 lnx-macos-arm64-github.tar.gz > lnx-macos-arm64-github.tar.gz.sha256
+          cp target/aarch64-unknown-linux-musl/release/lnx dist/lnx-linux-aarch64
+          cp target/gvproxy-linux-arm64 dist/gvproxy-linux-arm64
+          tar -C dist -czf lnx-macos-arm64.tar.gz lnx lnx-linux-aarch64 gvproxy-linux-arm64
+          shasum -a 256 lnx-macos-arm64.tar.gz > lnx-macos-arm64.tar.gz.sha256
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
         with:
-          name: lnx-macos-arm64-github
+          name: lnx-macos-arm64
           path: |
-            lnx-macos-arm64-github.tar.gz
-            lnx-macos-arm64-github.tar.gz.sha256
+            lnx-macos-arm64.tar.gz
+            lnx-macos-arm64.tar.gz.sha256

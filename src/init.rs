@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use crate::paths::Layout;
 
 const DEFAULT_IMAGE_VERSION: &str = "images-v0.4.0";
+const NESTED_HELPER_IMAGE_VERSION: &str = "images-v0.5.0";
 const RELEASE_BASE: &str = "https://github.com/semistrict/lnx/releases/download";
 const DEFAULT_ROOTFS_SIZE: u64 = 64 * 1024 * 1024 * 1024;
 const REQUIRED_EXT4_BLOCK_SIZE: u64 = 16 * 1024;
@@ -86,6 +87,14 @@ pub fn ensure_kernel(layout: &Layout) -> Result<()> {
     download_kernel(&layout.kernel)
 }
 
+pub fn ensure_nested_linux_lnx(dest: &Path) -> Result<()> {
+    download_executable_release(dest, "lnx-linux-aarch64", NESTED_HELPER_IMAGE_VERSION)
+}
+
+pub fn ensure_nested_linux_gvproxy(dest: &Path) -> Result<()> {
+    download_executable_release(dest, "gvproxy-linux-arm64", NESTED_HELPER_IMAGE_VERSION)
+}
+
 /// Installs a caller-supplied kernel image instead of downloading one.
 pub fn install_kernel(layout: &Layout, kernel: &Path) -> Result<()> {
     copy_if_needed(kernel, &layout.kernel, "kernel")
@@ -141,6 +150,10 @@ fn download_kernel(dest: &Path) -> Result<()> {
 }
 
 fn download_release(dest: &Path, asset: &str) -> Result<()> {
+    download_release_version(dest, asset, DEFAULT_IMAGE_VERSION)
+}
+
+fn download_release_version(dest: &Path, asset: &str, version: &str) -> Result<()> {
     if dest.exists() {
         eprintln!("init: {asset} exists, skipping {}", dest.display());
         return Ok(());
@@ -150,7 +163,7 @@ fn download_release(dest: &Path, asset: &str) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
 
-    let url = format!("{RELEASE_BASE}/{DEFAULT_IMAGE_VERSION}/{asset}");
+    let url = format!("{RELEASE_BASE}/{version}/{asset}");
     let download_tmp = dest.with_extension(format!(
         "{}download",
         dest.extension()
@@ -226,6 +239,28 @@ fn download_release(dest: &Path, asset: &str) -> Result<()> {
         .with_context(|| format!("rename {} to {}", output_tmp.display(), dest.display()))?;
     let _ = fs::remove_file(&download_tmp);
     eprintln!("init: installed {asset} -> {}", dest.display());
+    Ok(())
+}
+
+fn download_executable_release(dest: &Path, asset: &str, version: &str) -> Result<()> {
+    download_release_version(dest, asset, version)?;
+    make_executable(dest)
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("chmod executable {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<()> {
     Ok(())
 }
 

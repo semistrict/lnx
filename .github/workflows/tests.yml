@@ -9,7 +9,7 @@ on:
 
 jobs:
   test:
-    runs-on: depot-macos-latest
+    runs-on: macos-26
     timeout-minutes: 180
     env:
       CC_LINUX: /opt/homebrew/bin/aarch64-linux-musl-gcc
@@ -43,4 +43,3 @@ jobs:
 
       - name: Full system tests
         run: bun run test:full
-

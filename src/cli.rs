@@ -294,41 +294,52 @@ impl Cli {
         let explicit_rootfs = rootfs.is_some();
         let layout = Layout::resolve(&instance, kernel, rootfs)?;
         let persisted = descriptor::load(&layout)?;
-        let requested_cpus = cpus;
         let cpus = cpus.or(persisted.cpus).unwrap_or(DEFAULT_CPUS);
         let memory_mib = memory_mib
             .or(persisted.memory_mib)
             .unwrap_or(DEFAULT_MEMORY_MIB);
         let deterministic = deterministic.map(|seed| runner::DeterministicConfig { seed });
-        validate_deterministic_args(
-            requested_cpus,
-            nested_kvm,
-            &forwards,
-            deterministic.as_ref(),
-            trace_events,
-        )?;
-        let cpus = if deterministic.is_some() { 1 } else { cpus };
+        validate_deterministic_args(nested_kvm, &forwards, deterministic.as_ref(), trace_events)?;
+        let cpus = effective_cpus(cpus, deterministic.as_ref());
         let effective_no_host_shares = no_host_shares || deterministic.is_some();
         match command {
             Some(Command::Init(args)) => match args.image {
                 Some(image) => crate::oci::import_image(&layout, &image, args.kernel.as_deref()),
                 None => init::run(&layout, args.kernel.as_deref(), args.rootfs.as_deref()),
             },
-            Some(Command::Run(args)) => run_guest(
-                layout,
-                args.command,
-                cpus,
-                memory_mib,
-                snapshot_path,
-                nested_kvm,
-                effective_no_host_shares,
-                deterministic.clone(),
-                trace_events,
-                root,
-                forwards,
-                explicit_kernel,
-                explicit_rootfs,
-            ),
+            Some(Command::Run(args)) => {
+                if cfg!(target_os = "macos") && deterministic.is_some() {
+                    run_nested_deterministic_on_macos(
+                        &layout,
+                        cpus,
+                        memory_mib,
+                        snapshot_path.as_deref(),
+                        deterministic.as_ref().unwrap(),
+                        trace_events,
+                        root,
+                        &args.command,
+                        "run",
+                        Vec::new(),
+                        explicit_kernel,
+                    )
+                } else {
+                    run_guest(
+                        layout,
+                        args.command,
+                        cpus,
+                        memory_mib,
+                        snapshot_path,
+                        nested_kvm,
+                        effective_no_host_shares,
+                        deterministic.clone(),
+                        trace_events,
+                        root,
+                        forwards,
+                        explicit_kernel,
+                        explicit_rootfs,
+                    )
+                }
+            }
             Some(Command::Paths) => {
                 println!("kernel: {}", layout.kernel.display());
                 println!("rootfs: {}", layout.rootfs.display());
@@ -338,34 +349,81 @@ impl Cli {
                 println!("snapshots: {}", layout.snapshot_dir.display());
                 Ok(())
             }
-            Some(Command::Checkpoint(args)) => create_checkpoint(
-                layout,
-                args.message.as_deref(),
-                cpus,
-                memory_mib,
-                snapshot_path,
-                forwards,
-                explicit_kernel,
-                explicit_rootfs,
-                effective_no_host_shares,
-                deterministic.clone(),
-                trace_events,
-            ),
+            Some(Command::Checkpoint(args)) => {
+                if cfg!(target_os = "macos") && deterministic.is_some() {
+                    let mut subcommand = vec!["checkpoint".to_string()];
+                    if let Some(message) = args.message {
+                        subcommand.push("-m".to_string());
+                        subcommand.push(message);
+                    }
+                    run_nested_deterministic_on_macos(
+                        &layout,
+                        cpus,
+                        memory_mib,
+                        snapshot_path.as_deref(),
+                        deterministic.as_ref().unwrap(),
+                        trace_events,
+                        root,
+                        &[],
+                        "checkpoint",
+                        subcommand,
+                        explicit_kernel,
+                    )
+                } else {
+                    create_checkpoint(
+                        layout,
+                        args.message.as_deref(),
+                        cpus,
+                        memory_mib,
+                        snapshot_path,
+                        forwards,
+                        explicit_kernel,
+                        explicit_rootfs,
+                        effective_no_host_shares,
+                        deterministic.clone(),
+                        trace_events,
+                    )
+                }
+            }
             Some(Command::Checkpoints) => list_checkpoints(&layout),
-            Some(Command::Fork(args)) => fork_checkpoint(
-                layout,
-                args.checkpoint.as_deref(),
-                &args.instance,
-                cpus,
-                memory_mib,
-                snapshot_path,
-                forwards,
-                explicit_kernel,
-                explicit_rootfs,
-                effective_no_host_shares,
-                deterministic.clone(),
-                trace_events,
-            ),
+            Some(Command::Fork(args)) => {
+                if cfg!(target_os = "macos") && deterministic.is_some() {
+                    let mut subcommand = vec!["fork".to_string()];
+                    if let Some(checkpoint) = args.checkpoint {
+                        subcommand.push("--checkpoint".to_string());
+                        subcommand.push(checkpoint);
+                    }
+                    subcommand.push(args.instance);
+                    run_nested_deterministic_on_macos(
+                        &layout,
+                        cpus,
+                        memory_mib,
+                        snapshot_path.as_deref(),
+                        deterministic.as_ref().unwrap(),
+                        trace_events,
+                        root,
+                        &[],
+                        "fork",
+                        subcommand,
+                        explicit_kernel,
+                    )
+                } else {
+                    fork_checkpoint(
+                        layout,
+                        args.checkpoint.as_deref(),
+                        &args.instance,
+                        cpus,
+                        memory_mib,
+                        snapshot_path,
+                        forwards,
+                        explicit_kernel,
+                        explicit_rootfs,
+                        effective_no_host_shares,
+                        deterministic.clone(),
+                        trace_events,
+                    )
+                }
+            }
             Some(Command::Server(args)) => match args.command {
                 Some(ServerCommand::Push(push)) => crate::server::push(crate::server::PushConfig {
                     source: layout,
@@ -439,21 +497,39 @@ impl Cli {
                     .or(deterministic),
                 trace_events: trace_events || args.trace_events,
             }),
-            None => run_guest(
-                layout,
-                guest_command,
-                cpus,
-                memory_mib,
-                snapshot_path,
-                nested_kvm,
-                effective_no_host_shares,
-                deterministic,
-                trace_events,
-                root,
-                forwards,
-                explicit_kernel,
-                explicit_rootfs,
-            ),
+            None => {
+                if cfg!(target_os = "macos") && deterministic.is_some() {
+                    run_nested_deterministic_on_macos(
+                        &layout,
+                        cpus,
+                        memory_mib,
+                        snapshot_path.as_deref(),
+                        deterministic.as_ref().unwrap(),
+                        trace_events,
+                        root,
+                        &guest_command,
+                        "run",
+                        Vec::new(),
+                        explicit_kernel,
+                    )
+                } else {
+                    run_guest(
+                        layout,
+                        guest_command,
+                        cpus,
+                        memory_mib,
+                        snapshot_path,
+                        nested_kvm,
+                        effective_no_host_shares,
+                        deterministic,
+                        trace_events,
+                        root,
+                        forwards,
+                        explicit_kernel,
+                        explicit_rootfs,
+                    )
+                }
+            }
         }
     }
 }
@@ -825,7 +901,6 @@ fn ensure_vm_initialized(
 }
 
 fn validate_deterministic_args(
-    requested_cpus: Option<u8>,
     nested_kvm: bool,
     forwards: &[runner::PortForward],
     deterministic: Option<&runner::DeterministicConfig>,
@@ -837,19 +912,292 @@ fn validate_deterministic_args(
     if deterministic.is_none() {
         return Ok(());
     }
-    if !cfg!(target_os = "linux") {
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
         bail!("--deterministic is only supported on the KVM backend");
     }
-    if requested_cpus.is_some_and(|cpus| cpus != 1) {
-        bail!("--deterministic requires --cpus 1");
-    }
-    if nested_kvm {
+    if cfg!(target_os = "linux") && nested_kvm {
         bail!("--deterministic cannot be combined with --nested-kvm yet");
     }
     if !forwards.is_empty() {
         bail!("--deterministic cannot be combined with --forward yet");
     }
     Ok(())
+}
+
+fn effective_cpus(configured: u8, deterministic: Option<&runner::DeterministicConfig>) -> u8 {
+    if deterministic.is_some() {
+        1
+    } else {
+        configured
+    }
+}
+
+fn run_nested_deterministic_on_macos(
+    layout: &Layout,
+    cpus: u8,
+    memory_mib: u32,
+    snapshot_path: Option<&Path>,
+    deterministic: &runner::DeterministicConfig,
+    trace_events: bool,
+    run_as_root: bool,
+    guest_command: &[String],
+    command_label: &str,
+    subcommand: Vec<String>,
+    explicit_kernel: bool,
+) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        bail!("nested deterministic dispatch is only available on macOS");
+    }
+
+    let linux_lnx = find_linux_lnx_binary(&layout.base)?;
+    let linux_gvproxy = find_linux_gvproxy_binary(&layout.base)?;
+    let outer_instance = nested_deterministic_outer_instance(&layout.instance);
+    let outer_layout = Layout::resolve(&outer_instance, Some(layout.kernel.clone()), None)?;
+    ensure_image_and_instance(&outer_layout, explicit_kernel, false)?;
+    ensure_vm_initialized(
+        &outer_layout,
+        2,
+        memory_mib.max(DEFAULT_MEMORY_MIB),
+        Vec::new(),
+        false,
+        true,
+        false,
+        None,
+        false,
+    )?;
+
+    let inner_args = nested_deterministic_inner_args(
+        layout,
+        cpus,
+        memory_mib,
+        snapshot_path,
+        deterministic,
+        trace_events,
+        run_as_root,
+        guest_command,
+        subcommand,
+    );
+    let script = nested_deterministic_script(
+        &linux_lnx,
+        &linux_gvproxy,
+        &layout.base,
+        std::env::var_os("LNX_RUN_BASE")
+            .map(PathBuf::from)
+            .as_deref(),
+        &inner_args,
+    );
+    let cwd = std::env::current_dir().context("current directory")?;
+    let status = runner::run(runner::RunConfig {
+        layout: outer_layout,
+        command: vec!["bash".to_string(), "-lc".to_string(), script],
+        cwd,
+        cpus: 2,
+        memory_mib: memory_mib.max(DEFAULT_MEMORY_MIB),
+        nested_kvm: true,
+        restore_snapshot: None,
+        forwards: Vec::new(),
+        snapshot_output: None,
+        run_as_root: false,
+        no_host_shares: false,
+        deterministic: None,
+        trace_events: false,
+    })
+    .with_context(|| format!("run deterministic {command_label} in nested Linux"))?;
+    std::process::exit(status);
+}
+
+fn nested_deterministic_outer_instance(instance: &str) -> String {
+    format!("{instance}-deterministic-outer")
+}
+
+fn nested_deterministic_inner_args(
+    layout: &Layout,
+    cpus: u8,
+    memory_mib: u32,
+    snapshot_path: Option<&Path>,
+    deterministic: &runner::DeterministicConfig,
+    trace_events: bool,
+    run_as_root: bool,
+    guest_command: &[String],
+    subcommand: Vec<String>,
+) -> Vec<String> {
+    let mut args = vec![
+        "--instance".to_string(),
+        layout.instance.clone(),
+        "--kernel".to_string(),
+        layout.kernel.display().to_string(),
+        "--rootfs".to_string(),
+        layout.rootfs.display().to_string(),
+        "--cpus".to_string(),
+        cpus.to_string(),
+        "--memory-mib".to_string(),
+        memory_mib.to_string(),
+        "--no-host-shares".to_string(),
+        "--deterministic".to_string(),
+        deterministic.seed.clone(),
+    ];
+    if let Some(snapshot) = snapshot_path {
+        args.push("--snapshot".to_string());
+        args.push(snapshot.display().to_string());
+    }
+    if trace_events {
+        args.push("--trace-events".to_string());
+    }
+    if run_as_root {
+        args.push("--root".to_string());
+    }
+    args.extend(subcommand);
+    args.extend(guest_command.iter().cloned());
+    args
+}
+
+fn nested_deterministic_script(
+    linux_lnx: &Path,
+    linux_gvproxy: &Path,
+    base: &Path,
+    run_base: Option<&Path>,
+    inner_args: &[String],
+) -> String {
+    let mut lines = vec![
+        "set -euo pipefail".to_string(),
+        "test -c /dev/kvm".to_string(),
+        "test -r /dev/kvm".to_string(),
+        "nested_tools=/tmp/lnx-deterministic-tools".to_string(),
+        "rm -rf \"$nested_tools\"".to_string(),
+        "mkdir -p \"$nested_tools\"".to_string(),
+        format!(
+            "cp {} \"$nested_tools/lnx\"",
+            shell_quote(&linux_lnx.display().to_string())
+        ),
+        format!(
+            "cp {} \"$nested_tools/gvproxy-linux-arm64\"",
+            shell_quote(&linux_gvproxy.display().to_string())
+        ),
+        "chmod +x \"$nested_tools\"/*".to_string(),
+        "export LNX_BIN=\"$nested_tools/lnx\"".to_string(),
+        "export GVPROXY_PATH=\"$nested_tools/gvproxy-linux-arm64\"".to_string(),
+        "export LNX_ROOTFS_BACKEND=block".to_string(),
+        format!(
+            "export LNX_BASE={}",
+            shell_quote(&base.display().to_string())
+        ),
+    ];
+    if let Some(run_base) = run_base {
+        lines.push(format!(
+            "export LNX_RUN_BASE={}",
+            shell_quote(&run_base.display().to_string())
+        ));
+    }
+    let inner = inner_args
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    lines.push(format!("exec \"$LNX_BIN\" {inner}"));
+    lines.join("\n")
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn find_linux_lnx_binary(base: &Path) -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("LNX_LINUX_BIN").map(PathBuf::from) {
+        return require_executable_file(path, "Linux lnx binary");
+    }
+    let exe = std::env::current_exe().context("current executable")?;
+    for candidate in linux_lnx_candidates(&exe) {
+        if candidate.exists() {
+            return require_executable_file(candidate, "Linux lnx binary");
+        }
+    }
+    let cache_path = base.join("cache").join("lnx-linux-aarch64");
+    crate::init::ensure_nested_linux_lnx(&cache_path)?;
+    require_executable_file(cache_path, "Linux lnx binary")
+}
+
+fn linux_lnx_candidates(current_exe: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(dir) = current_exe.parent() {
+        candidates.push(dir.join("lnx-linux-aarch64"));
+    }
+    let mut cursor = current_exe.parent();
+    while let Some(dir) = cursor {
+        if dir.file_name().and_then(|name| name.to_str()) == Some("target") {
+            candidates.push(
+                dir.join("aarch64-unknown-linux-musl")
+                    .join("debug")
+                    .join("lnx"),
+            );
+            candidates.push(
+                dir.join("aarch64-unknown-linux-musl")
+                    .join("release")
+                    .join("lnx"),
+            );
+            break;
+        }
+        if matches!(
+            dir.file_name().and_then(|name| name.to_str()),
+            Some("debug" | "release")
+        ) && dir
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some("target")
+        {
+            let profile = dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("debug");
+            if let Some(target_dir) = dir.parent() {
+                candidates.push(
+                    target_dir
+                        .join("aarch64-unknown-linux-musl")
+                        .join(profile)
+                        .join("lnx"),
+                );
+            }
+        }
+        cursor = dir.parent();
+    }
+    candidates
+}
+
+fn find_linux_gvproxy_binary(base: &Path) -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("LNX_LINUX_GVPROXY").map(PathBuf::from) {
+        return require_executable_file(path, "Linux gvproxy binary");
+    }
+    let exe = std::env::current_exe().context("current executable")?;
+    if let Some(dir) = exe.parent() {
+        let candidate = dir.join("gvproxy-linux-arm64");
+        if candidate.exists() {
+            return require_executable_file(candidate, "Linux gvproxy binary");
+        }
+    }
+    let mut cursor = exe.parent();
+    while let Some(dir) = cursor {
+        if dir.file_name().and_then(|name| name.to_str()) == Some("target") {
+            let candidate = dir.join("gvproxy-linux-arm64");
+            if candidate.exists() {
+                return require_executable_file(candidate, "Linux gvproxy binary");
+            }
+        }
+        cursor = dir.parent();
+    }
+    let cache_path = base.join("cache").join("gvproxy-linux-arm64");
+    crate::init::ensure_nested_linux_gvproxy(&cache_path)?;
+    require_executable_file(cache_path, "Linux gvproxy binary")
+}
+
+fn require_executable_file(path: PathBuf, label: &str) -> Result<PathBuf> {
+    if path.is_file() {
+        Ok(path)
+    } else {
+        bail!("{label} not found: {}", path.display())
+    }
 }
 
 fn initialize_vm_instance(
@@ -1379,5 +1727,136 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(cp_transfer_operands(&args).is_err());
+    }
+
+    #[test]
+    fn deterministic_implies_one_cpu() {
+        let deterministic = runner::DeterministicConfig {
+            seed: "seed42".to_string(),
+        };
+
+        assert_eq!(effective_cpus(8, Some(&deterministic)), 1);
+        assert_eq!(effective_cpus(8, None), 8);
+    }
+
+    #[test]
+    fn nested_deterministic_inner_args_preserve_requested_run() {
+        let layout = Layout {
+            base: PathBuf::from("/Users/test/.lnx"),
+            instance: "dev".to_string(),
+            kernel: PathBuf::from("/Users/test/.lnx/vmlinuz"),
+            rootfs: PathBuf::from("/Users/test/.lnx/instances/dev/rootfs.ext4"),
+            instance_dir: PathBuf::from("/Users/test/.lnx/instances/dev"),
+            snapshot_dir: PathBuf::from("/Users/test/.lnx/instances/dev/memory-snapshots"),
+            checkpoint_dir: PathBuf::from("/Users/test/.lnx/instances/dev/checkpoints"),
+            vm_initialized: PathBuf::from("/Users/test/.lnx/instances/dev/vm-initialized"),
+            run_dir: PathBuf::from("/Users/test/.lnx/instances/dev"),
+            console_log: PathBuf::from("/Users/test/.lnx/instances/dev/console.log"),
+        };
+        let args = nested_deterministic_inner_args(
+            &layout,
+            1,
+            768,
+            Some(Path::new(
+                "/Users/test/.lnx/instances/dev/memory-snapshots/latest",
+            )),
+            &runner::DeterministicConfig {
+                seed: "seed42".to_string(),
+            },
+            true,
+            true,
+            &["bash".to_string(), "-lc".to_string(), "date".to_string()],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "--instance",
+                "dev",
+                "--kernel",
+                "/Users/test/.lnx/vmlinuz",
+                "--rootfs",
+                "/Users/test/.lnx/instances/dev/rootfs.ext4",
+                "--cpus",
+                "1",
+                "--memory-mib",
+                "768",
+                "--no-host-shares",
+                "--deterministic",
+                "seed42",
+                "--snapshot",
+                "/Users/test/.lnx/instances/dev/memory-snapshots/latest",
+                "--trace-events",
+                "--root",
+                "bash",
+                "-lc",
+                "date",
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_deterministic_inner_args_preserve_checkpoint_subcommand() {
+        let layout = Layout {
+            base: PathBuf::from("/Users/test/.lnx"),
+            instance: "dev".to_string(),
+            kernel: PathBuf::from("/Users/test/.lnx/vmlinuz"),
+            rootfs: PathBuf::from("/Users/test/.lnx/instances/dev/rootfs.ext4"),
+            instance_dir: PathBuf::from("/Users/test/.lnx/instances/dev"),
+            snapshot_dir: PathBuf::from("/Users/test/.lnx/instances/dev/memory-snapshots"),
+            checkpoint_dir: PathBuf::from("/Users/test/.lnx/instances/dev/checkpoints"),
+            vm_initialized: PathBuf::from("/Users/test/.lnx/instances/dev/vm-initialized"),
+            run_dir: PathBuf::from("/Users/test/.lnx/instances/dev"),
+            console_log: PathBuf::from("/Users/test/.lnx/instances/dev/console.log"),
+        };
+        let args = nested_deterministic_inner_args(
+            &layout,
+            1,
+            512,
+            None,
+            &runner::DeterministicConfig {
+                seed: "default".to_string(),
+            },
+            false,
+            false,
+            &[],
+            vec![
+                "checkpoint".to_string(),
+                "-m".to_string(),
+                "deterministic-base".to_string(),
+            ],
+        );
+
+        assert!(args.ends_with(&[
+            "checkpoint".to_string(),
+            "-m".to_string(),
+            "deterministic-base".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn nested_deterministic_script_quotes_paths_and_exports_inner_base() {
+        let script = nested_deterministic_script(
+            Path::new("/Users/test/src/target/aarch64-unknown-linux-musl/debug/lnx"),
+            Path::new("/Users/test/src/target/gvproxy-linux-arm64"),
+            Path::new("/Users/test/.lnx"),
+            Some(Path::new("/tmp/lnx run")),
+            &["--instance".to_string(), "dev one".to_string()],
+        );
+
+        assert!(script.contains("export LNX_ROOTFS_BACKEND=block"));
+        assert!(script.contains("export LNX_BASE='/Users/test/.lnx'"));
+        assert!(script.contains("export LNX_RUN_BASE='/tmp/lnx run'"));
+        assert!(script.contains("exec \"$LNX_BIN\" '--instance' 'dev one'"));
+    }
+
+    #[test]
+    fn linux_lnx_candidates_use_current_profile() {
+        let candidates = linux_lnx_candidates(Path::new("/Users/test/src/target/release/lnx"));
+
+        assert!(candidates.contains(&PathBuf::from(
+            "/Users/test/src/target/aarch64-unknown-linux-musl/release/lnx"
+        )));
     }
 }
