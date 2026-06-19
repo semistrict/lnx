@@ -471,7 +471,7 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &SnapshotReader) -> Result<()
         // that case, replaying distributor/redistributor state alone can
         // strand pending interrupts behind a reset CPU interface. Current
         // macOS snapshots do carry ICC regs, so they take the full GIC replay
-        // path below, matching the working machinen vmstate policy.
+        // path below, matching the working vmstate policy.
         crate::timing_event("snapshot.restore.macos_gic.skipped");
     } else {
         restore_macos_irqchip_state(inputs, reader, meta.capture_timer_counter)?;

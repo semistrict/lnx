@@ -3,7 +3,7 @@ use std::os::unix::io::AsRawFd;
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 
-use super::device::{Balloon, DFQ_INDEX, FRQ_INDEX, IFQ_INDEX, PHQ_INDEX, STQ_INDEX};
+use super::device::{Balloon, DFQ_INDEX, FRQ_INDEX, IFQ_INDEX, STQ_INDEX};
 use crate::virtio::device::VirtioDevice;
 
 impl Balloon {
@@ -12,7 +12,7 @@ impl Balloon {
     }
 
     pub(crate) fn handle_ifq_event(&mut self, event: &EpollEvent) {
-        debug!("balloon: unsupported inflate queue event (ignored)");
+        debug!("balloon: inflate queue event");
 
         let event_set = event.event_set();
         if event_set != EventSet::IN {
@@ -22,11 +22,13 @@ impl Balloon {
 
         if let Err(e) = self.queue_event(IFQ_INDEX).read() {
             error!("Failed to read balloon inflate queue event: {e:?}");
+        } else if self.process_ifq() {
+            self.device_state.signal_used_queue();
         }
     }
 
     pub(crate) fn handle_dfq_event(&mut self, event: &EpollEvent) {
-        debug!("balloon: unsupported deflate queue event (ignored)");
+        debug!("balloon: deflate queue event");
 
         let event_set = event.event_set();
         if event_set != EventSet::IN {
@@ -36,6 +38,8 @@ impl Balloon {
 
         if let Err(e) = self.queue_event(DFQ_INDEX).read() {
             error!("Failed to read balloon deflate queue event: {e:?}");
+        } else if self.process_dfq() {
+            self.device_state.signal_used_queue();
         }
     }
 
@@ -50,20 +54,6 @@ impl Balloon {
 
         if let Err(e) = self.queue_event(STQ_INDEX).read() {
             error!("Failed to read balloon stats queue event: {e:?}");
-        }
-    }
-
-    pub(crate) fn handle_phq_event(&mut self, event: &EpollEvent) {
-        debug!("balloon: unsupported page-hinting queue event (ignored)");
-
-        let event_set = event.event_set();
-        if event_set != EventSet::IN {
-            warn!("balloon: page-hinting unexpected event {event_set:?}");
-            return;
-        }
-
-        if let Err(e) = self.queue_event(PHQ_INDEX).read() {
-            error!("Failed to read balloon page-hinting queue event: {e:?}");
         }
     }
 
@@ -127,16 +117,6 @@ impl Balloon {
 
         event_manager
             .register(
-                self.queue_event(PHQ_INDEX).as_raw_fd(),
-                EpollEvent::new(EventSet::IN, self.queue_event(PHQ_INDEX).as_raw_fd() as u64),
-                self_subscriber.clone(),
-            )
-            .unwrap_or_else(|e| {
-                error!("Failed to register balloon dfq with event manager: {e:?}");
-            });
-
-        event_manager
-            .register(
                 self.queue_event(FRQ_INDEX).as_raw_fd(),
                 EpollEvent::new(EventSet::IN, self.queue_event(FRQ_INDEX).as_raw_fd() as u64),
                 self_subscriber.clone(),
@@ -159,7 +139,6 @@ impl Subscriber for Balloon {
         let ifq = self.queue_event(IFQ_INDEX).as_raw_fd();
         let dfq = self.queue_event(DFQ_INDEX).as_raw_fd();
         let stq = self.queue_event(STQ_INDEX).as_raw_fd();
-        let phq = self.queue_event(PHQ_INDEX).as_raw_fd();
         let frq = self.queue_event(FRQ_INDEX).as_raw_fd();
         let activate_evt = self.activate_evt.as_raw_fd();
 
@@ -168,7 +147,6 @@ impl Subscriber for Balloon {
                 _ if source == ifq => self.handle_ifq_event(event),
                 _ if source == dfq => self.handle_dfq_event(event),
                 _ if source == stq => self.handle_stq_event(event),
-                _ if source == phq => self.handle_phq_event(event),
                 _ if source == frq => self.handle_frq_event(event),
                 _ if source == activate_evt => {
                     self.handle_activate_event(event_manager);

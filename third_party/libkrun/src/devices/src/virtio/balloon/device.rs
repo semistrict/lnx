@@ -3,7 +3,7 @@ use std::convert::TryInto;
 use std::io::Write;
 
 use utils::eventfd::EventFd;
-use vm_memory::{ByteValued, GuestMemory, GuestMemoryMmap};
+use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, BalloonError, DeviceQueue, DeviceSnapshot, DeviceSnapshotError,
@@ -19,15 +19,12 @@ pub(crate) const IFQ_INDEX: usize = 0;
 pub(crate) const DFQ_INDEX: usize = 1;
 // Stats queue.
 pub(crate) const STQ_INDEX: usize = 2;
-// Page-hinting queue.
-pub(crate) const PHQ_INDEX: usize = 3;
 // Free page reporting queue.
-pub(crate) const FRQ_INDEX: usize = 4;
+pub(crate) const FRQ_INDEX: usize = 3;
 
 // Supported features.
 pub(crate) const AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_F_VERSION_1 as u64)
     | (1 << uapi::VIRTIO_BALLOON_F_STATS_VQ as u64)
-    | (1 << uapi::VIRTIO_BALLOON_F_FREE_PAGE_HINT as u64)
     | (1 << uapi::VIRTIO_BALLOON_F_REPORTING as u64);
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -85,9 +82,18 @@ impl Balloon {
             .as_mut()
             .expect("queues should exist when activated");
         let mut have_used = false;
+        if !queues[FRQ_INDEX].queue.is_valid(mem) {
+            let queue = &queues[FRQ_INDEX].queue;
+            warn!(
+                "balloon: free-page reporting queue is not ready ready={} size={} desc={:?} avail={:?} used={:?}",
+                queue.ready, queue.size, queue.desc_table, queue.avail_ring, queue.used_ring
+            );
+            return false;
+        }
 
         while let Some(head) = queues[FRQ_INDEX].queue.pop(mem) {
             let index = head.index;
+            let mut reported_bytes = 0u64;
             for desc in head.into_iter() {
                 let host_addr = mem.get_host_address(desc.addr).unwrap();
                 debug!(
@@ -97,18 +103,126 @@ impl Balloon {
                 #[cfg(target_os = "linux")]
                 let advice = libc::MADV_DONTNEED;
                 #[cfg(target_os = "macos")]
-                let advice = libc::MADV_FREE;
-                unsafe {
+                let advice = libc::MADV_FREE_REUSABLE;
+                let ret = unsafe {
                     libc::madvise(
                         host_addr as *mut libc::c_void,
                         desc.len.try_into().unwrap(),
                         advice,
                     )
                 };
+                if ret != 0 {
+                    warn!(
+                        "balloon: madvise failed for report guest_addr={:?}: {:?}",
+                        desc.addr,
+                        std::io::Error::last_os_error()
+                    );
+                } else {
+                    reported_bytes += u64::from(desc.len);
+                }
+            }
+
+            if reported_bytes > 0 {
+                info!("balloon: reported {reported_bytes} bytes from free-page reporting queue");
+            }
+            have_used = true;
+            if let Err(e) = queues[FRQ_INDEX].queue.add_used(mem, index, 0) {
+                error!("failed to add used elements to the queue: {e:?}");
+            }
+        }
+
+        have_used
+    }
+
+    fn release_guest_page(mem: &GuestMemoryMmap, page_frame_number: u32) {
+        let guest_addr =
+            GuestAddress(u64::from(page_frame_number) << defs::VIRTIO_BALLOON_PFN_SHIFT);
+        let host_addr = match mem.get_host_address(guest_addr) {
+            Ok(addr) => addr,
+            Err(e) => {
+                warn!("balloon: invalid inflate PFN {page_frame_number}: {e:?}");
+                return;
+            }
+        };
+        #[cfg(target_os = "linux")]
+        let advice = libc::MADV_DONTNEED;
+        #[cfg(target_os = "macos")]
+        let advice = libc::MADV_FREE_REUSABLE;
+        let page_size = 1usize << defs::VIRTIO_BALLOON_PFN_SHIFT;
+        let ret = unsafe { libc::madvise(host_addr as *mut libc::c_void, page_size, advice) };
+        if ret != 0 {
+            warn!(
+                "balloon: madvise failed for guest_addr={guest_addr:?}: {:?}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    pub fn process_ifq(&mut self) -> bool {
+        debug!("balloon: process_ifq()");
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem, _) => mem,
+            DeviceState::Inactive => unreachable!(),
+        };
+
+        let queues = self
+            .queues
+            .as_mut()
+            .expect("queues should exist when activated");
+        let mut have_used = false;
+        if !queues[IFQ_INDEX].queue.is_valid(mem) {
+            warn!("balloon: inflate queue is not ready");
+            return false;
+        }
+
+        while let Some(head) = queues[IFQ_INDEX].queue.pop(mem) {
+            let index = head.index;
+            for desc in head.into_iter() {
+                if desc.is_write_only() || desc.len % std::mem::size_of::<u32>() as u32 != 0 {
+                    warn!("balloon: skipping malformed inflate descriptor");
+                    continue;
+                }
+                let mut data = vec![0u8; desc.len as usize];
+                if let Err(e) = mem.read(&mut data, desc.addr) {
+                    warn!("balloon: failed to read inflate descriptor: {e:?}");
+                    continue;
+                }
+                for chunk in data.chunks_exact(std::mem::size_of::<u32>()) {
+                    let page_frame_number =
+                        u32::from_le_bytes(chunk.try_into().expect("u32 chunk"));
+                    Self::release_guest_page(mem, page_frame_number);
+                }
             }
 
             have_used = true;
-            if let Err(e) = queues[FRQ_INDEX].queue.add_used(mem, index, 0) {
+            if let Err(e) = queues[IFQ_INDEX].queue.add_used(mem, index, 0) {
+                error!("failed to add used elements to the queue: {e:?}");
+            }
+        }
+
+        have_used
+    }
+
+    pub fn process_dfq(&mut self) -> bool {
+        debug!("balloon: process_dfq()");
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem, _) => mem,
+            DeviceState::Inactive => unreachable!(),
+        };
+
+        let queues = self
+            .queues
+            .as_mut()
+            .expect("queues should exist when activated");
+        let mut have_used = false;
+        if !queues[DFQ_INDEX].queue.is_valid(mem) {
+            warn!("balloon: deflate queue is not ready");
+            return false;
+        }
+
+        while let Some(head) = queues[DFQ_INDEX].queue.pop(mem) {
+            have_used = true;
+            if let Err(e) = queues[DFQ_INDEX].queue.add_used(mem, head.index, 0) {
                 error!("failed to add used elements to the queue: {e:?}");
             }
         }
@@ -157,11 +271,20 @@ impl VirtioDevice for Balloon {
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
-        warn!(
-            "balloon: guest driver attempted to write device config (offset={:x}, len={:x})",
-            offset,
-            data.len()
-        );
+        let config_slice = self.config.as_mut_slice();
+        let Some(start) = usize::try_from(offset).ok() else {
+            error!("Failed to write balloon config space");
+            return;
+        };
+        let Some(end) = start.checked_add(data.len()) else {
+            error!("Failed to write balloon config space");
+            return;
+        };
+        let Some(dst) = config_slice.get_mut(start..end) else {
+            error!("Failed to write balloon config space");
+            return;
+        };
+        dst.copy_from_slice(data);
     }
 
     fn activate(
@@ -298,4 +421,24 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(BalloonConfigSnapshot::deserialize(deserializer)?.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn actual_is_writable_and_target_defaults_to_zero() {
+        let mut balloon = Balloon::new().unwrap();
+
+        let mut config = [0u8; std::mem::size_of::<VirtioBalloonConfig>()];
+        balloon.read_config(0, &mut config);
+        assert_eq!(u32::from_le_bytes(config[0..4].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(config[4..8].try_into().unwrap()), 0);
+
+        balloon.write_config(4, &1234u32.to_le_bytes());
+        balloon.read_config(0, &mut config);
+        assert_eq!(u32::from_le_bytes(config[0..4].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(config[4..8].try_into().unwrap()), 1234);
+    }
 }
