@@ -382,6 +382,7 @@ fn resume_after_capture(inputs: &CaptureInputs<'_>) -> Result<()> {
             }
         }
     }
+    post_vcpu_restore_devices(inputs)?;
     Ok(())
 }
 
@@ -664,6 +665,10 @@ fn restore_macos_virtio_irq_types(
 }
 
 fn restore_timer_delta(format: SnapshotFormat, capture_counter: u64) -> u64 {
+    if deterministic_time_enabled() {
+        crate::timing_event("snapshot.restore.deterministic_time.skip_timer_rebase");
+        return 0;
+    }
     match format {
         SnapshotFormat::Linux => host_timer_counter().wrapping_sub(capture_counter),
         SnapshotFormat::Macos => {
@@ -671,6 +676,10 @@ fn restore_timer_delta(format: SnapshotFormat, capture_counter: u64) -> u64 {
             0
         }
     }
+}
+
+fn deterministic_time_enabled() -> bool {
+    std::env::var_os("KRUN_DETERMINISTIC_TIME").is_some_and(|value| value == "1")
 }
 
 fn read_virtio_section(
@@ -736,6 +745,20 @@ fn post_restore_devices(inputs: &CaptureInputs<'_>) -> Result<()> {
             SnapshotError::DeviceRefused(format!("base=0x{base:x}: post restore: {e}"))
         })?;
     }
+    Ok(())
+}
+
+fn post_vcpu_restore_devices(inputs: &CaptureInputs<'_>) -> Result<()> {
+    crate::timing_event("snapshot.restore.post_vcpu_devices.begin");
+    for (base, transport_arc) in inputs.virtio_transports {
+        let transport = transport_arc.lock().unwrap();
+        let device_arc = transport.device();
+        let mut device = device_arc.lock().unwrap();
+        device.post_vcpu_restore().map_err(|e| {
+            SnapshotError::DeviceRefused(format!("base=0x{base:x}: post vcpu restore: {e}"))
+        })?;
+    }
+    crate::timing_event("snapshot.restore.post_vcpu_devices.done");
     Ok(())
 }
 
@@ -871,5 +894,16 @@ mod tests {
     #[test]
     fn macos_restore_timer_delta_is_zero() {
         assert_eq!(restore_timer_delta(SnapshotFormat::Macos, u64::MAX), 0);
+    }
+
+    #[test]
+    fn deterministic_time_skips_linux_timer_rebase() {
+        unsafe {
+            std::env::set_var("KRUN_DETERMINISTIC_TIME", "1");
+        }
+        assert_eq!(restore_timer_delta(SnapshotFormat::Linux, u64::MAX), 0);
+        unsafe {
+            std::env::remove_var("KRUN_DETERMINISTIC_TIME");
+        }
     }
 }

@@ -216,6 +216,7 @@ pub trait Vcpus: Send + Sync {
     fn should_wait(&self, vcpuid: u64) -> bool;
     fn has_pending_irq(&self, vcpuid: u64) -> bool;
     fn get_pending_irq(&self, vcpuid: u64) -> u32;
+    fn jump_deterministic_counter(&self, counter: u64);
     fn handle_sysreg_read(&self, vcpuid: u64, reg: u32) -> Option<u64>;
     fn handle_sysreg_write(&self, vcpuid: u64, reg: u32, val: u64) -> bool;
 }
@@ -572,6 +573,56 @@ mod tests {
         assert!(regions[0].blocks[0]);
         assert!(regions[0].blocks[block_count - 1]);
     }
+
+    #[test]
+    fn deterministic_time_makes_trng_repeatable_and_masked() {
+        unsafe {
+            std::env::set_var("KRUN_DETERMINISTIC_TIME", "1");
+        }
+        let first = trng_random_words(65).expect("first deterministic trng");
+        let second = trng_random_words(65).expect("second deterministic trng");
+        unsafe {
+            std::env::remove_var("KRUN_DETERMINISTIC_TIME");
+        }
+
+        assert_eq!(first, second);
+        assert!(first.iter().any(|word| *word != 0));
+        assert_eq!(first[1] & !1, 0);
+        assert_eq!(first[2], 0);
+    }
+
+    #[test]
+    fn deterministic_time_jumps_vtimer_waits_to_deadline() {
+        unsafe {
+            std::env::set_var("KRUN_DETERMINISTIC_TIME", "1");
+        }
+        assert_eq!(vtimer_duration(2_000, 1_000, 1_000), Duration::ZERO);
+        unsafe {
+            std::env::remove_var("KRUN_DETERMINISTIC_TIME");
+        }
+        assert_eq!(vtimer_duration(2_000, 1_000, 1_000), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn vtimer_offset_maps_host_counter_to_guest_deadline() {
+        let offset = vtimer_offset_for_guest_counter(10_000, 2_000);
+        assert_eq!(10_000u64.wrapping_sub(offset), 2_000);
+
+        let wrapped = vtimer_offset_for_guest_counter(100, u64::MAX - 10);
+        assert_eq!(100u64.wrapping_sub(wrapped), u64::MAX - 10);
+    }
+
+    #[test]
+    fn deterministic_time_traps_guest_counter_reads() {
+        unsafe {
+            std::env::set_var("KRUN_DETERMINISTIC_TIME", "1");
+        }
+        assert_eq!(cnthctl_el2_bits(), 0);
+        unsafe {
+            std::env::remove_var("KRUN_DETERMINISTIC_TIME");
+        }
+        assert_eq!(cnthctl_el2_bits(), CNTHCTL_EL2_BITS);
+    }
 }
 
 #[derive(Debug)]
@@ -604,8 +655,12 @@ fn trng_random_words(num_bits: u64) -> std::io::Result<[u64; 3]> {
     let byte_count = ((num_bits + 7) / 8) as usize;
 
     if byte_count > 0 {
-        let mut random = std::fs::File::open("/dev/urandom")?;
-        random.read_exact(&mut bytes[..byte_count])?;
+        if deterministic_time_enabled() {
+            fill_deterministic_trng_bytes(num_bits, &mut bytes[..byte_count]);
+        } else {
+            let mut random = std::fs::File::open("/dev/urandom")?;
+            random.read_exact(&mut bytes[..byte_count])?;
+        }
 
         let remaining_bits = num_bits % 8;
         if remaining_bits != 0 {
@@ -619,6 +674,52 @@ fn trng_random_words(num_bits: u64) -> std::io::Result<[u64; 3]> {
         u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
         u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
     ])
+}
+
+fn deterministic_time_enabled() -> bool {
+    std::env::var_os("KRUN_DETERMINISTIC_TIME").is_some_and(|value| value == "1")
+}
+
+fn cnthctl_el2_bits() -> u64 {
+    if deterministic_time_enabled() {
+        0
+    } else {
+        CNTHCTL_EL2_BITS
+    }
+}
+
+fn vtimer_duration(cval: u64, guest_now: u64, cntfrq: u64) -> Duration {
+    if deterministic_time_enabled() || guest_now >= cval {
+        Duration::ZERO
+    } else {
+        Duration::from_nanos((cval - guest_now) * (1_000_000_000 / cntfrq))
+    }
+}
+
+fn vtimer_offset_for_guest_counter(host_counter: u64, guest_counter: u64) -> u64 {
+    host_counter.wrapping_sub(guest_counter)
+}
+
+fn fill_deterministic_trng_bytes(num_bits: u64, bytes: &mut [u8]) {
+    let mut generated = 0usize;
+    let mut block = 0u64;
+    while generated < bytes.len() {
+        let mut state = num_bits.rotate_left(17)
+            ^ block.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ 0x6c6e_782d_6465_7472;
+        let chunk = xorshift64star(&mut state).to_le_bytes();
+        let take = (bytes.len() - generated).min(chunk.len());
+        bytes[generated..generated + take].copy_from_slice(&chunk[..take]);
+        generated += take;
+        block = block.saturating_add(1);
+    }
+}
+
+fn xorshift64star(state: &mut u64) -> u64 {
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    state.wrapping_mul(0x2545_f491_4f6c_dd1d)
 }
 
 pub struct HvfVcpu<'a> {
@@ -700,7 +801,7 @@ impl HvfVcpu<'_> {
                 hv_vcpu_set_sys_reg(
                     self.vcpuid,
                     hv_sys_reg_t_HV_SYS_REG_CNTHCTL_EL2,
-                    CNTHCTL_EL2_BITS,
+                    cnthctl_el2_bits(),
                 )
             };
             if ret != HV_SUCCESS {
@@ -820,6 +921,13 @@ impl HvfVcpu<'_> {
             return Err(Error::VcpuInitialRegisters);
         }
 
+        if deterministic_time_enabled() {
+            let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, cntvct_el0()) };
+            if ret != HV_SUCCESS {
+                return Err(Error::VcpuInitialRegisters);
+            }
+        }
+
         Ok(())
     }
 
@@ -896,12 +1004,17 @@ impl HvfVcpu<'_> {
         let mut offset: u64 = 0;
         unsafe { hv_vcpu_get_vtimer_offset(self.vcpuid, &mut offset as *mut _) };
         let guest_now = cntvct_el0().wrapping_sub(offset);
-        let duration = if guest_now >= cval {
-            Duration::ZERO
+        Some(vtimer_duration(cval, guest_now, self.cntfrq))
+    }
+
+    fn jump_vtimer_to_guest_counter(&self, guest_counter: u64) -> Result<(), Error> {
+        let offset = vtimer_offset_for_guest_counter(cntvct_el0(), guest_counter);
+        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, offset) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuInitialRegisters)
         } else {
-            Duration::from_nanos((cval - guest_now) * (1_000_000_000 / self.cntfrq))
-        };
-        Some(duration)
+            Ok(())
+        }
     }
 
     fn handle_trng_request(&self, func_id: u64) -> Result<VcpuExit<'_>, Error> {
@@ -1183,12 +1296,19 @@ impl HvfVcpu<'_> {
                 unsafe { hv_vcpu_get_vtimer_offset(self.vcpuid, &mut offset as *mut _) };
                 let host_now = cntvct_el0();
                 let guest_now = host_now.wrapping_sub(offset);
+                if deterministic_time_enabled() {
+                    self.jump_vtimer_to_guest_counter(cval)?;
+                    vcpu_list.jump_deterministic_counter(cval);
+                    return Ok(VcpuExit::WaitForEventExpired);
+                }
                 if guest_now > cval {
                     return Ok(VcpuExit::WaitForEventExpired);
                 }
-                let timeout =
-                    Duration::from_nanos((cval - guest_now) * (1_000_000_000 / self.cntfrq));
-                Ok(VcpuExit::WaitForEventTimeout(timeout))
+                Ok(VcpuExit::WaitForEventTimeout(vtimer_duration(
+                    cval,
+                    guest_now,
+                    self.cntfrq,
+                )))
             }
             EC_AA64_HVC => self.handle_psci_request(),
             EC_AA64_SMC => {

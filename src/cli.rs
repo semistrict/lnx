@@ -46,6 +46,18 @@ pub struct Cli {
 
     #[arg(
         long,
+        value_name = "SEED",
+        num_args = 0..=1,
+        default_missing_value = "default",
+        help = "Run with deterministic VM compatibility settings and optional seed"
+    )]
+    deterministic: Option<String>,
+
+    #[arg(long, help = "Emit deterministic replay trace events")]
+    trace_events: bool,
+
+    #[arg(
+        long,
         help = "Do not mount host directories into the guest with virtio-fs"
     )]
     no_host_shares: bool,
@@ -236,6 +248,12 @@ struct HiddenVmOwnerArgs {
 
     #[arg(long)]
     no_host_shares: bool,
+
+    #[arg(long, value_name = "SEED")]
+    deterministic: Option<String>,
+
+    #[arg(long)]
+    trace_events: bool,
 }
 
 #[derive(Debug, Args)]
@@ -263,6 +281,8 @@ impl Cli {
             memory_mib,
             snapshot: snapshot_path,
             nested_kvm,
+            deterministic,
+            trace_events,
             no_host_shares,
             root,
             forwards,
@@ -274,10 +294,21 @@ impl Cli {
         let explicit_rootfs = rootfs.is_some();
         let layout = Layout::resolve(&instance, kernel, rootfs)?;
         let persisted = descriptor::load(&layout)?;
+        let requested_cpus = cpus;
         let cpus = cpus.or(persisted.cpus).unwrap_or(DEFAULT_CPUS);
         let memory_mib = memory_mib
             .or(persisted.memory_mib)
             .unwrap_or(DEFAULT_MEMORY_MIB);
+        let deterministic = deterministic.map(|seed| runner::DeterministicConfig { seed });
+        validate_deterministic_args(
+            requested_cpus,
+            nested_kvm,
+            &forwards,
+            deterministic.as_ref(),
+            trace_events,
+        )?;
+        let cpus = if deterministic.is_some() { 1 } else { cpus };
+        let effective_no_host_shares = no_host_shares || deterministic.is_some();
         match command {
             Some(Command::Init(args)) => match args.image {
                 Some(image) => crate::oci::import_image(&layout, &image, args.kernel.as_deref()),
@@ -290,7 +321,9 @@ impl Cli {
                 memory_mib,
                 snapshot_path,
                 nested_kvm,
-                no_host_shares,
+                effective_no_host_shares,
+                deterministic.clone(),
+                trace_events,
                 root,
                 forwards,
                 explicit_kernel,
@@ -314,7 +347,9 @@ impl Cli {
                 forwards,
                 explicit_kernel,
                 explicit_rootfs,
-                no_host_shares,
+                effective_no_host_shares,
+                deterministic.clone(),
+                trace_events,
             ),
             Some(Command::Checkpoints) => list_checkpoints(&layout),
             Some(Command::Fork(args)) => fork_checkpoint(
@@ -327,7 +362,9 @@ impl Cli {
                 forwards,
                 explicit_kernel,
                 explicit_rootfs,
-                no_host_shares,
+                effective_no_host_shares,
+                deterministic.clone(),
+                trace_events,
             ),
             Some(Command::Server(args)) => match args.command {
                 Some(ServerCommand::Push(push)) => crate::server::push(crate::server::PushConfig {
@@ -344,7 +381,7 @@ impl Cli {
                     cpus,
                     memory_mib,
                     nested_kvm,
-                    no_host_shares,
+                    no_host_shares: effective_no_host_shares,
                 }),
             },
             Some(Command::Ingress(args)) => {
@@ -371,9 +408,15 @@ impl Cli {
                     config,
                 )
             }
-            Some(Command::HiddenVmInit) => {
-                initialize_vm_instance(layout, cpus, memory_mib, nested_kvm, no_host_shares)
-            }
+            Some(Command::HiddenVmInit) => initialize_vm_instance(
+                layout,
+                cpus,
+                memory_mib,
+                nested_kvm,
+                effective_no_host_shares,
+                deterministic.clone(),
+                trace_events,
+            ),
             Some(Command::HiddenOciBuild(args)) => crate::oci::build_rootfs(&args.staging),
             Some(Command::HiddenSparseCopy(args)) => {
                 crate::sparse_copy::clone_or_copy_file(&args.source, &args.dest)
@@ -389,7 +432,12 @@ impl Cli {
                 forwards,
                 snapshot_output: None,
                 run_as_root: false,
-                no_host_shares: no_host_shares || args.no_host_shares,
+                no_host_shares: effective_no_host_shares || args.no_host_shares,
+                deterministic: args
+                    .deterministic
+                    .map(|seed| runner::DeterministicConfig { seed })
+                    .or(deterministic),
+                trace_events: trace_events || args.trace_events,
             }),
             None => run_guest(
                 layout,
@@ -398,7 +446,9 @@ impl Cli {
                 memory_mib,
                 snapshot_path,
                 nested_kvm,
-                no_host_shares,
+                effective_no_host_shares,
+                deterministic,
+                trace_events,
                 root,
                 forwards,
                 explicit_kernel,
@@ -630,6 +680,8 @@ fn run_guest(
     snapshot_path: Option<PathBuf>,
     nested_kvm: bool,
     no_host_shares: bool,
+    deterministic: Option<runner::DeterministicConfig>,
+    trace_events: bool,
     run_as_root: bool,
     forwards: Vec<runner::PortForward>,
     explicit_kernel: bool,
@@ -644,6 +696,8 @@ fn run_guest(
         snapshot_path.is_some(),
         nested_kvm,
         no_host_shares,
+        deterministic.as_ref(),
+        trace_events,
     )?;
 
     // An empty command means "login shell"; the agent resolves which shell
@@ -651,6 +705,9 @@ fn run_guest(
     if command.first().map(String::as_str) == Some("cp")
         && command.iter().any(|arg| is_host_path(arg))
     {
+        if deterministic.is_some() {
+            bail!("--deterministic cannot copy host paths into or out of the guest");
+        }
         copy_between_host_and_guest(
             &layout,
             &command[1..],
@@ -683,6 +740,8 @@ fn run_guest(
         run_as_root,
         snapshot_output: None,
         no_host_shares,
+        deterministic,
+        trace_events,
     };
 
     let status = runner::run(config)?;
@@ -722,6 +781,8 @@ fn ensure_vm_initialized(
     explicit_snapshot: bool,
     nested_kvm: bool,
     no_host_shares: bool,
+    deterministic: Option<&runner::DeterministicConfig>,
+    trace_events: bool,
 ) -> Result<()> {
     if layout.vm_initialized.exists() || explicit_snapshot {
         return Ok(());
@@ -742,6 +803,13 @@ fn ensure_vm_initialized(
     if let Some(arg) = no_host_shares_arg {
         command.push(arg);
     }
+    if let Some(config) = deterministic {
+        command.push("--deterministic");
+        command.push(&config.seed);
+    }
+    if trace_events {
+        command.push("--trace-events");
+    }
     command.push("_vm-init");
     run_lnx_child(
         layout,
@@ -756,12 +824,42 @@ fn ensure_vm_initialized(
     Ok(())
 }
 
+fn validate_deterministic_args(
+    requested_cpus: Option<u8>,
+    nested_kvm: bool,
+    forwards: &[runner::PortForward],
+    deterministic: Option<&runner::DeterministicConfig>,
+    trace_events: bool,
+) -> Result<()> {
+    if trace_events && deterministic.is_none() {
+        bail!("--trace-events requires --deterministic");
+    }
+    if deterministic.is_none() {
+        return Ok(());
+    }
+    if !cfg!(target_os = "linux") {
+        bail!("--deterministic is only supported on the KVM backend");
+    }
+    if requested_cpus.is_some_and(|cpus| cpus != 1) {
+        bail!("--deterministic requires --cpus 1");
+    }
+    if nested_kvm {
+        bail!("--deterministic cannot be combined with --nested-kvm yet");
+    }
+    if !forwards.is_empty() {
+        bail!("--deterministic cannot be combined with --forward yet");
+    }
+    Ok(())
+}
+
 fn initialize_vm_instance(
     layout: Layout,
     cpus: u8,
     memory_mib: u32,
     nested_kvm: bool,
     no_host_shares: bool,
+    deterministic: Option<runner::DeterministicConfig>,
+    trace_events: bool,
 ) -> Result<()> {
     if layout.vm_initialized.exists() {
         return Ok(());
@@ -779,6 +877,8 @@ fn initialize_vm_instance(
         snapshot_output: Some(layout.snapshot_dir.join("latest")),
         run_as_root: false,
         no_host_shares,
+        deterministic,
+        trace_events,
     })
     .context("initialize VM instance")?;
     if status != 0 {
@@ -1054,6 +1154,8 @@ fn create_checkpoint(
     explicit_kernel: bool,
     explicit_rootfs: bool,
     no_host_shares: bool,
+    deterministic: Option<runner::DeterministicConfig>,
+    trace_events: bool,
 ) -> Result<()> {
     ensure_image_and_instance(&layout, explicit_kernel, explicit_rootfs)?;
 
@@ -1062,6 +1164,7 @@ fn create_checkpoint(
     let (checkpoint, path) = checkpoints::new_checkpoint_path(&layout, name)?;
     let broker_socket = layout.run_dir.join("broker.sock");
     if broker_socket.exists() {
+        runner::validate_runtime_deterministic_compatibility(&layout, deterministic.as_ref())?;
         runner::request_checkpoint(&broker_socket, &path).context("checkpoint running VM")?;
     } else {
         let cwd = std::env::current_dir().context("current directory")?;
@@ -1087,6 +1190,8 @@ fn create_checkpoint(
             snapshot_output: Some(path.clone()),
             run_as_root: false,
             no_host_shares,
+            deterministic,
+            trace_events,
         })?;
         if status != 0 {
             bail!("checkpoint command exited with status {status}");
@@ -1128,6 +1233,8 @@ fn fork_checkpoint(
     explicit_kernel: bool,
     explicit_rootfs: bool,
     no_host_shares: bool,
+    deterministic: Option<runner::DeterministicConfig>,
+    trace_events: bool,
 ) -> Result<()> {
     let checkpoint = match checkpoint {
         Some(checkpoint) => checkpoints::resolve(&source, checkpoint)?,
@@ -1140,6 +1247,8 @@ fn fork_checkpoint(
             explicit_kernel,
             explicit_rootfs,
             no_host_shares,
+            deterministic,
+            trace_events,
         )?,
     };
     let dest = Layout::resolve(instance, None, None)?;
@@ -1157,6 +1266,8 @@ fn create_internal_fork_checkpoint(
     explicit_kernel: bool,
     explicit_rootfs: bool,
     no_host_shares: bool,
+    deterministic: Option<runner::DeterministicConfig>,
+    trace_events: bool,
 ) -> Result<checkpoints::Checkpoint> {
     ensure_image_and_instance(layout, explicit_kernel, explicit_rootfs)?;
 
@@ -1165,6 +1276,7 @@ fn create_internal_fork_checkpoint(
     let (checkpoint, path) = checkpoints::new_checkpoint_path(layout, None)?;
     let broker_socket = layout.run_dir.join("broker.sock");
     if broker_socket.exists() {
+        runner::validate_runtime_deterministic_compatibility(layout, deterministic.as_ref())?;
         runner::request_checkpoint(&broker_socket, &path).context("checkpoint running VM")?;
     } else {
         let cwd = std::env::current_dir().context("current directory")?;
@@ -1190,6 +1302,8 @@ fn create_internal_fork_checkpoint(
             snapshot_output: Some(path.clone()),
             run_as_root: false,
             no_host_shares,
+            deterministic,
+            trace_events,
         })?;
         if status != 0 {
             bail!("checkpoint command exited with status {status}");

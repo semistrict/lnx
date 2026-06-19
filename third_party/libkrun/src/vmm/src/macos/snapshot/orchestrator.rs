@@ -212,6 +212,21 @@ fn cntvct_el0() -> u64 {
     unsafe { mach_absolute_time() }
 }
 
+fn deterministic_time_enabled() -> bool {
+    std::env::var_os("KRUN_DETERMINISTIC_TIME").is_some_and(|value| value == "1")
+}
+
+fn restore_timer_delta(format: SnapshotFormat, capture_counter: u64) -> u64 {
+    if deterministic_time_enabled() {
+        crate::timing_event("snapshot.restore.deterministic_time.skip_timer_rebase");
+        return 0;
+    }
+    match format {
+        SnapshotFormat::Macos => cntvct_el0().wrapping_sub(capture_counter),
+        SnapshotFormat::Linux => 0,
+    }
+}
+
 fn topology_hash_for(
     ram_ranges: &[(u64, u64)],
     vcpu_count: u32,
@@ -1180,10 +1195,7 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
     }
     crate::timing_event("snapshot.restore.linux_gic.pending_spis.done");
 
-    let timer_delta = match source_format {
-        SnapshotFormat::Macos => cntvct_el0().wrapping_sub(meta.capture_timer_counter),
-        SnapshotFormat::Linux => 0,
-    };
+    let timer_delta = restore_timer_delta(source_format, meta.capture_timer_counter);
     for (i, h) in inputs.vcpu_handles.iter().enumerate() {
         crate::timing_event(&format!("snapshot.restore.vcpu.timer.begin index={i}"));
         h.send_event(VcpuEvent::RebaseTimer(timer_delta))
@@ -1565,5 +1577,16 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deterministic_time_skips_macos_timer_rebase() {
+        unsafe {
+            std::env::set_var("KRUN_DETERMINISTIC_TIME", "1");
+        }
+        assert_eq!(restore_timer_delta(SnapshotFormat::Macos, u64::MAX), 0);
+        unsafe {
+            std::env::remove_var("KRUN_DETERMINISTIC_TIME");
+        }
     }
 }

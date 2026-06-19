@@ -5,7 +5,7 @@ BIN := target/debug/lnx
 RELEASE_BIN := target/release/lnx
 INSTALL_BIN ?= $(HOME)/.cargo/bin
 
-.PHONY: all build release install sign-notarize run apt-update deps check test test-system test-checkpoint test-fork-fanout test-snapshot-compat test-snapshot-roundtrip test-dirty-fs test-broker-recovery test-client-chaos test-pty-resume test-browser test-privileged-ingress test-stress test-stock test-ingress test-longevity test-full rootfs fmt clean
+.PHONY: all build release install sign-notarize run apt-update deps check test test-system test-checkpoint test-fork-fanout test-snapshot-compat test-snapshot-roundtrip test-deterministic-time test-dirty-fs test-broker-recovery test-client-chaos test-pty-resume test-browser test-privileged-ingress test-stress test-stock test-ingress test-longevity test-full rootfs fmt clean
 
 all: build
 
@@ -50,6 +50,9 @@ test-snapshot-compat:
 
 test-snapshot-roundtrip:
 	bun run test:snapshot-roundtrip
+
+test-deterministic-time:
+	bun run test:deterministic-time
 
 test-dirty-fs:
 	bun run test:dirty-fs

@@ -58,6 +58,7 @@ type Result<T> = result::Result<T, Error>;
 pub struct RTC {
     previous_now: Instant,
     tick_offset: i64,
+    deterministic_time: bool,
     // This is used for implementing the RTC alarm. However, in Firecracker we do not need it.
     match_value: u32,
     // Writes to this register load an update value into the RTC.
@@ -70,10 +71,17 @@ pub struct RTC {
 impl RTC {
     /// Constructs an AMBA PL031 RTC device.
     pub fn new(interrupt_evt: EventFd) -> RTC {
+        let deterministic_time =
+            std::env::var_os("KRUN_DETERMINISTIC_TIME").is_some_and(|value| value == "1");
         RTC {
             // This is used only for duration measuring purposes.
             previous_now: Instant::now(),
-            tick_offset: utils::time::get_time(utils::time::ClockType::Real) as i64,
+            tick_offset: if deterministic_time {
+                0
+            } else {
+                utils::time::get_time(utils::time::ClockType::Real) as i64
+            },
+            deterministic_time,
             match_value: 0,
             load: 0,
             imsc: 0,
@@ -87,8 +95,12 @@ impl RTC {
     }
 
     fn get_time(&self) -> u32 {
-        let ts = (self.tick_offset as i128)
-            + (Instant::now().duration_since(self.previous_now).as_nanos() as i128);
+        let elapsed = if self.deterministic_time {
+            0
+        } else {
+            Instant::now().duration_since(self.previous_now).as_nanos() as i128
+        };
+        let ts = (self.tick_offset as i128) + elapsed;
         (ts / utils::time::NANOS_PER_SECOND as i128) as u32
     }
 
@@ -185,7 +197,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deterministic_time_starts_rtc_at_zero_and_does_not_advance_from_host_time() {
+        unsafe {
+            std::env::set_var("KRUN_DETERMINISTIC_TIME", "1");
+        }
+        let rtc = RTC::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
+
+        assert_eq!(rtc.get_time(), 0);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(rtc.get_time(), 0);
+
+        unsafe {
+            std::env::remove_var("KRUN_DETERMINISTIC_TIME");
+        }
+    }
+
+    #[test]
     fn test_rtc_read_write_and_event() {
+        unsafe {
+            std::env::remove_var("KRUN_DETERMINISTIC_TIME");
+        }
         let mut rtc = RTC::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
         let mut data = [0; 4];
 

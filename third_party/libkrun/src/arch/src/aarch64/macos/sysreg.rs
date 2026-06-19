@@ -60,6 +60,9 @@ arm64_sys_reg!(SYSREG_ICC_SGI1R_EL1, 3, 0, 5, 12, 11);
 arm64_sys_reg!(SYSREG_ICC_SRE_EL1, 3, 0, 5, 12, 12);
 
 arm64_sys_reg!(SYSREG_CNTVOFF_EL2, 3, 4, 3, 14, 0);
+arm64_sys_reg!(SYSREG_CNTFRQ_EL0, 3, 3, 0, 14, 0);
+arm64_sys_reg!(SYSREG_CNTPCT_EL0, 3, 3, 1, 14, 0);
+arm64_sys_reg!(SYSREG_CNTVCT_EL0, 3, 3, 2, 14, 0);
 arm64_sys_reg!(SYSREG_CNTHCTL_EL2, 3, 4, 0, 14, 1);
 arm64_sys_reg!(SYSREG_CNTHP_TVAL_EL2, 3, 4, 0, 14, 2);
 arm64_sys_reg!(SYSREG_CNTHP_CTL_EL2, 3, 4, 1, 14, 2);
@@ -104,6 +107,9 @@ pub fn sys_reg_name(addr: u32) -> Option<&'static str> {
         SYSREG_ICC_SRE_EL1 => Some("SYSREG_ICC_SRE_EL1"),
 
         SYSREG_CNTVOFF_EL2 => Some("SYSREG_CNTVOFF_EL2"),
+        SYSREG_CNTFRQ_EL0 => Some("SYSREG_CNTFRQ_EL0"),
+        SYSREG_CNTPCT_EL0 => Some("SYSREG_CNTPCT_EL0"),
+        SYSREG_CNTVCT_EL0 => Some("SYSREG_CNTVCT_EL0"),
         SYSREG_CNTHCTL_EL2 => Some("SYSREG_CNTHCTL_EL2"),
         SYSREG_CNTHP_TVAL_EL2 => Some("SYSREG_CNTHP_TVAL_EL2"),
         SYSREG_CNTHP_CTL_EL2 => Some("SYSREG_CNTHP_CTL_EL2"),

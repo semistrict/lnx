@@ -19,6 +19,7 @@
 /.lnx-nested-debug/
 /.lnx-nested-kvm*/
 /.lnx-chaos/
+/.lnx-ndt-*/
 /.lnx-nk-*/
 /.lnx-oci-test/
 /.lnx-probe-*/

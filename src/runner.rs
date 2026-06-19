@@ -22,6 +22,8 @@ use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
 use lnx_protocol::{MAX_MESSAGE_SIZE, Message, PROTOCOL_VERSION};
+use rusqlite::{Connection, params};
+use sha2::{Digest, Sha256};
 
 use crate::{initramfs, krun::Context as KrunContext, paths::Layout};
 
@@ -49,6 +51,16 @@ const FORWARD_OWNER_SLOT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_AGENT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(90);
 const ROOTFS_BACKEND_ENV: &str = "LNX_ROOTFS_BACKEND";
 const RESTORE_ENTROPY_BYTES: usize = 64;
+const DETERMINISTIC_EXEC_UID: u32 = 1000;
+const DETERMINISTIC_EXEC_GID: u32 = 1000;
+const DETERMINISTIC_EXEC_GROUP: &str = "lnxuser";
+const DETERMINISTIC_TERM: &str = "xterm-256color";
+const DETERMINISTIC_COLORTERM: &str = "";
+const DETERMINISTIC_ROWS: u16 = 24;
+const DETERMINISTIC_COLS: u16 = 80;
+const DETERMINISTIC_CLOCK_STATE: &str = "deterministic-clock.state";
+const DETERMINISTIC_TIMER_JUMPS: &str = "deterministic-timer-jumps.log";
+const DETERMINISTIC_TIMER_JUMPS_CURSOR: &str = "deterministic-timer-jumps.cursor";
 static SIGNAL_INIT: Once = Once::new();
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
@@ -69,6 +81,23 @@ pub struct RunConfig {
     pub snapshot_output: Option<PathBuf>,
     pub run_as_root: bool,
     pub no_host_shares: bool,
+    pub deterministic: Option<DeterministicConfig>,
+    pub trace_events: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeterministicConfig {
+    pub seed: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeterministicClockState {
+    realtime_unix_nanos: u64,
+    monotonic_nanos: u64,
+    counter_frequency_hz: u64,
+    event_sequence: u64,
+    timer_jump_count: u64,
+    last_timer_deadline_ticks: u64,
 }
 
 /// Marks an owner start failure that happened while restoring a snapshot's
@@ -94,6 +123,9 @@ pub struct PortForward {
 }
 
 pub fn run(config: RunConfig) -> Result<i32> {
+    if config.trace_events && config.deterministic.is_none() {
+        bail!("trace events require deterministic mode");
+    }
     install_signal_handlers();
     INTERRUPTED.store(false, Ordering::SeqCst);
     fs::create_dir_all(&config.layout.run_dir)
@@ -122,12 +154,19 @@ pub fn run(config: RunConfig) -> Result<i32> {
     ));
     let broker_socket = config.layout.run_dir.join("broker.sock");
     if config.forwards.is_empty() {
+        if broker_socket.exists() {
+            validate_runtime_deterministic_compatibility(
+                &config.layout,
+                config.deterministic.as_ref(),
+            )?;
+        }
         if let Some(status) = run_existing_broker_client(
             &broker_socket,
             &config.command,
             &config.cwd,
             config.run_as_root,
             config.no_host_shares,
+            config.deterministic.as_ref(),
             Some(&run_log),
         )? {
             run_log.line(format!("run.done status={status}"));
@@ -160,6 +199,33 @@ pub fn run(config: RunConfig) -> Result<i32> {
     };
     run_log.line(format!("run.done status={status}"));
     Ok(status)
+}
+
+pub fn validate_runtime_deterministic_compatibility(
+    layout: &Layout,
+    deterministic: Option<&DeterministicConfig>,
+) -> Result<()> {
+    let current = deterministic_stamp_content(deterministic);
+    let stamp_path = layout.run_dir.join("deterministic.stamp");
+    match fs::read_to_string(&stamp_path) {
+        Ok(stamp) if stamp == current => Ok(()),
+        Ok(stamp) => bail!(
+            "running VM deterministic stamp is incompatible ({}): {}",
+            describe_deterministic_stamp_mismatch(&stamp, &current),
+            stamp_path.display()
+        ),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && current == deterministic_stamp_content(None) =>
+        {
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
+            "running VM has no deterministic compatibility stamp: {}",
+            stamp_path.display()
+        ),
+        Err(e) => Err(e).with_context(|| format!("read {}", stamp_path.display())),
+    }
 }
 
 fn wait_for_forward_owner_slot(layout: &Layout, run_log: &RunLog) -> Result<()> {
@@ -202,6 +268,9 @@ fn acquire_bootstrap_for_forward(lock_path: &Path, run_log: &RunLog) -> Result<B
 }
 
 pub fn run_owner(config: RunConfig) -> Result<()> {
+    if config.trace_events && config.deterministic.is_none() {
+        bail!("trace events require deterministic mode");
+    }
     fs::create_dir_all(&config.layout.run_dir)
         .with_context(|| format!("create {}", config.layout.run_dir.display()))?;
     fs::create_dir_all(&config.layout.snapshot_dir)
@@ -252,6 +321,7 @@ pub fn run_owner(config: RunConfig) -> Result<()> {
         Err(e) => return Err(e),
     };
     let _ = vm.owner.join();
+    flush_deterministic_trace_events(&config.layout, vm.trace_log.as_deref())?;
     run_log.line("owner.done");
     drop(vm.network);
     drop(bootstrap_lock);
@@ -268,6 +338,7 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
             &config.cwd,
             config.run_as_root,
             config.no_host_shares,
+            config.deterministic.as_ref(),
             &run_log,
         )? {
             BootstrapOutcome::Lock(lock) => lock,
@@ -283,6 +354,7 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
             &config.cwd,
             config.run_as_root,
             config.no_host_shares,
+            config.deterministic.as_ref(),
             Some(&run_log),
         )? {
             drop(bootstrap_lock);
@@ -312,6 +384,7 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
         &config.cwd,
         config.run_as_root,
         config.no_host_shares,
+        config.deterministic.as_ref(),
         Duration::from_secs(5),
     )
     .with_context(|| console_hint(&config.layout.console_log))
@@ -325,11 +398,35 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
         }
     };
     let _ = vm.owner.join();
+    flush_deterministic_trace_events(&config.layout, vm.trace_log.as_deref())?;
     vm.timings.event(&format!("run.done status={status}"));
     run_log.line(format!("run.done status={status}"));
     drop(vm.network);
     drop(bootstrap_lock);
     Ok(status)
+}
+
+fn restore_entropy(config: Option<&DeterministicConfig>) -> Result<Vec<u8>> {
+    if let Some(config) = config {
+        return Ok(deterministic_restore_entropy(&config.seed));
+    }
+    fresh_restore_entropy()
+}
+
+fn deterministic_restore_entropy(seed: &str) -> Vec<u8> {
+    let mut entropy = Vec::with_capacity(RESTORE_ENTROPY_BYTES);
+    let mut counter = 0u64;
+    while entropy.len() < RESTORE_ENTROPY_BYTES {
+        let mut hasher = Sha256::new();
+        hasher.update(b"lnx deterministic restore entropy v1\0");
+        hasher.update(seed.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(counter.to_le_bytes());
+        entropy.extend_from_slice(&hasher.finalize());
+        counter = counter.saturating_add(1);
+    }
+    entropy.truncate(RESTORE_ENTROPY_BYTES);
+    entropy
 }
 
 fn fresh_restore_entropy() -> Result<Vec<u8>> {
@@ -345,6 +442,7 @@ struct VmHandles {
     owner: thread::JoinHandle<()>,
     network: NetworkBacking,
     timings: Arc<TimingLog>,
+    trace_log: Option<Arc<TraceLog>>,
 }
 
 /// How the VM reaches the network: a routable per-VM address on the ingress
@@ -399,7 +497,7 @@ fn start_network(
     timings: &TimingLog,
 ) -> Result<NetworkBacking> {
     #[cfg(target_os = "macos")]
-    {
+    if config.deterministic.is_none() {
         let attachment = crate::ingress::load_config()
             .and_then(|ingress| {
                 crate::ingress::request_network_attachment(&ingress, &config.layout.instance)
@@ -422,6 +520,9 @@ fn start_network(
                 _keepalive: attachment.keepalive,
             });
         }
+    } else {
+        timings.event("network.deterministic.gvproxy");
+        run_log.line("network.deterministic.gvproxy");
     }
     let gvproxy = start_gvproxy(&config.layout.run_dir)?;
     timings.event("gvproxy.ready");
@@ -484,6 +585,13 @@ fn start_vm(
     )?);
     timings.install_for_libkrun();
     timings.event("dirs.ready");
+    let trace_log = if config.trace_events {
+        let trace_log = Arc::new(TraceLog::open(&config.layout)?);
+        run_log.line(format!("trace.events path={}", trace_log.path.display()));
+        Some(trace_log)
+    } else {
+        None
+    };
 
     let (initrd, rebuilt_initramfs) = initramfs::write_from_agent(
         include_bytes!(env!("LNX_AGENT")),
@@ -509,6 +617,69 @@ fn start_vm(
     let shares_stamp_path = config.layout.run_dir.join("shares.stamp");
     fs::write(&shares_stamp_path, &shares_stamp)
         .with_context(|| format!("write {}", shares_stamp_path.display()))?;
+    let deterministic_stamp = deterministic_stamp_content(config.deterministic.as_ref());
+    let deterministic_stamp_path = config.layout.run_dir.join("deterministic.stamp");
+    fs::write(&deterministic_stamp_path, &deterministic_stamp)
+        .with_context(|| format!("write {}", deterministic_stamp_path.display()))?;
+    configure_libkrun_deterministic_time(config.deterministic.is_some());
+    let deterministic_clock_state = deterministic_clock_state_for_start(
+        config.deterministic.as_ref(),
+        config.restore_snapshot.as_deref(),
+    )?;
+    if let Some(clock_state) = &deterministic_clock_state {
+        let clock_state_path = config.layout.run_dir.join(DETERMINISTIC_CLOCK_STATE);
+        write_deterministic_clock_state(&clock_state_path, clock_state)?;
+        configure_libkrun_deterministic_clock_state(Some(&clock_state_path));
+        configure_libkrun_deterministic_timer_jumps(Some(
+            &config.layout.run_dir.join(DETERMINISTIC_TIMER_JUMPS),
+        ));
+    } else {
+        let clock_state_path = config.layout.run_dir.join(DETERMINISTIC_CLOCK_STATE);
+        remove_path_if_exists(&clock_state_path)?;
+        configure_libkrun_deterministic_clock_state(None);
+        configure_libkrun_deterministic_timer_jumps(None);
+    }
+    if let (Some(trace), Some(clock_state)) = (&trace_log, &deterministic_clock_state) {
+        trace.set_next_sequence(clock_state.event_sequence);
+    }
+    if let Some(trace) = &trace_log {
+        let mut fields = vec![
+            trace_text("instance", config.layout.instance.clone()),
+            trace_integer("cpus", config.cpus as i64),
+            trace_integer("memory_mib", config.memory_mib as i64),
+            trace_bool("nested_kvm", config.nested_kvm),
+            trace_bool("no_host_shares", config.no_host_shares),
+            trace_bool("restore_snapshot", config.restore_snapshot.is_some()),
+            trace_text("network", network.stamp_line()),
+        ];
+        if let Some(deterministic) = &config.deterministic {
+            fields.push(trace_text("seed", deterministic.seed.clone()));
+            fields.push(trace_integer("initial_realtime_unix_secs", 0));
+        }
+        trace.event("vm_start_config", fields);
+        if let Some(clock_state) = &deterministic_clock_state {
+            trace.event(
+                "deterministic_clock_state",
+                vec![
+                    trace_integer(
+                        "realtime_unix_nanos",
+                        clock_state.realtime_unix_nanos as i64,
+                    ),
+                    trace_integer("monotonic_nanos", clock_state.monotonic_nanos as i64),
+                    trace_integer(
+                        "counter_frequency_hz",
+                        clock_state.counter_frequency_hz as i64,
+                    ),
+                    trace_integer("event_sequence", clock_state.event_sequence as i64),
+                    trace_integer("timer_jump_count", clock_state.timer_jump_count as i64),
+                    trace_integer(
+                        "last_timer_deadline_ticks",
+                        clock_state.last_timer_deadline_ticks as i64,
+                    ),
+                ],
+            );
+        }
+    }
     let restore_snapshot = if let Some(snapshot) = &config.restore_snapshot {
         if !snapshot_initramfs_is_compatible(snapshot, &initramfs_stamp) {
             bail!(
@@ -520,6 +691,13 @@ fn start_vm(
             bail!(
                 "snapshot host-share/network stamp is incompatible ({reason}): {}",
                 snapshot.join("shares.stamp").display()
+            );
+        }
+        if let Some(reason) = snapshot_deterministic_incompatibility(snapshot, &deterministic_stamp)
+        {
+            bail!(
+                "snapshot deterministic stamp is incompatible ({reason}): {}",
+                snapshot.join("deterministic.stamp").display()
             );
         }
         match snapshot_vm_config(snapshot) {
@@ -646,10 +824,13 @@ fn start_vm(
     }
 
     ctx.set_workdir("/")?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("host clock is before Unix epoch")?
-        .as_secs();
+    let init_unix_secs = match &config.deterministic {
+        Some(_) => 0,
+        None => SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("host clock is before Unix epoch")?
+            .as_secs(),
+    };
     let (net_ip, net_gateway) = network.guest_env();
     ctx.set_exec(
         "/init",
@@ -657,7 +838,7 @@ fn start_vm(
         &[
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
             "container=lnx".to_string(),
-            format!("LNX_HOST_UNIX_SECS={now}"),
+            format!("LNX_HOST_UNIX_SECS={init_unix_secs}"),
             format!("LNX_ROOT_DEVICE={root_device}"),
             format!("LNX_NET_IP={net_ip}"),
             format!("LNX_NET_GATEWAY={net_gateway}"),
@@ -712,9 +893,11 @@ fn start_vm(
         config.forwards.clone(),
         host_home,
         config.no_host_shares,
+        config.deterministic.clone(),
         idle,
         Arc::clone(&timings),
         Arc::clone(&run_log),
+        trace_log.clone(),
         vm_error_rx,
     );
     let owner = match owner {
@@ -734,6 +917,7 @@ fn start_vm(
         owner,
         network,
         timings,
+        trace_log,
     })
 }
 
@@ -894,6 +1078,11 @@ struct RunLog {
     file: Mutex<fs::File>,
 }
 
+struct TraceLog {
+    path: PathBuf,
+    state: Mutex<TraceState>,
+}
+
 struct SnapshotVmConfig {
     #[cfg_attr(
         any(not(all(target_os = "linux", target_arch = "aarch64")), not(test)),
@@ -917,6 +1106,23 @@ impl SnapshotVmConfig {
 struct TimingState {
     file: fs::File,
     state_file: fs::File,
+}
+
+struct TraceState {
+    connection: Connection,
+    next_sequence: i64,
+}
+
+struct TraceField {
+    key: &'static str,
+    ordinal: Option<i64>,
+    value: TraceValue,
+}
+
+enum TraceValue {
+    Text(String),
+    Integer(i64),
+    Blob(Vec<u8>),
 }
 
 struct BootstrapLock {
@@ -1074,6 +1280,178 @@ impl RunLog {
             now.subsec_nanos(),
             message
         );
+    }
+}
+
+impl TraceLog {
+    fn open(layout: &Layout) -> Result<Self> {
+        let path = layout.run_dir.join("deterministic-trace.sqlite3");
+        remove_path_if_exists(&path)?;
+        let connection =
+            Connection::open(&path).with_context(|| format!("open {}", path.display()))?;
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA journal_mode = WAL;
+                PRAGMA synchronous = NORMAL;
+                PRAGMA foreign_keys = ON;
+
+                CREATE TABLE trace_metadata (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    value TEXT NOT NULL
+                ) STRICT;
+
+                CREATE TABLE events (
+                    sequence INTEGER PRIMARY KEY NOT NULL,
+                    event TEXT NOT NULL
+                ) STRICT;
+
+                CREATE INDEX events_event_idx ON events(event);
+
+                CREATE TABLE event_text_fields (
+                    sequence INTEGER NOT NULL REFERENCES events(sequence) ON DELETE CASCADE,
+                    key TEXT NOT NULL,
+                    ordinal INTEGER,
+                    value TEXT NOT NULL
+                ) STRICT;
+
+                CREATE TABLE event_integer_fields (
+                    sequence INTEGER NOT NULL REFERENCES events(sequence) ON DELETE CASCADE,
+                    key TEXT NOT NULL,
+                    ordinal INTEGER,
+                    value INTEGER NOT NULL
+                ) STRICT;
+
+                CREATE TABLE event_blob_fields (
+                    sequence INTEGER NOT NULL REFERENCES events(sequence) ON DELETE CASCADE,
+                    key TEXT NOT NULL,
+                    ordinal INTEGER,
+                    value BLOB NOT NULL
+                ) STRICT;
+
+                CREATE INDEX event_text_fields_lookup_idx
+                    ON event_text_fields(sequence, key, ordinal);
+                CREATE INDEX event_integer_fields_lookup_idx
+                    ON event_integer_fields(sequence, key, ordinal);
+                CREATE INDEX event_blob_fields_lookup_idx
+                    ON event_blob_fields(sequence, key, ordinal);
+                "#,
+            )
+            .with_context(|| format!("initialize {}", path.display()))?;
+        connection
+            .execute(
+                "INSERT INTO trace_metadata (key, value) VALUES (?1, ?2)",
+                params!["format", "lnx-deterministic-trace-v1"],
+            )
+            .with_context(|| format!("write trace metadata {}", path.display()))?;
+        Ok(Self {
+            path,
+            state: Mutex::new(TraceState {
+                connection,
+                next_sequence: 0,
+            }),
+        })
+    }
+
+    fn event(&self, event: &str, fields: Vec<TraceField>) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        let sequence = state.next_sequence;
+        if insert_trace_event(&mut state.connection, sequence, event, &fields).is_err() {
+            return;
+        }
+        state.next_sequence = state.next_sequence.saturating_add(1);
+    }
+
+    fn set_next_sequence(&self, sequence: u64) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.next_sequence = i64::try_from(sequence).unwrap_or(i64::MAX);
+    }
+
+    fn next_sequence(&self) -> u64 {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return 0,
+        };
+        u64::try_from(state.next_sequence).unwrap_or(0)
+    }
+}
+
+fn insert_trace_event(
+    connection: &mut Connection,
+    sequence: i64,
+    event: &str,
+    fields: &[TraceField],
+) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "INSERT INTO events (sequence, event) VALUES (?1, ?2)",
+        params![sequence, event],
+    )?;
+    for field in fields {
+        match &field.value {
+            TraceValue::Text(value) => {
+                transaction.execute(
+                    "INSERT INTO event_text_fields (sequence, key, ordinal, value) VALUES (?1, ?2, ?3, ?4)",
+                    params![sequence, field.key, field.ordinal, value],
+                )?;
+            }
+            TraceValue::Integer(value) => {
+                transaction.execute(
+                    "INSERT INTO event_integer_fields (sequence, key, ordinal, value) VALUES (?1, ?2, ?3, ?4)",
+                    params![sequence, field.key, field.ordinal, value],
+                )?;
+            }
+            TraceValue::Blob(value) => {
+                transaction.execute(
+                    "INSERT INTO event_blob_fields (sequence, key, ordinal, value) VALUES (?1, ?2, ?3, ?4)",
+                    params![sequence, field.key, field.ordinal, value],
+                )?;
+            }
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn trace_text(key: &'static str, value: impl Into<String>) -> TraceField {
+    TraceField {
+        key,
+        ordinal: None,
+        value: TraceValue::Text(value.into()),
+    }
+}
+
+fn trace_text_ordinal(key: &'static str, ordinal: usize, value: impl Into<String>) -> TraceField {
+    TraceField {
+        key,
+        ordinal: Some(ordinal as i64),
+        value: TraceValue::Text(value.into()),
+    }
+}
+
+fn trace_integer(key: &'static str, value: impl Into<i64>) -> TraceField {
+    TraceField {
+        key,
+        ordinal: None,
+        value: TraceValue::Integer(value.into()),
+    }
+}
+
+fn trace_bool(key: &'static str, value: bool) -> TraceField {
+    trace_integer(key, if value { 1 } else { 0 })
+}
+
+fn trace_blob(key: &'static str, value: &[u8]) -> TraceField {
+    TraceField {
+        key,
+        ordinal: None,
+        value: TraceValue::Blob(value.to_vec()),
     }
 }
 
@@ -1347,6 +1725,264 @@ fn parse_shares_stamp(stamp: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn deterministic_stamp_content(config: Option<&DeterministicConfig>) -> String {
+    match config {
+        Some(config) => format!(
+            "deterministic=enabled-v1\nseed={}\ninitial_realtime_unix_secs=0\nclock_state=deterministic-clock-state-v1\nrestore_timer_rebase=disabled-v1\nvirtual_counter=kvm-controlled-counter-v1\nkvm_halt_poll=disabled-v1\nrtc=deterministic-zero-v1\ntrng=deterministic-smccc-v1\nvirtio_rng=deterministic-stateless-v1\nvsock_timesync=disabled-v1\nrestore_entropy=sha256-seed-v1\nexec_user=uid1000-gid1000-lnxuser\nexec_env=c-utf8-utc-v1\nexec_tty=none-24x80-xterm-256color-v1\nnetwork=gvproxy-fixed-v1\n",
+            config.seed
+        ),
+        None => "deterministic=disabled-v1\n".to_string(),
+    }
+}
+
+fn configure_libkrun_deterministic_time(enabled: bool) {
+    unsafe {
+        if enabled {
+            std::env::set_var("KRUN_DETERMINISTIC_TIME", "1");
+        } else {
+            std::env::remove_var("KRUN_DETERMINISTIC_TIME");
+        }
+    }
+}
+
+fn configure_libkrun_deterministic_clock_state(path: Option<&Path>) {
+    unsafe {
+        if let Some(path) = path {
+            std::env::set_var("KRUN_DETERMINISTIC_CLOCK_STATE", path);
+        } else {
+            std::env::remove_var("KRUN_DETERMINISTIC_CLOCK_STATE");
+        }
+    }
+}
+
+fn configure_libkrun_deterministic_timer_jumps(path: Option<&Path>) {
+    unsafe {
+        if let Some(path) = path {
+            std::env::set_var("KRUN_DETERMINISTIC_TIMER_JUMPS", path);
+        } else {
+            std::env::remove_var("KRUN_DETERMINISTIC_TIMER_JUMPS");
+        }
+    }
+}
+
+fn initial_deterministic_clock_state() -> DeterministicClockState {
+    DeterministicClockState {
+        realtime_unix_nanos: 0,
+        monotonic_nanos: 0,
+        counter_frequency_hz: 1_000_000_000,
+        event_sequence: 0,
+        timer_jump_count: 0,
+        last_timer_deadline_ticks: 0,
+    }
+}
+
+fn deterministic_clock_state_content(state: &DeterministicClockState) -> String {
+    format!(
+        "clock_state=deterministic-clock-state-v1\nrealtime_unix_nanos={}\nmonotonic_nanos={}\ncounter_frequency_hz={}\nevent_sequence={}\ntimer_jump_count={}\nlast_timer_deadline_ticks={}\n",
+        state.realtime_unix_nanos,
+        state.monotonic_nanos,
+        state.counter_frequency_hz,
+        state.event_sequence,
+        state.timer_jump_count,
+        state.last_timer_deadline_ticks
+    )
+}
+
+fn parse_deterministic_clock_state(raw: &str) -> Result<DeterministicClockState> {
+    let fields = parse_shares_stamp(raw);
+    match fields.get("clock_state").map(String::as_str) {
+        Some("deterministic-clock-state-v1") => {}
+        Some(other) => bail!("unsupported deterministic clock state {other}"),
+        None => bail!("missing deterministic clock state version"),
+    }
+    Ok(DeterministicClockState {
+        realtime_unix_nanos: parse_clock_state_u64(&fields, "realtime_unix_nanos")?,
+        monotonic_nanos: parse_clock_state_u64(&fields, "monotonic_nanos")?,
+        counter_frequency_hz: parse_clock_state_u64(&fields, "counter_frequency_hz")?,
+        event_sequence: parse_clock_state_u64(&fields, "event_sequence")?,
+        timer_jump_count: parse_clock_state_u64(&fields, "timer_jump_count")?,
+        last_timer_deadline_ticks: parse_clock_state_u64(&fields, "last_timer_deadline_ticks")?,
+    })
+}
+
+fn parse_clock_state_u64(fields: &BTreeMap<String, String>, key: &str) -> Result<u64> {
+    let value = fields
+        .get(key)
+        .with_context(|| format!("missing deterministic clock state field {key}"))?;
+    value
+        .parse()
+        .with_context(|| format!("parse deterministic clock state field {key}={value}"))
+}
+
+fn deterministic_clock_state_for_start(
+    deterministic: Option<&DeterministicConfig>,
+    restore_snapshot: Option<&Path>,
+) -> Result<Option<DeterministicClockState>> {
+    if deterministic.is_none() {
+        return Ok(None);
+    }
+    let Some(snapshot) = restore_snapshot else {
+        return Ok(Some(initial_deterministic_clock_state()));
+    };
+    read_deterministic_clock_state(snapshot)
+        .with_context(|| {
+            format!(
+                "read {}",
+                snapshot.join(DETERMINISTIC_CLOCK_STATE).display()
+            )
+        })
+        .map(Some)
+}
+
+fn read_deterministic_clock_state(snapshot: &Path) -> Result<DeterministicClockState> {
+    let path = snapshot.join(DETERMINISTIC_CLOCK_STATE);
+    let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    parse_deterministic_clock_state(&raw)
+}
+
+fn write_deterministic_clock_state(path: &Path, state: &DeterministicClockState) -> Result<()> {
+    fs::write(path, deterministic_clock_state_content(state))
+        .with_context(|| format!("write {}", path.display()))
+}
+
+fn flush_deterministic_trace_events(layout: &Layout, trace_log: Option<&TraceLog>) -> Result<()> {
+    let initramfs_stamp = layout.run_dir.join("initramfs.stamp");
+    import_deterministic_timer_jumps(&initramfs_stamp, trace_log)?;
+    sync_deterministic_clock_event_sequence(&initramfs_stamp, trace_log)
+}
+
+fn sync_deterministic_clock_event_sequence(
+    initramfs_stamp: &Path,
+    trace_log: Option<&TraceLog>,
+) -> Result<()> {
+    let Some(trace_log) = trace_log else {
+        return Ok(());
+    };
+    let path = initramfs_stamp.with_file_name(DETERMINISTIC_CLOCK_STATE);
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut state = parse_deterministic_clock_state(
+        &fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?,
+    )?;
+    state.event_sequence = trace_log.next_sequence();
+    write_deterministic_clock_state(&path, &state)
+}
+
+fn import_deterministic_timer_jumps(
+    initramfs_stamp: &Path,
+    trace_log: Option<&TraceLog>,
+) -> Result<()> {
+    let Some(trace_log) = trace_log else {
+        return Ok(());
+    };
+    let jumps_path = initramfs_stamp.with_file_name(DETERMINISTIC_TIMER_JUMPS);
+    if !jumps_path.exists() {
+        return Ok(());
+    }
+    let cursor_path = initramfs_stamp.with_file_name(DETERMINISTIC_TIMER_JUMPS_CURSOR);
+    let cursor = fs::read_to_string(&cursor_path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let raw = fs::read_to_string(&jumps_path)
+        .with_context(|| format!("read {}", jumps_path.display()))?;
+    let start = cursor.min(raw.len());
+    let mut consumed = start;
+    for line in raw[start..].lines() {
+        consumed = consumed.saturating_add(line.len() + 1);
+        let fields = parse_timer_jump_line(line);
+        let Some(deadline_ticks) = fields.get("deadline_ticks").copied() else {
+            continue;
+        };
+        let Some(counter_frequency_hz) = fields.get("counter_frequency_hz").copied() else {
+            continue;
+        };
+        let Some(deadline_nanos) = fields.get("deadline_nanos").copied() else {
+            continue;
+        };
+        trace_log.event(
+            "timer_jump",
+            vec![
+                trace_integer("deadline_ticks", deadline_ticks as i64),
+                trace_integer("counter_frequency_hz", counter_frequency_hz as i64),
+                trace_integer("deadline_nanos", deadline_nanos as i64),
+            ],
+        );
+    }
+    fs::write(&cursor_path, consumed.to_string())
+        .with_context(|| format!("write {}", cursor_path.display()))
+}
+
+fn parse_timer_jump_line(line: &str) -> BTreeMap<String, u64> {
+    line.split_whitespace()
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            Some((key.to_string(), value.parse().ok()?))
+        })
+        .collect()
+}
+
+fn snapshot_deterministic_incompatibility(snapshot_path: &Path, current: &str) -> Option<String> {
+    match fs::read_to_string(snapshot_path.join("deterministic.stamp")) {
+        Ok(stamp) if stamp == current => None,
+        Ok(stamp) => Some(describe_deterministic_stamp_mismatch(&stamp, current)),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && current == deterministic_stamp_content(None) =>
+        {
+            None
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Some("snapshot has no deterministic compatibility stamp".to_string())
+        }
+        Err(e) => Some(format!("deterministic_stamp_unreadable: {e}")),
+    }
+}
+
+fn describe_deterministic_stamp_mismatch(snapshot: &str, current: &str) -> String {
+    let snapshot_fields = parse_shares_stamp(snapshot);
+    let current_fields = parse_shares_stamp(current);
+    let mut mismatches = Vec::new();
+    for key in [
+        "deterministic",
+        "seed",
+        "initial_realtime_unix_secs",
+        "clock_state",
+        "restore_timer_rebase",
+        "virtual_counter",
+        "kvm_halt_poll",
+        "rtc",
+        "trng",
+        "virtio_rng",
+        "vsock_timesync",
+        "restore_entropy",
+        "exec_user",
+        "exec_env",
+        "exec_tty",
+        "network",
+    ] {
+        let snapshot_value = snapshot_fields
+            .get(key)
+            .map(String::as_str)
+            .unwrap_or("<absent>");
+        let current_value = current_fields
+            .get(key)
+            .map(String::as_str)
+            .unwrap_or("<absent>");
+        if snapshot_value != current_value {
+            mismatches.push(format!(
+                "{key}: snapshot={snapshot_value} current={current_value}"
+            ));
+        }
+    }
+    if mismatches.is_empty() {
+        "snapshot and current deterministic stamps differ only in unrecognized fields".to_string()
+    } else {
+        mismatches.join("; ")
+    }
+}
+
 fn initramfs_stamp_key(path: &Path) -> Option<String> {
     let stamp = fs::read_to_string(path).ok()?;
     for line in stamp.lines() {
@@ -1597,6 +2233,7 @@ fn acquire_bootstrap_or_run_client(
     cwd: &Path,
     run_as_root: bool,
     no_host_shares: bool,
+    deterministic: Option<&DeterministicConfig>,
     run_log: &RunLog,
 ) -> Result<BootstrapOutcome> {
     let start = Instant::now();
@@ -1619,6 +2256,7 @@ fn acquire_bootstrap_or_run_client(
             cwd,
             run_as_root,
             no_host_shares,
+            deterministic,
             Some(run_log),
         )? {
             return Ok(BootstrapOutcome::Status(status));
@@ -1640,6 +2278,7 @@ fn run_existing_broker_client(
     cwd: &Path,
     run_as_root: bool,
     no_host_shares: bool,
+    deterministic: Option<&DeterministicConfig>,
     run_log: Option<&RunLog>,
 ) -> Result<Option<i32>> {
     match connect_broker(socket) {
@@ -1650,7 +2289,15 @@ fn run_existing_broker_client(
                     socket.display()
                 ));
             }
-            run_broker_session(stream, command, cwd, run_as_root, no_host_shares).map(Some)
+            run_broker_session(
+                stream,
+                command,
+                cwd,
+                run_as_root,
+                no_host_shares,
+                deterministic,
+            )
+            .map(Some)
         }
         Err(e) => {
             if socket.exists() {
@@ -1691,18 +2338,29 @@ fn run_broker_session(
     cwd: &Path,
     run_as_root: bool,
     no_host_shares: bool,
+    deterministic: Option<&DeterministicConfig>,
 ) -> Result<i32> {
     INTERRUPTED.store(false, Ordering::SeqCst);
-    let channel_id = new_request_id()?;
     let host_home = host_home_for_cwd(cwd)?;
     let guest_cwd = if no_host_shares {
         "/".to_string()
     } else {
         guest_cwd(cwd, &host_home)
     };
-    let use_pty = should_request_pty();
+    let use_pty = if deterministic.is_some() {
+        false
+    } else {
+        should_request_pty()
+    };
     let raw_mode = if use_pty { RawTerminal::enter() } else { None };
-    let (term, colorterm, rows, cols) = if use_pty {
+    let (term, colorterm, rows, cols) = if deterministic.is_some() {
+        (
+            DETERMINISTIC_TERM.to_string(),
+            DETERMINISTIC_COLORTERM.to_string(),
+            DETERMINISTIC_ROWS,
+            DETERMINISTIC_COLS,
+        )
+    } else if use_pty {
         (
             std::env::var("TERM")
                 .ok()
@@ -1715,6 +2373,20 @@ fn run_broker_session(
     } else {
         (String::new(), String::new(), 1, 1)
     };
+    let (uid, gid, group) = exec_identity(run_as_root, deterministic);
+    let env = exec_env(deterministic);
+    let channel_id = match deterministic {
+        Some(config) => deterministic_exec_request_id(
+            &config.seed,
+            command,
+            &guest_cwd,
+            run_as_root,
+            use_pty,
+            rows,
+            cols,
+        ),
+        None => new_request_id()?,
+    };
     write_message(
         &mut stream,
         &Message::OpenExec {
@@ -1726,22 +2398,10 @@ fn run_broker_session(
             colorterm,
             rows,
             cols,
-            uid: if run_as_root {
-                0
-            } else {
-                unsafe { libc::getuid() }
-            },
-            gid: if run_as_root {
-                0
-            } else {
-                unsafe { libc::getgid() }
-            },
-            group: if run_as_root {
-                String::new()
-            } else {
-                host_group_name()
-            },
-            env: forwarded_exec_env(),
+            uid,
+            gid,
+            group,
+            env,
         },
     )?;
 
@@ -1894,6 +2554,39 @@ fn host_group_name() -> String {
         .into_owned()
 }
 
+fn exec_identity(
+    run_as_root: bool,
+    deterministic: Option<&DeterministicConfig>,
+) -> (u32, u32, String) {
+    if run_as_root {
+        return (0, 0, String::new());
+    }
+    if deterministic.is_some() {
+        return (
+            DETERMINISTIC_EXEC_UID,
+            DETERMINISTIC_EXEC_GID,
+            DETERMINISTIC_EXEC_GROUP.to_string(),
+        );
+    }
+    (
+        unsafe { libc::getuid() },
+        unsafe { libc::getgid() },
+        host_group_name(),
+    )
+}
+
+fn exec_env(deterministic: Option<&DeterministicConfig>) -> Vec<(String, String)> {
+    if deterministic.is_some() {
+        return vec![
+            ("TERM".to_string(), DETERMINISTIC_TERM.to_string()),
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+            ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+            ("TZ".to_string(), "UTC".to_string()),
+        ];
+    }
+    forwarded_exec_env()
+}
+
 fn forwarded_exec_env() -> Vec<(String, String)> {
     const EXACT: &[&str] = &[
         "TERM",
@@ -1927,6 +2620,7 @@ fn run_broker_client_retry(
     cwd: &Path,
     run_as_root: bool,
     no_host_shares: bool,
+    deterministic: Option<&DeterministicConfig>,
     timeout: Duration,
 ) -> Result<i32> {
     let start = Instant::now();
@@ -1934,7 +2628,14 @@ fn run_broker_client_retry(
     while start.elapsed() < timeout {
         match connect_broker(socket) {
             Ok(stream) => {
-                return run_broker_session(stream, command, cwd, run_as_root, no_host_shares);
+                return run_broker_session(
+                    stream,
+                    command,
+                    cwd,
+                    run_as_root,
+                    no_host_shares,
+                    deterministic,
+                );
             }
             Err(e) => {
                 last = Some(e);
@@ -1963,9 +2664,11 @@ fn run_broker_owner(
     forwards: Vec<PortForward>,
     host_home: PathBuf,
     no_host_shares: bool,
+    deterministic: Option<DeterministicConfig>,
     idle: IdlePolicy,
     timings: Arc<TimingLog>,
     run_log: Arc<RunLog>,
+    trace_log: Option<Arc<TraceLog>>,
     vm_error_rx: mpsc::Receiver<i32>,
 ) -> Result<thread::JoinHandle<()>> {
     listener
@@ -2021,7 +2724,10 @@ fn run_broker_owner(
     )?;
 
     if restore_snapshot.is_some() {
-        let channel_id = new_request_id()?;
+        let channel_id = match deterministic.as_ref() {
+            Some(config) => deterministic_restore_sync_request_id(&config.seed),
+            None => new_request_id()?,
+        };
         timings.event("snapshot.restore.sync.begin");
         run_log.line(format!(
             "snapshot.restore.sync.begin channel_id={channel_id:016x}"
@@ -2030,11 +2736,21 @@ fn run_broker_owner(
             .set_read_timeout(Some(DEFAULT_AGENT_ACCEPT_TIMEOUT))
             .context("set restore-sync read timeout")?;
         let sync_result = (|| -> Result<()> {
+            let entropy = restore_entropy(deterministic.as_ref())?;
+            if let Some(trace) = &trace_log {
+                trace.event(
+                    "restore_sync_begin",
+                    vec![
+                        trace_text("channel_id", format!("{channel_id:016x}")),
+                        trace_blob("entropy", &entropy),
+                    ],
+                );
+            }
             write_message(
                 &mut agent_stream,
                 &Message::RestoreSync {
                     channel_id,
-                    entropy: fresh_restore_entropy()?,
+                    entropy,
                 },
             )?;
             loop {
@@ -2056,6 +2772,12 @@ fn run_broker_owner(
                 run_log.line(format!(
                     "snapshot.restore.sync.done channel_id={channel_id:016x}"
                 ));
+                if let Some(trace) = &trace_log {
+                    trace.event(
+                        "restore_sync_done",
+                        vec![trace_text("channel_id", format!("{channel_id:016x}"))],
+                    );
+                }
             }
             Err(e) => {
                 timings.event("snapshot.restore.sync.error");
@@ -2087,6 +2809,7 @@ fn run_broker_owner(
     let reader_active = Arc::clone(&active);
     let reader_snapshot_exit_tx = snapshot_exit_tx.clone();
     let reader_log = Arc::clone(&run_log);
+    let reader_trace = trace_log.clone();
     thread::spawn(move || {
         let reader_err = loop {
             let message = match read_message(&mut agent_reader) {
@@ -2104,10 +2827,19 @@ fn run_broker_owner(
                 _ => None,
             };
             if let Message::SnapshotExit { channel_id } = message {
+                if let Some(trace) = &reader_trace {
+                    trace.event(
+                        "guest_snapshot_exit",
+                        vec![trace_text("channel_id", format!("{channel_id:016x}"))],
+                    );
+                }
                 let _ = reader_snapshot_exit_tx.send(channel_id);
                 continue;
             }
             if let Some(channel_id) = channel_id {
+                if let Some(trace) = &reader_trace {
+                    trace_agent_message(trace, &message);
+                }
                 let channel = reader_clients
                     .lock()
                     .ok()
@@ -2182,6 +2914,7 @@ fn run_broker_owner(
                     let client_log = Arc::clone(&owner_log);
                     let client_ctx = Arc::clone(&ctx);
                     let client_host_home = host_home.clone();
+                    let client_trace = trace_log.clone();
                     thread::spawn(move || {
                         if let Err(e) = handle_broker_client(
                             client,
@@ -2194,6 +2927,7 @@ fn run_broker_owner(
                             client_host_home,
                             no_host_shares,
                             Arc::clone(&client_log),
+                            client_trace,
                         ) {
                             client_log.line(format!("broker.client.error {e:#}"));
                         }
@@ -2206,20 +2940,49 @@ fn run_broker_owner(
                             "checkpoint.request path={}",
                             request.path.display()
                         ));
-                        let result = seed_incremental_snapshot(
-                            &request.path,
-                            restore_snapshot.as_deref(),
-                            &snapshot_path,
-                            &owner_log,
-                        )
-                        .and_then(|()| {
+                        if let Some(trace) = &trace_log {
+                            trace.event(
+                                "checkpoint_request",
+                                vec![trace_text("path", request.path.display().to_string())],
+                            );
+                        }
+                        let result = (|| -> Result<()> {
+                            seed_incremental_snapshot(
+                                &request.path,
+                                restore_snapshot.as_deref(),
+                                &snapshot_path,
+                                &owner_log,
+                            )?;
+                            owner_log.line(format!(
+                                "checkpoint.capture.begin path={}",
+                                request.path.display()
+                            ));
                             ctx.snapshot_with_file_copy(&request.path, &rootfs, "rootfs.ext4")?;
-                            copy_snapshot_stamp(&request.path, &initramfs_stamp)
-                        })
+                            owner_log.line(format!(
+                                "checkpoint.capture.done path={}",
+                                request.path.display()
+                            ));
+                            copy_snapshot_stamp(
+                                &request.path,
+                                &initramfs_stamp,
+                                trace_log.as_deref(),
+                            )?;
+                            owner_log.line(format!(
+                                "checkpoint.stamp.done path={}",
+                                request.path.display()
+                            ));
+                            Ok(())
+                        })()
                         .map_err(|e| format!("{e:#}"));
                         if result.is_ok() {
                             owner_log
                                 .line(format!("checkpoint.done path={}", request.path.display()));
+                            if let Some(trace) = &trace_log {
+                                trace.event(
+                                    "checkpoint_done",
+                                    vec![trace_text("path", request.path.display().to_string())],
+                                );
+                            }
                             log_snapshot_summary(&owner_log, "checkpoint", &request.path);
                         }
                         let _ = request.reply.send(result);
@@ -2235,6 +2998,7 @@ fn run_broker_owner(
                             &snapshot_path,
                             &rootfs,
                             &initramfs_stamp,
+                            trace_log.as_deref(),
                         );
                         match result {
                             Ok(()) => {
@@ -2242,6 +3006,15 @@ fn run_broker_owner(
                                     "snapshot_exit.done channel_id={channel_id} path={}",
                                     snapshot_path.display()
                                 ));
+                                if let Some(trace) = &trace_log {
+                                    trace.event(
+                                        "snapshot_exit_done",
+                                        vec![
+                                            trace_text("channel_id", format!("{channel_id:016x}")),
+                                            trace_text("path", snapshot_path.display().to_string()),
+                                        ],
+                                    );
+                                }
                                 log_snapshot_summary(&owner_log, "snapshot.latest", &snapshot_path);
                                 let _ = agent_tx.send(Message::CheckpointCreated { channel_id });
                             }
@@ -2280,6 +3053,15 @@ fn run_broker_owner(
             "snapshot.request.guest path={} full={force_full_snapshot}",
             snapshot_path.display()
         ));
+        if let Some(trace) = &trace_log {
+            trace.event(
+                "snapshot_request_guest",
+                vec![
+                    trace_text("path", snapshot_path.display().to_string()),
+                    trace_bool("full", force_full_snapshot),
+                ],
+            );
+        }
         let _ = agent_tx.send(Message::SnapshotReady);
         match serve_snapshot(
             snapshot_listener,
@@ -2287,11 +3069,18 @@ fn run_broker_owner(
             &snapshot_path,
             &rootfs,
             &initramfs_stamp,
+            trace_log.as_deref(),
             force_full_snapshot,
             &owner_timings,
         ) {
             Ok(()) => {
                 owner_log.line("snapshot.done");
+                if let Some(trace) = &trace_log {
+                    trace.event(
+                        "snapshot_done",
+                        vec![trace_text("path", snapshot_path.display().to_string())],
+                    );
+                }
                 log_snapshot_summary(&owner_log, "snapshot.latest", &snapshot_path);
             }
             Err(e) => owner_log.line(format!("snapshot.error {e:#}")),
@@ -2392,6 +3181,12 @@ fn spawn_owner_process(config: &RunConfig, run_log: &RunLog) -> Result<Child> {
     if config.no_host_shares {
         command.arg("--no-host-shares");
     }
+    if let Some(deterministic) = &config.deterministic {
+        command.arg("--deterministic").arg(&deterministic.seed);
+    }
+    if config.trace_events {
+        command.arg("--trace-events");
+    }
     for forward in &config.forwards {
         command.arg("--forward").arg(forward_spec(forward));
     }
@@ -2432,6 +3227,7 @@ fn run_broker_client_awaiting_owner(
                     cwd,
                     config.run_as_root,
                     config.no_host_shares,
+                    config.deterministic.as_ref(),
                 );
             }
             Err(e) => last = Some(e),
@@ -2534,6 +3330,7 @@ fn handle_broker_client(
     host_home: PathBuf,
     no_host_shares: bool,
     run_log: Arc<RunLog>,
+    trace_log: Option<Arc<TraceLog>>,
 ) -> Result<()> {
     client
         .set_nonblocking(false)
@@ -2550,6 +3347,15 @@ fn handle_broker_client(
     )?;
     let first = read_message(&mut client)?;
     if let Message::Checkpoint { channel_id, path } = first {
+        if let Some(trace) = &trace_log {
+            trace.event(
+                "client_checkpoint_request",
+                vec![
+                    trace_text("channel_id", format!("{channel_id:016x}")),
+                    trace_text("path", path.as_str()),
+                ],
+            );
+        }
         let (reply_tx, reply_rx) = mpsc::channel();
         checkpoint_tx
             .send(CheckpointRequest {
@@ -2574,6 +3380,9 @@ fn handle_broker_client(
         _ => bail!("client did not open a channel"),
     };
     run_log.line(format!("broker.client.open channel={channel_id:016x}"));
+    if let Some(trace) = &trace_log {
+        trace_client_open(trace, &first);
+    }
     if !no_host_shares {
         if let Message::OpenExec { cwd, .. } = &first {
             set_home_write_allowlist(ctx.as_ref(), Path::new(cwd), &host_home)?;
@@ -2581,16 +3390,32 @@ fn handle_broker_client(
     }
     seen_active.store(true, Ordering::SeqCst);
     let (to_client_tx, to_client_rx) = mpsc::channel::<Message>();
-    clients
-        .lock()
-        .map_err(|_| anyhow::anyhow!("lock broker clients"))?
-        .insert(
+    {
+        let mut clients = clients
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lock broker clients"))?;
+        if clients.contains_key(&channel_id) {
+            let message = format!(
+                "channel id collision for live channel {channel_id:016x}; deterministic mode cannot run identical commands concurrently"
+            );
+            run_log.line(format!("broker.client.channel_collision {message}"));
+            write_message(
+                &mut client,
+                &Message::Error {
+                    channel_id,
+                    message,
+                },
+            )?;
+            return Ok(());
+        }
+        clients.insert(
             channel_id,
             BrokerChannel {
                 tx: to_client_tx,
                 active_owned_by_reader: true,
             },
         );
+    }
     if let Err(e) = agent_tx.send(first) {
         if let Ok(mut clients) = clients.lock() {
             clients.remove(&channel_id);
@@ -2622,6 +3447,9 @@ fn handle_broker_client(
                     }
                     _ => {}
                 }
+                if let Some(trace) = &trace_log {
+                    trace_client_message(trace, &message);
+                }
                 if let Err(e) = agent_tx.send(message) {
                     // The agent writer is gone; this channel can never
                     // complete, so release its idle-accounting slot.
@@ -2643,6 +3471,176 @@ fn handle_broker_client(
                 return Ok(());
             }
         }
+    }
+}
+
+fn trace_client_open(trace: &TraceLog, message: &Message) {
+    match message {
+        Message::OpenExec {
+            channel_id,
+            argv,
+            cwd,
+            pty,
+            term,
+            colorterm,
+            rows,
+            cols,
+            uid,
+            gid,
+            group,
+            env,
+        } => trace.event(
+            "client_open_exec",
+            trace_open_exec_fields(
+                *channel_id,
+                argv,
+                cwd,
+                *pty,
+                term,
+                colorterm,
+                *rows,
+                *cols,
+                *uid,
+                *gid,
+                group,
+                env,
+            ),
+        ),
+        Message::OpenTcp {
+            channel_id,
+            host,
+            port,
+        } => trace.event(
+            "client_open_tcp",
+            vec![
+                trace_text("channel_id", format!("{channel_id:016x}")),
+                trace_text("host", host),
+                trace_integer("port", *port as i64),
+            ],
+        ),
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_open_exec_fields(
+    channel_id: u64,
+    argv: &[String],
+    cwd: &str,
+    pty: bool,
+    term: &str,
+    colorterm: &str,
+    rows: u16,
+    cols: u16,
+    uid: u32,
+    gid: u32,
+    group: &str,
+    env: &[(String, String)],
+) -> Vec<TraceField> {
+    let mut fields = vec![
+        trace_text("channel_id", format!("{channel_id:016x}")),
+        trace_text("cwd", cwd),
+        trace_bool("pty", pty),
+        trace_text("term", term),
+        trace_text("colorterm", colorterm),
+        trace_integer("rows", rows as i64),
+        trace_integer("cols", cols as i64),
+        trace_integer("uid", uid as i64),
+        trace_integer("gid", gid as i64),
+        trace_text("group", group),
+    ];
+    for (index, arg) in argv.iter().enumerate() {
+        fields.push(trace_text_ordinal("argv", index, arg));
+    }
+    for (index, (key, value)) in env.iter().enumerate() {
+        fields.push(trace_text_ordinal("env_key", index, key));
+        fields.push(trace_text_ordinal("env_value", index, value));
+    }
+    fields
+}
+
+fn trace_client_message(trace: &TraceLog, message: &Message) {
+    match message {
+        Message::Data { channel_id, bytes } => trace.event(
+            "client_stdin",
+            vec![
+                trace_text("channel_id", format!("{channel_id:016x}")),
+                trace_integer("len", bytes.len() as i64),
+                trace_blob("bytes", bytes),
+            ],
+        ),
+        Message::Eof { channel_id } => trace.event(
+            "client_eof",
+            vec![trace_text("channel_id", format!("{channel_id:016x}"))],
+        ),
+        Message::Close { channel_id } => trace.event(
+            "client_close",
+            vec![trace_text("channel_id", format!("{channel_id:016x}"))],
+        ),
+        Message::WindowResize {
+            channel_id,
+            rows,
+            cols,
+        } => trace.event(
+            "client_window_resize",
+            vec![
+                trace_text("channel_id", format!("{channel_id:016x}")),
+                trace_integer("rows", *rows as i64),
+                trace_integer("cols", *cols as i64),
+            ],
+        ),
+        _ => {}
+    }
+}
+
+fn trace_agent_message(trace: &TraceLog, message: &Message) {
+    match message {
+        Message::Data { channel_id, bytes } => trace.event(
+            "guest_stdout",
+            vec![
+                trace_text("channel_id", format!("{channel_id:016x}")),
+                trace_integer("len", bytes.len() as i64),
+                trace_blob("bytes", bytes),
+            ],
+        ),
+        Message::Stderr { channel_id, bytes } => trace.event(
+            "guest_stderr",
+            vec![
+                trace_text("channel_id", format!("{channel_id:016x}")),
+                trace_integer("len", bytes.len() as i64),
+                trace_blob("bytes", bytes),
+            ],
+        ),
+        Message::ExitStatus { channel_id, status } => trace.event(
+            "guest_exit_status",
+            vec![
+                trace_text("channel_id", format!("{channel_id:016x}")),
+                trace_integer("status", *status as i64),
+            ],
+        ),
+        Message::Eof { channel_id } => trace.event(
+            "guest_eof",
+            vec![trace_text("channel_id", format!("{channel_id:016x}"))],
+        ),
+        Message::Close { channel_id } => trace.event(
+            "guest_close",
+            vec![trace_text("channel_id", format!("{channel_id:016x}"))],
+        ),
+        Message::Error {
+            channel_id,
+            message,
+        } => trace.event(
+            "guest_error",
+            vec![
+                trace_text("channel_id", format!("{channel_id:016x}")),
+                trace_text("message", message),
+            ],
+        ),
+        Message::CheckpointCreated { channel_id } => trace.event(
+            "guest_checkpoint_created",
+            vec![trace_text("channel_id", format!("{channel_id:016x}"))],
+        ),
+        _ => {}
     }
 }
 
@@ -2960,8 +3958,12 @@ fn accept_agent_hello(
         stream
             .set_nonblocking(false)
             .context("set lnx-agent stream blocking")?;
+        stream
+            .set_read_timeout(Some(remaining.min(Duration::from_secs(2))))
+            .context("set lnx-agent hello read timeout")?;
         match read_message(&mut stream) {
             Ok(Message::Hello { version }) if version == PROTOCOL_VERSION => {
+                let _ = stream.set_read_timeout(None);
                 timings.event("agent.accepted");
                 run_log.line("agent.accepted");
                 return Ok(stream);
@@ -3040,6 +4042,50 @@ pub(crate) fn new_request_id() -> Result<u64> {
         .context("host clock is before Unix epoch")?
         .as_nanos() as u64;
     Ok(nanos ^ ((std::process::id() as u64) << 32))
+}
+
+fn deterministic_exec_request_id(
+    seed: &str,
+    command: &[String],
+    guest_cwd: &str,
+    run_as_root: bool,
+    pty: bool,
+    rows: u16,
+    cols: u16,
+) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lnx deterministic exec request id v1\0");
+    hasher.update(seed.as_bytes());
+    hasher.update(b"\0cwd\0");
+    hasher.update(guest_cwd.as_bytes());
+    hasher.update(b"\0root\0");
+    hasher.update([u8::from(run_as_root)]);
+    hasher.update(b"\0pty\0");
+    hasher.update([u8::from(pty)]);
+    hasher.update(b"\0rows\0");
+    hasher.update(rows.to_le_bytes());
+    hasher.update(b"\0cols\0");
+    hasher.update(cols.to_le_bytes());
+    for arg in command {
+        hasher.update(b"\0arg\0");
+        hasher.update(arg.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    let id = u64::from_le_bytes(bytes);
+    if id == 0 { 1 } else { id }
+}
+
+fn deterministic_restore_sync_request_id(seed: &str) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lnx deterministic restore-sync request id v1\0");
+    hasher.update(seed.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    let id = u64::from_le_bytes(bytes);
+    if id == 0 { 1 } else { id }
 }
 
 fn should_request_pty() -> bool {
@@ -3185,6 +4231,7 @@ fn serve_snapshot(
     snapshot_path: &Path,
     rootfs: &Path,
     initramfs_stamp: &Path,
+    trace_log: Option<&TraceLog>,
     force_full: bool,
     timings: &TimingLog,
 ) -> Result<()> {
@@ -3235,10 +4282,10 @@ fn serve_snapshot(
     timings.event("snapshot.ready.read");
     timings.event("snapshot.capture.begin");
     if force_full {
-        snapshot_with_file_copy_full(ctx, snapshot_path, rootfs, initramfs_stamp)?;
+        snapshot_with_file_copy_full(ctx, snapshot_path, rootfs, initramfs_stamp, trace_log)?;
     } else {
         ctx.snapshot_with_file_copy(snapshot_path, rootfs, "rootfs.ext4")?;
-        copy_snapshot_stamp(snapshot_path, initramfs_stamp)?;
+        copy_snapshot_stamp(snapshot_path, initramfs_stamp, trace_log)?;
     }
     timings.event("snapshot.done");
     Ok(())
@@ -3249,6 +4296,7 @@ fn snapshot_with_file_copy_full(
     snapshot_path: &Path,
     rootfs: &Path,
     initramfs_stamp: &Path,
+    trace_log: Option<&TraceLog>,
 ) -> Result<()> {
     let parent = snapshot_path
         .parent()
@@ -3263,7 +4311,7 @@ fn snapshot_with_file_copy_full(
     remove_path_if_exists(snapshot_path)?;
     fs::rename(&temp, snapshot_path)
         .with_context(|| format!("rename {} to {}", temp.display(), snapshot_path.display()))?;
-    copy_snapshot_stamp(snapshot_path, initramfs_stamp)?;
+    copy_snapshot_stamp(snapshot_path, initramfs_stamp, trace_log)?;
     Ok(())
 }
 
@@ -3300,6 +4348,8 @@ fn seed_incremental_snapshot(
         "rootfs.ext4",
         "initramfs.stamp",
         "shares.stamp",
+        "deterministic.stamp",
+        DETERMINISTIC_CLOCK_STATE,
     ] {
         let src = base.join(name);
         if src.exists() {
@@ -3324,11 +4374,31 @@ fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
     crate::sparse_copy::clone_or_copy_file(src, dst)
 }
 
-fn copy_snapshot_stamp(snapshot_path: &Path, initramfs_stamp: &Path) -> Result<()> {
-    // Both stamps live in the run dir; they travel with the snapshot so a
-    // later restore can check agent and share-root compatibility.
+fn copy_snapshot_stamp(
+    snapshot_path: &Path,
+    initramfs_stamp: &Path,
+    trace_log: Option<&TraceLog>,
+) -> Result<()> {
+    // Compatibility stamps live in the run dir; they travel with the snapshot
+    // so a later restore can check agent, share-root, and deterministic mode.
+    import_deterministic_timer_jumps(initramfs_stamp, trace_log)?;
+    sync_deterministic_clock_event_sequence(initramfs_stamp, trace_log)?;
     let shares_stamp = initramfs_stamp.with_file_name("shares.stamp");
-    for stamp in [initramfs_stamp, shares_stamp.as_path()] {
+    let deterministic_stamp = initramfs_stamp.with_file_name("deterministic.stamp");
+    let deterministic_clock_state = initramfs_stamp.with_file_name(DETERMINISTIC_CLOCK_STATE);
+    for stamp in [
+        initramfs_stamp,
+        shares_stamp.as_path(),
+        deterministic_stamp.as_path(),
+        deterministic_clock_state.as_path(),
+    ] {
+        if !stamp.exists()
+            && stamp
+                .file_name()
+                .is_some_and(|name| name == DETERMINISTIC_CLOCK_STATE)
+        {
+            continue;
+        }
         let name = stamp.file_name().context("stamp file name")?;
         let target = snapshot_path.join(name);
         fs::copy(stamp, &target)
@@ -3609,6 +4679,350 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    #[test]
+    fn snapshot_deterministic_compatibility_requires_matching_mode_and_seed() {
+        let temp = TempDir::new("snapshot-deterministic");
+        fs::create_dir_all(temp.path()).expect("create snapshot dir");
+        let disabled = deterministic_stamp_content(None);
+        let seed_a = DeterministicConfig {
+            seed: "seed-a".to_string(),
+        };
+        let seed_b = DeterministicConfig {
+            seed: "seed-b".to_string(),
+        };
+        let enabled_a = deterministic_stamp_content(Some(&seed_a));
+        let enabled_b = deterministic_stamp_content(Some(&seed_b));
+
+        assert_eq!(
+            snapshot_deterministic_incompatibility(temp.path(), &disabled),
+            None,
+            "legacy snapshots without deterministic stamp remain nondeterministic-compatible"
+        );
+        assert_eq!(
+            snapshot_deterministic_incompatibility(temp.path(), &enabled_a),
+            Some("snapshot has no deterministic compatibility stamp".to_string())
+        );
+
+        fs::write(temp.path().join("deterministic.stamp"), &enabled_a).expect("write stamp");
+        assert_eq!(
+            snapshot_deterministic_incompatibility(temp.path(), &enabled_a),
+            None
+        );
+        assert_eq!(
+            snapshot_deterministic_incompatibility(temp.path(), &enabled_b),
+            Some("seed: snapshot=seed-a current=seed-b".to_string())
+        );
+        assert_eq!(
+            snapshot_deterministic_incompatibility(temp.path(), &disabled),
+            Some(
+                "deterministic: snapshot=enabled-v1 current=disabled-v1; seed: snapshot=seed-a current=<absent>; initial_realtime_unix_secs: snapshot=0 current=<absent>; clock_state: snapshot=deterministic-clock-state-v1 current=<absent>; restore_timer_rebase: snapshot=disabled-v1 current=<absent>; virtual_counter: snapshot=kvm-controlled-counter-v1 current=<absent>; kvm_halt_poll: snapshot=disabled-v1 current=<absent>; rtc: snapshot=deterministic-zero-v1 current=<absent>; trng: snapshot=deterministic-smccc-v1 current=<absent>; virtio_rng: snapshot=deterministic-stateless-v1 current=<absent>; vsock_timesync: snapshot=disabled-v1 current=<absent>; restore_entropy: snapshot=sha256-seed-v1 current=<absent>; exec_user: snapshot=uid1000-gid1000-lnxuser current=<absent>; exec_env: snapshot=c-utf8-utc-v1 current=<absent>; exec_tty: snapshot=none-24x80-xterm-256color-v1 current=<absent>; network: snapshot=gvproxy-fixed-v1 current=<absent>"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn deterministic_time_configures_libkrun_restore_rebase_policy() {
+        unsafe {
+            std::env::remove_var("KRUN_DETERMINISTIC_TIME");
+        }
+        configure_libkrun_deterministic_time(true);
+        assert_eq!(std::env::var("KRUN_DETERMINISTIC_TIME").as_deref(), Ok("1"));
+        configure_libkrun_deterministic_time(false);
+        assert!(std::env::var_os("KRUN_DETERMINISTIC_TIME").is_none());
+    }
+
+    #[test]
+    fn deterministic_clock_state_round_trips_and_restores_from_snapshot() {
+        let temp = TempDir::new("deterministic-clock");
+        fs::create_dir_all(temp.path()).expect("create snapshot dir");
+        let state = DeterministicClockState {
+            realtime_unix_nanos: 12,
+            monotonic_nanos: 34,
+            counter_frequency_hz: 1_000_000_000,
+            event_sequence: 56,
+            timer_jump_count: 7,
+            last_timer_deadline_ticks: 890,
+        };
+        write_deterministic_clock_state(&temp.path().join(DETERMINISTIC_CLOCK_STATE), &state)
+            .expect("write state");
+
+        assert_eq!(read_deterministic_clock_state(temp.path()).unwrap(), state);
+        assert_eq!(
+            deterministic_clock_state_for_start(
+                Some(&DeterministicConfig {
+                    seed: "seed42".to_string()
+                }),
+                Some(temp.path())
+            )
+            .unwrap(),
+            Some(state)
+        );
+    }
+
+    #[test]
+    fn deterministic_clock_event_sequence_tracks_trace_sequence() {
+        let temp = TempDir::new("trace-clock-sequence");
+        let instance_dir = temp.path().join("instances").join("trace-vm");
+        let run_dir = instance_dir.clone();
+        let layout = Layout {
+            base: temp.path().to_path_buf(),
+            instance: "trace-vm".to_string(),
+            kernel: temp.path().join("vmlinuz"),
+            rootfs: instance_dir.join("rootfs.ext4"),
+            instance_dir: instance_dir.clone(),
+            snapshot_dir: instance_dir.join("memory-snapshots"),
+            checkpoint_dir: instance_dir.join("checkpoints"),
+            vm_initialized: instance_dir.join("vm-initialized"),
+            run_dir: run_dir.clone(),
+            console_log: run_dir.join("console.log"),
+        };
+        fs::create_dir_all(&layout.run_dir).expect("create run dir");
+        let trace = TraceLog::open(&layout).expect("open trace");
+        trace.set_next_sequence(7);
+        trace.event("restored_event", Vec::new());
+
+        let state_path = layout.run_dir.join(DETERMINISTIC_CLOCK_STATE);
+        write_deterministic_clock_state(&state_path, &initial_deterministic_clock_state())
+            .expect("write state");
+        sync_deterministic_clock_event_sequence(
+            &layout.run_dir.join("initramfs.stamp"),
+            Some(&trace),
+        )
+        .expect("sync sequence");
+
+        let state =
+            parse_deterministic_clock_state(&fs::read_to_string(&state_path).expect("read state"))
+                .expect("parse state");
+        assert_eq!(state.event_sequence, 8);
+        assert_eq!(state.timer_jump_count, 0);
+        assert_eq!(state.last_timer_deadline_ticks, 0);
+    }
+
+    #[test]
+    fn deterministic_timer_jumps_import_into_trace_once() {
+        let temp = TempDir::new("trace-timer-jumps");
+        let instance_dir = temp.path().join("instances").join("trace-vm");
+        let run_dir = instance_dir.clone();
+        let layout = Layout {
+            base: temp.path().to_path_buf(),
+            instance: "trace-vm".to_string(),
+            kernel: temp.path().join("vmlinuz"),
+            rootfs: instance_dir.join("rootfs.ext4"),
+            instance_dir: instance_dir.clone(),
+            snapshot_dir: instance_dir.join("memory-snapshots"),
+            checkpoint_dir: instance_dir.join("checkpoints"),
+            vm_initialized: instance_dir.join("vm-initialized"),
+            run_dir: run_dir.clone(),
+            console_log: run_dir.join("console.log"),
+        };
+        fs::create_dir_all(&layout.run_dir).expect("create run dir");
+        fs::write(
+            layout.run_dir.join(DETERMINISTIC_TIMER_JUMPS),
+            "deadline_ticks=10 counter_frequency_hz=1000000000 deadline_nanos=10\n",
+        )
+        .expect("write jumps");
+        let trace = TraceLog::open(&layout).expect("open trace");
+
+        import_deterministic_timer_jumps(&layout.run_dir.join("initramfs.stamp"), Some(&trace))
+            .expect("import jumps");
+        import_deterministic_timer_jumps(&layout.run_dir.join("initramfs.stamp"), Some(&trace))
+            .expect("import jumps again");
+        drop(trace);
+
+        let connection =
+            Connection::open(layout.run_dir.join("deterministic-trace.sqlite3")).expect("open db");
+        let events: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM events WHERE event = 'timer_jump'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count timer jumps");
+        assert_eq!(events, 1);
+        let deadline: i64 = connection
+            .query_row(
+                "SELECT value FROM event_integer_fields WHERE key = 'deadline_nanos'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read deadline");
+        assert_eq!(deadline, 10);
+    }
+
+    #[test]
+    fn deterministic_restore_requires_clock_state() {
+        let temp = TempDir::new("deterministic-clock-missing");
+        fs::create_dir_all(temp.path()).expect("create snapshot dir");
+        let err = deterministic_clock_state_for_start(
+            Some(&DeterministicConfig {
+                seed: "seed42".to_string(),
+            }),
+            Some(temp.path()),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("deterministic-clock.state"));
+    }
+
+    #[test]
+    fn deterministic_exec_identity_and_env_are_host_independent() {
+        let config = DeterministicConfig {
+            seed: "seed42".to_string(),
+        };
+        assert_eq!(
+            exec_identity(false, Some(&config)),
+            (
+                DETERMINISTIC_EXEC_UID,
+                DETERMINISTIC_EXEC_GID,
+                DETERMINISTIC_EXEC_GROUP.to_string()
+            )
+        );
+        assert_eq!(exec_identity(true, Some(&config)), (0, 0, String::new()));
+        assert_eq!(
+            exec_env(Some(&config)),
+            vec![
+                ("TERM".to_string(), DETERMINISTIC_TERM.to_string()),
+                ("LANG".to_string(), "C.UTF-8".to_string()),
+                ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+                ("TZ".to_string(), "UTC".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn deterministic_stamp_records_network_policy() {
+        let config = DeterministicConfig {
+            seed: "seed42".to_string(),
+        };
+        let stamp = deterministic_stamp_content(Some(&config));
+
+        assert!(stamp.contains("network=gvproxy-fixed-v1\n"));
+        assert!(stamp.contains("exec_env=c-utf8-utc-v1\n"));
+        assert!(stamp.contains("restore_entropy=sha256-seed-v1\n"));
+        assert!(stamp.contains("clock_state=deterministic-clock-state-v1\n"));
+        assert!(stamp.contains("restore_timer_rebase=disabled-v1\n"));
+        assert!(stamp.contains("virtual_counter=kvm-controlled-counter-v1\n"));
+        assert!(stamp.contains("kvm_halt_poll=disabled-v1\n"));
+        assert!(stamp.contains("rtc=deterministic-zero-v1\n"));
+        assert!(stamp.contains("trng=deterministic-smccc-v1\n"));
+        assert!(stamp.contains("virtio_rng=deterministic-stateless-v1\n"));
+        assert!(stamp.contains("vsock_timesync=disabled-v1\n"));
+    }
+
+    #[test]
+    fn deterministic_restore_entropy_depends_only_on_seed() {
+        let seed_a_first = deterministic_restore_entropy("seed-a");
+        let seed_a_second = deterministic_restore_entropy("seed-a");
+        let seed_b = deterministic_restore_entropy("seed-b");
+
+        assert_eq!(seed_a_first.len(), RESTORE_ENTROPY_BYTES);
+        assert_eq!(seed_a_first, seed_a_second);
+        assert_ne!(seed_a_first, seed_b);
+        assert!(seed_a_first.iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn deterministic_request_ids_depend_on_seed_and_exec_context() {
+        let command = vec!["pytest".to_string(), "-q".to_string()];
+        let first = deterministic_exec_request_id("seed42", &command, "/", false, false, 1, 1);
+        let second = deterministic_exec_request_id("seed42", &command, "/", false, false, 1, 1);
+        let different_seed =
+            deterministic_exec_request_id("other-seed", &command, "/", false, false, 1, 1);
+        let different_command = deterministic_exec_request_id(
+            "seed42",
+            &["pytest".to_string(), "-vv".to_string()],
+            "/",
+            false,
+            false,
+            1,
+            1,
+        );
+
+        assert_ne!(first, 0);
+        assert_eq!(first, second);
+        assert_ne!(first, different_seed);
+        assert_ne!(first, different_command);
+        assert_eq!(
+            deterministic_restore_sync_request_id("seed42"),
+            deterministic_restore_sync_request_id("seed42")
+        );
+        assert_ne!(
+            deterministic_restore_sync_request_id("seed42"),
+            deterministic_restore_sync_request_id("other-seed")
+        );
+    }
+
+    #[test]
+    fn trace_log_stores_ordered_events_in_independent_sqlite_db() {
+        let temp = TempDir::new("trace-log");
+        let instance_dir = temp.path().join("instances").join("trace-vm");
+        let run_dir = instance_dir.clone();
+        let layout = Layout {
+            base: temp.path().to_path_buf(),
+            instance: "trace-vm".to_string(),
+            kernel: temp.path().join("vmlinuz"),
+            rootfs: instance_dir.join("rootfs.ext4"),
+            instance_dir: instance_dir.clone(),
+            snapshot_dir: instance_dir.join("memory-snapshots"),
+            checkpoint_dir: instance_dir.join("checkpoints"),
+            vm_initialized: instance_dir.join("vm-initialized"),
+            run_dir: run_dir.clone(),
+            console_log: run_dir.join("console.log"),
+        };
+        fs::create_dir_all(&layout.run_dir).expect("create run dir");
+        let trace = TraceLog::open(&layout).expect("open trace");
+
+        trace.event("vm_start_config", vec![trace_text("seed", "seed42")]);
+        trace.event("guest_exit_status", vec![trace_integer("status", 0)]);
+        drop(trace);
+
+        let connection =
+            Connection::open(layout.run_dir.join("deterministic-trace.sqlite3")).expect("open db");
+        let format: String = connection
+            .query_row(
+                "SELECT value FROM trace_metadata WHERE key = 'format'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read metadata");
+        assert_eq!(format, "lnx-deterministic-trace-v1");
+
+        let events = connection
+            .prepare("SELECT sequence, event FROM events ORDER BY sequence")
+            .expect("prepare events")
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query events")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect events");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, 0);
+        assert_eq!(events[0].1, "vm_start_config");
+        assert_eq!(events[1].0, 1);
+        assert_eq!(events[1].1, "guest_exit_status");
+
+        let seed: String = connection
+            .query_row(
+                "SELECT value FROM event_text_fields WHERE sequence = 0 AND key = 'seed'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read seed");
+        assert_eq!(seed, "seed42");
+        let status: i64 = connection
+            .query_row(
+                "SELECT value FROM event_integer_fields WHERE sequence = 1 AND key = 'status'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read status");
+        assert_eq!(status, 0);
     }
 
     #[test]

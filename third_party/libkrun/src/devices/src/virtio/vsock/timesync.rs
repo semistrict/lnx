@@ -13,6 +13,10 @@ const UPDATE_INTERVAL: u64 = 60 * 1000 * 1000 * 1000;
 const SLEEP_NSECS: u64 = 2 * 1000 * 1000 * 1000;
 const TSYNC_PORT: u32 = 123;
 
+pub(crate) fn deterministic_time_enabled() -> bool {
+    std::env::var_os("KRUN_DETERMINISTIC_TIME").is_some_and(|value| value == "1")
+}
+
 pub struct TimesyncThread {
     cid: u64,
     mem: GuestMemoryMmap,
@@ -80,9 +84,35 @@ impl TimesyncThread {
     }
 
     pub fn run(mut self) {
+        if deterministic_time_enabled() {
+            info!("vsock timesync disabled for deterministic time");
+            return;
+        }
         thread::Builder::new()
             .name("vsock timesync".into())
             .spawn(move || self.work())
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deterministic_time_env_disables_vsock_timesync() {
+        unsafe {
+            std::env::remove_var("KRUN_DETERMINISTIC_TIME");
+        }
+        assert!(!deterministic_time_enabled());
+
+        unsafe {
+            std::env::set_var("KRUN_DETERMINISTIC_TIME", "1");
+        }
+        assert!(deterministic_time_enabled());
+
+        unsafe {
+            std::env::remove_var("KRUN_DETERMINISTIC_TIME");
+        }
     }
 }

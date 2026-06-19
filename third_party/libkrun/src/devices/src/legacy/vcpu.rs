@@ -1,7 +1,10 @@
 use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use arch::aarch64::layout::VTIMER_IRQ;
 use arch::aarch64::sysreg::*;
@@ -13,6 +16,11 @@ use hvf::{Vcpus, vcpu_request_exit};
 
 // See https://developer.arm.com/documentation/ddi0595/2020-12/AArch64-Registers/ICC-IAR0-EL1--Interrupt-Controller-Interrupt-Acknowledge-Register-0
 const GIC_INTID_SPURIOUS: u32 = 1023;
+const DETERMINISTIC_COUNTER_STEP: u64 = 1;
+
+fn deterministic_time_enabled() -> bool {
+    std::env::var_os("KRUN_DETERMINISTIC_TIME").is_some_and(|value| value == "1")
+}
 
 enum VcpuStatus {
     Running,
@@ -67,6 +75,7 @@ impl PerCPUInterruptControllerState {
 pub struct VcpuList {
     cpu_count: u64,
     vcpus: Vec<Mutex<PerCPUInterruptControllerState>>,
+    deterministic_counter: AtomicU64,
 }
 
 impl VcpuList {
@@ -81,7 +90,11 @@ impl VcpuList {
             }));
         }
 
-        Self { cpu_count, vcpus }
+        Self {
+            cpu_count,
+            vcpus,
+            deterministic_counter: AtomicU64::new(0),
+        }
     }
 
     pub fn get_cpu_count(&self) -> u64 {
@@ -130,11 +143,16 @@ impl VcpuList {
                 pending_irqs: v.pending_irqs.iter().copied().collect(),
             });
         }
-        VcpuListState { per_vcpu }
+        VcpuListState {
+            per_vcpu,
+            deterministic_counter: self.deterministic_counter.load(Ordering::SeqCst),
+        }
     }
 
     pub fn restore_state(&self, st: &VcpuListState) {
         assert_eq!(st.per_vcpu.len(), self.cpu_count as usize);
+        self.deterministic_counter
+            .store(st.deterministic_counter, Ordering::SeqCst);
         for (i, s) in st.per_vcpu.iter().enumerate() {
             let mut v = self.vcpus[i].lock().unwrap();
             v.pending_irqs = s
@@ -144,6 +162,11 @@ impl VcpuList {
                 .filter(|irq| *irq != VTIMER_IRQ)
                 .collect();
         }
+    }
+
+    fn read_deterministic_counter(&self) -> u64 {
+        self.deterministic_counter
+            .fetch_add(DETERMINISTIC_COUNTER_STEP, Ordering::SeqCst)
     }
 }
 
@@ -155,6 +178,8 @@ pub struct PerVcpuGicState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VcpuListState {
     pub per_vcpu: Vec<PerVcpuGicState>,
+    #[serde(default)]
+    pub deterministic_counter: u64,
 }
 
 impl Vcpus for VcpuList {
@@ -187,6 +212,14 @@ impl Vcpus for VcpuList {
             .get_pending_irq()
     }
 
+    fn jump_deterministic_counter(&self, counter: u64) {
+        let _ = self.deterministic_counter.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |current| (counter > current).then_some(counter),
+        );
+    }
+
     fn handle_sysreg_read(&self, vcpuid: u64, reg: u32) -> Option<u64> {
         assert!(vcpuid < self.cpu_count);
 
@@ -195,6 +228,10 @@ impl Vcpus for VcpuList {
         }
 
         match reg {
+            SYSREG_CNTVCT_EL0 | SYSREG_CNTPCT_EL0 if deterministic_time_enabled() => {
+                Some(self.read_deterministic_counter())
+            }
+            SYSREG_CNTFRQ_EL0 if deterministic_time_enabled() => Some(1_000_000_000),
             SYSREG_ICC_IAR1_EL1 => {
                 let irq = self.vcpus[vcpuid as usize]
                     .lock()
@@ -297,6 +334,36 @@ impl Vcpus for VcpuList {
             | SYSREG_OSLAR_EL1
             | SYSREG_OSDLR_EL1 => true,
             _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deterministic_counter_reads_advance_and_snapshot_restore() {
+        unsafe {
+            std::env::set_var("KRUN_DETERMINISTIC_TIME", "1");
+        }
+
+        let vcpus = VcpuList::new(1);
+        assert_eq!(vcpus.read_deterministic_counter(), 0);
+        assert_eq!(vcpus.read_deterministic_counter(), 1);
+
+        vcpus.jump_deterministic_counter(42);
+        assert_eq!(vcpus.read_deterministic_counter(), 42);
+
+        let state = vcpus.to_state();
+        assert_eq!(state.deterministic_counter, 43);
+
+        let restored = VcpuList::new(1);
+        restored.restore_state(&state);
+        assert_eq!(restored.read_deterministic_counter(), 43);
+
+        unsafe {
+            std::env::remove_var("KRUN_DETERMINISTIC_TIME");
         }
     }
 }

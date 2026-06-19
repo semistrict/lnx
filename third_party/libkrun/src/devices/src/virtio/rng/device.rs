@@ -64,7 +64,9 @@ impl Rng {
             let mut written = 0;
             for desc in head.into_iter() {
                 let mut rand_bytes = vec![0u8; desc.len as usize];
-                if let Err(e) = OsRng.try_fill_bytes(&mut rand_bytes) {
+                if deterministic_time_enabled() {
+                    fill_deterministic_rng_bytes(&mut rand_bytes);
+                } else if let Err(e) = OsRng.try_fill_bytes(&mut rand_bytes) {
                     error!("Failed to fill buffer with random data: {e:?}");
                     queues[REQ_INDEX].queue.go_to_previous_position();
                     break;
@@ -89,6 +91,32 @@ impl Rng {
 
         have_used
     }
+}
+
+fn deterministic_time_enabled() -> bool {
+    std::env::var_os("KRUN_DETERMINISTIC_TIME").is_some_and(|value| value == "1")
+}
+
+fn fill_deterministic_rng_bytes(bytes: &mut [u8]) {
+    let len = bytes.len() as u64;
+    let mut generated = 0usize;
+    let mut block = 0u64;
+    while generated < bytes.len() {
+        let mut state =
+            len.rotate_left(19) ^ block.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x6c6e_782d_7669_6f72;
+        let chunk = xorshift64star(&mut state).to_le_bytes();
+        let take = (bytes.len() - generated).min(chunk.len());
+        bytes[generated..generated + take].copy_from_slice(&chunk[..take]);
+        generated += take;
+        block = block.saturating_add(1);
+    }
+}
+
+fn xorshift64star(state: &mut u64) -> u64 {
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    state.wrapping_mul(0x2545_f491_4f6c_dd1d)
 }
 
 impl VirtioDevice for Rng {
@@ -213,4 +241,24 @@ impl VirtioDevice for Rng {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RngSnapshotBody {
     acked_features: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deterministic_rng_bytes_are_repeatable_and_nonzero() {
+        let mut first = vec![0u8; 33];
+        let mut second = vec![0u8; 33];
+        let mut different_len = vec![0u8; 34];
+
+        fill_deterministic_rng_bytes(&mut first);
+        fill_deterministic_rng_bytes(&mut second);
+        fill_deterministic_rng_bytes(&mut different_len);
+
+        assert_eq!(first, second);
+        assert!(first.iter().any(|byte| *byte != 0));
+        assert_ne!(first, different_len[..33]);
+    }
 }
