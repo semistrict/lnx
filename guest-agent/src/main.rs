@@ -68,6 +68,7 @@ const OLD_SERVICE_PATH: &str = "/etc/systemd/system/lnx-agent.service";
 const OLD_WANTS_LINK: &str = "/etc/systemd/system/multi-user.target.wants/lnx-agent.service";
 const CONTROL_SOCKET: &str = "/run/lnx-agent.sock";
 const CONTROL_SOCKET_ENV: &str = "LNX_CONTROL_SOCKET";
+const VIRTIOFS_DAX_ENV: &str = "LNX_VIRTIOFS_DAX";
 const VMSTATE_RESEED_MARKER: &str = "/run/lnx-vmstate-reseed";
 const SERVICE_PATH: &str = "/run/systemd/system/lnx-agent.service";
 const WANTS_DIR: &str = "/run/systemd/system/multi-user.target.wants";
@@ -254,10 +255,21 @@ fn mount_virtiofs(tag: &str, guest_path: &str, read_only: bool) {
     let target = CString::new(target).unwrap();
     let fstype = cstr(b"virtiofs\0");
     let flags = if read_only { MS_RDONLY } else { 0 };
-    let data = cstr(b"dax\0");
-    if unsafe { mount(tag.as_ptr(), target.as_ptr(), fstype, flags, data.cast()) } < 0 {
+    let data = if virtiofs_dax_enabled() {
+        cstr(b"dax\0") as *const c_void
+    } else {
+        ptr::null()
+    };
+    if unsafe { mount(tag.as_ptr(), target.as_ptr(), fstype, flags, data) } < 0 {
         die("mount virtiofs");
     }
+}
+
+fn virtiofs_dax_enabled() -> bool {
+    !matches!(
+        env::var(VIRTIOFS_DAX_ENV).as_deref(),
+        Ok("0" | "false" | "off" | "no")
+    )
 }
 
 fn mount_host_shares() {

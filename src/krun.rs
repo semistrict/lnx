@@ -7,6 +7,10 @@ const COMPAT_NET_FEATURES: u32 = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1
 const NET_FLAG_VFKIT: u32 = 1 << 0;
 const NET_FLAG_DHCP_CLIENT: u32 = 1 << 1;
 const VIRTIOFS_DAX_WINDOW_BYTES: u64 = 8 << 30;
+/// Opt back into the old host-share DAX path. Writable host-share DAX can
+/// wedge SQLite WAL close/unmap paths on macOS, so the default is the safer
+/// non-DAX virtio-fs mount.
+pub(crate) const HOST_SHARE_DAX_ENV: &str = "LNX_HOST_SHARE_DAX";
 
 pub struct Context {
     pub(crate) id: u32,
@@ -103,7 +107,7 @@ impl Context {
                     self.id,
                     tag.as_ptr(),
                     path.as_ptr(),
-                    VIRTIOFS_DAX_WINDOW_BYTES,
+                    host_share_dax_window_bytes(),
                     false,
                     true,
                 )
@@ -258,6 +262,21 @@ impl Context {
 
     pub fn start_enter(&self) -> i32 {
         libkrun::krun_start_enter(self.id)
+    }
+}
+
+pub(crate) fn host_share_dax_enabled() -> bool {
+    matches!(
+        std::env::var(HOST_SHARE_DAX_ENV).as_deref(),
+        Ok("1" | "true" | "on" | "yes")
+    )
+}
+
+fn host_share_dax_window_bytes() -> u64 {
+    if host_share_dax_enabled() {
+        VIRTIOFS_DAX_WINDOW_BYTES
+    } else {
+        0
     }
 }
 

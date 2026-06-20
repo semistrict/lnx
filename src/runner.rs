@@ -899,6 +899,14 @@ fn start_vm(
             format!("LNX_ROOT_DEVICE={root_device}"),
             format!("LNX_NET_IP={net_ip}"),
             format!("LNX_NET_GATEWAY={net_gateway}"),
+            format!(
+                "LNX_VIRTIOFS_DAX={}",
+                if crate::krun::host_share_dax_enabled() {
+                    "1"
+                } else {
+                    "0"
+                }
+            ),
             format!("LNX_VIRTIOFS_HOME={guest_home}"),
             share_layout
                 .outside_home_cwd
@@ -1681,7 +1689,10 @@ fn snapshot_initramfs_is_compatible(snapshot_path: &Path, current_stamp: &Path) 
     snapshot_key == current_key
 }
 
-const HOST_SHARE_CACHE_STAMP: &str = "host-share-cache=dax+keep-cache+writeback+restore-sync-v1";
+const HOST_SHARE_CACHE_DAX_STAMP: &str =
+    "host-share-cache=dax+keep-cache+writeback+restore-sync-v1";
+const HOST_SHARE_CACHE_NODAX_STAMP: &str =
+    "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1";
 const HOST_SHARES_DISABLED_STAMP: &str = "host-shares=disabled-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1709,10 +1720,31 @@ fn shares_stamp_content(
     net_stamp_line: &str,
     no_host_shares: bool,
 ) -> String {
+    let host_share_cache_stamp = if crate::krun::host_share_dax_enabled() {
+        HOST_SHARE_CACHE_DAX_STAMP
+    } else {
+        HOST_SHARE_CACHE_NODAX_STAMP
+    };
+    shares_stamp_content_with_cache_stamp(
+        host_home,
+        outside_home_cwd,
+        net_stamp_line,
+        no_host_shares,
+        host_share_cache_stamp,
+    )
+}
+
+fn shares_stamp_content_with_cache_stamp(
+    host_home: &Path,
+    outside_home_cwd: Option<&Path>,
+    net_stamp_line: &str,
+    no_host_shares: bool,
+    host_share_cache_stamp: &str,
+) -> String {
     if no_host_shares {
         return format!("{HOST_SHARES_DISABLED_STAMP}\n{net_stamp_line}\n");
     }
-    let mut content = format!("{HOST_SHARE_CACHE_STAMP}\nhome={}\n", host_home.display());
+    let mut content = format!("{host_share_cache_stamp}\nhome={}\n", host_home.display());
     if let Some(cwd) = outside_home_cwd {
         content.push_str(&format!("cwd={}\n", cwd.display()));
     }
@@ -1757,7 +1789,9 @@ fn snapshot_shares_incompatibility(snapshot_path: &Path, current: &str) -> Optio
         Ok(stamp) if stamp == current => None,
         Ok(stamp)
             if !stamp.lines().any(|line| {
-                line == HOST_SHARE_CACHE_STAMP || line == HOST_SHARES_DISABLED_STAMP
+                line == HOST_SHARE_CACHE_DAX_STAMP
+                    || line == HOST_SHARE_CACHE_NODAX_STAMP
+                    || line == HOST_SHARES_DISABLED_STAMP
             }) =>
         {
             Some("host_share_cache_policy: snapshot was created before host-share cache policy was recorded".to_string())

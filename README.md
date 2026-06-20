@@ -74,6 +74,12 @@ Per-run timings are appended to `~/.lnx/instances/<instance>/timings.log`.
 Incremental snapshots skip `fsync` by default for speed; set
 `KRUN_SNAPSHOT_SYNC=1` to make snapshot files crash-durable before returning.
 
+Writable host shares mount without virtio-fs DAX by default. The old DAX mode
+can wedge SQLite WAL close/unmap paths on macOS host shares; set
+`LNX_HOST_SHARE_DAX=1` to opt back into DAX for host shares. The selected mode
+is recorded in the snapshot compatibility stamp, so snapshots created under
+one mode do not restore into the other mode.
+
 Nested KVM testing:
 
 ```sh

@@ -242,21 +242,44 @@ fn snapshot_rootfs_promotion_rejects_ext4_errors() {
 #[test]
 fn shares_stamp_content_lists_home_cwd_and_network() {
     assert_eq!(
-        shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", false),
-        "host-share-cache=dax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\nnet=gvproxy\n"
+        shares_stamp_content_with_cache_stamp(
+            Path::new("/Users/ramon"),
+            None,
+            "net=gvproxy",
+            false,
+            HOST_SHARE_CACHE_NODAX_STAMP,
+        ),
+        "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\nnet=gvproxy\n"
     );
     assert_eq!(
-        shares_stamp_content(
+        shares_stamp_content_with_cache_stamp(
             Path::new("/Users/ramon"),
             Some(Path::new("/tmp/build")),
             "net=vmnet:prefix=24:gateway=192.168.106.0",
             false,
+            HOST_SHARE_CACHE_NODAX_STAMP,
         ),
-        "host-share-cache=dax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\ncwd=/tmp/build\nnet=vmnet:prefix=24:gateway=192.168.106.0\n"
+        "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\ncwd=/tmp/build\nnet=vmnet:prefix=24:gateway=192.168.106.0\n"
     );
     assert_eq!(
-        shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", true),
+        shares_stamp_content_with_cache_stamp(
+            Path::new("/Users/ramon"),
+            None,
+            "net=gvproxy",
+            true,
+            HOST_SHARE_CACHE_NODAX_STAMP,
+        ),
         "host-shares=disabled-v1\nnet=gvproxy\n"
+    );
+    assert_eq!(
+        shares_stamp_content_with_cache_stamp(
+            Path::new("/Users/ramon"),
+            None,
+            "net=gvproxy",
+            false,
+            HOST_SHARE_CACHE_DAX_STAMP,
+        ),
+        "host-share-cache=dax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\nnet=gvproxy\n"
     );
 }
 
@@ -321,7 +344,7 @@ fn snapshot_shares_compatibility_requires_identical_stamp() {
     assert_eq!(
             snapshot_shares_incompatibility(temp.path(), &current),
             Some(
-                "share_mismatch: host-shares: snapshot=disabled current=enabled; host-share-cache: snapshot=<absent> current=dax+keep-cache+writeback+restore-sync-v1; home: snapshot=<absent> current=/Users/ramon"
+                "share_mismatch: host-shares: snapshot=disabled current=enabled; host-share-cache: snapshot=<absent> current=nodax+keep-cache+writeback+restore-sync-v1; home: snapshot=<absent> current=/Users/ramon"
                     .to_string()
             )
         );
@@ -330,7 +353,22 @@ fn snapshot_shares_compatibility_requires_identical_stamp() {
     assert_eq!(
             snapshot_shares_incompatibility(temp.path(), &disabled),
             Some(
-                "share_mismatch: host-shares: snapshot=enabled current=disabled; host-share-cache: snapshot=dax+keep-cache+writeback+restore-sync-v1 current=<absent>; home: snapshot=/Users/ramon current=<absent>"
+                "share_mismatch: host-shares: snapshot=enabled current=disabled; host-share-cache: snapshot=nodax+keep-cache+writeback+restore-sync-v1 current=<absent>; home: snapshot=/Users/ramon current=<absent>"
+                    .to_string()
+            )
+        );
+
+    let dax_current = shares_stamp_content_with_cache_stamp(
+        Path::new("/Users/ramon"),
+        None,
+        "net=gvproxy",
+        false,
+        HOST_SHARE_CACHE_DAX_STAMP,
+    );
+    assert_eq!(
+            snapshot_shares_incompatibility(temp.path(), &dax_current),
+            Some(
+                "share_mismatch: host-share-cache: snapshot=nodax+keep-cache+writeback+restore-sync-v1 current=dax+keep-cache+writeback+restore-sync-v1"
                     .to_string()
             )
         );
