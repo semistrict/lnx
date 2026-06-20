@@ -93,7 +93,7 @@ pub fn resolve(layout: &Layout, identifier: &str) -> Result<Checkpoint> {
     }
 }
 
-pub fn fork(source: &Layout, checkpoint: &Checkpoint, dest: &Layout) -> Result<()> {
+pub fn fork(_source: &Layout, checkpoint: &Checkpoint, dest: &Layout) -> Result<()> {
     if dest.rootfs.exists() {
         bail!(
             "destination rootfs already exists: {}",
@@ -115,9 +115,6 @@ pub fn fork(source: &Layout, checkpoint: &Checkpoint, dest: &Layout) -> Result<(
     clone_or_copy(&checkpoint.path.join("rootfs.ext4"), &dest.rootfs)?;
     clone_snapshot_dir(&checkpoint.path, &dest.snapshot_dir.join("latest"))?;
     mark_vm_initialized(dest)?;
-    if source.kernel.exists() && !dest.kernel.exists() {
-        clone_or_copy(&source.kernel, &dest.kernel)?;
-    }
     Ok(())
 }
 
@@ -313,8 +310,6 @@ mod tests {
             path: source.checkpoint_dir.join("checkpoint"),
         };
         fs::create_dir_all(&checkpoint.path).expect("create checkpoint");
-        fs::create_dir_all(source.kernel.parent().unwrap()).expect("create kernel parent");
-        fs::write(&source.kernel, b"kernel").expect("kernel");
         fs::write(checkpoint.path.join("rootfs.ext4"), b"rootfs").expect("rootfs");
         fs::write(checkpoint.path.join("vmstate.bin"), b"vmstate").expect("vmstate");
         fs::write(checkpoint.path.join("pages.img"), b"pages").expect("pages");
@@ -323,7 +318,7 @@ mod tests {
 
         fork(&source, &checkpoint, &dest).expect("fork");
 
-        assert_eq!(fs::read(&dest.kernel).expect("read kernel"), b"kernel");
+        assert!(!dest.kernel.exists());
         assert_eq!(fs::read(&dest.rootfs).expect("read rootfs"), b"rootfs");
         assert_eq!(
             fs::read(dest.snapshot_dir.join("latest/vmstate.bin")).expect("read vmstate"),

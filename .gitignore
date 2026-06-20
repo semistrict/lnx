@@ -24,6 +24,7 @@
 /.lnx-oci-test/
 /.lnx-probe-*/
 /.lnx-snapshot-root-debug/
+/.lnx/
 
 # Nested build artifacts
 /guest-agent/target/

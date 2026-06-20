@@ -2791,7 +2791,6 @@ mod tests {
         let bundle_base = TempDir::new().expect("bundle tempdir");
         let source = test_layout(source_base.path(), "source");
         fs::create_dir_all(&source.instance_dir).expect("create source instance");
-        fs::write(&source.kernel, b"kernel").expect("write kernel");
         fs::write(&source.rootfs, b"stale-rootfs").expect("write source rootfs");
         fs::write(
             source.instance_dir.join("lnx.json"),
@@ -2823,10 +2822,7 @@ mod tests {
             fs::read(bundle.snapshot_dir.join("latest/vmstate.bin")).expect("read bundle vmstate"),
             b"checkpoint-vmstate"
         );
-        assert_eq!(
-            fs::read(&bundle.kernel).expect("read bundle kernel"),
-            b"kernel"
-        );
+        assert!(!bundle.kernel.exists());
         assert!(bundle.vm_initialized.exists());
         assert_eq!(
             descriptor::load(&bundle)
