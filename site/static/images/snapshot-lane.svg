@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 620" role="img" aria-labelledby="title desc">
+  <title id="title">lnx snapshot execution lane</title>
+  <desc id="desc">A dark technical timeline showing a host command flowing to a VM broker, guest agent, and snapshot store.</desc>
+  <defs>
+    <linearGradient id="plate" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#22261e"/>
+      <stop offset="0.55" stop-color="#0e100d"/>
+      <stop offset="1" stop-color="#171a14"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="0" x2="1">
+      <stop offset="0" stop-color="#c8f06b"/>
+      <stop offset="0.5" stop-color="#75d6c8"/>
+      <stop offset="1" stop-color="#f5b759"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0v32" fill="none" stroke="#f3f0dc" stroke-opacity=".08" stroke-width="1"/>
+    </pattern>
+    <filter id="soft">
+      <feDropShadow dx="0" dy="18" stdDeviation="24" flood-color="#000" flood-opacity=".38"/>
+    </filter>
+  </defs>
+  <rect width="960" height="620" rx="22" fill="url(#plate)"/>
+  <rect width="960" height="620" rx="22" fill="url(#grid)"/>
+  <g filter="url(#soft)">
+    <rect x="74" y="82" width="812" height="456" rx="10" fill="#11140f" stroke="#eef0d2" stroke-opacity=".18"/>
+    <path d="M116 166h718M116 282h718M116 398h718" stroke="#eef0d2" stroke-opacity=".12"/>
+    <path d="M180 118v366M330 118v366M520 118v366M694 118v366" stroke="#eef0d2" stroke-opacity=".10"/>
+    <g fill="#f3f0dc" font-family="Menlo, monospace" font-size="18">
+      <text x="116" y="135">host</text>
+      <text x="116" y="251">owner</text>
+      <text x="116" y="367">guest</text>
+      <text x="116" y="483">snapshot</text>
+    </g>
+    <path d="M204 128C290 128 282 226 374 226H492C572 226 560 342 644 342H796" fill="none" stroke="url(#signal)" stroke-width="5" stroke-linecap="round"/>
+    <path d="M330 458h118c76 0 86-58 154-58h184" fill="none" stroke="#c8f06b" stroke-opacity=".72" stroke-width="4" stroke-linecap="round" stroke-dasharray="10 12"/>
+    <g>
+      <rect x="190" y="104" width="142" height="48" rx="6" fill="#1d2218" stroke="#c8f06b" stroke-opacity=".55"/>
+      <text x="214" y="134" fill="#f3f0dc" font-family="Menlo, monospace" font-size="18">lnx exec</text>
+    </g>
+    <g>
+      <rect x="356" y="202" width="174" height="48" rx="6" fill="#1d2218" stroke="#75d6c8" stroke-opacity=".55"/>
+      <text x="380" y="232" fill="#f3f0dc" font-family="Menlo, monospace" font-size="18">broker.sock</text>
+    </g>
+    <g>
+      <rect x="620" y="318" width="174" height="48" rx="6" fill="#1d2218" stroke="#f5b759" stroke-opacity=".60"/>
+      <text x="648" y="348" fill="#f3f0dc" font-family="Menlo, monospace" font-size="18">lnx-agent</text>
+    </g>
+    <g>
+      <rect x="306" y="434" width="206" height="48" rx="6" fill="#1d2218" stroke="#c8f06b" stroke-opacity=".45"/>
+      <text x="330" y="464" fill="#f3f0dc" font-family="Menlo, monospace" font-size="18">dirty blocks</text>
+    </g>
+    <g fill="#f5b759">
+      <circle cx="204" cy="128" r="7"/>
+      <circle cx="374" cy="226" r="7"/>
+      <circle cx="644" cy="342" r="7"/>
+      <circle cx="796" cy="342" r="7"/>
+    </g>
+    <g fill="#c8f06b" opacity=".85">
+      <rect x="706" y="452" width="18" height="18" rx="2"/>
+      <rect x="734" y="452" width="18" height="18" rx="2"/>
+      <rect x="762" y="452" width="18" height="18" rx="2"/>
+      <rect x="790" y="452" width="18" height="18" rx="2"/>
+      <rect x="818" y="452" width="18" height="18" rx="2"/>
+    </g>
+  </g>
+</svg>

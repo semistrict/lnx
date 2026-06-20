@@ -523,7 +523,7 @@ Options:
 
   if (!skipInit) {
     console.log("--- Global image init, outside timed benchmark ---");
-    await run([lnxBin, "init"], { timeoutMs, env: { LNX_BASE: base } });
+    await run([lnxBin, "init", "-g"], { timeoutMs, env: { LNX_BASE: base } });
   }
 
   console.log("--- Source checkpoint, outside timed benchmark ---");

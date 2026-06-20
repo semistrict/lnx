@@ -34,7 +34,7 @@ try {
     assertEq(failed.stderr, "stderr-line", "stderr propagation");
     const notFound = await lnxVm(["definitely-not-a-command"], { check: false });
     assertEq(notFound.status, 127, "command-not-found status");
-    assertContains(notFound.stderr, "exec failed", "command-not-found stderr");
+    assertContains(notFound.stderr, "command not found: definitely-not-a-command", "command-not-found stderr");
 
     assertEq((await lnxVm(["id", "-un"])).stdout, "lnxuser", "exec runs as lnxuser");
     assertEq((await lnxVm(["bash", "-lc", 'printf "%s:%s:%s" "$USER" "$LOGNAME" "$HOME"'])).stdout, "lnxuser:lnxuser:/home/lnxuser", "exec user environment");

@@ -47,6 +47,7 @@ try {
       "--rootfs",
       join(ctx.tmpdir, "copied-rootfs.ext4"),
       "init",
+      "-g",
       "--kernel",
       join(ctx.tmpdir, "kernel"),
       "--rootfs",
@@ -79,7 +80,7 @@ try {
     assertEq(failed.stderr, "stderr-line", "stderr propagation");
     const notFound = await lnx(ctx, ["definitely-not-a-command"], { check: false });
     assertEq(notFound.status, 127, "command-not-found status");
-    assertContains(notFound.stderr, "exec failed", "command-not-found stderr");
+    assertContains(notFound.stderr, "command not found: definitely-not-a-command", "command-not-found stderr");
   });
 
   await testStep("guest shape", async () => {

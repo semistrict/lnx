@@ -27,6 +27,7 @@ const EAGAIN: c_int = 11;
 const ECHILD: c_int = 10;
 const EIO: c_int = 5;
 const EINVAL: c_int = 22;
+const ENOENT: c_int = 2;
 const ENOTTY: c_int = 25;
 const F_GETFD: c_int = 1;
 const F_SETFD: c_int = 2;
@@ -1282,8 +1283,13 @@ fn relax_nested_kvm() {
 
 fn exec_failed(arg0: *const c_char) -> ! {
     unsafe {
+        let err = errno();
         let msg = CStr::from_ptr(arg0).to_bytes();
-        write_all(STDERR_FILENO, b"exec failed: ");
+        if err == ENOENT {
+            write_all(STDERR_FILENO, b"command not found: ");
+        } else {
+            write_all(STDERR_FILENO, b"exec failed: ");
+        }
         write_all(STDERR_FILENO, msg);
         write_all(STDERR_FILENO, b"\n");
         _exit(127);

@@ -1,0 +1,72 @@
+{{ define "main" }}
+<main id="main">
+  <section class="hero" aria-labelledby="hero-title">
+    <div class="hero-copy">
+      <p class="eyebrow">Rust VM runner for macOS</p>
+      <h1 id="hero-title">lnx</h1>
+      <p class="lede">{{ .Params.tagline }}</p>
+      <div class="hero-actions" aria-label="Primary actions">
+        <a class="button button-primary" href="#build">Build it</a>
+        <a class="button button-secondary" href="#architecture">Trace the boot</a>
+      </div>
+    </div>
+
+    <figure class="hero-visual">
+      <img src="{{ "images/snapshot-lane.svg" | relURL }}" alt="Timeline of a command entering lnx, reaching the VM broker, and exiting through memory snapshot restore lanes.">
+      <figcaption>Command path, owner process, and snapshot lane.</figcaption>
+    </figure>
+  </section>
+
+  <section class="metric-band" aria-label="Project traits">
+    {{ range .Params.metrics }}
+      <div class="metric">
+        <strong>{{ .value }}</strong>
+        <span>{{ .label }}</span>
+      </div>
+    {{ end }}
+  </section>
+
+  <section class="section section-split" id="build" aria-labelledby="build-title">
+    <div>
+      <p class="section-kicker">First run</p>
+      <h2 id="build-title">A VM runner that acts like a command.</h2>
+      <p>Build the Rust binary, sign it for Hypervisor.framework, and run a Linux command. The VM owner exits after idle by snapshotting memory and disk state for the next invocation.</p>
+    </div>
+    <div class="command-stack" aria-label="Quickstart commands">
+      {{ range .Params.quickstart }}
+        <div class="command-row">
+          <span>{{ .label }}</span>
+          <code>{{ .command }}</code>
+        </div>
+      {{ end }}
+    </div>
+  </section>
+
+  <section class="section architecture" id="architecture" aria-labelledby="architecture-title">
+    <div class="section-heading">
+      <p class="section-kicker">Architecture</p>
+      <h2 id="architecture-title">The initramfs is a handoff, not the root.</h2>
+      <p>The host generates a tiny initramfs, but the real guest stays on the existing systemd ext4 image. That keeps the VM useful for normal Linux workflows while preserving command-shaped ergonomics.</p>
+    </div>
+    <ol class="flow-list">
+      {{ range .Params.flow }}
+        <li>{{ . }}</li>
+      {{ end }}
+    </ol>
+  </section>
+
+  <section class="section feature-grid" id="snapshots" aria-labelledby="snapshots-title">
+    <div class="section-heading">
+      <p class="section-kicker">Snapshot loop</p>
+      <h2 id="snapshots-title">Fast resumes without pretending the guest is stateless.</h2>
+    </div>
+    {{ range .Params.features }}
+      <article class="feature">
+        <h3>{{ .title }}</h3>
+        <p>{{ .text }}</p>
+      </article>
+    {{ end }}
+  </section>
+
+</main>
+{{ end }}

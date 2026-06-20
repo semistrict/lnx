@@ -29,6 +29,54 @@ fn parses_directory_before_guest_command() {
 }
 
 #[test]
+fn init_requires_path_or_global_flag() {
+    assert!(Cli::try_parse_from(["lnx", "init"]).is_err());
+
+    let local = Cli::try_parse_from(["lnx", "init", "."]).expect("parse local init");
+    let Some(Command::Init(args)) = local.command else {
+        panic!("expected init command");
+    };
+    assert!(!args.global);
+    assert_eq!(args.path, Some(PathBuf::from(".")));
+
+    let global = Cli::try_parse_from(["lnx", "init", "-g"]).expect("parse global init");
+    let Some(Command::Init(args)) = global.command else {
+        panic!("expected init command");
+    };
+    assert!(args.global);
+    assert!(args.path.is_none());
+
+    assert!(Cli::try_parse_from(["lnx", "init", "-g", "."]).is_err());
+}
+
+#[test]
+fn init_path_accepts_default_instance_seed() {
+    let cli = Cli::try_parse_from(["lnx", "init", ".", "--default-instance", "alpine:3.21"])
+        .expect("parse local init seed");
+    let Some(Command::Init(args)) = cli.command else {
+        panic!("expected init command");
+    };
+
+    assert_eq!(args.path, Some(PathBuf::from(".")));
+    assert_eq!(args.default_instance.as_deref(), Some("alpine:3.21"));
+}
+
+#[test]
+fn init_local_target_normalizes_relative_path() {
+    let target = init_local_target(Some(Path::new("project")))
+        .expect("target")
+        .expect("local target");
+
+    assert_eq!(
+        target.dest_base,
+        std::env::current_dir()
+            .expect("cwd")
+            .join("project")
+            .join(".lnx")
+    );
+}
+
+#[test]
 fn parse_git_worktree_list_detects_linked_worktree() {
     let output = "\
 worktree /repo/main

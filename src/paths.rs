@@ -58,12 +58,6 @@ impl Layout {
         )
     }
 
-    pub fn current_dir_base() -> Result<PathBuf> {
-        Ok(std::env::current_dir()
-            .context("current directory")?
-            .join(".lnx"))
-    }
-
     pub fn find_instance_base(instance: &str) -> Result<Option<PathBuf>> {
         let home = dirs::home_dir().context("could not resolve home directory")?;
         let cwd = std::env::current_dir().context("current directory")?;

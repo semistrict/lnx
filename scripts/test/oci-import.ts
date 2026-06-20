@@ -38,7 +38,7 @@ try {
   await prepareContext(ctx);
 
   await testStep("import an OCI image as the instance rootfs", async () => {
-    await run([ctx.lnxBin, "--instance", ctx.instance, "init", "--image", image], {
+    await run([ctx.lnxBin, "--instance", ctx.instance, "init", "-g", "--image", image], {
       timeoutMs: 600_000,
     });
     assertFile(join(ctx.imageDir, "rootfs.ext4"), "imported rootfs");
@@ -121,7 +121,7 @@ try {
 
   await testStep("an init-less image keeps the agent as pid 1", async () => {
     await run(
-      [ctx.lnxBin, "--instance", noInitInstance, "init", "--image", "debian:stable-slim"],
+      [ctx.lnxBin, "--instance", noInitInstance, "init", "-g", "--image", "debian:stable-slim"],
       { timeoutMs: 600_000 },
     );
     const probe = await run(

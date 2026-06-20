@@ -1,0 +1,10 @@
+baseURL = "https://lnx.local/"
+languageCode = "en-us"
+title = "lnx"
+disableKinds = ["taxonomy", "term"]
+
+[params]
+description = "A Rust and libkrun Linux VM runner for macOS that keeps memory and disk state warm between commands."
+
+[markup.goldmark.renderer]
+unsafe = true

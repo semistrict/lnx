@@ -121,6 +121,30 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct InitArgs {
+    #[arg(
+        short = 'g',
+        long,
+        conflicts_with = "path",
+        help = "Initialize the global lnx store"
+    )]
+    global: bool,
+
+    #[arg(
+        value_name = "PATH",
+        required_unless_present = "global",
+        help = "Initialize PATH/.lnx"
+    )]
+    path: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "VM_INSTANCE_NAME|DOCKER_IMAGE_AND_TAG",
+        requires = "path",
+        conflicts_with = "image",
+        help = "Seed the local default instance from an existing VM instance or OCI image"
+    )]
+    default_instance: Option<String>,
+
     #[arg(long)]
     kernel: Option<PathBuf>,
 
@@ -317,7 +341,19 @@ impl Cli {
             deterministic.clone(),
             trace_events,
         )?;
-        let layout = Layout::resolve(&instance, kernel, rootfs)?;
+        let init_target = match &command {
+            Some(Command::Init(args)) => init_local_target(args.path.as_deref())?,
+            _ => None,
+        };
+        let layout = match &init_target {
+            Some(target) => Layout::resolve_in_base(
+                &instance,
+                target.dest_base.clone(),
+                kernel.clone(),
+                rootfs.clone(),
+            ),
+            None => Layout::resolve(&instance, kernel.clone(), rootfs.clone())?,
+        };
         let persisted = descriptor::load(&layout)?;
         let cpus = cpus.or(persisted.cpus).unwrap_or(DEFAULT_CPUS);
         let memory_mib = memory_mib
@@ -325,30 +361,21 @@ impl Cli {
             .unwrap_or(DEFAULT_MEMORY_MIB);
         let cpus = effective_cpus(cpus, deterministic.as_ref());
         match command {
-            Some(Command::Init(args)) => match args.image {
-                Some(image) => crate::oci::import_image(&layout, &image, args.kernel.as_deref()),
-                None if should_init_local_fork(
-                    args.kernel.as_ref(),
-                    args.rootfs.as_ref(),
-                    explicit_kernel,
-                    explicit_rootfs,
-                ) =>
-                {
-                    init_local_fork(
-                        &instance,
-                        cpus,
-                        memory_mib,
-                        snapshot_path,
-                        forwards,
-                        explicit_kernel,
-                        explicit_rootfs,
-                        effective_no_host_shares,
-                        deterministic.clone(),
-                        trace_events,
-                    )
-                }
-                None => init::run(&layout, args.kernel.as_deref(), args.rootfs.as_deref()),
-            },
+            Some(Command::Init(args)) => run_init_command(
+                &layout,
+                init_target,
+                &instance,
+                args,
+                cpus,
+                memory_mib,
+                snapshot_path,
+                forwards,
+                explicit_kernel,
+                explicit_rootfs,
+                effective_no_host_shares,
+                deterministic.clone(),
+                trace_events,
+            ),
             Some(Command::Run(args)) => {
                 if cfg!(target_os = "macos") && deterministic.is_some() {
                     run_nested_deterministic_on_macos(
@@ -576,6 +603,151 @@ impl Cli {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InitLocalTarget {
+    dest_base: PathBuf,
+    preferred_source_base: Option<PathBuf>,
+}
+
+fn init_local_target(path: Option<&Path>) -> Result<Option<InitLocalTarget>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("current directory")?
+            .join(path)
+    };
+    let dest_base = path.join(".lnx");
+    let preferred_source_base = if std::env::var_os("LNX_BASE").is_none() && path.exists() {
+        linked_git_worktree(&path).and_then(|worktree| {
+            let source_base = worktree.main_root.join(".lnx");
+            source_base.is_dir().then_some(source_base)
+        })
+    } else {
+        None
+    };
+    Ok(Some(InitLocalTarget {
+        dest_base,
+        preferred_source_base,
+    }))
+}
+
+fn run_init_command(
+    layout: &Layout,
+    local_target: Option<InitLocalTarget>,
+    instance: &str,
+    args: InitArgs,
+    cpus: u8,
+    memory_mib: u32,
+    snapshot_path: Option<PathBuf>,
+    forwards: Vec<runner::PortForward>,
+    explicit_kernel: bool,
+    explicit_rootfs: bool,
+    no_host_shares: bool,
+    deterministic: Option<runner::DeterministicConfig>,
+    trace_events: bool,
+) -> Result<()> {
+    if let Some(default_instance) = args.default_instance.as_deref() {
+        return init_local_default_instance(
+            layout,
+            default_instance,
+            args.kernel.as_deref(),
+            cpus,
+            memory_mib,
+            snapshot_path,
+            forwards,
+            explicit_kernel,
+            explicit_rootfs,
+            no_host_shares,
+            deterministic,
+            trace_events,
+        );
+    }
+
+    if let Some(image) = args.image {
+        init::ensure_base_ignored(&layout.base)?;
+        return crate::oci::import_image(layout, &image, args.kernel.as_deref());
+    }
+
+    if let Some(target) = local_target {
+        if should_init_local_fork(
+            args.kernel.as_ref(),
+            args.rootfs.as_ref(),
+            explicit_kernel,
+            explicit_rootfs,
+        ) {
+            return init_local_fork_from_base(
+                instance,
+                target.dest_base,
+                target.preferred_source_base,
+                cpus,
+                memory_mib,
+                snapshot_path,
+                forwards,
+                explicit_kernel,
+                explicit_rootfs,
+                no_host_shares,
+                deterministic,
+                trace_events,
+            );
+        }
+    }
+
+    init::run(layout, args.kernel.as_deref(), args.rootfs.as_deref())
+}
+
+fn init_local_default_instance(
+    dest: &Layout,
+    default_instance: &str,
+    kernel: Option<&Path>,
+    cpus: u8,
+    memory_mib: u32,
+    snapshot_path: Option<PathBuf>,
+    forwards: Vec<runner::PortForward>,
+    explicit_kernel: bool,
+    explicit_rootfs: bool,
+    no_host_shares: bool,
+    deterministic: Option<runner::DeterministicConfig>,
+    trace_events: bool,
+) -> Result<()> {
+    init::ensure_base_ignored(&dest.base)?;
+    if let Some(source_base) = Layout::find_instance_base(default_instance)? {
+        let source = Layout::resolve_in_base(default_instance, source_base, None, None);
+        if same_path(&source.base, &dest.base) {
+            bail!(
+                "local instance already exists: {}",
+                dest.instance_dir.display()
+            );
+        }
+        if source.rootfs.exists() {
+            let checkpoint = create_internal_fork_checkpoint(
+                &source,
+                cpus,
+                memory_mib,
+                snapshot_path,
+                forwards,
+                explicit_kernel,
+                explicit_rootfs,
+                no_host_shares,
+                deterministic,
+                trace_events,
+            )?;
+            checkpoints::fork(&source, &checkpoint, dest)?;
+            eprintln!(
+                "init: local base {} from instance {}",
+                dest.base.display(),
+                default_instance
+            );
+            return Ok(());
+        }
+    }
+
+    crate::oci::import_image(dest, default_instance, kernel)
+}
+
 fn set_instance_settings(layout: &Layout, settings: &[String]) -> Result<()> {
     let mut config = descriptor::load(layout)?;
     for setting in settings {
@@ -623,35 +795,6 @@ fn should_init_local_fork(
         && !explicit_kernel
         && !explicit_rootfs
         && std::env::var_os("LNX_BASE").is_none()
-}
-
-fn init_local_fork(
-    instance: &str,
-    cpus: u8,
-    memory_mib: u32,
-    snapshot_path: Option<PathBuf>,
-    forwards: Vec<runner::PortForward>,
-    explicit_kernel: bool,
-    explicit_rootfs: bool,
-    no_host_shares: bool,
-    deterministic: Option<runner::DeterministicConfig>,
-    trace_events: bool,
-) -> Result<()> {
-    let (dest_base, source_base) = local_init_bases()?;
-    init_local_fork_from_base(
-        instance,
-        dest_base,
-        source_base,
-        cpus,
-        memory_mib,
-        snapshot_path,
-        forwards,
-        explicit_kernel,
-        explicit_rootfs,
-        no_host_shares,
-        deterministic,
-        trace_events,
-    )
 }
 
 fn init_local_fork_from_base(
@@ -752,19 +895,6 @@ fn init_from_source_base_files(dest: &Layout, source_base: &Path) -> Result<bool
     )?;
     init::ensure_instance(dest)?;
     Ok(true)
-}
-
-fn local_init_bases() -> Result<(PathBuf, Option<PathBuf>)> {
-    if std::env::var_os("LNX_BASE").is_none() {
-        let cwd = std::env::current_dir().context("current directory")?;
-        if let Some(worktree) = linked_git_worktree(&cwd) {
-            let source_base = worktree.main_root.join(".lnx");
-            if source_base.is_dir() {
-                return Ok((worktree.current_root.join(".lnx"), Some(source_base)));
-            }
-        }
-    }
-    Ok((Layout::current_dir_base()?, None))
 }
 
 fn maybe_auto_init_git_worktree(
