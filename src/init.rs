@@ -16,6 +16,10 @@ const DEFAULT_ROOTFS_SIZE: u64 = 64 * 1024 * 1024 * 1024;
 const REQUIRED_EXT4_BLOCK_SIZE: u64 = 16 * 1024;
 const EXT4_SUPERBLOCK_OFFSET: u64 = 1024;
 const EXT4_SUPERBLOCK_LEN: usize = 1024;
+const EXT4_MAGIC: u16 = 0xEF53;
+#[cfg(test)]
+const EXT4_VALID_FS: u16 = 0x0001;
+const EXT4_ERROR_FS: u16 = 0x0002;
 const ZERO_SCAN_BLOCK: usize = 16 * 1024 * 1024;
 
 pub fn run(layout: &Layout, kernel: Option<&Path>, rootfs: Option<&Path>) -> Result<()> {
@@ -363,7 +367,38 @@ fn validate_managed_rootfs(path: &Path, min_size: u64) -> Result<()> {
     Ok(())
 }
 
-fn ext4_block_size(path: &Path) -> Result<u64> {
+struct Ext4Superblock {
+    log_block_size: u32,
+    state: u16,
+    errors: u16,
+}
+
+impl Ext4Superblock {
+    fn block_size(&self) -> Result<u64> {
+        1024u64
+            .checked_shl(self.log_block_size)
+            .context("invalid ext4 block size")
+    }
+
+    fn has_errors(&self) -> bool {
+        self.state & EXT4_ERROR_FS != 0
+    }
+}
+
+pub(crate) fn ensure_ext4_has_no_errors(path: &Path, label: &str) -> Result<()> {
+    let superblock = read_ext4_superblock(path)?;
+    if superblock.has_errors() {
+        bail!(
+            "{label} {} is marked with ext4 errors (state=0x{:04x}, errors=0x{:04x}); run e2fsck before restoring or snapshotting it",
+            path.display(),
+            superblock.state,
+            superblock.errors
+        );
+    }
+    Ok(())
+}
+
+fn read_ext4_superblock(path: &Path) -> Result<Ext4Superblock> {
     let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut superblock = [0u8; EXT4_SUPERBLOCK_LEN];
     file.seek(SeekFrom::Start(EXT4_SUPERBLOCK_OFFSET))
@@ -372,7 +407,7 @@ fn ext4_block_size(path: &Path) -> Result<u64> {
         .with_context(|| format!("read ext4 superblock from {}", path.display()))?;
 
     let magic = u16::from_le_bytes([superblock[56], superblock[57]]);
-    if magic != 0xEF53 {
+    if magic != EXT4_MAGIC {
         bail!("rootfs {} is not an ext2/3/4 filesystem", path.display());
     }
 
@@ -382,9 +417,17 @@ fn ext4_block_size(path: &Path) -> Result<u64> {
         superblock[26],
         superblock[27],
     ]);
-    1024u64
-        .checked_shl(log_block_size)
-        .context("invalid ext4 block size")
+    let state = u16::from_le_bytes([superblock[58], superblock[59]]);
+    let errors = u16::from_le_bytes([superblock[60], superblock[61]]);
+    Ok(Ext4Superblock {
+        log_block_size,
+        state,
+        errors,
+    })
+}
+
+fn ext4_block_size(path: &Path) -> Result<u64> {
+    read_ext4_superblock(path)?.block_size()
 }
 
 fn find_tool(name: &str) -> Result<PathBuf> {

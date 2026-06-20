@@ -341,17 +341,20 @@ impl FsWorker {
         }
 
         loop {
-            self.queues[queue_index]
-                .disable_notification(&self.mem)
-                .unwrap();
+            if let Err(e) = self.queues[queue_index].disable_notification(&self.mem) {
+                error!("failed to disable virtiofs queue notification: {e:?}");
+                break;
+            }
 
             self.process_queue(queue_index);
 
-            if !self.queues[queue_index]
-                .enable_notification(&self.mem)
-                .unwrap()
-            {
-                break;
+            match self.queues[queue_index].enable_notification(&self.mem) {
+                Ok(false) => break,
+                Ok(true) => {}
+                Err(e) => {
+                    error!("failed to enable virtiofs queue notification: {e:?}");
+                    break;
+                }
             }
         }
     }
@@ -359,12 +362,32 @@ impl FsWorker {
     fn process_queue(&mut self, queue_index: usize) {
         let queue = &mut self.queues[queue_index];
         while let Some(head) = queue.pop(&self.mem) {
-            let reader = Reader::new(&self.mem, head.clone())
-                .map_err(FsError::QueueReader)
-                .unwrap();
-            let writer = Writer::new(&self.mem, head.clone())
-                .map_err(FsError::QueueWriter)
-                .unwrap();
+            let reader = match Reader::new(&self.mem, head.clone()).map_err(FsError::QueueReader) {
+                Ok(reader) => reader,
+                Err(e) => {
+                    error!("failed to create virtiofs queue reader: {e:?}");
+                    if let Err(e) = queue.add_used(&self.mem, head.index, 0) {
+                        error!("failed to add used elements after queue reader error: {e:?}");
+                    }
+                    if queue.needs_notification(&self.mem).unwrap_or(false) {
+                        self.interrupt.signal_used_queue();
+                    }
+                    continue;
+                }
+            };
+            let writer = match Writer::new(&self.mem, head.clone()).map_err(FsError::QueueWriter) {
+                Ok(writer) => writer,
+                Err(e) => {
+                    error!("failed to create virtiofs queue writer: {e:?}");
+                    if let Err(e) = queue.add_used(&self.mem, head.index, 0) {
+                        error!("failed to add used elements after queue writer error: {e:?}");
+                    }
+                    if queue.needs_notification(&self.mem).unwrap_or(false) {
+                        self.interrupt.signal_used_queue();
+                    }
+                    continue;
+                }
+            };
 
             let len = match self.server.handle_message(
                 reader,
@@ -385,7 +408,7 @@ impl FsWorker {
                 error!("failed to add used elements to the queue: {e:?}");
             }
 
-            if queue.needs_notification(&self.mem).unwrap() {
+            if queue.needs_notification(&self.mem).unwrap_or(false) {
                 self.interrupt.signal_used_queue();
             }
         }

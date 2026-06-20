@@ -1,5 +1,8 @@
 use super::*;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    io::{Seek, SeekFrom, Write},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 struct TempDir {
     path: PathBuf,
@@ -25,6 +28,35 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+fn temp_layout(temp: &TempDir, instance: &str) -> Layout {
+    let instance_dir = temp.path().join("instances").join(instance);
+    Layout {
+        base: temp.path().to_path_buf(),
+        instance: instance.to_string(),
+        kernel: temp.path().join("vmlinuz"),
+        rootfs: instance_dir.join("rootfs.ext4"),
+        instance_dir: instance_dir.clone(),
+        snapshot_dir: instance_dir.join("memory-snapshots"),
+        checkpoint_dir: instance_dir.join("checkpoints"),
+        vm_initialized: instance_dir.join("vm-initialized"),
+        run_dir: instance_dir.clone(),
+        console_log: instance_dir.join("console.log"),
+    }
+}
+
+fn write_fake_ext4(path: &Path, state: u16, marker: &[u8]) {
+    let mut file = fs::File::create(path).expect("create fake ext4");
+    file.set_len(4096).expect("size fake ext4");
+    let mut superblock = [0u8; 1024];
+    superblock[24..28].copy_from_slice(&4u32.to_le_bytes());
+    superblock[56..58].copy_from_slice(&0xEF53u16.to_le_bytes());
+    superblock[58..60].copy_from_slice(&state.to_le_bytes());
+    file.seek(SeekFrom::Start(1024)).expect("seek superblock");
+    file.write_all(&superblock).expect("write superblock");
+    file.seek(SeekFrom::Start(3072)).expect("seek marker");
+    file.write_all(marker).expect("write marker");
 }
 
 fn write_vmstate_header_with_version(
@@ -72,6 +104,139 @@ fn snapshot_vm_config_parses_header_and_matches_config() {
     assert!(config.matches(2, 4096));
     assert!(!config.matches(1, 4096));
     assert!(!config.matches(2, 8192));
+}
+
+#[test]
+fn agent_reader_failure_notifies_waiting_clients() {
+    let clients = Mutex::new(HashMap::new());
+    let active = AtomicUsize::new(1);
+    let (tx, rx) = mpsc::channel();
+    let channel_id = 0xabcddcba_u64;
+    clients.lock().unwrap().insert(
+        channel_id,
+        BrokerChannel {
+            tx,
+            active_owned_by_reader: true,
+        },
+    );
+
+    let dropped = drain_broker_channels(
+        &clients,
+        &active,
+        Some("guest agent disconnected before command completed".to_string()),
+    );
+
+    assert_eq!(dropped, 1);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert!(clients.lock().unwrap().is_empty());
+    match rx.recv().expect("client error") {
+        Message::Error {
+            channel_id: id,
+            message,
+        } => {
+            assert_eq!(id, channel_id);
+            assert!(message.contains("guest agent disconnected"));
+        }
+        other => panic!("expected client error, got {other:?}"),
+    }
+}
+
+#[test]
+fn fresh_owner_slot_removes_stale_bootstrap_lock() {
+    let temp = TempDir::new("fresh-owner-stale-lock");
+    let layout = temp_layout(&temp, "vm");
+    fs::create_dir_all(&layout.run_dir).expect("create run dir");
+    let lock = layout.run_dir.join("bootstrap.lock.d");
+    fs::create_dir(&lock).expect("create lock");
+    fs::write(lock.join("owner.pid"), "999999").expect("write stale pid");
+    let run_log = RunLog::open(&layout).expect("open run log");
+
+    wait_for_fresh_owner_slot(&layout, &run_log).expect("stale lock should be removed");
+
+    assert!(!lock.exists());
+}
+
+#[test]
+fn owner_attempt_log_reset_truncates_stale_diagnostics() {
+    let temp = TempDir::new("owner-log-reset");
+    let layout = temp_layout(&temp, "vm");
+    fs::create_dir_all(&layout.run_dir).expect("create run dir");
+    let owner_log = layout.run_dir.join("owner.log");
+    fs::write(&owner_log, b"old owner failure").expect("write owner log");
+    fs::write(&layout.console_log, b"old console failure").expect("write console log");
+    let run_log = RunLog::open(&layout).expect("open run log");
+
+    reset_owner_attempt_logs(&layout, &run_log);
+
+    assert_eq!(fs::read(&owner_log).expect("read owner log"), b"");
+    assert_eq!(
+        fs::read(&layout.console_log).expect("read console log"),
+        b""
+    );
+}
+
+#[test]
+fn snapshot_rootfs_promotion_replaces_cold_boot_rootfs() {
+    let temp = TempDir::new("promote-rootfs");
+    let layout = temp_layout(&temp, "vm");
+    fs::create_dir_all(&layout.run_dir).expect("create run dir");
+    let snapshot = layout.snapshot_dir.join("latest");
+    fs::create_dir_all(&snapshot).expect("create snapshot");
+    fs::write(&layout.rootfs, b"old cold rootfs").expect("write old rootfs");
+    write_fake_ext4(
+        snapshot.join("rootfs.ext4").as_path(),
+        0x0001,
+        b"new snapshot rootfs",
+    );
+    let timings = TimingLog::open(&layout, &["true".to_string()], None).expect("open timings");
+    let run_log = RunLog::open(&layout).expect("open run log");
+
+    promote_snapshot_rootfs(&snapshot, &layout.rootfs, &timings, &run_log)
+        .expect("promote snapshot rootfs");
+
+    let promoted = fs::read(&layout.rootfs).expect("read promoted rootfs");
+    assert!(
+        promoted
+            .windows(b"new snapshot rootfs".len())
+            .any(|window| window == b"new snapshot rootfs")
+    );
+    assert!(
+        !layout
+            .rootfs
+            .parent()
+            .unwrap()
+            .join(".rootfs.ext4.promote")
+            .exists()
+    );
+}
+
+#[test]
+fn snapshot_rootfs_promotion_rejects_ext4_errors() {
+    let temp = TempDir::new("promote-rootfs-errors");
+    let layout = temp_layout(&temp, "vm");
+    fs::create_dir_all(&layout.run_dir).expect("create run dir");
+    let snapshot = layout.snapshot_dir.join("latest");
+    fs::create_dir_all(&snapshot).expect("create snapshot");
+    fs::write(&layout.rootfs, b"old cold rootfs").expect("write old rootfs");
+    write_fake_ext4(
+        snapshot.join("rootfs.ext4").as_path(),
+        0x0001 | 0x0002,
+        b"bad snapshot rootfs",
+    );
+    let timings = TimingLog::open(&layout, &["true".to_string()], None).expect("open timings");
+    let run_log = RunLog::open(&layout).expect("open run log");
+
+    let error = promote_snapshot_rootfs(&snapshot, &layout.rootfs, &timings, &run_log)
+        .expect_err("bad snapshot rootfs should not be promoted");
+
+    assert!(
+        error.to_string().contains("marked with ext4 errors"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(
+        fs::read(&layout.rootfs).expect("read canonical rootfs"),
+        b"old cold rootfs"
+    );
 }
 
 #[test]

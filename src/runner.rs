@@ -240,6 +240,14 @@ fn wait_for_fresh_owner_slot(layout: &Layout, run_log: &RunLog) -> Result<()> {
     let start = Instant::now();
     let mut logged_wait = false;
     while lock_path.exists() {
+        if bootstrap_lock_is_stale(&lock_path)? {
+            run_log.line(format!(
+                "fresh_owner.slot.stale_lock.remove lock={}",
+                lock_path.display()
+            ));
+            let _ = fs::remove_dir_all(&lock_path);
+            continue;
+        }
         if !logged_wait {
             run_log.line(format!(
                 "fresh_owner.slot.wait lock={} timeout_ms={}",
@@ -304,6 +312,7 @@ pub fn run_owner(config: RunConfig) -> Result<()> {
         run_log.line("owner.exit reason=existing_broker");
         return Ok(());
     };
+    reset_owner_attempt_logs(&config.layout, &run_log);
     if broker_socket.exists() {
         run_log.line(format!(
             "broker.stale_socket.remove path={}",
@@ -790,6 +799,18 @@ fn start_vm(
         .map(|snapshot| snapshot.join("rootfs.ext4"))
         .filter(|path| path.exists())
         .unwrap_or_else(|| config.layout.rootfs.clone());
+    let rootfs_label = if rootfs != config.layout.rootfs {
+        "snapshot rootfs"
+    } else {
+        "rootfs"
+    };
+    crate::init::ensure_ext4_has_no_errors(&rootfs, rootfs_label).map_err(|e| {
+        run_log.line(format!(
+            "rootfs.health.error path={} error={e:#}",
+            rootfs.display()
+        ));
+        e
+    })?;
     log_file_summary(&run_log, "rootfs.selected", &rootfs);
     let rootfs_backend = RootfsBackend::from_env(std::env::var(ROOTFS_BACKEND_ENV).ok())?;
     let root_device = match rootfs_backend {
@@ -915,12 +936,18 @@ fn start_vm(
         .snapshot_output
         .clone()
         .unwrap_or_else(|| config.layout.snapshot_dir.join("latest"));
+    let latest_snapshot = config.layout.snapshot_dir.join("latest");
+    let promote_rootfs_after_snapshot = rootfs != config.layout.rootfs
+        && snapshot_output == latest_snapshot
+        && requested_restore_snapshot.as_deref() == Some(latest_snapshot.as_path());
     let owner = run_broker_owner(
         listener,
         config.layout.console_log.clone(),
         Arc::clone(&ctx),
         snapshot_output,
         rootfs,
+        config.layout.rootfs.clone(),
+        promote_rootfs_after_snapshot,
         snapshot_listener,
         control_listener,
         broker_listener,
@@ -1207,6 +1234,33 @@ impl Drop for ActiveReservation {
             self.active.fetch_sub(1, Ordering::SeqCst);
         }
     }
+}
+
+fn drain_broker_channels(
+    clients: &Mutex<HashMap<u64, BrokerChannel>>,
+    active: &AtomicUsize,
+    error_message: Option<String>,
+) -> usize {
+    let drained = match clients.lock() {
+        Ok(mut clients) => clients.drain().collect::<Vec<_>>(),
+        Err(_) => return 0,
+    };
+    let active_owned = drained
+        .iter()
+        .filter(|(_, channel)| channel.active_owned_by_reader)
+        .count();
+    if let Some(message) = error_message {
+        for (channel_id, channel) in &drained {
+            let _ = channel.tx.send(Message::Error {
+                channel_id: *channel_id,
+                message: message.clone(),
+            });
+        }
+    }
+    if active_owned > 0 {
+        active.fetch_sub(active_owned, Ordering::SeqCst);
+    }
+    active_owned
 }
 
 impl BootstrapLock {
@@ -2740,6 +2794,8 @@ fn run_broker_owner(
     ctx: Arc<KrunContext>,
     snapshot_path: PathBuf,
     rootfs: PathBuf,
+    canonical_rootfs: PathBuf,
+    promote_rootfs_after_snapshot: bool,
     snapshot_listener: UnixListener,
     _control_listener: UnixListener,
     broker_listener: UnixListener,
@@ -2877,6 +2933,8 @@ fn run_broker_owner(
     let client_senders = Arc::new(Mutex::new(HashMap::<u64, BrokerChannel>::new()));
     let active = Arc::new(AtomicUsize::new(0));
     let seen_active = Arc::new(AtomicBool::new(idle.starts_idle));
+    let agent_failed_before_snapshot = Arc::new(AtomicBool::new(false));
+    let snapshot_started = Arc::new(AtomicBool::new(false));
 
     let mut agent_writer = agent_stream
         .try_clone()
@@ -2893,6 +2951,8 @@ fn run_broker_owner(
     let reader_clients = Arc::clone(&client_senders);
     let reader_active = Arc::clone(&active);
     let reader_snapshot_exit_tx = snapshot_exit_tx.clone();
+    let reader_agent_failed_before_snapshot = Arc::clone(&agent_failed_before_snapshot);
+    let reader_snapshot_started = Arc::clone(&snapshot_started);
     let reader_log = Arc::clone(&run_log);
     let reader_trace = trace_log.clone();
     thread::spawn(move || {
@@ -2945,19 +3005,19 @@ fn run_broker_owner(
                 }
             }
         };
-        if let Ok(mut clients) = reader_clients.lock() {
-            let dropped = clients
-                .values()
-                .filter(|channel| channel.active_owned_by_reader)
-                .count();
-            clients.clear();
-            if dropped > 0 {
-                reader_active.fetch_sub(dropped, Ordering::SeqCst);
-            }
-            reader_log.line(format!(
-                "broker.agent.reader_eof dropped_channels={dropped} error={reader_err:#}"
-            ));
-        }
+        let snapshot_started = reader_snapshot_started.load(Ordering::SeqCst);
+        let error_message = if snapshot_started {
+            None
+        } else {
+            reader_agent_failed_before_snapshot.store(true, Ordering::SeqCst);
+            Some(format!(
+                "guest agent disconnected before command completed: {reader_err:#}"
+            ))
+        };
+        let dropped = drain_broker_channels(&reader_clients, &reader_active, error_message.clone());
+        reader_log.line(format!(
+            "broker.agent.reader_eof dropped_channels={dropped} snapshot_started={snapshot_started} error={reader_err:#}"
+        ));
     });
 
     broker_listener
@@ -3043,6 +3103,7 @@ fn run_broker_owner(
                                 request.path.display()
                             ));
                             ctx.snapshot_with_file_copy(&request.path, &rootfs, "rootfs.ext4")?;
+                            validate_snapshot_rootfs(&request.path)?;
                             owner_log.line(format!(
                                 "checkpoint.capture.done path={}",
                                 request.path.display()
@@ -3084,7 +3145,19 @@ fn run_broker_owner(
                             &rootfs,
                             &initramfs_stamp,
                             trace_log.as_deref(),
-                        );
+                        )
+                        .and_then(|()| {
+                            if promote_rootfs_after_snapshot {
+                                promote_snapshot_rootfs(
+                                    &snapshot_path,
+                                    &canonical_rootfs,
+                                    &owner_timings,
+                                    &owner_log,
+                                )
+                            } else {
+                                Ok(())
+                            }
+                        });
                         match result {
                             Ok(()) => {
                                 owner_log.line(format!(
@@ -3114,6 +3187,15 @@ fn run_broker_owner(
                             }
                         }
                     }
+                    if agent_failed_before_snapshot.load(Ordering::SeqCst) {
+                        owner_timings.event("snapshot.skipped.agent_failed");
+                        owner_log.line(
+                            "snapshot.skipped reason=guest_agent_disconnected_before_snapshot",
+                        );
+                        let _ = fs::remove_file(&broker_socket);
+                        drop(broker_listener);
+                        return;
+                    }
                     if active.load(Ordering::SeqCst) > 0 {
                         idle_deadline = None;
                     } else if seen_active.load(Ordering::SeqCst) {
@@ -3133,6 +3215,12 @@ fn run_broker_owner(
         }
         let _ = fs::remove_file(&broker_socket);
         drop(broker_listener);
+        if agent_failed_before_snapshot.load(Ordering::SeqCst) {
+            owner_timings.event("snapshot.skipped.agent_failed");
+            owner_log.line("snapshot.skipped reason=guest_agent_disconnected_before_snapshot");
+            return;
+        }
+        snapshot_started.store(true, Ordering::SeqCst);
         owner_timings.event("snapshot.request.guest");
         owner_log.line(format!(
             "snapshot.request.guest path={} full={force_full_snapshot}",
@@ -3156,7 +3244,9 @@ fn run_broker_owner(
             &initramfs_stamp,
             trace_log.as_deref(),
             force_full_snapshot,
+            promote_rootfs_after_snapshot.then_some(canonical_rootfs.as_path()),
             &owner_timings,
+            &owner_log,
         ) {
             Ok(()) => {
                 owner_log.line("snapshot.done");
@@ -3411,6 +3501,26 @@ fn owner_log_hint(layout: &Layout) -> String {
         path.display(),
         String::from_utf8_lossy(&bytes[start..]).trim_end()
     )
+}
+
+fn reset_owner_attempt_logs(layout: &Layout, run_log: &RunLog) {
+    for (label, path) in [
+        ("owner", layout.run_dir.join("owner.log")),
+        ("console", layout.console_log.clone()),
+    ] {
+        match OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+        {
+            Ok(_) => run_log.line(format!("{label}.log.reset path={}", path.display())),
+            Err(e) => run_log.line(format!(
+                "{label}.log.reset_error path={} error={e}",
+                path.display()
+            )),
+        }
+    }
 }
 
 fn agent_accept_timeout_from_env(value: Option<String>) -> Duration {
@@ -4334,7 +4444,9 @@ fn serve_snapshot(
     initramfs_stamp: &Path,
     trace_log: Option<&TraceLog>,
     force_full: bool,
+    promote_rootfs_to: Option<&Path>,
     timings: &TimingLog,
+    run_log: &RunLog,
 ) -> Result<()> {
     listener
         .set_nonblocking(true)
@@ -4386,9 +4498,60 @@ fn serve_snapshot(
         snapshot_with_file_copy_full(ctx, snapshot_path, rootfs, initramfs_stamp, trace_log)?;
     } else {
         ctx.snapshot_with_file_copy(snapshot_path, rootfs, "rootfs.ext4")?;
+        if let Err(e) = validate_snapshot_rootfs(snapshot_path) {
+            quarantine_snapshot(snapshot_path, run_log, "rootfs_ext4_errors");
+            return Err(e);
+        }
         copy_snapshot_stamp(snapshot_path, initramfs_stamp, trace_log)?;
     }
+    if let Some(canonical_rootfs) = promote_rootfs_to {
+        promote_snapshot_rootfs(snapshot_path, canonical_rootfs, timings, run_log)?;
+    }
     timings.event("snapshot.done");
+    Ok(())
+}
+
+fn promote_snapshot_rootfs(
+    snapshot_path: &Path,
+    canonical_rootfs: &Path,
+    timings: &TimingLog,
+    run_log: &RunLog,
+) -> Result<()> {
+    let snapshot_rootfs = snapshot_path.join("rootfs.ext4");
+    if snapshot_rootfs == canonical_rootfs {
+        return Ok(());
+    }
+    if !snapshot_rootfs.exists() {
+        bail!(
+            "snapshot rootfs is missing after snapshot capture: {}",
+            snapshot_rootfs.display()
+        );
+    }
+    crate::init::ensure_ext4_has_no_errors(&snapshot_rootfs, "snapshot rootfs")?;
+    let parent = canonical_rootfs
+        .parent()
+        .context("canonical rootfs path has no parent")?;
+    let file_name = canonical_rootfs
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("canonical rootfs path has no file name")?;
+    let temp = parent.join(format!(".{file_name}.promote"));
+    timings.event("snapshot.rootfs.promote.begin");
+    run_log.line(format!(
+        "snapshot.rootfs.promote source={} dest={}",
+        snapshot_rootfs.display(),
+        canonical_rootfs.display()
+    ));
+    remove_path_if_exists(&temp)?;
+    clone_or_copy_file(&snapshot_rootfs, &temp)?;
+    fs::rename(&temp, canonical_rootfs).with_context(|| {
+        format!(
+            "rename {} to {}",
+            temp.display(),
+            canonical_rootfs.display()
+        )
+    })?;
+    timings.event("snapshot.rootfs.promote.done");
     Ok(())
 }
 
@@ -4409,11 +4572,48 @@ fn snapshot_with_file_copy_full(
     let temp = parent.join(format!(".{name}.full"));
     remove_path_if_exists(&temp)?;
     ctx.snapshot_with_file_copy(&temp, rootfs, "rootfs.ext4")?;
+    if let Err(e) = validate_snapshot_rootfs(&temp) {
+        let _ = remove_path_if_exists(&temp);
+        return Err(e);
+    }
     remove_path_if_exists(snapshot_path)?;
     fs::rename(&temp, snapshot_path)
         .with_context(|| format!("rename {} to {}", temp.display(), snapshot_path.display()))?;
     copy_snapshot_stamp(snapshot_path, initramfs_stamp, trace_log)?;
     Ok(())
+}
+
+fn validate_snapshot_rootfs(snapshot_path: &Path) -> Result<()> {
+    crate::init::ensure_ext4_has_no_errors(&snapshot_path.join("rootfs.ext4"), "snapshot rootfs")
+}
+
+fn quarantine_snapshot(snapshot_path: &Path, run_log: &RunLog, reason: &str) {
+    if !snapshot_path.exists() {
+        return;
+    }
+    let Some(parent) = snapshot_path.parent() else {
+        return;
+    };
+    let Some(name) = snapshot_path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let quarantine = parent.join(format!("{name}.bad.{stamp}"));
+    match fs::rename(snapshot_path, &quarantine) {
+        Ok(()) => run_log.line(format!(
+            "snapshot.quarantine path={} dest={} reason={reason}",
+            snapshot_path.display(),
+            quarantine.display()
+        )),
+        Err(e) => run_log.line(format!(
+            "snapshot.quarantine.error path={} dest={} reason={reason} error={e}",
+            snapshot_path.display(),
+            quarantine.display()
+        )),
+    }
 }
 
 fn seed_incremental_snapshot(
