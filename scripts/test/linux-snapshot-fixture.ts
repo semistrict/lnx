@@ -40,6 +40,7 @@ const innerBase = join(cwd, "inner-base");
 const innerRunBase = `/tmp/lnx-run-linux-fixture-${process.pid}`;
 const innerInstance = `linux-fixture-${process.pid}`;
 const checkpointName = Bun.env.LNX_LINUX_SNAPSHOT_CHECKPOINT_NAME ?? "linux-macos-fixture";
+const outerRootfs = join(cwd, "outer-rootfs.ext4");
 
 function e2fsTool(name: string): string {
   for (const dir of [
@@ -69,6 +70,11 @@ async function shrinkRootfsToMinimum(path: string) {
   await run([resize2fs, "-M", path], {
     timeoutMs: 180_000,
   });
+}
+
+async function cloneShrunkRootfs(src: string, dest: string) {
+  await cloneSparseImage(src, dest);
+  await shrinkRootfsToMinimum(dest);
 }
 
 async function checkpointPathByName(imageDir: string, name: string): Promise<string> {
@@ -190,6 +196,7 @@ try {
 
   await ensureLinuxTools();
   await run(["cp", kernel, join(innerBase, "vmlinuz")], { timeoutMs: 180_000 });
+  await cloneShrunkRootfs(rootfs, outerRootfs);
   const innerRootfs = join(innerBase, "instances", innerInstance, "rootfs.ext4");
   await cloneSparseImage(rootfs, innerRootfs);
   await shrinkRootfsToMinimum(innerRootfs);
@@ -203,7 +210,7 @@ try {
       "--kernel",
       outerKernel,
       "--rootfs",
-      rootfs,
+      outerRootfs,
       "--cpus",
       "2",
       "--memory-mib",
@@ -215,6 +222,7 @@ try {
       timeoutMs: 180_000,
       env: {
         LNX_BROKER_IDLE_TTL_MS: "250",
+        LNX_ROOTFS_BACKEND: "block",
       },
     },
   );
@@ -233,7 +241,7 @@ try {
       "--kernel",
       outerKernel,
       "--rootfs",
-      rootfs,
+      outerRootfs,
       "--cpus",
       "2",
       "--memory-mib",
@@ -248,6 +256,7 @@ try {
       timeoutMs: 420_000,
       env: {
         LNX_BROKER_IDLE_TTL_MS: "250",
+        LNX_ROOTFS_BACKEND: "block",
       },
     },
   );

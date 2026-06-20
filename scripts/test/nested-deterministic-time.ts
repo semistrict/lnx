@@ -38,6 +38,7 @@ const rootfs =
   join(hostHome, ".lnx", "instances", "default", "rootfs.ext4");
 const outerInstance = `${ctx.instance}-outer`;
 const suiteBase = join(cwd, "inner-base");
+const outerRootfs = join(cwd, "outer-rootfs.ext4");
 const suiteCache = join(suiteBase, "cache", "rootfs.ext4");
 const suiteDefault = join(suiteBase, "instances", "default", "rootfs.ext4");
 const outerVmArgs = [
@@ -45,7 +46,7 @@ const outerVmArgs = [
   "--kernel",
   kernel,
   "--rootfs",
-  rootfs,
+  outerRootfs,
   "--cpus",
   "2",
   "--memory-mib",
@@ -145,6 +146,7 @@ async function prepareInnerBase() {
   await mkdir(join(suiteBase, "cache"), { recursive: true });
   await mkdir(join(suiteBase, "instances", "default"), { recursive: true });
   await run(["cp", kernel, join(suiteBase, "vmlinuz")], { timeoutMs: 180_000 });
+  await cloneShrunkRootfs(rootfs, outerRootfs);
   await cloneShrunkRootfs(rootfs, suiteCache);
   await cloneSparseImage(suiteCache, suiteDefault);
   await writeFile(join(suiteBase, "instances", "default", "vm-initialized"), "1\n");
@@ -222,6 +224,7 @@ try {
         env: {
           LNX_BROKER_IDLE_TTL_MS: "250",
           LNX_INGRESS_STATE_DIR: join(cwd, "disabled-ingress"),
+          LNX_ROOTFS_BACKEND: "block",
         },
       },
     );

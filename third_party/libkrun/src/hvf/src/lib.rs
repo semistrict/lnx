@@ -513,6 +513,8 @@ fn dirty_tracking_handle_write_fault(pa: u64) -> Result<bool, Error> {
 mod tests {
     use super::*;
 
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn mark_dirty_ranges_marks_intersecting_blocks_only() {
         let mut regions = vec![DirtyRegion {
@@ -576,6 +578,9 @@ mod tests {
 
     #[test]
     fn deterministic_time_makes_trng_repeatable_and_masked() {
+        let _env_lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         unsafe {
             std::env::set_var("KRUN_DETERMINISTIC_TIME", "1");
         }
@@ -593,6 +598,9 @@ mod tests {
 
     #[test]
     fn deterministic_time_jumps_vtimer_waits_to_deadline() {
+        let _env_lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         unsafe {
             std::env::set_var("KRUN_DETERMINISTIC_TIME", "1");
         }
@@ -614,6 +622,9 @@ mod tests {
 
     #[test]
     fn deterministic_time_traps_guest_counter_reads() {
+        let _env_lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         unsafe {
             std::env::set_var("KRUN_DETERMINISTIC_TIME", "1");
         }

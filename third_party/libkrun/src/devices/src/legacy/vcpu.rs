@@ -344,6 +344,7 @@ mod tests {
 
     #[test]
     fn deterministic_counter_reads_advance_and_snapshot_restore() {
+        let _env_lock = crate::test_env::lock();
         unsafe {
             std::env::set_var("KRUN_DETERMINISTIC_TIME", "1");
         }

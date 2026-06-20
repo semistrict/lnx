@@ -101,6 +101,7 @@ mod tests {
 
     #[test]
     fn deterministic_time_env_disables_vsock_timesync() {
+        let _env_lock = crate::test_env::lock();
         unsafe {
             std::env::remove_var("KRUN_DETERMINISTIC_TIME");
         }

@@ -53,6 +53,7 @@ const innerKernel =
 const rootfs =
   Bun.env.LNX_NESTED_ROOTFS ??
   join(hostHome, ".lnx", "instances", "default", "rootfs.ext4");
+const outerRootfs = join(cwd, "outer-rootfs.ext4");
 const snapshotInnerRootfs = join(cwd, "snapshot-inner-rootfs.ext4");
 const nestedCheckpointInstance = "lnx-checkpoint-nested";
 const nestedSnapshotInstance = "lnx-nested-snapshot";
@@ -70,7 +71,7 @@ const outerVmArgs = [
   "--kernel",
   kernel,
   "--rootfs",
-  rootfs,
+  outerRootfs,
   "--cpus",
   "2",
   "--memory-mib",
@@ -403,6 +404,7 @@ function outerLnx(
     env: {
       LNX_BROKER_IDLE_TTL_MS: "250",
       LNX_INGRESS_STATE_DIR: join(cwd, "disabled-ingress"),
+      LNX_ROOTFS_BACKEND: "block",
       ...options.env,
     },
   });
@@ -415,6 +417,7 @@ async function prepareColdOuter(instance: string) {
     env: {
       LNX_BROKER_IDLE_TTL_MS: "250",
       LNX_INGRESS_STATE_DIR: join(cwd, "disabled-ingress"),
+      LNX_ROOTFS_BACKEND: "block",
     },
   });
   await waitForOuterExit(instance);
@@ -930,6 +933,7 @@ try {
     if (!existsSync(rootfs)) {
       throw new Error(`missing rootfs image: ${rootfs}`);
     }
+    await cloneShrunkRootfs(rootfs, outerRootfs);
     await cloneShrunkRootfs(rootfs, snapshotInnerRootfs);
   });
 

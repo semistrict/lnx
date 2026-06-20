@@ -198,6 +198,7 @@ mod tests {
 
     #[test]
     fn deterministic_time_starts_rtc_at_zero_and_does_not_advance_from_host_time() {
+        let _env_lock = crate::test_env::lock();
         unsafe {
             std::env::set_var("KRUN_DETERMINISTIC_TIME", "1");
         }
@@ -214,6 +215,7 @@ mod tests {
 
     #[test]
     fn test_rtc_read_write_and_event() {
+        let _env_lock = crate::test_env::lock();
         unsafe {
             std::env::remove_var("KRUN_DETERMINISTIC_TIME");
         }

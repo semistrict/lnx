@@ -8,6 +8,7 @@ const ctx = defaultContext("snapshot-compat");
 const badSnapshot = join(ctx.tmpdir, "bad-memory-snapshot");
 const corruptSectionSnapshot = join(ctx.tmpdir, "corrupt-section-snapshot");
 const legacyCacheSnapshot = join(ctx.tmpdir, "legacy-cache-snapshot");
+const shareMismatchSnapshot = join(ctx.tmpdir, "share-mismatch-snapshot");
 
 try {
   await prepareContext(ctx);
@@ -72,7 +73,7 @@ try {
     }
     assertContains(
       failure.stderr,
-      "snapshot host-share/network stamp is incompatible (host_share_cache_policy)",
+      "snapshot host-share/network stamp is incompatible (host_share_cache_policy:",
       "legacy cache policy rejected",
     );
   });
@@ -115,18 +116,19 @@ try {
   });
 
   await testStep("share root drift rejects restore", async () => {
-    // The earlier steps captured snapshots from this suite's cwd. Running
-    // from the other side of the $HOME boundary changes the host share
-    // roots, so the pre-flight must skip the restore and boot cold; a
-    // restored guest would keep mounts backed by the old share roots.
     await waitForVmSuspend(ctx);
-    const home = Bun.env.HOME ?? "/";
-    const insideHome = `${process.cwd()}/`.startsWith(`${home}/`);
-    const otherSide = insideHome ? "/tmp" : home;
-    // A working exec proves the cwd chdir succeeded: the agent fails the
-    // exec outright when the share backing the cwd is missing.
-    const drifted = await lnx(ctx, ["bash", "-lc", "echo should-not-run"], {
-      cwd: otherSide,
+    await cp(join(ctx.snapshotDir, "latest"), shareMismatchSnapshot, { recursive: true });
+    const stampPath = join(shareMismatchSnapshot, "shares.stamp");
+    const currentStamp = await readFile(stampPath, "utf8");
+    await writeFile(stampPath, currentStamp.replace(/^home=.*\n/m, "home=/Users/lnx-share-drift\n"));
+
+    const drifted = await lnx(ctx, [
+      "--snapshot",
+      shareMismatchSnapshot,
+      "bash",
+      "-lc",
+      "echo should-not-run",
+    ], {
       timeoutMs: 240_000,
       check: false,
     });
@@ -135,7 +137,7 @@ try {
     }
     assertContains(
       drifted.stderr,
-      "snapshot host-share/network stamp is incompatible (share_mismatch)",
+      "snapshot host-share/network stamp is incompatible (share_mismatch:",
       "share root drift rejects the restore",
     );
   });
