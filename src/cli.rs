@@ -301,16 +301,29 @@ impl Cli {
 
         let explicit_kernel = kernel.is_some();
         let explicit_rootfs = rootfs.is_some();
+        let deterministic = deterministic.map(|seed| runner::DeterministicConfig { seed });
+        validate_deterministic_args(nested_kvm, &forwards, deterministic.as_ref(), trace_events)?;
+        let effective_no_host_shares = no_host_shares || deterministic.is_some();
+        maybe_auto_init_git_worktree(
+            &instance,
+            command.as_ref(),
+            explicit_kernel,
+            explicit_rootfs,
+            cpus,
+            memory_mib,
+            snapshot_path.clone(),
+            forwards.clone(),
+            effective_no_host_shares,
+            deterministic.clone(),
+            trace_events,
+        )?;
         let layout = Layout::resolve(&instance, kernel, rootfs)?;
         let persisted = descriptor::load(&layout)?;
         let cpus = cpus.or(persisted.cpus).unwrap_or(DEFAULT_CPUS);
         let memory_mib = memory_mib
             .or(persisted.memory_mib)
             .unwrap_or(DEFAULT_MEMORY_MIB);
-        let deterministic = deterministic.map(|seed| runner::DeterministicConfig { seed });
-        validate_deterministic_args(nested_kvm, &forwards, deterministic.as_ref(), trace_events)?;
         let cpus = effective_cpus(cpus, deterministic.as_ref());
-        let effective_no_host_shares = no_host_shares || deterministic.is_some();
         match command {
             Some(Command::Init(args)) => match args.image {
                 Some(image) => crate::oci::import_image(&layout, &image, args.kernel.as_deref()),
@@ -624,10 +637,44 @@ fn init_local_fork(
     deterministic: Option<runner::DeterministicConfig>,
     trace_events: bool,
 ) -> Result<()> {
-    let dest_base = Layout::current_dir_base()?;
+    let (dest_base, source_base) = local_init_bases()?;
+    init_local_fork_from_base(
+        instance,
+        dest_base,
+        source_base,
+        cpus,
+        memory_mib,
+        snapshot_path,
+        forwards,
+        explicit_kernel,
+        explicit_rootfs,
+        no_host_shares,
+        deterministic,
+        trace_events,
+    )
+}
+
+fn init_local_fork_from_base(
+    instance: &str,
+    dest_base: PathBuf,
+    preferred_source_base: Option<PathBuf>,
+    cpus: u8,
+    memory_mib: u32,
+    snapshot_path: Option<PathBuf>,
+    forwards: Vec<runner::PortForward>,
+    explicit_kernel: bool,
+    explicit_rootfs: bool,
+    no_host_shares: bool,
+    deterministic: Option<runner::DeterministicConfig>,
+    trace_events: bool,
+) -> Result<()> {
     let dest = Layout::resolve_in_base(instance, dest_base, None, None);
     init::ensure_base_ignored(&dest.base)?;
-    match Layout::find_instance_base(instance)? {
+    let source_base = match preferred_source_base {
+        Some(source_base) if !same_path(&source_base, &dest.base) => Some(source_base),
+        _ => Layout::find_instance_base(instance)?,
+    };
+    match source_base {
         Some(source_base) => {
             let source = Layout::resolve_in_base(instance, source_base, None, None);
             if source.base == dest.base {
@@ -636,19 +683,43 @@ fn init_local_fork(
                     dest.instance_dir.display()
                 );
             }
-            let checkpoint = create_internal_fork_checkpoint(
-                &source,
-                cpus,
-                memory_mib,
-                snapshot_path,
-                forwards,
-                explicit_kernel,
-                explicit_rootfs,
-                no_host_shares,
-                deterministic,
-                trace_events,
-            )?;
-            checkpoints::fork(&source, &checkpoint, &dest)?;
+            if source.rootfs.exists() {
+                let checkpoint = create_internal_fork_checkpoint(
+                    &source,
+                    cpus,
+                    memory_mib,
+                    snapshot_path,
+                    forwards,
+                    explicit_kernel,
+                    explicit_rootfs,
+                    no_host_shares,
+                    deterministic,
+                    trace_events,
+                )?;
+                checkpoints::fork(&source, &checkpoint, &dest)?;
+            } else if init_from_source_base_files(&dest, &source.base)? {
+                initialize_vm_instance(
+                    dest.clone(),
+                    cpus,
+                    memory_mib,
+                    false,
+                    no_host_shares,
+                    deterministic,
+                    trace_events,
+                )?;
+            } else {
+                init::run(&dest, None, None)?;
+                init::ensure_instance(&dest)?;
+                initialize_vm_instance(
+                    dest.clone(),
+                    cpus,
+                    memory_mib,
+                    false,
+                    no_host_shares,
+                    deterministic,
+                    trace_events,
+                )?;
+            }
         }
         None => {
             init::run(&dest, None, None)?;
@@ -666,6 +737,199 @@ fn init_local_fork(
     }
     eprintln!("init: local base {}", dest.base.display());
     Ok(())
+}
+
+fn init_from_source_base_files(dest: &Layout, source_base: &Path) -> Result<bool> {
+    let kernel = source_base.join("vmlinuz");
+    let rootfs = source_base.join("cache").join("rootfs.ext4");
+    if !kernel.exists() && !rootfs.exists() {
+        return Ok(false);
+    }
+    init::run(
+        dest,
+        kernel.exists().then_some(kernel.as_path()),
+        rootfs.exists().then_some(rootfs.as_path()),
+    )?;
+    init::ensure_instance(dest)?;
+    Ok(true)
+}
+
+fn local_init_bases() -> Result<(PathBuf, Option<PathBuf>)> {
+    if std::env::var_os("LNX_BASE").is_none() {
+        let cwd = std::env::current_dir().context("current directory")?;
+        if let Some(worktree) = linked_git_worktree(&cwd) {
+            let source_base = worktree.main_root.join(".lnx");
+            if source_base.is_dir() {
+                return Ok((worktree.current_root.join(".lnx"), Some(source_base)));
+            }
+        }
+    }
+    Ok((Layout::current_dir_base()?, None))
+}
+
+fn maybe_auto_init_git_worktree(
+    instance: &str,
+    command: Option<&Command>,
+    explicit_kernel: bool,
+    explicit_rootfs: bool,
+    cpus: Option<u8>,
+    memory_mib: Option<u32>,
+    snapshot_path: Option<PathBuf>,
+    forwards: Vec<runner::PortForward>,
+    no_host_shares: bool,
+    deterministic: Option<runner::DeterministicConfig>,
+    trace_events: bool,
+) -> Result<()> {
+    if std::env::var_os("LNX_BASE").is_some()
+        || explicit_kernel
+        || explicit_rootfs
+        || !command_allows_worktree_auto_init(command)
+    {
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir().context("current directory")?;
+    let Some(worktree) = linked_git_worktree(&cwd) else {
+        return Ok(());
+    };
+    let Some(plan) = worktree_auto_init_plan(&worktree, instance) else {
+        return Ok(());
+    };
+
+    let source = Layout::resolve_in_base(instance, plan.source_base.clone(), None, None);
+    let source_config = descriptor::load(&source)?;
+    let cpus = effective_cpus(
+        cpus.or(source_config.cpus).unwrap_or(DEFAULT_CPUS),
+        deterministic.as_ref(),
+    );
+    let memory_mib = memory_mib
+        .or(source_config.memory_mib)
+        .unwrap_or(DEFAULT_MEMORY_MIB);
+    eprintln!(
+        "init: git worktree {} from {}",
+        plan.dest_base.display(),
+        plan.source_base.display()
+    );
+    init_local_fork_from_base(
+        instance,
+        plan.dest_base,
+        Some(plan.source_base),
+        cpus,
+        memory_mib,
+        snapshot_path,
+        forwards,
+        false,
+        false,
+        no_host_shares,
+        deterministic,
+        trace_events,
+    )
+}
+
+fn command_allows_worktree_auto_init(command: Option<&Command>) -> bool {
+    match command {
+        Some(Command::Init(_))
+        | Some(Command::Ingress(_))
+        | Some(Command::HiddenIngress(_))
+        | Some(Command::HiddenVmInit)
+        | Some(Command::HiddenOciBuild(_))
+        | Some(Command::HiddenSparseCopy(_))
+        | Some(Command::HiddenVmOwner(_)) => false,
+        Some(Command::Server(args)) => args.command.is_some(),
+        _ => true,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinkedGitWorktree {
+    main_root: PathBuf,
+    current_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorktreeAutoInitPlan {
+    dest_base: PathBuf,
+    source_base: PathBuf,
+}
+
+fn linked_git_worktree(cwd: &Path) -> Option<LinkedGitWorktree> {
+    let current_root = git_toplevel(cwd)?;
+    let output = ProcessCommand::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_git_worktree_list(&text, &current_root)
+}
+
+fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
+    let output = ProcessCommand::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+fn parse_git_worktree_list(output: &str, current_root: &Path) -> Option<LinkedGitWorktree> {
+    let roots = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    linked_git_worktree_from_roots(&roots, current_root)
+}
+
+fn linked_git_worktree_from_roots(
+    roots: &[PathBuf],
+    current_root: &Path,
+) -> Option<LinkedGitWorktree> {
+    if roots.len() < 2 {
+        return None;
+    }
+    let main_root = roots.first()?.clone();
+    let current_root = roots
+        .iter()
+        .find(|root| same_path(root, current_root))?
+        .clone();
+    if same_path(&main_root, &current_root) {
+        return None;
+    }
+    Some(LinkedGitWorktree {
+        main_root,
+        current_root,
+    })
+}
+
+fn worktree_auto_init_plan(
+    worktree: &LinkedGitWorktree,
+    instance: &str,
+) -> Option<WorktreeAutoInitPlan> {
+    let source_base = worktree.main_root.join(".lnx");
+    if !source_base.is_dir() {
+        return None;
+    }
+    let dest_base = worktree.current_root.join(".lnx");
+    if same_path(&source_base, &dest_base) || dest_base.join("instances").join(instance).is_dir() {
+        return None;
+    }
+    Some(WorktreeAutoInitPlan {
+        dest_base,
+        source_base,
+    })
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    let normalize = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    normalize(a) == normalize(b)
 }
 
 fn inspect_instance(layout: &Layout, cpus: u8, memory_mib: u32) -> Result<()> {
@@ -1798,6 +2062,7 @@ fn parse_port(value: &str) -> Result<u16, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn parses_short_forward_spec_as_localhost_to_localhost() {
@@ -1824,6 +2089,81 @@ mod tests {
         assert_eq!(cli.directory, Some(PathBuf::from("/tmp")));
         assert!(cli.command.is_none());
         assert_eq!(cli.guest_command, ["echo", "hi"]);
+    }
+
+    #[test]
+    fn parse_git_worktree_list_detects_linked_worktree() {
+        let output = "\
+worktree /repo/main
+HEAD 1111111111111111111111111111111111111111
+branch refs/heads/main
+
+worktree /repo/feature
+HEAD 2222222222222222222222222222222222222222
+branch refs/heads/feature
+";
+
+        let worktree =
+            parse_git_worktree_list(output, Path::new("/repo/feature")).expect("linked worktree");
+
+        assert_eq!(worktree.main_root, PathBuf::from("/repo/main"));
+        assert_eq!(worktree.current_root, PathBuf::from("/repo/feature"));
+    }
+
+    #[test]
+    fn parse_git_worktree_list_ignores_main_checkout() {
+        let output = "\
+worktree /repo/main
+HEAD 1111111111111111111111111111111111111111
+branch refs/heads/main
+
+worktree /repo/feature
+HEAD 2222222222222222222222222222222222222222
+branch refs/heads/feature
+";
+
+        assert!(parse_git_worktree_list(output, Path::new("/repo/main")).is_none());
+    }
+
+    #[test]
+    fn worktree_auto_init_plan_uses_main_checkout_lnx() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let main = temp.path().join("main");
+        let linked = temp.path().join("linked");
+        fs::create_dir_all(main.join(".lnx")).expect("create source base");
+        fs::create_dir_all(&linked).expect("create linked worktree");
+
+        let plan = worktree_auto_init_plan(
+            &LinkedGitWorktree {
+                main_root: main.clone(),
+                current_root: linked.clone(),
+            },
+            "dev",
+        )
+        .expect("auto init plan");
+
+        assert_eq!(plan.source_base, main.join(".lnx"));
+        assert_eq!(plan.dest_base, linked.join(".lnx"));
+    }
+
+    #[test]
+    fn worktree_auto_init_plan_skips_existing_linked_instance() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let main = temp.path().join("main");
+        let linked = temp.path().join("linked");
+        fs::create_dir_all(main.join(".lnx")).expect("create source base");
+        fs::create_dir_all(linked.join(".lnx/instances/dev")).expect("create dest instance");
+
+        assert!(
+            worktree_auto_init_plan(
+                &LinkedGitWorktree {
+                    main_root: main,
+                    current_root: linked,
+                },
+                "dev",
+            )
+            .is_none()
+        );
     }
 
     #[test]
