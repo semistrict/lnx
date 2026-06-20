@@ -799,10 +799,8 @@ fn run_guest(
     }
     let cwd = std::env::current_dir().context("current directory")?;
 
-    let restore_snapshot = snapshot_path.or_else(|| {
-        let latest = layout.snapshot_dir.join("latest");
-        latest.exists().then_some(latest)
-    });
+    let restore_snapshot =
+        restore_snapshot_for_run(&layout, snapshot_path, explicit_kernel, explicit_rootfs);
 
     let config = runner::RunConfig {
         layout,
@@ -847,6 +845,22 @@ fn ensure_image_and_instance(
         init::ensure_instance(layout).context("auto-init instance")?;
     }
     Ok(())
+}
+
+fn restore_snapshot_for_run(
+    layout: &Layout,
+    snapshot_path: Option<PathBuf>,
+    explicit_kernel: bool,
+    explicit_rootfs: bool,
+) -> Option<PathBuf> {
+    if snapshot_path.is_some() {
+        return snapshot_path;
+    }
+    if explicit_kernel || explicit_rootfs {
+        return None;
+    }
+    let latest = layout.snapshot_dir.join("latest");
+    latest.exists().then_some(latest)
 }
 
 fn ensure_vm_initialized(
@@ -1516,10 +1530,8 @@ fn create_checkpoint(
         runner::request_checkpoint(&broker_socket, &path).context("checkpoint running VM")?;
     } else {
         let cwd = std::env::current_dir().context("current directory")?;
-        let restore_snapshot = snapshot_path.or_else(|| {
-            let latest = layout.snapshot_dir.join("latest");
-            latest.exists().then_some(latest)
-        });
+        let restore_snapshot =
+            restore_snapshot_for_run(&layout, snapshot_path, explicit_kernel, explicit_rootfs);
         runner::seed_checkpoint_from_base(
             &layout,
             &path,
@@ -1628,10 +1640,8 @@ fn create_internal_fork_checkpoint(
         runner::request_checkpoint(&broker_socket, &path).context("checkpoint running VM")?;
     } else {
         let cwd = std::env::current_dir().context("current directory")?;
-        let restore_snapshot = snapshot_path.or_else(|| {
-            let latest = layout.snapshot_dir.join("latest");
-            latest.exists().then_some(latest)
-        });
+        let restore_snapshot =
+            restore_snapshot_for_run(layout, snapshot_path, explicit_kernel, explicit_rootfs);
         runner::seed_checkpoint_from_base(
             layout,
             &path,
@@ -1740,6 +1750,42 @@ mod tests {
     }
 
     #[test]
+    fn restore_snapshot_uses_latest_by_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = test_layout(temp.path());
+        let latest = layout.snapshot_dir.join("latest");
+        std::fs::create_dir_all(&latest).expect("create latest snapshot");
+
+        assert_eq!(
+            restore_snapshot_for_run(&layout, None, false, false),
+            Some(latest)
+        );
+    }
+
+    #[test]
+    fn restore_snapshot_skips_latest_for_explicit_image_inputs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = test_layout(temp.path());
+        std::fs::create_dir_all(layout.snapshot_dir.join("latest"))
+            .expect("create latest snapshot");
+
+        assert_eq!(restore_snapshot_for_run(&layout, None, true, false), None);
+        assert_eq!(restore_snapshot_for_run(&layout, None, false, true), None);
+    }
+
+    #[test]
+    fn restore_snapshot_preserves_explicit_snapshot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = test_layout(temp.path());
+        let snapshot = temp.path().join("requested-snapshot");
+
+        assert_eq!(
+            restore_snapshot_for_run(&layout, Some(snapshot.clone()), true, true),
+            Some(snapshot)
+        );
+    }
+
+    #[test]
     fn nested_deterministic_inner_args_preserve_requested_run() {
         let layout = Layout {
             base: PathBuf::from("/Users/test/.lnx"),
@@ -1833,6 +1879,21 @@ mod tests {
             "-m".to_string(),
             "deterministic-base".to_string(),
         ]));
+    }
+
+    fn test_layout(base: &Path) -> Layout {
+        Layout {
+            base: base.to_path_buf(),
+            instance: "dev".to_string(),
+            kernel: base.join("vmlinuz"),
+            rootfs: base.join("instances/dev/rootfs.ext4"),
+            instance_dir: base.join("instances/dev"),
+            snapshot_dir: base.join("instances/dev/memory-snapshots"),
+            checkpoint_dir: base.join("instances/dev/checkpoints"),
+            vm_initialized: base.join("instances/dev/vm-initialized"),
+            run_dir: base.join("instances/dev"),
+            console_log: base.join("instances/dev/console.log"),
+        }
     }
 
     #[test]
