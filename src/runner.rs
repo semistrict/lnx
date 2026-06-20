@@ -47,7 +47,7 @@ const DEFAULT_OWNER_IDLE_TTL: Duration = Duration::from_secs(5);
 // that spawned it ever connects.
 const MIN_OWNER_IDLE_TTL: Duration = Duration::from_millis(250);
 const OWNER_BOOT_TIMEOUT: Duration = Duration::from_secs(120);
-const FORWARD_OWNER_SLOT_TIMEOUT: Duration = Duration::from_secs(30);
+const FRESH_OWNER_SLOT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_AGENT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(90);
 const ROOTFS_BACKEND_ENV: &str = "LNX_ROOTFS_BACKEND";
 const RESTORE_ENTROPY_BYTES: usize = 64;
@@ -153,7 +153,14 @@ pub fn run(config: RunConfig) -> Result<i32> {
         config.layout.run_dir.join("gvproxy.log").display()
     ));
     let broker_socket = config.layout.run_dir.join("broker.sock");
-    if config.forwards.is_empty() {
+    let no_daemon_reuse = debug_flag_enabled("nodaemonreuse");
+    if no_daemon_reuse {
+        run_log.line("debug.nodaemonreuse enabled");
+        eprintln!(
+            "debug[nodaemonreuse]: daemon reuse disabled; this command will start a fresh VM owner and will not keep it running for reuse."
+        );
+    }
+    if config.forwards.is_empty() && !no_daemon_reuse {
         if broker_socket.exists() {
             validate_runtime_deterministic_compatibility(
                 &config.layout,
@@ -173,7 +180,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
             return Ok(status);
         }
     } else {
-        wait_for_forward_owner_slot(&config.layout, &run_log)?;
+        wait_for_fresh_owner_slot(&config.layout, &run_log)?;
     }
     if config.snapshot_output.is_some() {
         // Checkpoint and vm-init runs need the snapshot written before they
@@ -228,22 +235,22 @@ pub fn validate_runtime_deterministic_compatibility(
     }
 }
 
-fn wait_for_forward_owner_slot(layout: &Layout, run_log: &RunLog) -> Result<()> {
+fn wait_for_fresh_owner_slot(layout: &Layout, run_log: &RunLog) -> Result<()> {
     let lock_path = layout.run_dir.join("bootstrap.lock.d");
     let start = Instant::now();
     let mut logged_wait = false;
     while lock_path.exists() {
         if !logged_wait {
             run_log.line(format!(
-                "forward.owner_slot.wait lock={} timeout_ms={}",
+                "fresh_owner.slot.wait lock={} timeout_ms={}",
                 lock_path.display(),
-                FORWARD_OWNER_SLOT_TIMEOUT.as_millis()
+                FRESH_OWNER_SLOT_TIMEOUT.as_millis()
             ));
             logged_wait = true;
         }
-        if start.elapsed() > FORWARD_OWNER_SLOT_TIMEOUT {
+        if start.elapsed() > FRESH_OWNER_SLOT_TIMEOUT {
             bail!(
-                "--forward requires starting a fresh VM owner, but an existing owner is still running for instance {}; wait for it to checkpoint and exit before retrying",
+                "starting a fresh VM owner requires exclusive ownership, but an existing owner is still running for instance {}; wait for it to checkpoint and exit before retrying",
                 layout.instance
             );
         }
@@ -262,7 +269,7 @@ fn acquire_bootstrap_for_forward(lock_path: &Path, run_log: &RunLog) -> Result<B
             Ok(lock)
         }
         None => bail!(
-            "--forward requires starting a fresh VM owner, but another owner started for this instance"
+            "starting a fresh VM owner requires exclusive ownership, but another owner started for this instance"
         ),
     }
 }
@@ -307,7 +314,7 @@ pub fn run_owner(config: RunConfig) -> Result<()> {
 
     let idle = IdlePolicy {
         ttl: owner_idle_ttl(),
-        starts_idle: true,
+        starts_idle: !debug_flag_enabled("nodaemonreuse"),
     };
     let vm = match start_vm(&config, &run_log, &broker_socket, idle) {
         Ok(vm) => vm,
@@ -339,6 +346,7 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
             config.run_as_root,
             config.no_host_shares,
             config.deterministic.as_ref(),
+            debug_flag_enabled("nodaemonreuse"),
             &run_log,
         )? {
             BootstrapOutcome::Lock(lock) => lock,
@@ -347,7 +355,7 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
     } else {
         acquire_bootstrap_for_forward(&lock_path, &run_log)?
     };
-    if config.forwards.is_empty() {
+    if config.forwards.is_empty() && !debug_flag_enabled("nodaemonreuse") {
         if let Some(status) = run_existing_broker_client(
             &broker_socket,
             &config.command,
@@ -606,14 +614,34 @@ fn start_vm(
     let requested_restore_snapshot = config.restore_snapshot.clone();
     let initramfs_stamp = config.layout.run_dir.join("initramfs.stamp");
     let mut network = start_network(&config, &run_log, &timings)?;
-    let host_home = host_home_for_cwd(&config.cwd)?;
-    let outside_home_cwd = (!config.cwd.starts_with(&host_home)).then(|| config.cwd.clone());
-    let shares_stamp = shares_stamp_content(
-        &host_home,
-        outside_home_cwd.as_deref(),
+    let current_host_home = host_home_for_cwd(&config.cwd)?;
+    let current_outside_home_cwd =
+        (!config.cwd.starts_with(&current_host_home)).then(|| config.cwd.clone());
+    let current_shares_stamp = shares_stamp_content(
+        &current_host_home,
+        current_outside_home_cwd.as_deref(),
         &network.stamp_line(),
         config.no_host_shares,
     );
+    let mut share_layout = ShareLayout {
+        host_home: current_host_home,
+        outside_home_cwd: current_outside_home_cwd,
+        no_host_shares: config.no_host_shares,
+    };
+    let mut shares_stamp = current_shares_stamp.clone();
+    if let Some(snapshot) = &config.restore_snapshot {
+        if let Some(snapshot_share_layout) = snapshot_share_layout(snapshot)? {
+            if shares_stamps_match_ignoring_cwd(&snapshot_share_layout.stamp, &current_shares_stamp)
+            {
+                run_log.line(format!(
+                    "snapshot.shares.restore_layout path={}",
+                    snapshot.join("shares.stamp").display()
+                ));
+                shares_stamp = snapshot_share_layout.stamp;
+                share_layout = snapshot_share_layout.layout;
+            }
+        }
+    }
     let shares_stamp_path = config.layout.run_dir.join("shares.stamp");
     fs::write(&shares_stamp_path, &shares_stamp)
         .with_context(|| format!("write {}", shares_stamp_path.display()))?;
@@ -682,10 +710,11 @@ fn start_vm(
     }
     let restore_snapshot = if let Some(snapshot) = &config.restore_snapshot {
         if !snapshot_initramfs_is_compatible(snapshot, &initramfs_stamp) {
-            bail!(
-                "snapshot initramfs stamp does not match the current lnx agent: {}",
-                snapshot.join("initramfs.stamp").display()
-            );
+            run_log.line(format!(
+                "snapshot.initramfs_stamp_mismatch ignored snapshot={} current={}",
+                snapshot.join("initramfs.stamp").display(),
+                initramfs_stamp.display()
+            ));
         }
         if let Some(reason) = snapshot_shares_incompatibility(snapshot, &shares_stamp) {
             bail!(
@@ -773,20 +802,27 @@ fn start_vm(
             "/dev/vda"
         }
     };
-    let (guest_home, guest_cwd) = if config.no_host_shares {
+    let (guest_home, guest_cwd) = if share_layout.no_host_shares {
         (String::new(), String::new())
     } else {
-        (guest_home(&host_home), guest_cwd(&config.cwd, &host_home))
+        (
+            guest_home(&share_layout.host_home),
+            share_layout
+                .outside_home_cwd
+                .as_deref()
+                .map(|cwd| guest_cwd(cwd, &share_layout.host_home))
+                .unwrap_or_default(),
+        )
     };
-    if config.no_host_shares {
+    if share_layout.no_host_shares {
         run_log.line("host_shares.disabled");
     } else {
         ctx.add_host_virtiofs(
             "home",
-            &host_home,
-            &home_write_allowlist(&config.cwd, &host_home),
+            &share_layout.host_home,
+            &home_write_allowlist(&config.cwd, &share_layout.host_home),
         )?;
-        if let Some(cwd) = &outside_home_cwd {
+        if let Some(cwd) = &share_layout.outside_home_cwd {
             ctx.add_host_virtiofs("cwd", cwd, &cwd_write_allowlist())?;
         }
     }
@@ -843,9 +879,10 @@ fn start_vm(
             format!("LNX_NET_IP={net_ip}"),
             format!("LNX_NET_GATEWAY={net_gateway}"),
             format!("LNX_VIRTIOFS_HOME={guest_home}"),
-            outside_home_cwd
+            share_layout
+                .outside_home_cwd
                 .as_ref()
-                .filter(|_| !config.no_host_shares)
+                .filter(|_| !share_layout.no_host_shares)
                 .map(|_| format!("LNX_VIRTIOFS_CWD={guest_cwd}"))
                 .unwrap_or_else(|| "LNX_VIRTIOFS_CWD=".to_string()),
         ],
@@ -891,8 +928,8 @@ fn start_vm(
         initramfs_stamp,
         restore_snapshot,
         config.forwards.clone(),
-        host_home,
-        config.no_host_shares,
+        share_layout.host_home.clone(),
+        share_layout.no_host_shares,
         config.deterministic.clone(),
         idle,
         Arc::clone(&timings),
@@ -1593,6 +1630,18 @@ fn snapshot_initramfs_is_compatible(snapshot_path: &Path, current_stamp: &Path) 
 const HOST_SHARE_CACHE_STAMP: &str = "host-share-cache=dax+keep-cache+writeback+restore-sync-v1";
 const HOST_SHARES_DISABLED_STAMP: &str = "host-shares=disabled-v1";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShareLayout {
+    host_home: PathBuf,
+    outside_home_cwd: Option<PathBuf>,
+    no_host_shares: bool,
+}
+
+struct SnapshotShareLayout {
+    stamp: String,
+    layout: ShareLayout,
+}
+
 // A restored guest keeps its snapshot-time share mounts, network
 // configuration, and kernel-side virtiofs caches. A snapshot is only valid for
 // the same host share roots, network backing, and host-share cache policy: a
@@ -1659,6 +1708,7 @@ fn snapshot_shares_incompatibility(snapshot_path: &Path, current: &str) -> Optio
         {
             Some("host_share_cache_policy: snapshot was created before host-share cache policy was recorded".to_string())
         }
+        Ok(stamp) if shares_stamps_match_ignoring_cwd(&stamp, current) => None,
         Ok(stamp) => Some(describe_shares_stamp_mismatch(&stamp, current)),
         // Missing stamps predate the host-share cache-policy stamp. Do not
         // memory-restore them: the guest may hold stale page-cache, inode-size,
@@ -1694,7 +1744,7 @@ fn describe_shares_stamp_mismatch(snapshot: &str, current: &str) -> String {
         ));
     }
 
-    for key in ["host-share-cache", "home", "cwd", "net"] {
+    for key in ["host-share-cache", "home", "net"] {
         let snapshot_value = snapshot_fields
             .get(key)
             .map(String::as_str)
@@ -1715,6 +1765,38 @@ fn describe_shares_stamp_mismatch(snapshot: &str, current: &str) -> String {
     } else {
         format!("share_mismatch: {}", mismatches.join("; "))
     }
+}
+
+fn shares_stamps_match_ignoring_cwd(snapshot: &str, current: &str) -> bool {
+    parse_shares_stamp(snapshot)
+        .into_iter()
+        .filter(|(key, _)| key != "cwd")
+        .collect::<BTreeMap<_, _>>()
+        == parse_shares_stamp(current)
+            .into_iter()
+            .filter(|(key, _)| key != "cwd")
+            .collect::<BTreeMap<_, _>>()
+}
+
+fn snapshot_share_layout(snapshot_path: &Path) -> Result<Option<SnapshotShareLayout>> {
+    let path = snapshot_path.join("shares.stamp");
+    let stamp = match fs::read_to_string(&path) {
+        Ok(stamp) => stamp,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let fields = parse_shares_stamp(&stamp);
+    let no_host_shares = fields.contains_key("host-shares");
+    let host_home = fields.get("home").map(PathBuf::from).unwrap_or_default();
+    let outside_home_cwd = fields.get("cwd").map(PathBuf::from);
+    Ok(Some(SnapshotShareLayout {
+        stamp,
+        layout: ShareLayout {
+            host_home,
+            outside_home_cwd,
+            no_host_shares,
+        },
+    }))
 }
 
 fn parse_shares_stamp(stamp: &str) -> BTreeMap<String, String> {
@@ -2234,6 +2316,7 @@ fn acquire_bootstrap_or_run_client(
     run_as_root: bool,
     no_host_shares: bool,
     deterministic: Option<&DeterministicConfig>,
+    no_daemon_reuse: bool,
     run_log: &RunLog,
 ) -> Result<BootstrapOutcome> {
     let start = Instant::now();
@@ -2250,16 +2333,18 @@ fn acquire_bootstrap_or_run_client(
             run_log.line(format!("bootstrap.lock.busy path={}", lock_path.display()));
             logged_wait = true;
         }
-        if let Some(status) = run_existing_broker_client(
-            socket,
-            command,
-            cwd,
-            run_as_root,
-            no_host_shares,
-            deterministic,
-            Some(run_log),
-        )? {
-            return Ok(BootstrapOutcome::Status(status));
+        if !no_daemon_reuse {
+            if let Some(status) = run_existing_broker_client(
+                socket,
+                command,
+                cwd,
+                run_as_root,
+                no_host_shares,
+                deterministic,
+                Some(run_log),
+            )? {
+                return Ok(BootstrapOutcome::Status(status));
+            }
         }
         if start.elapsed() > Duration::from_secs(120) {
             run_log.line(format!(
@@ -3137,7 +3222,11 @@ fn broker_idle_ttl_from_env(value: Option<&str>) -> Duration {
 }
 
 fn owner_idle_ttl() -> Duration {
-    owner_idle_ttl_from_env(std::env::var("LNX_BROKER_IDLE_TTL_MS").ok().as_deref())
+    if debug_flag_enabled("nodaemonreuse") {
+        Duration::ZERO
+    } else {
+        owner_idle_ttl_from_env(std::env::var("LNX_BROKER_IDLE_TTL_MS").ok().as_deref())
+    }
 }
 
 fn owner_idle_ttl_from_env(value: Option<&str>) -> Duration {
@@ -3146,6 +3235,18 @@ fn owner_idle_ttl_from_env(value: Option<&str>) -> Duration {
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_OWNER_IDLE_TTL)
         .max(MIN_OWNER_IDLE_TTL)
+}
+
+fn debug_flag_enabled(flag: &str) -> bool {
+    debug_flag_enabled_in(std::env::var("LNX_DEBUG").ok().as_deref(), flag)
+}
+
+fn debug_flag_enabled_in(value: Option<&str>, flag: &str) -> bool {
+    value.is_some_and(|value| {
+        value
+            .split([',', ':', ';', ' ', '\t', '\n'])
+            .any(|part| part == flag)
+    })
 }
 
 fn forward_spec(forward: &PortForward) -> String {
@@ -4682,6 +4783,49 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_shares_compatibility_tolerates_cwd_share_changes() {
+        let temp = TempDir::new("snapshot-shares-cwd");
+        fs::create_dir_all(temp.path()).expect("create snapshot dir");
+        let snapshot = shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", false);
+        let current = shares_stamp_content(
+            Path::new("/Users/ramon"),
+            Some(Path::new("/private/tmp")),
+            "net=gvproxy",
+            false,
+        );
+
+        fs::write(temp.path().join("shares.stamp"), snapshot).expect("write stamp");
+        assert_eq!(snapshot_shares_incompatibility(temp.path(), &current), None);
+    }
+
+    #[test]
+    fn snapshot_share_layout_reads_recorded_share_dirs() {
+        let temp = TempDir::new("snapshot-share-layout");
+        fs::create_dir_all(temp.path()).expect("create snapshot dir");
+        let stamp = shares_stamp_content(
+            Path::new("/Users/ramon"),
+            Some(Path::new("/tmp/build")),
+            "net=gvproxy",
+            false,
+        );
+        fs::write(temp.path().join("shares.stamp"), &stamp).expect("write stamp");
+
+        let layout = snapshot_share_layout(temp.path())
+            .expect("read layout")
+            .expect("layout");
+
+        assert_eq!(layout.stamp, stamp);
+        assert_eq!(
+            layout.layout,
+            ShareLayout {
+                host_home: PathBuf::from("/Users/ramon"),
+                outside_home_cwd: Some(PathBuf::from("/tmp/build")),
+                no_host_shares: false,
+            }
+        );
+    }
+
+    #[test]
     fn snapshot_deterministic_compatibility_requires_matching_mode_and_seed() {
         let temp = TempDir::new("snapshot-deterministic");
         fs::create_dir_all(temp.path()).expect("create snapshot dir");
@@ -5136,6 +5280,23 @@ mod tests {
             owner_idle_ttl_from_env(Some("0")),
             Duration::from_millis(250)
         );
+    }
+
+    #[test]
+    fn debug_flag_parses_nodaemonreuse_token() {
+        assert!(debug_flag_enabled_in(
+            Some("trace,nodaemonreuse;other"),
+            "nodaemonreuse"
+        ));
+        assert!(debug_flag_enabled_in(
+            Some("trace nodaemonreuse"),
+            "nodaemonreuse"
+        ));
+        assert!(!debug_flag_enabled_in(
+            Some("trace-nodaemonreuse"),
+            "nodaemonreuse"
+        ));
+        assert!(!debug_flag_enabled_in(None, "nodaemonreuse"));
     }
 
     #[test]

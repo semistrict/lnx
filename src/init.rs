@@ -21,6 +21,7 @@ const ZERO_SCAN_BLOCK: usize = 16 * 1024 * 1024;
 pub fn run(layout: &Layout, kernel: Option<&Path>, rootfs: Option<&Path>) -> Result<()> {
     eprintln!("init: base {}", layout.base.display());
     create_dir(&layout.base)?;
+    ensure_base_ignored(&layout.base)?;
     let default_rootfs = default_rootfs(layout);
     create_dir(
         default_rootfs
@@ -60,6 +61,7 @@ pub fn run(layout: &Layout, kernel: Option<&Path>, rootfs: Option<&Path>) -> Res
 }
 
 pub fn ensure_instance(layout: &Layout) -> Result<()> {
+    ensure_base_ignored(&layout.base)?;
     create_dir(&layout.instance_dir)?;
     create_dir(
         layout
@@ -81,6 +83,15 @@ pub fn ensure_instance(layout: &Layout) -> Result<()> {
         layout.rootfs.display()
     );
     clone_or_copy(&default_rootfs, &layout.rootfs)
+}
+
+pub fn ensure_base_ignored(base: &Path) -> Result<()> {
+    fs::create_dir_all(base).with_context(|| format!("create {}", base.display()))?;
+    let ignore = base.join(".gitignore");
+    if ignore.exists() {
+        return Ok(());
+    }
+    fs::write(&ignore, "*\n").with_context(|| format!("write {}", ignore.display()))
 }
 
 pub fn ensure_kernel(layout: &Layout) -> Result<()> {

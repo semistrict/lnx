@@ -17,6 +17,9 @@ const DEFAULT_MEMORY_MIB: u32 = 4096;
 #[derive(Debug, Parser)]
 #[command(name = "lnx", about = "Linux VM runner using Rust and libkrun")]
 pub struct Cli {
+    #[arg(short = 'C', value_name = "DIR", help = "Run as if started in DIR")]
+    directory: Option<PathBuf>,
+
     #[arg(long, env = "LNX_INSTANCE", default_value = "default")]
     instance: String,
 
@@ -274,6 +277,7 @@ struct HiddenIngressArgs {
 impl Cli {
     pub fn run(self) -> Result<()> {
         let Cli {
+            directory,
             instance,
             kernel,
             rootfs,
@@ -290,6 +294,11 @@ impl Cli {
             guest_command,
         } = self;
 
+        if let Some(directory) = directory {
+            std::env::set_current_dir(&directory)
+                .with_context(|| format!("change directory to {}", directory.display()))?;
+        }
+
         let explicit_kernel = kernel.is_some();
         let explicit_rootfs = rootfs.is_some();
         let layout = Layout::resolve(&instance, kernel, rootfs)?;
@@ -305,6 +314,26 @@ impl Cli {
         match command {
             Some(Command::Init(args)) => match args.image {
                 Some(image) => crate::oci::import_image(&layout, &image, args.kernel.as_deref()),
+                None if should_init_local_fork(
+                    args.kernel.as_ref(),
+                    args.rootfs.as_ref(),
+                    explicit_kernel,
+                    explicit_rootfs,
+                ) =>
+                {
+                    init_local_fork(
+                        &instance,
+                        cpus,
+                        memory_mib,
+                        snapshot_path,
+                        forwards,
+                        explicit_kernel,
+                        explicit_rootfs,
+                        effective_no_host_shares,
+                        deterministic.clone(),
+                        trace_events,
+                    )
+                }
                 None => init::run(&layout, args.kernel.as_deref(), args.rootfs.as_deref()),
             },
             Some(Command::Run(args)) => {
@@ -570,6 +599,75 @@ fn set_instance_settings(layout: &Layout, settings: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn should_init_local_fork(
+    init_kernel: Option<&PathBuf>,
+    init_rootfs: Option<&PathBuf>,
+    explicit_kernel: bool,
+    explicit_rootfs: bool,
+) -> bool {
+    init_kernel.is_none()
+        && init_rootfs.is_none()
+        && !explicit_kernel
+        && !explicit_rootfs
+        && std::env::var_os("LNX_BASE").is_none()
+}
+
+fn init_local_fork(
+    instance: &str,
+    cpus: u8,
+    memory_mib: u32,
+    snapshot_path: Option<PathBuf>,
+    forwards: Vec<runner::PortForward>,
+    explicit_kernel: bool,
+    explicit_rootfs: bool,
+    no_host_shares: bool,
+    deterministic: Option<runner::DeterministicConfig>,
+    trace_events: bool,
+) -> Result<()> {
+    let dest_base = Layout::current_dir_base()?;
+    let dest = Layout::resolve_in_base(instance, dest_base, None, None);
+    init::ensure_base_ignored(&dest.base)?;
+    match Layout::find_instance_base(instance)? {
+        Some(source_base) => {
+            let source = Layout::resolve_in_base(instance, source_base, None, None);
+            if source.base == dest.base {
+                bail!(
+                    "local instance already exists: {}",
+                    dest.instance_dir.display()
+                );
+            }
+            let checkpoint = create_internal_fork_checkpoint(
+                &source,
+                cpus,
+                memory_mib,
+                snapshot_path,
+                forwards,
+                explicit_kernel,
+                explicit_rootfs,
+                no_host_shares,
+                deterministic,
+                trace_events,
+            )?;
+            checkpoints::fork(&source, &checkpoint, &dest)?;
+        }
+        None => {
+            init::run(&dest, None, None)?;
+            init::ensure_instance(&dest)?;
+            initialize_vm_instance(
+                dest.clone(),
+                cpus,
+                memory_mib,
+                false,
+                no_host_shares,
+                deterministic,
+                trace_events,
+            )?;
+        }
+    }
+    eprintln!("init: local base {}", dest.base.display());
+    Ok(())
+}
+
 fn inspect_instance(layout: &Layout, cpus: u8, memory_mib: u32) -> Result<()> {
     let config = descriptor::load(layout)?;
     let latest_snapshot = layout.snapshot_dir.join("latest");
@@ -642,7 +740,7 @@ fn list_instances(base: &Path) -> Result<()> {
     let mut instances = names
         .into_iter()
         .map(|name| {
-            let layout = Layout::resolve(&name, None, None)?;
+            let layout = Layout::resolve_in_base(&name, base.to_path_buf(), None, None);
             let state = instance_state(&layout);
             let pids = instance_pids(&layout).join(",");
             Ok(InstanceRow { name, state, pids })
@@ -1611,7 +1709,8 @@ fn fork_checkpoint(
             trace_events,
         )?,
     };
-    let dest = Layout::resolve(instance, None, None)?;
+    let dest = Layout::resolve_in_base(instance, source.base.clone(), None, None);
+    init::ensure_base_ignored(&dest.base)?;
     checkpoints::fork(&source, &checkpoint, &dest)?;
     println!("{instance}");
     Ok(())
@@ -1716,6 +1815,15 @@ mod tests {
         assert_eq!(forward.listen_port, 18080);
         assert_eq!(forward.guest_host, "localhost");
         assert_eq!(forward.guest_port, 8080);
+    }
+
+    #[test]
+    fn parses_directory_before_guest_command() {
+        let cli = Cli::try_parse_from(["lnx", "-C", "/tmp", "echo", "hi"]).expect("parse");
+
+        assert_eq!(cli.directory, Some(PathBuf::from("/tmp")));
+        assert!(cli.command.is_none());
+        assert_eq!(cli.guest_command, ["echo", "hi"]);
     }
 
     #[test]

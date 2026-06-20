@@ -39,7 +39,7 @@ pub fn import_image(layout: &Layout, reference: &str, kernel: Option<&Path>) -> 
             bail!("image has no layers");
         }
         let builder_instance = format!("{}-oci-builder", layout.instance);
-        build_rootfs_with_instance(&staging, &builder_instance)?;
+        build_rootfs_with_instance(&staging, &builder_instance, Some(&layout.base))?;
         publish_rootfs(layout, &staging, reference)
     })();
     let _ = fs::remove_dir_all(&staging);
@@ -299,19 +299,29 @@ echo BUILD_OK
 pub fn build_rootfs(staging: &Path) -> Result<()> {
     let builder_instance = std::env::var("LNX_OCI_BUILDER_INSTANCE")
         .unwrap_or_else(|_| format!("oci-builder-{}", std::process::id()));
-    build_rootfs_with_instance(staging, &builder_instance)
+    build_rootfs_with_instance(staging, &builder_instance, None)
 }
 
-fn build_rootfs_with_instance(staging: &Path, builder_instance: &str) -> Result<()> {
+fn build_rootfs_with_instance(
+    staging: &Path,
+    builder_instance: &str,
+    base: Option<&Path>,
+) -> Result<()> {
     eprintln!("oci: building rootfs in builder VM {builder_instance}");
     let exe = std::env::current_exe().context("current executable")?;
-    let builder_layout = Layout::resolve(builder_instance, None, None)
-        .with_context(|| format!("resolve builder instance {builder_instance}"))?;
+    let builder_layout = match base {
+        Some(base) => Layout::resolve_in_base(builder_instance, base.to_path_buf(), None, None),
+        None => Layout::resolve(builder_instance, None, None)
+            .with_context(|| format!("resolve builder instance {builder_instance}"))?,
+    };
     cleanup_builder_instance(&builder_layout);
     // Only root can preserve ownership and device nodes while unpacking.
-    let output = Command::new(exe)
-        .arg("--instance")
-        .arg(builder_instance)
+    let mut command = Command::new(exe);
+    command.arg("--instance").arg(builder_instance);
+    if let Some(base) = base {
+        command.env("LNX_BASE", base);
+    }
+    let output = command
         .arg("--root")
         .arg("bash")
         .arg("-lc")
