@@ -142,6 +142,15 @@ impl Fs {
         true
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn set_unshare_dir(&mut self, path: PathBuf) -> bool {
+        let Some(cfg) = self.passthrough_cfg.as_mut() else {
+            return false;
+        };
+        cfg.unshare_dir = Some(path);
+        true
+    }
+
     pub fn set_shm_region(&mut self, shm_region: VirtioShmRegion) {
         self.shm_region = Some(shm_region);
     }

@@ -60,6 +60,14 @@ When adding or changing any instance fork or clone behavior:
   matching Apple's `HV_DENIED`.
 - Treat `HV_DENIED` as an entitlement/signing failure first, not as VM count or
   memory pressure.
+- On macOS, do not run raw `cargo test --workspace` for HVF-capable tests. Use
+  `bun run test`, or set
+  `CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="bun $PWD/scripts/test/codesign-runner.ts"`
+  when invoking Cargo directly, so test binaries are signed with
+  `com.apple.security.hypervisor`.
+- If a workspace test fails with `VmCreate`/`HV_DENIED` but passes through the
+  signing runner, treat the raw Cargo invocation as the problem rather than a
+  code regression.
 - If this appears after rebuilding or reinstalling the CLI, debug the installed
   binary's signature before chasing snapshot, ext4, or device-topology problems.
 - After `cargo install`, verify the installed binary still has

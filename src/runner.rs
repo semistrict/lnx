@@ -842,9 +842,15 @@ fn start_vm(
             "home",
             &share_layout.host_home,
             &home_write_allowlist(&config.cwd, &share_layout.host_home),
+            &host_share_unshare_dir(&config.layout, "home"),
         )?;
         if let Some(cwd) = &share_layout.outside_home_cwd {
-            ctx.add_host_virtiofs("cwd", cwd, &cwd_write_allowlist())?;
+            ctx.add_host_virtiofs(
+                "cwd",
+                cwd,
+                &cwd_write_allowlist(),
+                &host_share_unshare_dir(&config.layout, "cwd"),
+            )?;
         }
     }
     let mut kernel_cmdline =
@@ -950,6 +956,7 @@ fn start_vm(
         && requested_restore_snapshot.as_deref() == Some(latest_snapshot.as_path());
     let owner = run_broker_owner(
         listener,
+        config.layout.clone(),
         config.layout.console_log.clone(),
         Arc::clone(&ctx),
         snapshot_output,
@@ -2824,6 +2831,7 @@ fn run_broker_client_retry(
 
 fn run_broker_owner(
     listener: UnixListener,
+    layout: Layout,
     console_log: PathBuf,
     ctx: Arc<KrunContext>,
     snapshot_path: PathBuf,
@@ -3147,6 +3155,7 @@ fn run_broker_owner(
                                 &initramfs_stamp,
                                 trace_log.as_deref(),
                             )?;
+                            copy_host_share_state_to_snapshot(&layout, &request.path)?;
                             owner_log.line(format!(
                                 "checkpoint.stamp.done path={}",
                                 request.path.display()
@@ -3180,6 +3189,7 @@ fn run_broker_owner(
                             &initramfs_stamp,
                             trace_log.as_deref(),
                         )
+                        .and_then(|()| copy_host_share_state_to_snapshot(&layout, &snapshot_path))
                         .and_then(|()| {
                             if promote_rootfs_after_snapshot {
                                 promote_snapshot_rootfs(
@@ -3276,6 +3286,7 @@ fn run_broker_owner(
             &snapshot_path,
             &rootfs,
             &initramfs_stamp,
+            &layout,
             trace_log.as_deref(),
             force_full_snapshot,
             promote_rootfs_after_snapshot.then_some(canonical_rootfs.as_path()),
@@ -4460,6 +4471,14 @@ fn cwd_write_allowlist() -> Vec<String> {
     vec![".".to_string()]
 }
 
+fn host_share_unshare_dir(layout: &Layout, tag: &str) -> PathBuf {
+    host_share_state_root(layout).join(tag)
+}
+
+fn host_share_state_root(layout: &Layout) -> PathBuf {
+    layout.instance_dir.join("host-share-state")
+}
+
 #[cfg(target_os = "macos")]
 fn set_home_write_allowlist(ctx: &KrunContext, cwd: &Path, host_home: &Path) -> Result<()> {
     ctx.set_host_virtiofs_write_allowlist("home", &home_write_allowlist(cwd, host_home))
@@ -4476,6 +4495,7 @@ fn serve_snapshot(
     snapshot_path: &Path,
     rootfs: &Path,
     initramfs_stamp: &Path,
+    layout: &Layout,
     trace_log: Option<&TraceLog>,
     force_full: bool,
     promote_rootfs_to: Option<&Path>,
@@ -4538,6 +4558,7 @@ fn serve_snapshot(
         }
         copy_snapshot_stamp(snapshot_path, initramfs_stamp, trace_log)?;
     }
+    copy_host_share_state_to_snapshot(layout, snapshot_path)?;
     if let Some(canonical_rootfs) = promote_rootfs_to {
         promote_snapshot_rootfs(snapshot_path, canonical_rootfs, timings, run_log)?;
     }
@@ -4740,6 +4761,40 @@ fn copy_snapshot_stamp(
             .with_context(|| format!("copy {} to {}", stamp.display(), target.display()))?;
     }
     Ok(())
+}
+
+fn copy_host_share_state_to_snapshot(layout: &Layout, snapshot_path: &Path) -> Result<()> {
+    let source = host_share_state_root(layout);
+    if !source.exists() {
+        return Ok(());
+    }
+    let target = snapshot_path.join("host-share-state");
+    remove_path_if_exists(&target)?;
+    clone_or_copy_tree(&source, &target)
+}
+
+fn clone_or_copy_tree(source: &Path, target: &Path) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(source).with_context(|| format!("stat {}", source.display()))?;
+    if metadata.is_dir() {
+        fs::create_dir_all(target).with_context(|| format!("create {}", target.display()))?;
+        for entry in fs::read_dir(source).with_context(|| format!("read {}", source.display()))? {
+            let entry = entry.with_context(|| format!("read {}", source.display()))?;
+            clone_or_copy_tree(&entry.path(), &target.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    if metadata.file_type().is_symlink() {
+        let link =
+            fs::read_link(source).with_context(|| format!("readlink {}", source.display()))?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::os::unix::fs::symlink(&link, target)
+            .with_context(|| format!("symlink {} to {}", link.display(), target.display()))?;
+        return Ok(());
+    }
+    clone_or_copy_file(source, target)
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<()> {

@@ -99,6 +99,15 @@ fn fork_clones_checkpoint_files_to_destination_layout() {
     fs::write(checkpoint.path.join("vmstate.bin"), b"vmstate").expect("vmstate");
     fs::write(checkpoint.path.join("pages.img"), b"pages").expect("pages");
     fs::write(checkpoint.path.join("initramfs.stamp"), b"stamp").expect("stamp");
+    fs::create_dir_all(checkpoint.path.join("host-share-state/home/upper/src/app"))
+        .expect("create host-share state");
+    fs::write(
+        checkpoint
+            .path
+            .join("host-share-state/home/upper/src/app/.wrangler-state"),
+        b"worker state",
+    )
+    .expect("write host-share state");
     write_metadata(&source, &checkpoint).expect("metadata");
 
     fork(&source, &checkpoint, &dest).expect("fork");
@@ -121,6 +130,14 @@ fn fork_clones_checkpoint_files_to_destination_layout() {
     assert_eq!(
         fs::read(&dest.vm_initialized).expect("read initialized marker"),
         b"1\n"
+    );
+    assert_eq!(
+        fs::read(
+            dest.instance_dir
+                .join("host-share-state/home/upper/src/app/.wrangler-state")
+        )
+        .expect("read host-share state"),
+        b"worker state"
     );
 }
 

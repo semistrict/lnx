@@ -96,7 +96,6 @@ use vm_memory::Address;
 use vm_memory::Bytes;
 #[cfg(all(feature = "vhost-user", target_os = "linux"))]
 use vm_memory::FileOffset;
-#[cfg(not(target_os = "macos"))]
 use vm_memory::GuestMemory;
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
 use vm_memory::GuestRegionMmap;
@@ -2393,6 +2392,10 @@ fn attach_fs_devices(
         if let Some(allowlist) = &config.write_allowlist {
             fs.lock().unwrap().enable_write_allowlist(allowlist.clone());
         }
+        #[cfg(target_os = "macos")]
+        if let Some(unshare_dir) = &config.unshare_dir {
+            fs.lock().unwrap().set_unshare_dir(unshare_dir.clone());
+        }
 
         let id = format!("{}{}", String::from(fs.lock().unwrap().id()), i);
 
@@ -2748,6 +2751,13 @@ fn attach_pmem_devices(
             )
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("pmem: {e}")))?,
         ));
+        // Record the host base of the device's DAX mapping so guest FLUSH (and
+        // the pre-snapshot device pause) can msync(MS_SYNC) it before fsync.
+        let host_addr = vmm
+            .guest_memory
+            .get_host_address(GuestAddress(region.guest_addr))
+            .map_err(StartMicrovmError::ShmHostAddr)? as u64;
+        pmem.lock().unwrap().set_host_addr(host_addr);
         event_manager
             .add_subscriber(pmem.clone())
             .map_err(RegisterEvent)?;

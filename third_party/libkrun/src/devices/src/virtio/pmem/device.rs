@@ -62,8 +62,44 @@ impl Pmem {
         &self.id
     }
 
-    fn flush(&self) -> io::Result<()> {
+    /// Records the host virtual address of this device's DAX mapping so
+    /// [`Self::flush_mapping`] can `msync(MS_SYNC)` it. Wired up once after
+    /// guest memory is built (see `attach_pmem_devices`).
+    pub fn set_host_addr(&mut self, host_addr: u64) {
+        self.shm_region.host_addr = host_addr;
+    }
+
+    /// Makes all guest DAX writes durable on the backing file.
+    ///
+    /// The guest writes into the pmem window directly through the
+    /// `mmap(MAP_SHARED)` DAX mapping created in `build_pmem_regions`. `fsync`
+    /// alone does **not** flush pages dirtied purely by CPU stores through that
+    /// mapping — the dirty state lives in the page tables, not the file's
+    /// writeback set — so POSIX requires an explicit `msync(MS_SYNC)` over the
+    /// mapped range before the `fsync`. `host_addr` is the page-aligned mmap
+    /// base and `size` the mapped length.
+    fn flush_mapping(&self) -> io::Result<()> {
+        let host_addr = self.shm_region.host_addr;
+        if host_addr != 0 {
+            // SAFETY: `host_addr`/`size` describe this device's live DAX
+            // mapping, established from its guest memory region at build time;
+            // `host_addr` is the page-aligned mmap base and `size` its length.
+            let ret = unsafe {
+                libc::msync(
+                    host_addr as *mut libc::c_void,
+                    self.shm_region.size,
+                    libc::MS_SYNC,
+                )
+            };
+            if ret != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
         self.file.sync_all()
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        self.flush_mapping()
     }
 
     pub fn process_req(&mut self) -> bool {
@@ -216,6 +252,12 @@ impl VirtioDevice for Pmem {
     }
 
     fn pause(&mut self) -> Result<(), DeviceSnapshotError> {
+        // The snapshot orchestrator pauses every device before its paused hook
+        // clones the backing rootfs. Flush guest DAX writes here so the clone
+        // captures a coherent, fully-synced image — the host half of the
+        // AGENTS.md pause+flush contract.
+        self.flush_mapping()
+            .map_err(|e| DeviceSnapshotError::Invalid(format!("pmem flush before pause: {e}")))?;
         Ok(())
     }
 
@@ -263,4 +305,93 @@ impl VirtioDevice for Pmem {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PmemSnapshotBody {
     acked_features: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("lnx-pmem-{tag}-{}.bin", std::process::id()))
+    }
+
+    fn make_backing_file(path: &Path, len: u64) {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.set_len(len).unwrap();
+    }
+
+    /// `flush` must `msync(MS_SYNC)` the wired DAX mapping and `fsync` the file
+    /// without error, and bytes dirtied purely through CPU stores on the
+    /// `MAP_SHARED` mapping must be readable through an independent descriptor.
+    /// This guards the `host_addr`/size wiring (a bad base or length makes
+    /// `msync` fail with `EINVAL`).
+    #[test]
+    fn flush_syncs_mmap_dirtied_pages() {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let path = temp_path("flush");
+        make_backing_file(&path, page as u64);
+
+        // Map the file shared exactly as `build_pmem_regions` does for the guest.
+        let map_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let host_addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                map_file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(host_addr, libc::MAP_FAILED, "mmap failed");
+
+        let mut pmem = Pmem::new("test".to_string(), &path, 0, page as u64).unwrap();
+        pmem.set_host_addr(host_addr as u64);
+
+        // Dirty the mapping through CPU stores — the DAX write path.
+        let pattern = b"pmem-msync-durability";
+        unsafe {
+            std::ptr::copy_nonoverlapping(pattern.as_ptr(), host_addr as *mut u8, pattern.len());
+        }
+
+        pmem.flush()
+            .expect("flush must msync + fsync without error");
+
+        let mut observed = Vec::new();
+        File::open(&path)
+            .unwrap()
+            .read_to_end(&mut observed)
+            .unwrap();
+        assert_eq!(&observed[..pattern.len()], pattern);
+
+        unsafe {
+            libc::munmap(host_addr, page);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A device whose mapping was never wired (`host_addr == 0`) must still
+    /// `fsync` and must not call `msync` with a null base.
+    #[test]
+    fn flush_without_mapping_falls_back_to_fsync() {
+        let path = temp_path("nomap");
+        make_backing_file(&path, 4096);
+        let pmem = Pmem::new("test".to_string(), &path, 0, 4096).unwrap();
+        assert_eq!(pmem.shm_region.host_addr, 0);
+        pmem.flush()
+            .expect("flush should fsync even without a mapping");
+        let _ = std::fs::remove_file(&path);
+    }
 }

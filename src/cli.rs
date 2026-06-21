@@ -93,6 +93,7 @@ enum Command {
     Checkpoint(CheckpointArgs),
     Checkpoints,
     Fork(ForkArgs),
+    Fs(FsArgs),
     Server(ServerArgs),
     Ingress(IngressArgs),
     Instances(InstancesArgs),
@@ -177,6 +178,34 @@ struct ForkArgs {
     checkpoint: Option<String>,
 
     instance: String,
+}
+
+#[derive(Debug, Args)]
+struct FsArgs {
+    #[command(subcommand)]
+    command: FsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum FsCommand {
+    #[command(about = "Inspect or clear host-share copy-on-write state")]
+    Unshare(FsUnshareArgs),
+}
+
+#[derive(Debug, Args)]
+struct FsUnshareArgs {
+    #[arg(long, conflicts_with = "path", help = "List copy-on-write paths")]
+    list: bool,
+
+    #[arg(
+        long,
+        conflicts_with = "list",
+        help = "Remove PATH's copy-on-write state"
+    )]
+    remove: bool,
+
+    #[arg(value_name = "PATH", required_unless_present = "list")]
+    path: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -493,6 +522,9 @@ impl Cli {
                     )
                 }
             }
+            Some(Command::Fs(args)) => match args.command {
+                FsCommand::Unshare(unshare) => run_fs_unshare(&layout, unshare),
+            },
             Some(Command::Server(args)) => match args.command {
                 Some(ServerCommand::Push(push)) => crate::server::push(crate::server::PushConfig {
                     source: layout,
@@ -1312,6 +1344,80 @@ fn run_guest(
 
     let status = runner::run(config)?;
     std::process::exit(status);
+}
+
+fn run_fs_unshare(layout: &Layout, args: FsUnshareArgs) -> Result<()> {
+    let state = layout.instance_dir.join("host-share-state");
+    if args.list {
+        if !state.exists() {
+            return Ok(());
+        }
+        for tag in ["home", "cwd"] {
+            let tag_state = state.join(tag);
+            if tag_state.exists() {
+                println!("{}", tag_state.display());
+            }
+        }
+        return Ok(());
+    }
+
+    let Some(path) = args.path else {
+        bail!("fs unshare requires PATH unless --list is used");
+    };
+    if !args.remove {
+        println!(
+            "gitignored host-share paths are copy-on-write automatically; state: {}",
+            state.display()
+        );
+        return Ok(());
+    }
+
+    let targets = host_share_state_targets(&path)?;
+    if targets.is_empty() {
+        bail!("path is not on a host share: {}", path.display());
+    }
+    for (tag, suffix) in targets {
+        if suffix.as_os_str().is_empty() {
+            bail!("refusing to remove all host-share copy-on-write state");
+        }
+        let upper = state.join(tag).join("upper").join(&suffix);
+        remove_path_if_exists(&upper)?;
+        let whiteout = state.join(tag).join("whiteouts").join(&suffix);
+        remove_path_if_exists(&whiteout)?;
+    }
+    Ok(())
+}
+
+fn host_share_state_targets(path: &Path) -> Result<Vec<(&'static str, PathBuf)>> {
+    let cwd = std::env::current_dir().context("current directory")?;
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let mut targets = Vec::new();
+    let home = dirs::home_dir();
+    if let Some(home) = &home
+        && let Ok(suffix) = absolute.strip_prefix(&home)
+    {
+        targets.push(("home", suffix.to_path_buf()));
+    }
+    let cwd_is_under_home = home.as_ref().is_some_and(|home| cwd.starts_with(home));
+    if !cwd_is_under_home && let Ok(suffix) = absolute.strip_prefix(&cwd) {
+        targets.push(("cwd", suffix.to_path_buf()));
+    }
+    Ok(targets)
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {
+            fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))
+        }
+        Ok(_) => fs::remove_file(path).with_context(|| format!("remove {}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("stat {}", path.display())),
+    }
 }
 
 fn ensure_image_and_instance(

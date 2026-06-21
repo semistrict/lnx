@@ -62,6 +62,18 @@ fn init_path_accepts_default_instance_seed() {
 }
 
 #[test]
+fn fs_unshare_parses_path() {
+    let cli = Cli::try_parse_from(["lnx", "fs", "unshare", "/Users/test/project"])
+        .expect("parse fs unshare");
+    let Some(Command::Fs(args)) = cli.command else {
+        panic!("expected fs command");
+    };
+    let FsCommand::Unshare(args) = args.command;
+
+    assert_eq!(args.path, Some(PathBuf::from("/Users/test/project")));
+}
+
+#[test]
 fn init_local_target_normalizes_relative_path() {
     let target = init_local_target(Some(Path::new("project")))
         .expect("target")

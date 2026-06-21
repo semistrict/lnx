@@ -12,6 +12,7 @@ pub struct FsDeviceConfig {
     pub shm_size: Option<usize>,
     pub read_only: bool,
     pub write_allowlist: Option<Arc<RwLock<Vec<PathBuf>>>>,
+    pub unshare_dir: Option<PathBuf>,
     #[cfg(not(feature = "aws-nitro"))]
     pub virtual_entries: Vec<VirtualDirEntry>,
 }

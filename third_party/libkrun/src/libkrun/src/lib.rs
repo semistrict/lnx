@@ -639,6 +639,7 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
                     shm_size: Some(1 << 29),
                     read_only: false,
                     write_allowlist: None,
+                    unshare_dir: None,
                     virtual_entries: {
                         let mut v = Vec::new();
                         if !cfg.disable_implicit_init {
@@ -744,6 +745,7 @@ pub unsafe extern "C" fn krun_add_virtiofs4(
                     shm_size: shm,
                     read_only,
                     write_allowlist: write_allowlist.then(|| Arc::new(RwLock::new(Vec::new()))),
+                    unshare_dir: None,
                     virtual_entries,
                 });
             }
@@ -800,6 +802,53 @@ pub unsafe extern "C" fn krun_set_virtiofs_write_allowlist(
                     return -libc::EINVAL;
                 };
                 *allowlist.write().unwrap() = paths;
+            }
+            Entry::Vacant(_) => return -libc::ENOENT,
+        }
+
+        KRUN_SUCCESS
+    }
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub unsafe extern "C" fn krun_set_virtiofs_unshare_dir(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_path: *const c_char,
+) -> i32 {
+    unsafe {
+        if c_tag.is_null() || c_path.is_null() {
+            return -libc::EINVAL;
+        }
+        let tag = match CStr::from_ptr(c_tag).to_str() {
+            Ok(tag) => tag,
+            Err(_) => return -libc::EINVAL,
+        };
+        let path = match CStr::from_ptr(c_path).to_str() {
+            Ok(path) => PathBuf::from(path),
+            Err(_) => return -libc::EINVAL,
+        };
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if let Some(vmm) = RUNNING_VMMS.lock().unwrap().get(&ctx_id).cloned() {
+                return if vmm.lock().unwrap().set_virtiofs_unshare_dir(tag, path) {
+                    KRUN_SUCCESS
+                } else {
+                    -libc::ENOENT
+                };
+            }
+        }
+
+        match CTX_MAP.lock().unwrap().entry(ctx_id) {
+            Entry::Occupied(mut ctx_cfg) => {
+                let cfg = ctx_cfg.get_mut();
+                let Some(fs) = cfg.vmr.fs.iter_mut().find(|fs| fs.fs_id == tag) else {
+                    return -libc::ENOENT;
+                };
+                fs.unshare_dir = Some(path);
             }
             Entry::Vacant(_) => return -libc::ENOENT,
         }
@@ -2623,6 +2672,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                     shm_size: Some(1 << 29),
                     read_only: false,
                     write_allowlist: None,
+                    unshare_dir: None,
                     virtual_entries,
                 });
 

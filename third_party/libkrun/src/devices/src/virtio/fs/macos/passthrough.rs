@@ -7,11 +7,13 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::btree_map;
 use std::ffi::{CStr, CString};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io;
 use std::mem::MaybeUninit;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::ptr::null_mut;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -61,6 +63,12 @@ struct InodeData {
 enum InodeHandle {
     Fd(RawFd),
     Path(CString),
+}
+
+enum OverlayPath {
+    Lower(CString),
+    Upper(CString),
+    Whiteout,
 }
 
 struct CachedDirEntry {
@@ -156,12 +164,14 @@ mod tests {
     use std::ffi::CString;
     use std::fs::{self, File};
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::process::Command as ProcessCommand;
     use std::sync::{Arc, RwLock};
 
     use super::{
         CachePolicy, Config, Context, DaxMappingSnapshot, Extensions, FileSystem, FsOptions,
-        PassthroughFs, fuse,
+        PassthroughFs, SetattrValid, fuse,
     };
     use crate::virtio::fs::bindings;
     use crate::virtio::fs::inode_alloc::InodeAllocator;
@@ -214,6 +224,32 @@ mod tests {
         .unwrap();
         fs.init(FsOptions::empty()).unwrap();
         fs
+    }
+
+    fn new_fs_with_unshare(root: &Path, unshare_dir: &Path) -> PassthroughFs {
+        let fs = PassthroughFs::new(
+            Config {
+                root_dir: root.to_string_lossy().into_owned(),
+                write_allowlist: Some(Arc::new(RwLock::new(vec![PathBuf::from(".")]))),
+                unshare_dir: Some(unshare_dir.to_path_buf()),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        fs
+    }
+
+    fn init_git_repo(path: &Path, gitignore: &str) {
+        let status = ProcessCommand::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(path)
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+        fs::write(path.join(".gitignore"), gitignore).unwrap();
     }
 
     #[test]
@@ -287,6 +323,29 @@ mod tests {
         assert_eq!(entry.attr_timeout, std::time::Duration::ZERO);
         assert_eq!(entry.entry_timeout, std::time::Duration::ZERO);
         assert_eq!(attr_timeout, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn setattr_mode_updates_host_file_mode() {
+        let temp = TempRoot::new("chmod-host-mode");
+        let path = temp.path().join("script.sh");
+        fs::write(&path, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let fs = new_fs(temp.path(), vec![PathBuf::from(".")]);
+        let ctx = test_ctx();
+
+        let file = fs.lookup(ctx, fuse::ROOT_ID, &cstr("script.sh")).unwrap();
+        let (mut attr, _) = fs.getattr(ctx, file.inode, None).unwrap();
+        attr.st_mode = 0o755;
+        fs.setattr(ctx, file.inode, attr, None, SetattrValid::MODE)
+            .unwrap();
+
+        let host_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(host_mode, 0o755);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let (attr, _) = fs.getattr(ctx, file.inode, None).unwrap();
+        assert_eq!(attr.st_mode as u32 & 0o777, 0o644);
     }
 
     #[test]
@@ -375,6 +434,225 @@ mod tests {
         };
         assert_eq!(err.raw_os_error(), Some(libc::EROFS));
         assert!(!temp.path().join("denied/no.txt").exists());
+    }
+
+    #[test]
+    fn gitignored_create_uses_upper_state() {
+        let temp = TempRoot::new("gitignored-create");
+        let share = temp.path().join("share");
+        let state = temp.path().join("state");
+        fs::create_dir(&share).unwrap();
+        init_git_repo(&share, "ignored.txt\n");
+        let fs = new_fs_with_unshare(&share, &state);
+        let ctx = test_ctx();
+
+        fs.create(
+            ctx,
+            fuse::ROOT_ID,
+            &cstr("ignored.txt"),
+            0o644,
+            false,
+            libc::O_WRONLY as u32,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+
+        assert!(!share.join("ignored.txt").exists());
+        assert!(state.join("upper/ignored.txt").exists());
+    }
+
+    #[test]
+    fn nonignored_create_writes_through_to_host() {
+        let temp = TempRoot::new("tracked-create");
+        let share = temp.path().join("share");
+        let state = temp.path().join("state");
+        fs::create_dir(&share).unwrap();
+        init_git_repo(&share, "ignored.txt\n");
+        let fs = new_fs_with_unshare(&share, &state);
+        let ctx = test_ctx();
+
+        fs.create(
+            ctx,
+            fuse::ROOT_ID,
+            &cstr("tracked.txt"),
+            0o644,
+            false,
+            libc::O_WRONLY as u32,
+            0,
+            Extensions::default(),
+        )
+        .unwrap();
+
+        assert!(share.join("tracked.txt").exists());
+        assert!(!state.join("upper/tracked.txt").exists());
+    }
+
+    #[test]
+    fn gitignored_truncate_copies_up_before_mutating() {
+        let temp = TempRoot::new("gitignored-truncate");
+        let share = temp.path().join("share");
+        let state = temp.path().join("state");
+        fs::create_dir(&share).unwrap();
+        fs::create_dir(share.join("state")).unwrap();
+        fs::write(share.join("state/db.sqlite"), b"host contents").unwrap();
+        init_git_repo(&share, "state/\n");
+        let fs = new_fs_with_unshare(&share, &state);
+        let ctx = test_ctx();
+
+        let dir = fs.lookup(ctx, fuse::ROOT_ID, &cstr("state")).unwrap();
+        let file = fs.lookup(ctx, dir.inode, &cstr("db.sqlite")).unwrap();
+        fs.open(
+            ctx,
+            file.inode,
+            false,
+            libc::O_WRONLY as u32 | bindings::LINUX_O_TRUNC as u32,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(share.join("state/db.sqlite")).unwrap(),
+            b"host contents"
+        );
+        assert_eq!(
+            fs::metadata(state.join("upper/state/db.sqlite"))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn gitignored_unlink_whiteouts_lower_file() {
+        let temp = TempRoot::new("gitignored-whiteout");
+        let share = temp.path().join("share");
+        let state = temp.path().join("state");
+        fs::create_dir(&share).unwrap();
+        fs::create_dir(share.join("state")).unwrap();
+        fs::write(share.join("state/db.sqlite"), b"host contents").unwrap();
+        init_git_repo(&share, "state/\n");
+        let fs = new_fs_with_unshare(&share, &state);
+        let ctx = test_ctx();
+
+        let dir = fs.lookup(ctx, fuse::ROOT_ID, &cstr("state")).unwrap();
+        fs.lookup(ctx, dir.inode, &cstr("db.sqlite")).unwrap();
+        fs.unlink(ctx, dir.inode, &cstr("db.sqlite")).unwrap();
+
+        assert!(share.join("state/db.sqlite").exists());
+        assert!(state.join("whiteouts/state/db.sqlite").exists());
+        let err = match fs.lookup(ctx, dir.inode, &cstr("db.sqlite")) {
+            Ok(_) => panic!("whiteout should hide lower file"),
+            Err(err) => err,
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+    }
+
+    #[test]
+    fn gitignored_rmdir_lower_file_returns_enotdir() {
+        let temp = TempRoot::new("gitignored-rmdir-file");
+        let share = temp.path().join("share");
+        let state = temp.path().join("state");
+        fs::create_dir(&share).unwrap();
+        fs::create_dir(share.join("state")).unwrap();
+        fs::write(share.join("state/db.sqlite"), b"host contents").unwrap();
+        init_git_repo(&share, "state/\n");
+        let fs = new_fs_with_unshare(&share, &state);
+        let ctx = test_ctx();
+
+        let dir = fs.lookup(ctx, fuse::ROOT_ID, &cstr("state")).unwrap();
+        let err = match fs.rmdir(ctx, dir.inode, &cstr("db.sqlite")) {
+            Ok(()) => panic!("rmdir on a lower file unexpectedly succeeded"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
+        assert!(!state.join("whiteouts/state/db.sqlite").exists());
+    }
+
+    #[test]
+    fn gitignored_rmdir_nonempty_lower_dir_returns_enotempty() {
+        let temp = TempRoot::new("gitignored-rmdir-nonempty");
+        let share = temp.path().join("share");
+        let state = temp.path().join("state");
+        fs::create_dir(&share).unwrap();
+        fs::create_dir(share.join("state")).unwrap();
+        fs::write(share.join("state/db.sqlite"), b"host contents").unwrap();
+        init_git_repo(&share, "state/\n");
+        let fs = new_fs_with_unshare(&share, &state);
+        let ctx = test_ctx();
+
+        let err = match fs.rmdir(ctx, fuse::ROOT_ID, &cstr("state")) {
+            Ok(()) => panic!("rmdir on a non-empty lower directory unexpectedly succeeded"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.raw_os_error(), Some(bindings::LINUX_ENOTEMPTY));
+        assert!(share.join("state/db.sqlite").exists());
+        assert!(!state.join("whiteouts/state").exists());
+    }
+
+    #[test]
+    fn overlay_readdir_uses_open_lower_directory_fd() {
+        let temp = TempRoot::new("overlay-readdir-fd");
+        let share = temp.path().join("share");
+        let state = temp.path().join("state");
+        fs::create_dir(&share).unwrap();
+        fs::create_dir(share.join("list")).unwrap();
+        fs::write(share.join("list/file.txt"), b"contents").unwrap();
+        init_git_repo(&share, "");
+        let fs = new_fs_with_unshare(&share, &state);
+        let ctx = test_ctx();
+
+        let dir = fs.lookup(ctx, fuse::ROOT_ID, &cstr("list")).unwrap();
+        let (handle, _) = fs.opendir(ctx, dir.inode, libc::O_RDONLY as u32).unwrap();
+        let handle = handle.unwrap();
+        fs::rename(share.join("list"), share.join("moved")).unwrap();
+
+        let mut names = Vec::new();
+        fs.readdir(ctx, dir.inode, handle, 4096, 0, |entry| {
+            names.push(String::from_utf8_lossy(entry.name).into_owned());
+            Ok(1)
+        })
+        .unwrap();
+
+        assert!(names.iter().any(|name| name == "file.txt"));
+    }
+
+    #[test]
+    fn overlay_rename_keeps_existing_inode_path() {
+        let temp = TempRoot::new("overlay-rename-path");
+        let share = temp.path().join("share");
+        let state = temp.path().join("state");
+        fs::create_dir(&share).unwrap();
+        fs::create_dir(share.join("state")).unwrap();
+        fs::write(share.join("state/db.sqlite"), b"host contents").unwrap();
+        init_git_repo(&share, "state/\n");
+        let fs = new_fs_with_unshare(&share, &state);
+        let ctx = test_ctx();
+
+        let dir = fs.lookup(ctx, fuse::ROOT_ID, &cstr("state")).unwrap();
+        let file = fs.lookup(ctx, dir.inode, &cstr("db.sqlite")).unwrap();
+        fs.rename(
+            ctx,
+            dir.inode,
+            &cstr("db.sqlite"),
+            dir.inode,
+            &cstr("renamed.sqlite"),
+            0,
+        )
+        .unwrap();
+
+        let (mut attr, _) = fs.getattr(ctx, file.inode, None).unwrap();
+        attr.st_mode = 0o600;
+        fs.setattr(ctx, file.inode, attr, None, SetattrValid::MODE)
+            .unwrap();
+
+        let mode = fs::metadata(state.join("upper/state/renamed.sqlite"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
@@ -692,12 +970,6 @@ fn set_xattr_stat(
     mode: Option<u32>,
 ) -> io::Result<()> {
     let st = st.unwrap_or(istat(file, true)?);
-    let options = if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
-        libc::XATTR_NOFOLLOW
-    } else {
-        0
-    };
-
     let buf = if is_valid_owner(owner) && mode.is_some() {
         let owner = owner.unwrap();
         let mode = mode.unwrap();
@@ -738,6 +1010,35 @@ fn set_xattr_stat(
         buf
     };
 
+    write_xattr_stat(file, st, &buf)
+}
+
+fn clear_xattr_mode(file: &InodeHandle, st: Option<bindings::stat64>) -> io::Result<()> {
+    let st = st.unwrap_or(istat(file, true)?);
+    let (uid, gid, _) = match file {
+        InodeHandle::Fd(fd) => get_xattr_fstat(*fd, st)?,
+        InodeHandle::Path(c_path) => get_xattr_lstat(c_path, st)?,
+    };
+    let mut buf = String::new();
+    if let Some(uid) = uid {
+        buf.push_str(&format!("{uid}"));
+    } else {
+        buf.push('x');
+    }
+    if let Some(gid) = gid {
+        buf.push_str(&format!(":{gid}:x"));
+    } else {
+        buf.push_str(":x:x");
+    }
+    write_xattr_stat(file, st, &buf)
+}
+
+fn write_xattr_stat(file: &InodeHandle, st: bindings::stat64, buf: &str) -> io::Result<()> {
+    let options = if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+        libc::XATTR_NOFOLLOW
+    } else {
+        0
+    };
     let res = match file {
         InodeHandle::Path(path) => unsafe {
             libc::setxattr(
@@ -761,6 +1062,19 @@ fn set_xattr_stat(
         },
     };
 
+    if res < 0 {
+        Err(linux_error(io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
+fn chmod_host(file: &InodeHandle, mode: u32) -> io::Result<()> {
+    let mode = (mode & 0o7777) as libc::mode_t;
+    let res = match file {
+        InodeHandle::Path(path) => unsafe { libc::chmod(path.as_ptr(), mode) },
+        InodeHandle::Fd(fd) => unsafe { libc::fchmod(*fd, mode) },
+    };
     if res < 0 {
         Err(linux_error(io::Error::last_os_error()))
     } else {
@@ -954,6 +1268,7 @@ pub struct Config {
     /// Table of exported FDs to share with other subsystems. Not supported for macos.
     pub export_table: Option<ExportTable>,
     pub write_allowlist: Option<Arc<RwLock<Vec<PathBuf>>>>,
+    pub unshare_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -969,6 +1284,7 @@ impl Default for Config {
             export_fsid: 0,
             export_table: None,
             write_allowlist: None,
+            unshare_dir: None,
         }
     }
 }
@@ -1014,6 +1330,11 @@ impl PassthroughFs {
 
         unsafe { libc::close(fd) };
 
+        if let Some(unshare_dir) = &cfg.unshare_dir {
+            fs::create_dir_all(unshare_dir.join("upper")).map_err(linux_error)?;
+            fs::create_dir_all(unshare_dir.join("whiteouts")).map_err(linux_error)?;
+        }
+
         Ok(PassthroughFs {
             inodes: RwLock::new(MultikeyBTreeMap::new()),
             inode_alloc,
@@ -1048,6 +1369,26 @@ impl PassthroughFs {
 
     fn remember_inode_path(&self, inode: Inode, path: PathBuf) {
         self.inode_paths.write().unwrap().insert(inode, path);
+    }
+
+    fn move_inode_path(&self, old_path: &Path, new_path: &Path) -> Vec<Inode> {
+        let mut inode_paths = self.inode_paths.write().unwrap();
+        let moved: Vec<Inode> = inode_paths
+            .iter()
+            .filter_map(|(&inode, path)| (path == old_path).then_some(inode))
+            .collect();
+
+        if moved.is_empty() {
+            return moved;
+        }
+
+        let moved_set: HashSet<Inode> = moved.iter().copied().collect();
+        inode_paths.retain(|inode, path| moved_set.contains(inode) || path != new_path);
+        for inode in &moved {
+            inode_paths.insert(*inode, new_path.to_path_buf());
+        }
+
+        moved
     }
 
     fn inode_path(&self, inode: Inode) -> io::Result<PathBuf> {
@@ -1198,11 +1539,320 @@ impl PassthroughFs {
         CString::new(path.to_string_lossy().into_owned()).map_err(|_| einval())
     }
 
+    fn path_to_cstring(&self, path: &Path) -> io::Result<CString> {
+        CString::new(path.to_string_lossy().into_owned()).map_err(|_| einval())
+    }
+
+    fn unshare_dir(&self) -> Option<&Path> {
+        self.cfg.unshare_dir.as_deref()
+    }
+
+    fn upper_root(&self) -> Option<PathBuf> {
+        self.unshare_dir().map(|path| path.join("upper"))
+    }
+
+    fn whiteout_root(&self) -> Option<PathBuf> {
+        self.unshare_dir().map(|path| path.join("whiteouts"))
+    }
+
+    fn lower_path(&self, rel_path: &Path) -> PathBuf {
+        let mut path = PathBuf::from(&self.cfg.root_dir);
+        if !rel_path.as_os_str().is_empty() {
+            path.push(rel_path);
+        }
+        path
+    }
+
+    fn upper_path(&self, rel_path: &Path) -> Option<PathBuf> {
+        let mut path = self.upper_root()?;
+        if !rel_path.as_os_str().is_empty() {
+            path.push(rel_path);
+        }
+        Some(path)
+    }
+
+    fn whiteout_path(&self, rel_path: &Path) -> Option<PathBuf> {
+        let mut path = self.whiteout_root()?;
+        if !rel_path.as_os_str().is_empty() {
+            path.push(rel_path);
+        }
+        Some(path)
+    }
+
+    fn has_path(path: &Path) -> io::Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(linux_error(err)),
+        }
+    }
+
+    fn path_metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(linux_error(err)),
+        }
+    }
+
+    fn direct_whiteout_exists(&self, rel_path: &Path) -> io::Result<bool> {
+        let Some(path) = self.whiteout_path(rel_path) else {
+            return Ok(false);
+        };
+        Self::has_path(&path)
+    }
+
+    fn whiteout_covers(&self, rel_path: &Path) -> io::Result<bool> {
+        if self.unshare_dir().is_none() {
+            return Ok(false);
+        }
+        for ancestor in rel_path.ancestors() {
+            if ancestor.as_os_str().is_empty() {
+                continue;
+            }
+            if self.direct_whiteout_exists(ancestor)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn clear_direct_whiteout(&self, rel_path: &Path) -> io::Result<()> {
+        let Some(path) = self.whiteout_path(rel_path) else {
+            return Ok(());
+        };
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(linux_error(err)),
+        }
+    }
+
+    fn create_direct_whiteout(&self, rel_path: &Path) -> io::Result<()> {
+        let Some(path) = self.whiteout_path(rel_path) else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(linux_error)?;
+        }
+        fs::write(path, b"whiteout\n").map_err(linux_error)
+    }
+
+    fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+        let mut current = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent()?.to_path_buf()
+        };
+        loop {
+            if current.exists() {
+                return Some(current);
+            }
+            if !current.pop() {
+                return None;
+            }
+        }
+    }
+
+    fn git_ignored(&self, rel_path: &Path) -> bool {
+        if self.unshare_dir().is_none() || rel_path.as_os_str().is_empty() {
+            return false;
+        }
+        let lower = self.lower_path(rel_path);
+        let Some(cwd) = Self::nearest_existing_ancestor(&lower) else {
+            return false;
+        };
+        Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .arg("check-ignore")
+            .arg("-q")
+            .arg("--")
+            .arg(&lower)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn path_has_upper(&self, rel_path: &Path) -> io::Result<bool> {
+        let Some(path) = self.upper_path(rel_path) else {
+            return Ok(false);
+        };
+        Self::has_path(&path)
+    }
+
+    fn should_unshare_path(&self, rel_path: &Path) -> io::Result<bool> {
+        if self.unshare_dir().is_none() || rel_path.as_os_str().is_empty() {
+            return Ok(false);
+        }
+        Ok(self.path_has_upper(rel_path)?
+            || self.whiteout_covers(rel_path)?
+            || self.git_ignored(rel_path))
+    }
+
+    fn overlay_path(
+        &self,
+        _parent: Inode,
+        name: &CStr,
+        rel_path: &Path,
+    ) -> io::Result<OverlayPath> {
+        if self.whiteout_covers(rel_path)? {
+            return Ok(OverlayPath::Whiteout);
+        }
+        if let Some(upper) = self.upper_path(rel_path)
+            && Self::has_path(&upper)?
+        {
+            return Ok(OverlayPath::Upper(self.path_to_cstring(&upper)?));
+        }
+        let _ = name;
+        Ok(OverlayPath::Lower(self.rel_path_to_cstring(rel_path)?))
+    }
+
+    fn prepare_upper_parent(&self, rel_path: &Path) -> io::Result<()> {
+        let Some(parent) = rel_path.parent() else {
+            return Ok(());
+        };
+        let Some(upper_root) = self.upper_root() else {
+            return Ok(());
+        };
+        fs::create_dir_all(&upper_root).map_err(linux_error)?;
+
+        let mut current = PathBuf::new();
+        for component in parent.components() {
+            current.push(component.as_os_str());
+            let Some(upper) = self.upper_path(&current) else {
+                continue;
+            };
+            if Self::has_path(&upper)? {
+                continue;
+            }
+            let lower = self.lower_path(&current);
+            fs::create_dir(&upper).map_err(linux_error)?;
+            if Self::has_path(&lower)? {
+                let lower_c = self.path_to_cstring(&lower)?;
+                let upper_c = self.path_to_cstring(&upper)?;
+                let st = lstat(&lower_c, false)?;
+                self.mirror_copied_metadata(&InodeHandle::Path(upper_c), st)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_upper_create(&self, rel_path: &Path) -> io::Result<CString> {
+        self.prepare_upper_parent(rel_path)?;
+        self.clear_direct_whiteout(rel_path)?;
+        let upper = self.upper_path(rel_path).ok_or_else(einval)?;
+        self.path_to_cstring(&upper)
+    }
+
+    fn mirror_copied_metadata(&self, file: &InodeHandle, st: bindings::stat64) -> io::Result<()> {
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFLNK {
+            chmod_host(file, st.st_mode as u32)?;
+        }
+        set_xattr_stat(
+            file,
+            None,
+            Some((st.st_uid, st.st_gid)),
+            Some(st.st_mode as u32),
+        )
+    }
+
+    fn copy_up_path(&self, rel_path: &Path) -> io::Result<()> {
+        if self.path_has_upper(rel_path)? {
+            return Ok(());
+        }
+        if self.whiteout_covers(rel_path)? && !self.direct_whiteout_exists(rel_path)? {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOENT)));
+        }
+
+        let lower = self.lower_path(rel_path);
+        let upper = self.upper_path(rel_path).ok_or_else(einval)?;
+        let lower_c = self.path_to_cstring(&lower)?;
+        let st = lstat(&lower_c, false)?;
+        self.prepare_upper_parent(rel_path)?;
+
+        match st.st_mode & libc::S_IFMT {
+            mode if mode == libc::S_IFDIR => {
+                fs::create_dir(&upper).map_err(linux_error)?;
+            }
+            mode if mode == libc::S_IFLNK => {
+                let target = fs::read_link(&lower).map_err(linux_error)?;
+                std::os::unix::fs::symlink(target, &upper).map_err(linux_error)?;
+            }
+            mode if mode == libc::S_IFREG => {
+                fs::copy(&lower, &upper).map_err(linux_error)?;
+            }
+            _ => {
+                return Err(linux_error(io::Error::from_raw_os_error(libc::EOPNOTSUPP)));
+            }
+        }
+
+        let upper_c = self.path_to_cstring(&upper)?;
+        self.mirror_copied_metadata(&InodeHandle::Path(upper_c), st)?;
+        self.clear_direct_whiteout(rel_path)
+    }
+
+    fn refresh_inode_backing(&self, inode: Inode, rel_path: &Path) -> io::Result<()> {
+        let Some(upper) = self.upper_path(rel_path) else {
+            return Ok(());
+        };
+        let upper_c = self.path_to_cstring(&upper)?;
+        let st = lstat(&upper_c, false)?;
+        let old = self.inodes.read().unwrap().get(&inode).cloned();
+        let refcount = old
+            .as_ref()
+            .map(|data| data.refcount.load(Ordering::Acquire))
+            .unwrap_or(1);
+        self.inodes.write().unwrap().insert(
+            inode,
+            InodeAltKey {
+                ino: st.st_ino,
+                dev: st.st_dev,
+            },
+            Arc::new(InodeData {
+                inode,
+                ino: st.st_ino,
+                dev: st.st_dev,
+                refcount: AtomicU64::new(refcount),
+                unlinked_fd: AtomicI64::new(-1),
+            }),
+        );
+        Ok(())
+    }
+
+    fn ensure_unshared_inode(&self, inode: Inode) -> io::Result<bool> {
+        let rel_path = self.inode_path(inode)?;
+        if !self.should_unshare_path(&rel_path)? {
+            return Ok(false);
+        }
+        self.copy_up_path(&rel_path)?;
+        self.refresh_inode_backing(inode, &rel_path)?;
+        Ok(true)
+    }
+
+    fn child_write_path(&self, parent: Inode, name: &CStr, rel_path: &Path) -> io::Result<CString> {
+        if self.should_unshare_path(rel_path)? {
+            self.prepare_upper_create(rel_path)
+        } else {
+            self.name_to_path(parent, name)
+        }
+    }
+
     fn current_host_object(
         &self,
         rel_path: &Path,
     ) -> io::Result<(InodeAltKey, HostObjectSnapshot)> {
-        let path = self.rel_path_to_cstring(rel_path)?;
+        let path = if self.whiteout_covers(rel_path)? {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOENT)));
+        } else if let Some(upper) = self.upper_path(rel_path) {
+            if Self::has_path(&upper)? {
+                self.path_to_cstring(&upper)?
+            } else {
+                self.rel_path_to_cstring(rel_path)?
+            }
+        } else {
+            self.rel_path_to_cstring(rel_path)?
+        };
         let st = lstat(&path, false)?;
         Ok((
             InodeAltKey {
@@ -1642,8 +2292,15 @@ impl PassthroughFs {
         }
 
         if !ds.ready {
-            // Fill the cache on first call
-            if let Err(e) = ds.fill_from_fd(data.file.write().unwrap().as_raw_fd()) {
+            let fd = data.file.write().unwrap().as_raw_fd();
+            let fill_result = if self.unshare_dir().is_some() {
+                self.fill_overlay_readdir(inode, fd, &mut ds)
+            } else {
+                ds.fill_from_fd(fd)
+            };
+
+            // Fill the cache on first call.
+            if let Err(e) = fill_result {
                 if ds.entries.is_empty() {
                     return Err(e);
                 }
@@ -1676,6 +2333,139 @@ impl PassthroughFs {
             }
         }
 
+        Ok(())
+    }
+
+    fn fill_overlay_readdir(
+        &self,
+        inode: Inode,
+        lower_fd: RawFd,
+        ds: &mut DirStream,
+    ) -> io::Result<()> {
+        let rel_path = self.inode_path(inode)?;
+        let mut entries = BTreeMap::<Vec<u8>, CachedDirEntry>::new();
+
+        ds.fill_from_fd(lower_fd)?;
+        for entry in ds.entries.drain(..) {
+            entries.insert(entry.name.to_vec(), entry);
+        }
+        self.collect_upper_dir_entries(&rel_path, &mut entries)?;
+        self.apply_whiteouts(&rel_path, &mut entries)?;
+
+        ds.entries = entries.into_values().collect();
+        Ok(())
+    }
+
+    fn apply_whiteouts(
+        &self,
+        rel_path: &Path,
+        entries: &mut BTreeMap<Vec<u8>, CachedDirEntry>,
+    ) -> io::Result<()> {
+        let mut hidden = HashSet::new();
+        if let Some(whiteouts) = self.whiteout_path(&rel_path)
+            && Self::has_path(&whiteouts)?
+        {
+            for entry in fs::read_dir(whiteouts).map_err(linux_error)? {
+                let entry = entry.map_err(linux_error)?;
+                hidden.insert(
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                        .into_bytes(),
+                );
+            }
+        }
+
+        entries.retain(|name, _| !hidden.contains(name));
+        Ok(())
+    }
+
+    fn collect_upper_dir_entries(
+        &self,
+        rel_path: &Path,
+        entries: &mut BTreeMap<Vec<u8>, CachedDirEntry>,
+    ) -> io::Result<()> {
+        if let Some(upper) = self.upper_path(rel_path)
+            && Self::has_path(&upper)?
+        {
+            self.collect_dir_entries(&upper, entries)?;
+        }
+        Ok(())
+    }
+
+    fn overlay_dir_entries_from_paths(
+        &self,
+        rel_path: &Path,
+    ) -> io::Result<BTreeMap<Vec<u8>, CachedDirEntry>> {
+        let lower = self.lower_path(rel_path);
+        let mut entries = BTreeMap::<Vec<u8>, CachedDirEntry>::new();
+
+        if Self::has_path(&lower)? {
+            self.collect_dir_entries(&lower, &mut entries)?;
+        }
+        self.collect_upper_dir_entries(rel_path, &mut entries)?;
+        self.apply_whiteouts(rel_path, &mut entries)?;
+        Ok(entries)
+    }
+
+    fn overlay_dir_is_empty(&self, rel_path: &Path) -> io::Result<bool> {
+        Ok(self.overlay_dir_entries_from_paths(rel_path)?.is_empty())
+    }
+
+    fn validate_lower_unlink(
+        &self,
+        rel_path: &Path,
+        metadata: &fs::Metadata,
+        flags: libc::c_int,
+    ) -> io::Result<()> {
+        if flags == libc::AT_REMOVEDIR {
+            if !metadata.file_type().is_dir() {
+                return Err(linux_error(io::Error::from_raw_os_error(libc::ENOTDIR)));
+            }
+            if !self.overlay_dir_is_empty(rel_path)? {
+                return Err(linux_error(io::Error::from_raw_os_error(libc::ENOTEMPTY)));
+            }
+        } else if metadata.file_type().is_dir() {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EISDIR)));
+        }
+        Ok(())
+    }
+
+    fn collect_dir_entries(
+        &self,
+        path: &Path,
+        entries: &mut BTreeMap<Vec<u8>, CachedDirEntry>,
+    ) -> io::Result<()> {
+        for entry in fs::read_dir(path).map_err(linux_error)? {
+            let entry = entry.map_err(linux_error)?;
+            let name = entry
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path()).map_err(linux_error)?;
+            let type_ = if metadata.file_type().is_dir() {
+                libc::DT_DIR
+            } else if metadata.file_type().is_symlink() {
+                libc::DT_LNK
+            } else if metadata.file_type().is_file() {
+                libc::DT_REG
+            } else {
+                libc::DT_UNKNOWN
+            } as u8;
+            entries.insert(
+                name.clone(),
+                CachedDirEntry {
+                    ino: metadata.ino(),
+                    name: name.into_boxed_slice(),
+                    type_,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -1859,6 +2649,96 @@ impl PassthroughFs {
             }
             Err(linux_error(err))
         }
+    }
+
+    fn overlay_unlink(&self, rel_path: &Path, flags: libc::c_int) -> io::Result<()> {
+        if self.whiteout_covers(rel_path)? && !self.direct_whiteout_exists(rel_path)? {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOENT)));
+        }
+
+        let upper_removed = if let Some(upper) = self.upper_path(rel_path) {
+            match Self::path_metadata(&upper)? {
+                Some(metadata) if flags == libc::AT_REMOVEDIR => {
+                    if !metadata.file_type().is_dir() {
+                        return Err(linux_error(io::Error::from_raw_os_error(libc::ENOTDIR)));
+                    }
+                    fs::remove_dir(&upper).map_err(linux_error)?;
+                    true
+                }
+                Some(metadata) => {
+                    if metadata.file_type().is_dir() {
+                        return Err(linux_error(io::Error::from_raw_os_error(libc::EISDIR)));
+                    }
+                    fs::remove_file(&upper).map_err(linux_error)?;
+                    true
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+
+        let lower = self.lower_path(rel_path);
+        if let Some(metadata) = Self::path_metadata(&lower)? {
+            if !upper_removed {
+                self.validate_lower_unlink(rel_path, &metadata, flags)?;
+            }
+            self.create_direct_whiteout(rel_path)?;
+        } else if !upper_removed {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOENT)));
+        } else {
+            self.clear_direct_whiteout(rel_path)?;
+        }
+
+        self.inode_paths
+            .write()
+            .unwrap()
+            .retain(|_, path| path != rel_path);
+        Ok(())
+    }
+
+    fn overlay_rename(
+        &self,
+        old_rel_path: &Path,
+        new_rel_path: &Path,
+        flags: u32,
+    ) -> io::Result<()> {
+        if ((flags as i32) & bindings::LINUX_RENAME_EXCHANGE) != 0
+            || ((flags as i32) & bindings::LINUX_RENAME_WHITEOUT) != 0
+        {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+        }
+
+        let old_unshared = self.should_unshare_path(old_rel_path)?;
+        let new_unshared = self.should_unshare_path(new_rel_path)?;
+        if !old_unshared && !new_unshared {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+        }
+        if !old_unshared || !new_unshared {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EXDEV)));
+        }
+
+        let old_lower_exists = Self::has_path(&self.lower_path(old_rel_path))?;
+        self.copy_up_path(old_rel_path)?;
+        self.prepare_upper_parent(new_rel_path)?;
+
+        if ((flags as i32) & bindings::LINUX_RENAME_NOREPLACE) != 0 {
+            if self.path_has_upper(new_rel_path)? || Self::has_path(&self.lower_path(new_rel_path))?
+            {
+                return Err(linux_error(io::Error::from_raw_os_error(libc::EEXIST)));
+            }
+        }
+
+        let old_upper = self.upper_path(old_rel_path).ok_or_else(einval)?;
+        let new_upper = self.upper_path(new_rel_path).ok_or_else(einval)?;
+        self.clear_direct_whiteout(new_rel_path)?;
+        fs::rename(&old_upper, &new_upper).map_err(linux_error)?;
+        if old_lower_exists {
+            self.create_direct_whiteout(old_rel_path)?;
+        } else {
+            self.clear_direct_whiteout(old_rel_path)?;
+        }
+        Ok(())
     }
 
     fn parse_open_flags(&self, flags: i32) -> i32 {
@@ -2101,7 +2981,12 @@ impl FileSystem for PassthroughFs {
             .cloned()
             .ok_or_else(ebadf)?;
 
-        let c_path = self.name_to_path(parent, name)?;
+        let c_path = match self.overlay_path(parent, name, &rel_path)? {
+            OverlayPath::Lower(path) | OverlayPath::Upper(path) => path,
+            OverlayPath::Whiteout => {
+                return Err(linux_error(io::Error::from_raw_os_error(libc::ENOENT)));
+            }
+        };
         let st = lstat(&c_path, false)?;
 
         debug!(
@@ -2209,7 +3094,7 @@ impl FileSystem for PassthroughFs {
         extensions: Extensions,
     ) -> io::Result<Entry> {
         let rel_path = self.check_write_child(parent, name)?;
-        let c_path = self.name_to_path(parent, name)?;
+        let c_path = self.child_write_path(parent, name, &rel_path)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::mkdir(c_path.as_ptr(), 0o700) };
@@ -2235,7 +3120,10 @@ impl FileSystem for PassthroughFs {
     }
 
     fn rmdir(&self, ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
-        self.check_write_child(parent, name)?;
+        let rel_path = self.check_write_child(parent, name)?;
+        if self.should_unshare_path(&rel_path)? {
+            return self.overlay_unlink(&rel_path, libc::AT_REMOVEDIR);
+        }
         self.do_unlink(ctx, parent, name, libc::AT_REMOVEDIR)
     }
 
@@ -2290,6 +3178,7 @@ impl FileSystem for PassthroughFs {
         let f = flags as i32;
         if f & libc::O_ACCMODE != libc::O_RDONLY || f & libc::O_TRUNC != 0 {
             self.check_write_inode(inode)?;
+            self.ensure_unshared_inode(inode)?;
         }
         self.do_open(inode, kill_priv, flags)
     }
@@ -2319,7 +3208,7 @@ impl FileSystem for PassthroughFs {
         extensions: Extensions,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
         let rel_path = self.check_write_child(parent, name)?;
-        let c_path = self.name_to_path(parent, name)?;
+        let c_path = self.child_write_path(parent, name, &rel_path)?;
 
         let flags = self.parse_open_flags(flags as i32);
         let hostmode = if (flags & libc::O_DIRECTORY) != 0 {
@@ -2391,7 +3280,10 @@ impl FileSystem for PassthroughFs {
     }
 
     fn unlink(&self, ctx: Context, parent: Inode, name: &CStr) -> io::Result<()> {
-        self.check_write_child(parent, name)?;
+        let rel_path = self.check_write_child(parent, name)?;
+        if self.should_unshare_path(&rel_path)? {
+            return self.overlay_unlink(&rel_path, 0);
+        }
         self.do_unlink(ctx, parent, name, 0)
     }
 
@@ -2490,9 +3382,16 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<(bindings::stat64, Duration)> {
         if !valid.is_empty() {
             self.check_write_inode(inode)?;
+            self.ensure_unshared_inode(inode)?;
         }
         // If we have a handle then use it otherwise get a new fd from the inode.
-        let ihandle = if let Some(handle) = handle {
+        let use_inode_handle = self
+            .inode_path(inode)
+            .map(|path| self.path_has_upper(&path).unwrap_or(false))
+            .unwrap_or(false);
+        let ihandle = if let Some(handle) = handle
+            && !use_inode_handle
+        {
             let hd = self
                 .handles
                 .read()
@@ -2509,7 +3408,8 @@ impl FileSystem for PassthroughFs {
         };
 
         if valid.contains(SetattrValid::MODE) {
-            set_xattr_stat(&ihandle, None, None, Some(attr.st_mode as u32))?
+            chmod_host(&ihandle, attr.st_mode as u32)?;
+            clear_xattr_mode(&ihandle, None)?;
         }
 
         if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
@@ -2634,6 +3534,14 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<()> {
         let old_rel_path = self.check_write_child(olddir, oldname)?;
         let new_rel_path = self.check_write_child(newdir, newname)?;
+        if self.should_unshare_path(&old_rel_path)? || self.should_unshare_path(&new_rel_path)? {
+            self.overlay_rename(&old_rel_path, &new_rel_path, flags)?;
+            let moved = self.move_inode_path(&old_rel_path, &new_rel_path);
+            for inode in moved {
+                self.refresh_inode_backing(inode, &new_rel_path)?;
+            }
+            return Ok(());
+        }
         let mut mflags: u32 = 0;
         if ((flags as i32) & bindings::LINUX_RENAME_NOREPLACE) != 0 {
             mflags |= libc::RENAME_EXCL;
@@ -2754,7 +3662,7 @@ impl FileSystem for PassthroughFs {
         extensions: Extensions,
     ) -> io::Result<Entry> {
         let rel_path = self.check_write_child(parent, name)?;
-        let c_path = self.name_to_path(parent, name)?;
+        let c_path = self.child_write_path(parent, name, &rel_path)?;
 
         let fd = unsafe {
             libc::open(
@@ -2798,6 +3706,9 @@ impl FileSystem for PassthroughFs {
         newname: &CStr,
     ) -> io::Result<Entry> {
         let rel_path = self.check_write_child(newparent, newname)?;
+        if self.should_unshare_path(&rel_path)? {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::EXDEV)));
+        }
         let orig_c_path = match self.inode_to_handle(inode, false)? {
             InodeHandle::Path(c_path) => c_path,
             InodeHandle::Fd(_) => return Err(ebadf()),
@@ -2824,7 +3735,7 @@ impl FileSystem for PassthroughFs {
         extensions: Extensions,
     ) -> io::Result<Entry> {
         let rel_path = self.check_write_child(parent, name)?;
-        let c_path = self.name_to_path(parent, name)?;
+        let c_path = self.child_write_path(parent, name, &rel_path)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::symlink(linkname.as_ptr(), c_path.as_ptr()) };
@@ -3007,6 +3918,7 @@ impl FileSystem for PassthroughFs {
         flags: u32,
     ) -> io::Result<()> {
         self.check_write_inode(inode)?;
+        self.ensure_unshared_inode(inode)?;
         debug!("setxattr: inode={inode} name={name:?} value={value:?}");
 
         if !self.cfg.xattr {
@@ -3193,6 +4105,7 @@ impl FileSystem for PassthroughFs {
 
     fn removexattr(&self, _ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
         self.check_write_inode(inode)?;
+        self.ensure_unshared_inode(inode)?;
         if !self.cfg.xattr {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
@@ -3227,6 +4140,7 @@ impl FileSystem for PassthroughFs {
         length: u64,
     ) -> io::Result<()> {
         self.check_write_inode(inode)?;
+        self.ensure_unshared_inode(inode)?;
         let data = self
             .handles
             .read()
@@ -3359,6 +4273,7 @@ impl FileSystem for PassthroughFs {
             return Err(einval());
         }
         self.check_write_inode(inode_out)?;
+        self.ensure_unshared_inode(inode_out)?;
 
         let data_in = self
             .handles
@@ -3398,6 +4313,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<()> {
         if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
             self.check_write_inode(inode)?;
+            self.ensure_unshared_inode(inode)?;
         }
         if map_sender.is_none() {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));

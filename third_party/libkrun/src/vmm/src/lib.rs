@@ -441,6 +441,24 @@ impl Vmm {
         false
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn set_virtiofs_unshare_dir(&mut self, tag: &str, path: PathBuf) -> bool {
+        for (_, transport) in self.mmio_device_manager.virtio_transports() {
+            let device = transport.lock().unwrap().device();
+            let mut device = device.lock().unwrap();
+            let Some(fs) = device
+                .as_mut_any()
+                .downcast_mut::<devices::virtio::fs::Fs>()
+            else {
+                continue;
+            };
+            if fs.tag() == tag {
+                return fs.set_unshare_dir(path);
+            }
+        }
+        false
+    }
+
     /// Injects CTRL+ALT+DEL keystroke combo in the i8042 device.
     #[cfg(target_arch = "x86_64")]
     pub fn send_ctrl_alt_del(&mut self) -> Result<()> {
@@ -541,6 +559,10 @@ impl Vmm {
             nested_enabled: ctx.nested_enabled,
         };
         crate::macos::snapshot::capture_with_paused_hook(inputs, path, |stage_dir| {
+            // `capture_with_paused_hook` pauses every virtio device before
+            // running this hook; pmem's `pause()` msync(MS_SYNC)s + fsyncs its
+            // DAX mapping, so `copy_src` already holds all guest-synced data by
+            // the time we clone it here.
             let dst = stage_dir.join(copy_dst_name);
             clone_or_copy_file(copy_src, &dst)?;
             Ok(())
@@ -644,6 +666,10 @@ impl Vmm {
             nested_enabled: self.snapshot_nested_enabled,
         };
         crate::linux::snapshot::capture_with_paused_hook(inputs, path, |stage_dir| {
+            // `capture_with_paused_hook` pauses every virtio device before
+            // running this hook; pmem's `pause()` msync(MS_SYNC)s + fsyncs its
+            // DAX mapping, so `copy_src` already holds all guest-synced data by
+            // the time we clone it here.
             let dst = stage_dir.join(copy_dst_name);
             clone_or_copy_file(copy_src, &dst).map_err(crate::linux::snapshot::SnapshotError::Io)
         })

@@ -98,9 +98,11 @@ impl Context {
         tag: &str,
         path: &Path,
         write_allowlist: &[String],
+        unshare_dir: &Path,
     ) -> Result<()> {
         let tag = CString::new(tag)?;
         let path = cstring_path(path)?;
+        let unshare_dir = cstring_path(unshare_dir)?;
         call(
             unsafe {
                 libkrun::krun_add_virtiofs4(
@@ -113,6 +115,12 @@ impl Context {
                 )
             },
             "krun_add_virtiofs4",
+        )?;
+        call(
+            unsafe {
+                libkrun::krun_set_virtiofs_unshare_dir(self.id, tag.as_ptr(), unshare_dir.as_ptr())
+            },
+            "krun_set_virtiofs_unshare_dir",
         )?;
         self.set_host_virtiofs_write_allowlist_cstr(&tag, write_allowlist)
     }
