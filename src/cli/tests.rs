@@ -350,7 +350,7 @@ fn nested_deterministic_script_quotes_paths_and_exports_inner_base() {
         &["--instance".to_string(), "dev one".to_string()],
     );
 
-    assert!(script.contains("export LNX_ROOTFS_BACKEND=block"));
+    assert!(!script.contains("LNX_ROOTFS_BACKEND"));
     assert!(script.contains("export LNX_BASE='/Users/test/.lnx'"));
     assert!(script.contains("export LNX_RUN_BASE='/tmp/lnx run'"));
     assert!(script.contains("exec \"$LNX_BIN\" '--instance' 'dev one'"));

@@ -154,14 +154,7 @@ fn download_kernel(dest: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let mut errors = Vec::new();
-    for asset in ["vmlinuz.gz", "kernel.Image"] {
-        match download_release(dest, asset) {
-            Ok(()) => return Ok(()),
-            Err(e) => errors.push(format!("{asset}: {e:#}")),
-        }
-    }
-    bail!("{}", errors.join("; "))
+    download_release(dest, "vmlinuz.gz")
 }
 
 fn download_release(dest: &Path, asset: &str) -> Result<()> {

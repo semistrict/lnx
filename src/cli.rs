@@ -1688,7 +1688,6 @@ fn nested_deterministic_script(
         "chmod +x \"$nested_tools\"/*".to_string(),
         "export LNX_BIN=\"$nested_tools/lnx\"".to_string(),
         "export GVPROXY_PATH=\"$nested_tools/gvproxy-linux-arm64\"".to_string(),
-        "export LNX_ROOTFS_BACKEND=block".to_string(),
         format!(
             "export LNX_BASE={}",
             shell_quote(&base.display().to_string())

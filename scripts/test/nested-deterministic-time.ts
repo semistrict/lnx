@@ -206,7 +206,6 @@ try {
       ...stageNestedToolsScript(),
       "command -v bun >/dev/null",
       `export LNX_BASE=${quoteShell(suiteBase)}`,
-      "export LNX_ROOTFS_BACKEND=block",
       "export LNX_TEST_INSTANCE=default",
       "export LNX_TEST_CPUS=1",
       "export LNX_TEST_MEMORY_MIB=512",

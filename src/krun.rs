@@ -85,14 +85,6 @@ impl Context {
         )
     }
 
-    pub fn set_root_disk(&self, rootfs: &Path) -> Result<()> {
-        let rootfs = cstring_path(rootfs)?;
-        call(
-            unsafe { libkrun::krun_set_root_disk(self.id, rootfs.as_ptr()) },
-            "krun_set_root_disk",
-        )
-    }
-
     pub fn add_host_virtiofs(
         &self,
         tag: &str,

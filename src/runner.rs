@@ -568,16 +568,14 @@ fn instance_mac(instance: &str) -> [u8; 6] {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RootfsBackend {
     Pmem,
-    Block,
 }
 
 impl RootfsBackend {
     fn from_env(value: Option<String>) -> Result<Self> {
         match value.as_deref() {
             None | Some("") | Some("pmem") => Ok(Self::Pmem),
-            Some("block") => Ok(Self::Block),
             Some(value) => {
-                bail!("{ROOTFS_BACKEND_ENV} must be either 'pmem' or 'block', got {value:?}")
+                bail!("{ROOTFS_BACKEND_ENV} must be 'pmem' or unset, got {value:?}")
             }
         }
     }
@@ -818,10 +816,6 @@ fn start_vm(
             ctx.add_root_pmem(&rootfs)?;
             "/dev/pmem0"
         }
-        RootfsBackend::Block => {
-            ctx.set_root_disk(&rootfs)?;
-            "/dev/vda"
-        }
     };
     let (guest_home, guest_cwd) = if share_layout.no_host_shares {
         (String::new(), String::new())
@@ -857,9 +851,7 @@ fn start_vm(
         format!("console=hvc0 reboot=k panic=1 root={root_device} rw rootfstype=ext4");
     #[cfg(target_arch = "aarch64")]
     kernel_cmdline.push_str(" arm64.nopauth");
-    if matches!(rootfs_backend, RootfsBackend::Pmem) {
-        kernel_cmdline.push_str(" rootflags=dax");
-    }
+    kernel_cmdline.push_str(" rootflags=dax");
     if config.nested_kvm {
         kernel_cmdline.push_str(" kvm.allow_unsafe_mappings=1");
     }

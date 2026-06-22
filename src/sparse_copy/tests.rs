@@ -1,4 +1,5 @@
 use super::*;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 struct TempDir {
@@ -37,7 +38,7 @@ fn copies_sparse_file_without_materializing_holes() {
     file.sync_all().expect("sync");
     drop(file);
 
-    clone_or_copy_file(&src, &dst).expect("copy");
+    clone_or_copy_file(&src, &dst).expect("clone");
 
     let src_bytes = fs::read(&src).expect("read src");
     let dst_bytes = fs::read(&dst).expect("read dst");

@@ -152,7 +152,6 @@ print("linux-source-after", flush=True)
     "chmod +x \"$nested_tools\"/*",
     "export LNX_BIN=\"$nested_tools/lnx\"",
     "export GVPROXY_PATH=\"$nested_tools/gvproxy-linux-arm64\"",
-    "export LNX_ROOTFS_BACKEND=block",
     "export LNX_BROKER_IDLE_TTL_MS=250",
     `inner_instance=${quoteShell(innerInstance)}`,
     `checkpointName=${quoteShell(checkpointName)}`,

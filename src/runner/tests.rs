@@ -898,11 +898,8 @@ fn rootfs_backend_defaults_to_pmem() {
 }
 
 #[test]
-fn rootfs_backend_accepts_block() {
-    assert_eq!(
-        RootfsBackend::from_env(Some("block".to_string())).unwrap(),
-        RootfsBackend::Block
-    );
+fn rootfs_backend_rejects_block() {
+    assert!(RootfsBackend::from_env(Some("block".to_string())).is_err());
 }
 
 #[test]

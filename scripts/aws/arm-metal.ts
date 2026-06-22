@@ -247,7 +247,6 @@ rm -rf "$restore_snapshot_dir"
 stat -c 'remote-snapshot %n size=%s blocks=%b block_size=%B' "$snapshot_dir"/rootfs.ext4 "$snapshot_dir"/pages.img
 set +e
 LNX_INGRESS_STATE_DIR=/tmp/lnx-disabled-ingress \\
-LNX_ROOTFS_BACKEND=block \\
 LNX_AGENT_TIMEOUT_MS=30000 \\
 LNX_KRUN_LOG_LEVEL=4 \\
 ./target/debug/lnx \\
@@ -967,7 +966,7 @@ if test -s "$HOME/.lnx/server/pid"; then
     sleep 0.1
   done
 fi
-nohup env LNX_ROOTFS_BACKEND=block ./target/debug/lnx --no-host-shares server --listen 127.0.0.1:${lnxServerPort} >"$HOME/.lnx/server/server.log" 2>&1 &
+nohup ./target/debug/lnx --no-host-shares server --listen 127.0.0.1:${lnxServerPort} >"$HOME/.lnx/server/server.log" 2>&1 &
 printf '%s\\n' "$!" >"$HOME/.lnx/server/pid"
 for _ in $(seq 1 120); do
   if curl -fsS --max-time 2 http://127.0.0.1:${lnxServerPort}/v1/health >/dev/null 2>&1; then
