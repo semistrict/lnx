@@ -117,7 +117,7 @@ Features are additive and controlled at the `libkrun` crate level. Each device f
 - Format: `<subsystem>: <title>` — e.g., `virtio/blk: add print_text() function`
 - Commits must be self-contained, compile, and pass tests independently
 - Sign all commits with `git commit -s` (DCO requirement)
-- Agent attribution format: `Assisted-by: <Agent-tool>: <model-name>` - e.g., `Assisted-by: Claude Code: sonnet-4.6`, `Assisted-by: Cursor: codex-5.3`
+- Agent attribution format: `Assisted-by: <Agent-tool>: <model-name>` - e.g., `Assisted-by: Claude Code: sonnet-4.6`, `Assisted-by: Cursor: codex-5.3`. Do not use `Co-authored-by`.
 - Commit messages should be concise and written in the imperative mood. Small, focused commits are preferred.
 
 ### Rust coding style
