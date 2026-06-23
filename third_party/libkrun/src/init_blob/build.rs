@@ -117,6 +117,13 @@ fn build_rust_init() -> PathBuf {
 
     if use_musl {
         cmd.arg("--target").arg(musl_target);
+
+        // The parent cargo sets CARGO_ENCODED_RUSTFLAGS="" for build scripts.
+        // The child cargo we spawn inherits it, and since that env var has
+        // higher precedence than CARGO_TARGET_*_RUSTFLAGS, the cross-linker
+        // flags from the Makefile would be silently ignored. Remove it so
+        // the per-target env vars take effect.
+        cmd.env_remove("CARGO_ENCODED_RUSTFLAGS");
     }
 
     let mut features: Vec<&str> = Vec::new();
