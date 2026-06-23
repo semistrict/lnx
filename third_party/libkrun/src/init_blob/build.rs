@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn musl_target_for_host() -> &'static str {
-    let host = env::var("HOST").unwrap_or_default();
+    let host = env::var("TARGET").unwrap_or_default();
     if host.starts_with("aarch64") {
         "aarch64-unknown-linux-musl"
     } else {
