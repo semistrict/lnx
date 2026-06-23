@@ -107,28 +107,15 @@ all: $(LIBRARY_RELEASE_$(OS)) libkrun.pc
 debug: $(LIBRARY_DEBUG_$(OS)) libkrun.pc
 
 ifeq ($(OS),Darwin)
-# If SYSROOT_LINUX is not set and we're on macOS, generate sysroot automatically
-ifeq ($(SYSROOT_LINUX),)
-    SYSROOT_LINUX = $(ROOTFS_DIR)
-    SYSROOT_TARGET = $(ROOTFS_DIR)/.sysroot_ready
+    # Cross-linker for musl targets on macOS (brew install llvm for lld).
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER = $(CLANG)
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = \
+        -C link-arg=-target -C link-arg=aarch64-linux-gnu \
+        -C link-arg=-fuse-ld=lld -C link-arg=-Wl,-strip-debug
+    SYSROOT_TARGET =
 else
     SYSROOT_TARGET =
 endif
-    # The GCC runtime dir (e.g. usr/lib/gcc/aarch64-linux-gnu/12) holds crtbeginT.o,
-    # crtend.o, libgcc.a and libgcc_eh.a. Apple clang does not search it
-    # automatically, so we pass it via -B (startup files) and -L (libraries).
-    GCC_TRIPLET = $(subst arm64,aarch64,$(ARCH))-linux-gnu
-    GCC_LIB_DIR = $(abspath $(SYSROOT_LINUX))/usr/lib/gcc/$(GCC_TRIPLET)/$(GCC_VERSION)
-    # Cross-compile on macOS with the LLVM linker (brew install lld)
-    CC_LINUX=$(CLANG) -target $(GCC_TRIPLET) -fuse-ld=lld -Wl,-strip-debug --sysroot $(abspath $(SYSROOT_LINUX)) -B$(GCC_LIB_DIR) -L$(GCC_LIB_DIR) -Wno-c23-extensions
-else
-    # Build on Linux host
-    CC_LINUX=$(CC)
-    SYSROOT_TARGET =
-endif
-
-# Make the variable available to Rust build scripts.
-export CC_LINUX
 
 AWS_NITRO_INIT_BINARY= init/aws-nitro/init
 $(AWS_NITRO_INIT_BINARY): $(AWS_NITRO_INIT_SRC)
