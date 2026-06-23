@@ -1,6 +1,6 @@
 [package]
 name = "krun-hvf"
-version = "0.1.0-1.18.0"
+version = "0.1.0-2.0.0-dev"
 authors = ["The libkrun Authors"]
 edition = "2024"
 description = "Apple Hypervisor.framework backend for libkrun"
@@ -13,7 +13,7 @@ libloading = "0.8"
 log = "0.4.0"
 serde = { version = "1.0", features = ["derive"] }
 
-arch = { package = "krun-arch", version = "=0.1.0-1.18.0", path = "../arch" }
+arch = { package = "krun-arch", version = "=0.1.0-2.0.0-dev", path = "../arch" }
 
 [build-dependencies]
 cc = "1"
