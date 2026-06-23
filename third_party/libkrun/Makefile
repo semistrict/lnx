@@ -74,9 +74,6 @@ CLANG = /usr/bin/clang
 
 OS = $(shell uname -s)
 ARCH = $(shell uname -m)
-DEBIAN_DIST ?= bookworm
-ROOTFS_DIR = linux-sysroot
-GCC_VERSION ?= 12
 FREEBSD_VERSION ?= 14.3-RELEASE
 FREEBSD_ROOTFS_DIR = freebsd-sysroot
 
@@ -112,9 +109,6 @@ ifeq ($(OS),Darwin)
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = \
         -C link-arg=-target -C link-arg=aarch64-linux-gnu \
         -C link-arg=-fuse-ld=lld -C link-arg=-Wl,-strip-debug
-    SYSROOT_TARGET =
-else
-    SYSROOT_TARGET =
 endif
 
 AWS_NITRO_INIT_BINARY= init/aws-nitro/init
@@ -172,34 +166,6 @@ $(INIT_BINARY_BSD): $(shell find init/src -name '*.rs') init/Cargo.toml $(SYSROO
 	cp target/$(FREEBSD_RUST_TARGET)/release/krun-init $@
 endif
 
-# Sysroot preparation rules for cross-compilation on macOS
-DEBIAN_PACKAGES = libc6 libc6-dev libgcc-$(GCC_VERSION)-dev linux-libc-dev
-ROOTFS_TMP = $(ROOTFS_DIR)/.tmp
-PACKAGES_FILE = $(ROOTFS_TMP)/Packages.xz
-
-.INTERMEDIATE: $(PACKAGES_FILE)
-
-$(ROOTFS_DIR)/.sysroot_ready: $(PACKAGES_FILE)
-	@echo "Extracting Debian packages to $(ROOTFS_DIR)..."
-	@for pkg in $(DEBIAN_PACKAGES); do \
-		DEB_PATH=$$(xzcat $(PACKAGES_FILE) | sed '1,/Package: '$$pkg'$$/d' | grep Filename: | sed 's/^Filename: //' | head -n1); \
-		DEB_URL="https://deb.debian.org/debian/$$DEB_PATH"; \
-		DEB_NAME=$$(basename "$$DEB_PATH"); \
-		if [ ! -f "$(ROOTFS_TMP)/$$DEB_NAME" ]; then \
-			echo "Downloading $$DEB_URL"; \
-			curl -fL -o "$(ROOTFS_TMP)/$$DEB_NAME" "$$DEB_URL"; \
-		fi; \
-		cd $(ROOTFS_TMP) && ar x "$$DEB_NAME" && cd ../..; \
-		tar xf $(ROOTFS_TMP)/data.tar.* -C $(ROOTFS_DIR); \
-		rm -f $(ROOTFS_TMP)/*.deb $(ROOTFS_TMP)/data.tar.* $(ROOTFS_TMP)/control.tar.* $(ROOTFS_TMP)/debian-binary; \
-	done
-	@touch $@
-
-$(PACKAGES_FILE):
-	@echo "Downloading Debian package index for $(DEBIAN_DIST)/$(ARCH)..."
-	@mkdir -p $(ROOTFS_TMP)
-	@curl -fL -o $@ https://deb.debian.org/debian/dists/$(DEBIAN_DIST)/main/binary-$(ARCH)/Packages.xz
-
 # FreeBSD sysroot preparation rules for cross-compilation on macOS
 FREEBSD_BASE_TXZ = $(FREEBSD_ROOTFS_DIR)/base.txz
 
@@ -218,11 +184,10 @@ $(FREEBSD_BASE_TXZ):
 	@curl -fL -o $@ https://download.freebsd.org/releases/$(BSD_ARCH)/$(FREEBSD_VERSION)/base.txz
 
 clean-sysroot:
-	rm -rf $(ROOTFS_DIR)
 	rm -rf $(FREEBSD_ROOTFS_DIR)
 
 
-$(LIBRARY_RELEASE_$(OS)): $(SYSROOT_TARGET) $(INIT_BINARY_BSD)
+$(LIBRARY_RELEASE_$(OS)): $(INIT_BINARY_BSD)
 	cargo build --release $(FEATURE_FLAGS)
 ifeq ($(SEV),1)
 	mv target/release/libkrun.so target/release/$(KRUN_BASE_$(OS))
@@ -238,7 +203,7 @@ ifeq ($(OS),Darwin)
 endif
 	cp target/release/$(KRUN_BASE_$(OS)) $(LIBRARY_RELEASE_$(OS))
 
-$(LIBRARY_DEBUG_$(OS)): $(SYSROOT_TARGET) $(INIT_BINARY_BSD)
+$(LIBRARY_DEBUG_$(OS)): $(INIT_BINARY_BSD)
 	cargo build $(FEATURE_FLAGS)
 ifeq ($(SEV),1)
 	mv target/debug/libkrun.so target/debug/$(KRUN_BASE_$(OS))

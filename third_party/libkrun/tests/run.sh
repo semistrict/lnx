@@ -32,13 +32,6 @@ fi
 
 # On macOS, we need to cross-compile for Linux musl
 if [ "$OS" = "Darwin" ]; then
-	SYSROOT="../linux-sysroot"
-	if [ ! -d "$SYSROOT" ]; then
-		echo "ERROR: Linux sysroot not found at $SYSROOT"
-		echo "Run 'make' in the libkrun root directory first to create it."
-		exit 1
-	fi
-
 	echo "Cross-compiling guest-agent for $GUEST_TARGET"
 
 	# e2fsprogs is keg-only on macOS; add it to PATH for mke2fs.
