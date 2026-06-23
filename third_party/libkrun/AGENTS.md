@@ -33,7 +33,7 @@ make install
 make PREFIX=$HOME/.local install
 ```
 
-The Makefile exports `CC_LINUX` for Rust build scripts that compile C code targeting Linux. On macOS it auto-downloads a Debian sysroot; on Linux it uses the host toolchain.
+On macOS the Makefile exports `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER` and `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS` to configure clang+lld as the cross-linker for musl targets.
 
 ## Lint and format
 
@@ -91,11 +91,11 @@ The workspace (`Cargo.toml`) contains these crates under `src/`:
    - Loads the kernel via **kernel**
    - Instantiates virtio devices from **devices**
    - Starts vCPU threads (KVM ioctls on Linux, HVF on macOS)
-   - The guest boots, the C init binary runs as PID 1, reads `.krun_config.json` from the virtiofs overlay, and execs the workload
+   - The guest boots, the init binary runs as PID 1, reads `.krun_config.json` from the virtiofs overlay, and execs the workload
 
-### The init binary (`init/init.c`)
+### The init binary (`init/`)
 
-The guest PID-1 is a statically-linked C binary (`init/init.c`) compiled by `src/devices/build.rs` via `CC_LINUX`. The compiled binary path is set in the `KRUN_INIT_BINARY_PATH` env var at build time and embedded into the devices crate via `include_bytes!`. The passthrough fs backend exposes it as a virtual read-only file named `init.krun` (inode defined in `src/devices/src/virtio/fs/linux/passthrough.rs`) — the real host filesystem never sees it.
+The guest PID-1 is a statically-linked Rust binary (`init/src/main.rs`). It is built by `src/init_blob/build.rs` as a separate cargo invocation targeting musl. The compiled binary is embedded into the `init_blob` crate via `include_bytes!` and exposed by the passthrough fs backend as a virtual read-only file named `init.krun`.
 
 AWS Nitro uses a separate C init (`init/aws-nitro/`) built by the Makefile when `AWS_NITRO=1`.
 
