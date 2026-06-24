@@ -15,12 +15,12 @@ All builds go through the Makefile, which handles feature flags, platform detect
 make
 
 # Release build with common optional devices
-make BLK=1 NET=1 GPU=1 SND=1 INPUT=1
+make BLK=1 NET=1 GPU=1 INPUT=1
 
 # Debug build
 make debug
 
-# TEE variants (mutually exclusive with each other and GPU/SND/INPUT)
+# TEE variants (mutually exclusive with each other and GPU/INPUT)
 make SEV=1        # AMD SEV — produces libkrun-sev.so
 make TDX=1        # Intel TDX — produces libkrun-tdx.so
 
@@ -44,7 +44,7 @@ Clippy is run with `-D warnings` — zero warnings are allowed. The CI checks se
 cargo clippy --locked -- -D warnings
 cargo clippy --locked --features amd-sev -- -D warnings
 cargo clippy --locked --features tdx -- -D warnings
-cargo clippy --locked --features net,blk,gpu,snd,input -- -D warnings
+cargo clippy --locked --features net,blk,gpu,input -- -D warnings
 
 # Format check
 cargo fmt -- --check
@@ -101,7 +101,7 @@ AWS Nitro uses a separate C init (`init/aws-nitro/`) built by the Makefile when 
 
 ### Feature flags
 
-Features are additive and controlled at the `libkrun` crate level. Each device feature (`blk`, `net`, `gpu`, `snd`, `input`) enables the corresponding code in both `devices` and `vmm`. The TEE variants (`amd-sev`, `tdx`) imply `blk` + `tee` and affect the soname of the output library.
+Features are additive and controlled at the `libkrun` crate level. Each device feature (`blk`, `net`, `gpu`, `input`) enables the corresponding code in both `devices` and `vmm`. The TEE variants (`amd-sev`, `tdx`) imply `blk` + `tee` and affect the soname of the output library.
 
 ## Pull Request expectations
 - New tests are added when necessary.
