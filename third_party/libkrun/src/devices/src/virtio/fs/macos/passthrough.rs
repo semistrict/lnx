@@ -1026,12 +1026,13 @@ fn is_valid_owner(owner: Option<(u32, u32)>) -> bool {
 // We won't need this once expressions like "if let ... &&" are allowed.
 #[allow(clippy::unnecessary_unwrap)]
 fn set_xattr_stat(
+    ctx: &Context,
     file: &InodeHandle,
     st: Option<bindings::stat64>,
     owner: Option<(u32, u32)>,
     mode: Option<u32>,
 ) -> io::Result<()> {
-    let st = st.unwrap_or(istat(file, true)?);
+    let st = st.unwrap_or(istat(ctx, file, true)?);
     let buf = if is_valid_owner(owner) && mode.is_some() {
         let owner = owner.unwrap();
         let mode = mode.unwrap();
@@ -1075,8 +1076,12 @@ fn set_xattr_stat(
     write_xattr_stat(file, st, &buf)
 }
 
-fn clear_xattr_mode(file: &InodeHandle, st: Option<bindings::stat64>) -> io::Result<()> {
-    let st = st.unwrap_or(istat(file, true)?);
+fn clear_xattr_mode(
+    ctx: &Context,
+    file: &InodeHandle,
+    st: Option<bindings::stat64>,
+) -> io::Result<()> {
+    let st = st.unwrap_or(istat(ctx, file, true)?);
     let (uid, gid, _) = match file {
         InodeHandle::Fd(fd) => get_xattr_fstat(*fd, st)?,
         InodeHandle::Path(c_path) => get_xattr_lstat(c_path, st)?,
@@ -1145,32 +1150,30 @@ fn chmod_host(file: &InodeHandle, mode: u32) -> io::Result<()> {
 }
 
 fn stat_common(
+    _ctx: &Context,
     mut st: bindings::stat64,
     uid: Option<u32>,
     gid: Option<u32>,
     mode: Option<u32>,
-    host: bool,
 ) -> io::Result<bindings::stat64> {
-    if !host {
-        if let Some(uid) = uid {
-            st.st_uid = uid;
-        }
-        if let Some(gid) = gid {
-            st.st_gid = gid;
-        }
-        if let Some(mode) = mode {
-            if mode as u16 & libc::S_IFMT == 0 {
-                st.st_mode = (st.st_mode & libc::S_IFMT) | mode as u16;
-            } else {
-                st.st_mode = mode as u16;
-            }
+    if let Some(uid) = uid {
+        st.st_uid = uid;
+    }
+    if let Some(gid) = gid {
+        st.st_gid = gid;
+    }
+    if let Some(mode) = mode {
+        if mode as u16 & libc::S_IFMT == 0 {
+            st.st_mode = (st.st_mode & libc::S_IFMT) | mode as u16;
+        } else {
+            st.st_mode = mode as u16;
         }
     }
 
     Ok(st)
 }
 
-fn fstat(fd: RawFd, host: bool) -> io::Result<bindings::stat64> {
+fn fstat(ctx: &Context, fd: RawFd, host: bool) -> io::Result<bindings::stat64> {
     let mut st = MaybeUninit::<bindings::stat64>::zeroed();
 
     // Safe because the kernel will only write data in `st` and we check the return
@@ -1181,7 +1184,7 @@ fn fstat(fd: RawFd, host: bool) -> io::Result<bindings::stat64> {
         let st = unsafe { st.assume_init() };
         if !host {
             let (uid, gid, mode) = get_xattr_fstat(fd, st)?;
-            stat_common(st, uid, gid, mode, host)
+            stat_common(ctx, st, uid, gid, mode)
         } else {
             Ok(st)
         }
@@ -1208,7 +1211,7 @@ fn punch_hole(fd: RawFd, offset: u64, length: u64) -> io::Result<()> {
     Ok(())
 }
 
-fn lstat(c_path: &CString, host: bool) -> io::Result<bindings::stat64> {
+fn lstat(ctx: &Context, c_path: &CString, host: bool) -> io::Result<bindings::stat64> {
     let mut st = MaybeUninit::<bindings::stat64>::zeroed();
 
     // Safe because the kernel will only write data in `st` and we check the return
@@ -1219,7 +1222,7 @@ fn lstat(c_path: &CString, host: bool) -> io::Result<bindings::stat64> {
         let st = unsafe { st.assume_init() };
         if !host {
             let (uid, gid, mode) = get_xattr_lstat(c_path, st)?;
-            stat_common(st, uid, gid, mode, host)
+            stat_common(ctx, st, uid, gid, mode)
         } else {
             Ok(st)
         }
@@ -1228,10 +1231,10 @@ fn lstat(c_path: &CString, host: bool) -> io::Result<bindings::stat64> {
     }
 }
 
-fn istat(ihandle: &InodeHandle, host: bool) -> io::Result<bindings::stat64> {
+fn istat(ctx: &Context, ihandle: &InodeHandle, host: bool) -> io::Result<bindings::stat64> {
     match ihandle {
-        InodeHandle::Fd(fd) => fstat(*fd, host),
-        InodeHandle::Path(c_path) => lstat(c_path, host),
+        InodeHandle::Fd(fd) => fstat(ctx, *fd, host),
+        InodeHandle::Path(c_path) => lstat(ctx, c_path, host),
     }
 }
 
@@ -1493,20 +1496,21 @@ impl PassthroughFs {
 
     fn copy_sparse_range(
         &self,
+        ctx: &Context,
         fd_in: RawFd,
         offset_in: u64,
         fd_out: RawFd,
         offset_out: u64,
         len: u64,
     ) -> io::Result<usize> {
-        let src_size = fstat(fd_in, true)?.st_size.max(0) as u64;
+        let src_size = fstat(ctx, fd_in, true)?.st_size.max(0) as u64;
         if offset_in >= src_size || len == 0 {
             return Ok(0);
         }
 
         let end = offset_in.saturating_add(len).min(src_size);
         let dst_end = offset_out + (end - offset_in);
-        if (fstat(fd_out, true)?.st_size.max(0) as u64) < dst_end {
+        if (fstat(ctx, fd_out, true)?.st_size.max(0) as u64) < dst_end {
             let res = unsafe { libc::ftruncate(fd_out, dst_end as libc::off_t) };
             if res < 0 {
                 return Err(linux_error(io::Error::last_os_error()));
@@ -1800,7 +1804,7 @@ impl PassthroughFs {
         Ok(OverlayPath::Lower(self.rel_path_to_cstring(rel_path)?))
     }
 
-    fn prepare_upper_parent(&self, rel_path: &Path) -> io::Result<()> {
+    fn prepare_upper_parent(&self, ctx: &Context, rel_path: &Path) -> io::Result<()> {
         let Some(parent) = rel_path.parent() else {
             return Ok(());
         };
@@ -1823,25 +1827,31 @@ impl PassthroughFs {
             if Self::has_path(&lower)? {
                 let lower_c = self.path_to_cstring(&lower)?;
                 let upper_c = self.path_to_cstring(&upper)?;
-                let st = lstat(&lower_c, false)?;
-                self.mirror_copied_metadata(&InodeHandle::Path(upper_c), st)?;
+                let st = lstat(ctx, &lower_c, false)?;
+                self.mirror_copied_metadata(ctx, &InodeHandle::Path(upper_c), st)?;
             }
         }
         Ok(())
     }
 
-    fn prepare_upper_create(&self, rel_path: &Path) -> io::Result<CString> {
-        self.prepare_upper_parent(rel_path)?;
+    fn prepare_upper_create(&self, ctx: &Context, rel_path: &Path) -> io::Result<CString> {
+        self.prepare_upper_parent(ctx, rel_path)?;
         self.clear_direct_whiteout(rel_path)?;
         let upper = self.upper_path(rel_path).ok_or_else(einval)?;
         self.path_to_cstring(&upper)
     }
 
-    fn mirror_copied_metadata(&self, file: &InodeHandle, st: bindings::stat64) -> io::Result<()> {
+    fn mirror_copied_metadata(
+        &self,
+        ctx: &Context,
+        file: &InodeHandle,
+        st: bindings::stat64,
+    ) -> io::Result<()> {
         if (st.st_mode & libc::S_IFMT) != libc::S_IFLNK {
             chmod_host(file, st.st_mode as u32)?;
         }
         set_xattr_stat(
+            ctx,
             file,
             None,
             Some((st.st_uid, st.st_gid)),
@@ -1849,7 +1859,7 @@ impl PassthroughFs {
         )
     }
 
-    fn copy_up_path(&self, rel_path: &Path) -> io::Result<()> {
+    fn copy_up_path(&self, ctx: &Context, rel_path: &Path) -> io::Result<()> {
         if self.path_has_upper(rel_path)? {
             return Ok(());
         }
@@ -1860,8 +1870,8 @@ impl PassthroughFs {
         let lower = self.lower_path(rel_path);
         let upper = self.upper_path(rel_path).ok_or_else(einval)?;
         let lower_c = self.path_to_cstring(&lower)?;
-        let st = lstat(&lower_c, false)?;
-        self.prepare_upper_parent(rel_path)?;
+        let st = lstat(ctx, &lower_c, false)?;
+        self.prepare_upper_parent(ctx, rel_path)?;
 
         match st.st_mode & libc::S_IFMT {
             mode if mode == libc::S_IFDIR => {
@@ -1880,16 +1890,21 @@ impl PassthroughFs {
         }
 
         let upper_c = self.path_to_cstring(&upper)?;
-        self.mirror_copied_metadata(&InodeHandle::Path(upper_c), st)?;
+        self.mirror_copied_metadata(ctx, &InodeHandle::Path(upper_c), st)?;
         self.clear_direct_whiteout(rel_path)
     }
 
-    fn refresh_inode_backing(&self, inode: Inode, rel_path: &Path) -> io::Result<()> {
+    fn refresh_inode_backing(
+        &self,
+        ctx: &Context,
+        inode: Inode,
+        rel_path: &Path,
+    ) -> io::Result<()> {
         let Some(upper) = self.upper_path(rel_path) else {
             return Ok(());
         };
         let upper_c = self.path_to_cstring(&upper)?;
-        let st = lstat(&upper_c, false)?;
+        let st = lstat(ctx, &upper_c, false)?;
         let old = self.inodes.read().unwrap().get(&inode).cloned();
         let refcount = old
             .as_ref()
@@ -1912,19 +1927,25 @@ impl PassthroughFs {
         Ok(())
     }
 
-    fn ensure_unshared_inode(&self, inode: Inode) -> io::Result<bool> {
+    fn ensure_unshared_inode(&self, ctx: &Context, inode: Inode) -> io::Result<bool> {
         let rel_path = self.inode_path(inode)?;
         if !self.should_unshare_path(&rel_path)? {
             return Ok(false);
         }
-        self.copy_up_path(&rel_path)?;
-        self.refresh_inode_backing(inode, &rel_path)?;
+        self.copy_up_path(ctx, &rel_path)?;
+        self.refresh_inode_backing(ctx, inode, &rel_path)?;
         Ok(true)
     }
 
-    fn child_write_path(&self, parent: Inode, name: &CStr, rel_path: &Path) -> io::Result<CString> {
+    fn child_write_path(
+        &self,
+        ctx: &Context,
+        parent: Inode,
+        name: &CStr,
+        rel_path: &Path,
+    ) -> io::Result<CString> {
         if self.should_unshare_path(rel_path)? {
-            self.prepare_upper_create(rel_path)
+            self.prepare_upper_create(ctx, rel_path)
         } else {
             self.name_to_path(parent, name)
         }
@@ -1945,7 +1966,12 @@ impl PassthroughFs {
         } else {
             self.rel_path_to_cstring(rel_path)?
         };
-        let st = lstat(&path, false)?;
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let st = lstat(&ctx, &path, false)?;
         Ok((
             InodeAltKey {
                 ino: st.st_ino,
@@ -1957,7 +1983,12 @@ impl PassthroughFs {
 
     fn snapshot_host_object(&self, data: &InodeData) -> Option<HostObjectSnapshot> {
         let path = CString::new(format!("/.vol/{}/{}", data.dev, data.ino)).ok()?;
-        lstat(&path, false)
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        lstat(&ctx, &path, false)
             .ok()
             .map(|st| HostObjectSnapshot::from_stat(&st))
     }
@@ -2570,6 +2601,7 @@ impl PassthroughFs {
 
     fn do_open(
         &self,
+        ctx: &Context,
         inode: Inode,
         kill_priv: bool,
         flags: u32,
@@ -2585,10 +2617,10 @@ impl PassthroughFs {
 
             remove_security_capability(&ihandle);
 
-            if let Ok(st) = fstat(fd, false) {
+            if let Ok(st) = fstat(ctx, fd, false) {
                 let new_mode = clear_suid_sgid(st.st_mode as u32);
                 if new_mode != st.st_mode as u32
-                    && let Err(err) = set_xattr_stat(&ihandle, Some(st), None, Some(new_mode))
+                    && let Err(err) = set_xattr_stat(ctx, &ihandle, Some(st), None, Some(new_mode))
                 {
                     error!("Couldn't clear suid/sgid for inode {inode}: {err}");
                 }
@@ -2636,11 +2668,11 @@ impl PassthroughFs {
         Err(ebadf())
     }
 
-    fn do_getattr(&self, inode: Inode) -> io::Result<(bindings::stat64, Duration)> {
+    fn do_getattr(&self, ctx: &Context, inode: Inode) -> io::Result<(bindings::stat64, Duration)> {
         let ihandle = self.inode_to_handle(inode, true)?;
         let st = match ihandle {
-            InodeHandle::Path(c_path) => lstat(&c_path, false)?,
-            InodeHandle::Fd(fd) => fstat(fd, false)?,
+            InodeHandle::Path(c_path) => lstat(ctx, &c_path, false)?,
+            InodeHandle::Fd(fd) => fstat(ctx, fd, false)?,
         };
 
         Ok((st, self.cfg.attr_timeout))
@@ -2655,8 +2687,8 @@ impl PassthroughFs {
         Ok(fd)
     }
 
-    fn store_unlinked_fd(&self, unlinked_fd: RawFd) -> io::Result<bool> {
-        let st = fstat(unlinked_fd, true)?;
+    fn store_unlinked_fd(&self, ctx: &Context, unlinked_fd: RawFd) -> io::Result<bool> {
+        let st = fstat(ctx, unlinked_fd, true)?;
         let altkey = InodeAltKey {
             ino: st.st_ino,
             dev: st.st_dev,
@@ -2684,7 +2716,7 @@ impl PassthroughFs {
 
     fn do_unlink(
         &self,
-        _ctx: Context,
+        ctx: Context,
         parent: Inode,
         name: &CStr,
         flags: libc::c_int,
@@ -2728,7 +2760,7 @@ impl PassthroughFs {
 
         if res == 0 {
             if let Some(unlinked_fd) = unlinked_fd {
-                match self.store_unlinked_fd(unlinked_fd) {
+                match self.store_unlinked_fd(&ctx, unlinked_fd) {
                     // The tracked inode took ownership of the fd.
                     Ok(true) => {}
                     // No tracked inode: we still own the fd and must close it.
@@ -2798,6 +2830,7 @@ impl PassthroughFs {
 
     fn overlay_rename(
         &self,
+        ctx: &Context,
         old_rel_path: &Path,
         new_rel_path: &Path,
         flags: u32,
@@ -2818,8 +2851,8 @@ impl PassthroughFs {
         }
 
         let old_lower_exists = Self::has_path(&self.lower_path(old_rel_path))?;
-        self.copy_up_path(old_rel_path)?;
-        self.prepare_upper_parent(new_rel_path)?;
+        self.copy_up_path(ctx, old_rel_path)?;
+        self.prepare_upper_parent(ctx, new_rel_path)?;
 
         if ((flags as i32) & bindings::LINUX_RENAME_NOREPLACE) != 0 {
             if self.path_has_upper(new_rel_path)? || Self::has_path(&self.lower_path(new_rel_path))?
@@ -3007,7 +3040,12 @@ impl FileSystem for PassthroughFs {
         // Safe because we just opened this fd above.
         let f = unsafe { File::from_raw_fd(fd) };
 
-        let st = fstat(f.as_raw_fd(), true)?;
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let st = fstat(&ctx, f.as_raw_fd(), true)?;
 
         // Safe because this doesn't modify any memory and there is no need to check the return
         // value because this system call always succeeds. We need to clear the umask here because
@@ -3070,7 +3108,7 @@ impl FileSystem for PassthroughFs {
         }
     }
 
-    fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
+    fn lookup(&self, ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
         let rel_path = self.rel_child_path(parent, name)?;
         let parent_data = self
             .inodes
@@ -3086,7 +3124,7 @@ impl FileSystem for PassthroughFs {
                 return Err(linux_error(io::Error::from_raw_os_error(libc::ENOENT)));
             }
         };
-        let st = lstat(&c_path, false)?;
+        let st = lstat(&ctx, &c_path, false)?;
 
         debug!(
             "lookup: inode={} path={}",
@@ -3166,11 +3204,11 @@ impl FileSystem for PassthroughFs {
 
     fn opendir(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
-        self.do_open(inode, false, flags | libc::O_DIRECTORY as u32)
+        self.do_open(&ctx, inode, false, flags | libc::O_DIRECTORY as u32)
     }
 
     fn releasedir(
@@ -3193,7 +3231,7 @@ impl FileSystem for PassthroughFs {
         extensions: Extensions,
     ) -> io::Result<Entry> {
         let rel_path = self.check_write_child(parent, name)?;
-        let c_path = self.child_write_path(parent, name, &rel_path)?;
+        let c_path = self.child_write_path(&ctx, parent, name, &rel_path)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::mkdir(c_path.as_ptr(), 0o700) };
@@ -3205,6 +3243,7 @@ impl FileSystem for PassthroughFs {
             };
 
             set_xattr_stat(
+                &ctx,
                 &ihandle,
                 None,
                 Some((ctx.uid, ctx.gid)),
@@ -3269,7 +3308,7 @@ impl FileSystem for PassthroughFs {
 
     fn open(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         kill_priv: bool,
         flags: u32,
@@ -3277,9 +3316,9 @@ impl FileSystem for PassthroughFs {
         let f = flags as i32;
         if f & libc::O_ACCMODE != libc::O_RDONLY || f & libc::O_TRUNC != 0 {
             self.check_write_inode(inode)?;
-            self.ensure_unshared_inode(inode)?;
+            self.ensure_unshared_inode(&ctx, inode)?;
         }
-        self.do_open(inode, kill_priv, flags)
+        self.do_open(&ctx, inode, kill_priv, flags)
     }
 
     fn release(
@@ -3307,7 +3346,7 @@ impl FileSystem for PassthroughFs {
         extensions: Extensions,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions)> {
         let rel_path = self.check_write_child(parent, name)?;
-        let c_path = self.child_write_path(parent, name, &rel_path)?;
+        let c_path = self.child_write_path(&ctx, parent, name, &rel_path)?;
 
         let flags = self.parse_open_flags(flags as i32);
         let hostmode = if (flags & libc::O_DIRECTORY) != 0 {
@@ -3332,6 +3371,7 @@ impl FileSystem for PassthroughFs {
         let ihandle = InodeHandle::Fd(fd);
 
         if let Err(e) = set_xattr_stat(
+            &ctx,
             &ihandle,
             None,
             Some((ctx.uid, ctx.gid)),
@@ -3415,7 +3455,7 @@ impl FileSystem for PassthroughFs {
 
     fn write<R: io::Read + ZeroCopyReader>(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         handle: Handle,
         mut r: R,
@@ -3448,11 +3488,12 @@ impl FileSystem for PassthroughFs {
 
             remove_security_capability(&ihandle);
 
-            if let Ok(st) = fstat(fd, false) {
+            if let Ok(st) = fstat(&ctx, fd, false) {
                 let new_mode = clear_suid_sgid(st.st_mode as u32);
                 if new_mode != st.st_mode as u32 {
                     // Update mode in xattr
-                    if let Err(err) = set_xattr_stat(&ihandle, Some(st), None, Some(new_mode)) {
+                    if let Err(err) = set_xattr_stat(&ctx, &ihandle, Some(st), None, Some(new_mode))
+                    {
                         error!("Couldn't clear suid/sgid for inode {inode}: {err}");
                     }
                 }
@@ -3464,16 +3505,16 @@ impl FileSystem for PassthroughFs {
 
     fn getattr(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         _handle: Option<Handle>,
     ) -> io::Result<(bindings::stat64, Duration)> {
-        self.do_getattr(inode)
+        self.do_getattr(&ctx, inode)
     }
 
     fn setattr(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         attr: bindings::stat64,
         handle: Option<Handle>,
@@ -3481,7 +3522,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<(bindings::stat64, Duration)> {
         if !valid.is_empty() {
             self.check_write_inode(inode)?;
-            self.ensure_unshared_inode(inode)?;
+            self.ensure_unshared_inode(&ctx, inode)?;
         }
         // If we have a handle then use it otherwise get a new fd from the inode.
         let use_inode_handle = self
@@ -3508,7 +3549,7 @@ impl FileSystem for PassthroughFs {
 
         if valid.contains(SetattrValid::MODE) {
             chmod_host(&ihandle, attr.st_mode as u32)?;
-            clear_xattr_mode(&ihandle, None)?;
+            clear_xattr_mode(&ctx, &ihandle, None)?;
         }
 
         if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
@@ -3526,7 +3567,7 @@ impl FileSystem for PassthroughFs {
             };
 
             remove_security_capability(&ihandle);
-            let st = istat(&ihandle, false)?;
+            let st = istat(&ctx, &ihandle, false)?;
 
             // Clear suid/sgid if UID or GID is being changed
             let new_mode = clear_suid_sgid(st.st_mode as u32);
@@ -3535,7 +3576,7 @@ impl FileSystem for PassthroughFs {
             } else {
                 None
             };
-            set_xattr_stat(&ihandle, Some(st), Some((uid, gid)), new_mode)?;
+            set_xattr_stat(&ctx, &ihandle, Some(st), Some((uid, gid)), new_mode)?;
         }
 
         if valid.contains(SetattrValid::SIZE) {
@@ -3549,10 +3590,10 @@ impl FileSystem for PassthroughFs {
 
                     // Clear security.capability on truncate unconditionally
                     remove_security_capability(&ihandle);
-                    let st = fstat(fd, false)?;
+                    let st = fstat(&ctx, fd, false)?;
                     let new_mode = clear_suid_sgid(st.st_mode as u32);
                     if new_mode != st.st_mode as u32 {
-                        set_xattr_stat(&ihandle, Some(st), None, Some(new_mode))?;
+                        set_xattr_stat(&ctx, &ihandle, Some(st), None, Some(new_mode))?;
                     }
                 }
                 InodeHandle::Path(_) => {
@@ -3569,10 +3610,10 @@ impl FileSystem for PassthroughFs {
                     // reuse the FD we just opened, thus reducing the number of syscalls.
                     let ihandle = InodeHandle::Fd(f.as_raw_fd());
                     remove_security_capability(&ihandle);
-                    let st = istat(&ihandle, false)?;
+                    let st = istat(&ctx, &ihandle, false)?;
                     let new_mode = clear_suid_sgid(st.st_mode as u32);
                     if new_mode != st.st_mode as u32 {
-                        set_xattr_stat(&ihandle, Some(st), None, Some(new_mode))?;
+                        set_xattr_stat(&ctx, &ihandle, Some(st), None, Some(new_mode))?;
                     }
                 }
             };
@@ -3619,7 +3660,7 @@ impl FileSystem for PassthroughFs {
             }
         }
 
-        self.do_getattr(inode)
+        self.do_getattr(&ctx, inode)
     }
 
     fn rename(
@@ -3634,10 +3675,10 @@ impl FileSystem for PassthroughFs {
         let old_rel_path = self.check_write_child(olddir, oldname)?;
         let new_rel_path = self.check_write_child(newdir, newname)?;
         if self.should_unshare_path(&old_rel_path)? || self.should_unshare_path(&new_rel_path)? {
-            self.overlay_rename(&old_rel_path, &new_rel_path, flags)?;
+            self.overlay_rename(&ctx, &old_rel_path, &new_rel_path, flags)?;
             let moved = self.move_inode_path(&old_rel_path, &new_rel_path);
             for inode in moved {
-                self.refresh_inode_backing(inode, &new_rel_path)?;
+                self.refresh_inode_backing(&ctx, inode, &new_rel_path)?;
             }
             return Ok(());
         }
@@ -3702,7 +3743,7 @@ impl FileSystem for PassthroughFs {
             // `store_unlinked_fd` takes ownership only when that inode is
             // tracked; close the fd ourselves otherwise so it is never leaked.
             if let Some(fd) = doomed_fd {
-                match self.store_unlinked_fd(fd) {
+                match self.store_unlinked_fd(&ctx, fd) {
                     Ok(true) => {}
                     Ok(false) | Err(_) => unsafe {
                         libc::close(fd);
@@ -3720,6 +3761,7 @@ impl FileSystem for PassthroughFs {
                 };
                 if fd > 0 {
                     if let Err(e) = set_xattr_stat(
+                        &ctx,
                         &InodeHandle::Fd(fd),
                         None,
                         None,
@@ -3761,7 +3803,7 @@ impl FileSystem for PassthroughFs {
         extensions: Extensions,
     ) -> io::Result<Entry> {
         let rel_path = self.check_write_child(parent, name)?;
-        let c_path = self.child_write_path(parent, name, &rel_path)?;
+        let c_path = self.child_write_path(&ctx, parent, name, &rel_path)?;
 
         let fd = unsafe {
             libc::open(
@@ -3781,6 +3823,7 @@ impl FileSystem for PassthroughFs {
             };
 
             if let Err(e) = set_xattr_stat(
+                &ctx,
                 &ihandle,
                 None,
                 Some((ctx.uid, ctx.gid)),
@@ -3834,7 +3877,7 @@ impl FileSystem for PassthroughFs {
         extensions: Extensions,
     ) -> io::Result<Entry> {
         let rel_path = self.check_write_child(parent, name)?;
-        let c_path = self.child_write_path(parent, name, &rel_path)?;
+        let c_path = self.child_write_path(&ctx, parent, name, &rel_path)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::symlink(linkname.as_ptr(), c_path.as_ptr()) };
@@ -3848,7 +3891,13 @@ impl FileSystem for PassthroughFs {
 
             let mut entry = self.lookup(ctx, parent, name)?;
             let mode = libc::S_IFLNK | 0o777;
-            set_xattr_stat(&ihandle, None, Some((ctx.uid, ctx.gid)), Some(mode as u32))?;
+            set_xattr_stat(
+                &ctx,
+                &ihandle,
+                None,
+                Some((ctx.uid, ctx.gid)),
+                Some(mode as u32),
+            )?;
             entry.attr.st_uid = ctx.uid;
             entry.attr.st_gid = ctx.gid;
             entry.attr.st_mode = mode;
@@ -3958,8 +4007,8 @@ impl FileSystem for PassthroughFs {
             self.check_write_inode(inode)?;
         }
         let st = match self.inode_to_handle(inode, true)? {
-            InodeHandle::Path(c_path) => lstat(&c_path, false)?,
-            InodeHandle::Fd(fd) => fstat(fd, false)?,
+            InodeHandle::Path(c_path) => lstat(&ctx, &c_path, false)?,
+            InodeHandle::Fd(fd) => fstat(&ctx, fd, false)?,
         };
 
         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
@@ -4010,14 +4059,14 @@ impl FileSystem for PassthroughFs {
 
     fn setxattr(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         name: &CStr,
         value: &[u8],
         flags: u32,
     ) -> io::Result<()> {
         self.check_write_inode(inode)?;
-        self.ensure_unshared_inode(inode)?;
+        self.ensure_unshared_inode(&ctx, inode)?;
         debug!("setxattr: inode={inode} name={name:?} value={value:?}");
 
         if !self.cfg.xattr {
@@ -4202,9 +4251,9 @@ impl FileSystem for PassthroughFs {
         }
     }
 
-    fn removexattr(&self, _ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
+    fn removexattr(&self, ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
         self.check_write_inode(inode)?;
-        self.ensure_unshared_inode(inode)?;
+        self.ensure_unshared_inode(&ctx, inode)?;
         if !self.cfg.xattr {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
         }
@@ -4231,7 +4280,7 @@ impl FileSystem for PassthroughFs {
 
     fn fallocate(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         handle: Handle,
         mode: u32,
@@ -4239,7 +4288,7 @@ impl FileSystem for PassthroughFs {
         length: u64,
     ) -> io::Result<()> {
         self.check_write_inode(inode)?;
-        self.ensure_unshared_inode(inode)?;
+        self.ensure_unshared_inode(&ctx, inode)?;
         let data = self
             .handles
             .read()
@@ -4271,7 +4320,7 @@ impl FileSystem for PassthroughFs {
                 // The best thing we can do here is extend the file to (offset + length).
                 // This doesn't adhere to the same semantics, but should work fine (albeit
                 // less performant) for most guest applications.
-                let st = fstat(fd, true)?;
+                let st = fstat(&ctx, fd, true)?;
                 let new_length = (offset + length) as i64;
 
                 if keep_size {
@@ -4358,7 +4407,7 @@ impl FileSystem for PassthroughFs {
 
     fn copyfilerange(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode_in: Inode,
         handle_in: Handle,
         offset_in: u64,
@@ -4372,7 +4421,7 @@ impl FileSystem for PassthroughFs {
             return Err(einval());
         }
         self.check_write_inode(inode_out)?;
-        self.ensure_unshared_inode(inode_out)?;
+        self.ensure_unshared_inode(&ctx, inode_out)?;
 
         let data_in = self
             .handles
@@ -4394,12 +4443,12 @@ impl FileSystem for PassthroughFs {
             .ok_or_else(ebadf)?;
         let fd_out = data_out.file.read().unwrap().as_raw_fd();
 
-        self.copy_sparse_range(fd_in, offset_in, fd_out, offset_out, len)
+        self.copy_sparse_range(&ctx, fd_in, offset_in, fd_out, offset_out, len)
     }
 
     fn setupmapping(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         _handle: Handle,
         foffset: u64,
@@ -4412,7 +4461,7 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<()> {
         if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
             self.check_write_inode(inode)?;
-            self.ensure_unshared_inode(inode)?;
+            self.ensure_unshared_inode(&ctx, inode)?;
         }
         if map_sender.is_none() {
             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
