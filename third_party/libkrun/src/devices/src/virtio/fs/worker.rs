@@ -114,6 +114,7 @@ impl FsServer {
         &self,
         r: Reader,
         w: Writer,
+        allow_idmap: bool,
         shm_region: &Option<VirtioShmRegion>,
         exit_code: &Arc<AtomicI32>,
         #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
@@ -122,6 +123,7 @@ impl FsServer {
             FsServer::ReadWrite(s) => s.handle_message(
                 r,
                 w,
+                allow_idmap,
                 shm_region,
                 exit_code,
                 #[cfg(target_os = "macos")]
@@ -130,6 +132,7 @@ impl FsServer {
             FsServer::ReadOnly(s) => s.handle_message(
                 r,
                 w,
+                allow_idmap,
                 shm_region,
                 exit_code,
                 #[cfg(target_os = "macos")]
@@ -138,6 +141,7 @@ impl FsServer {
             FsServer::Null(s) => s.handle_message(
                 r,
                 w,
+                allow_idmap,
                 shm_region,
                 exit_code,
                 #[cfg(target_os = "macos")]
@@ -152,6 +156,7 @@ pub struct FsWorker {
     queue_evts: Vec<Arc<EventFd>>,
     interrupt: InterruptTransport,
     mem: GuestMemoryMmap,
+    allow_idmap: bool,
     shm_region: Option<VirtioShmRegion>,
     server: FsServer,
     stop_fd: EventFd,
@@ -173,6 +178,7 @@ impl FsWorker {
         queue_evts: Vec<Arc<EventFd>>,
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
+        allow_idmap: bool,
         shm_region: Option<VirtioShmRegion>,
         passthrough_cfg: Option<passthrough::Config>,
         read_only: bool,
@@ -227,6 +233,7 @@ impl FsWorker {
             queue_evts,
             interrupt,
             mem,
+            allow_idmap,
             shm_region,
             server,
             stop_fd,
@@ -242,6 +249,7 @@ impl FsWorker {
         queue_evts: Vec<Arc<EventFd>>,
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
+        allow_idmap: bool,
         shm_region: Option<VirtioShmRegion>,
         server: FsServer,
         stop_fd: EventFd,
@@ -253,6 +261,7 @@ impl FsWorker {
             queue_evts,
             interrupt,
             mem,
+            allow_idmap,
             shm_region,
             server,
             stop_fd,
@@ -395,6 +404,7 @@ impl FsWorker {
             let len = match self.server.handle_message(
                 reader,
                 writer,
+                self.allow_idmap,
                 &self.shm_region,
                 &self.exit_code,
                 #[cfg(target_os = "macos")]
