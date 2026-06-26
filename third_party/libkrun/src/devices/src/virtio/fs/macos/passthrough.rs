@@ -3905,7 +3905,7 @@ impl FileSystem for PassthroughFs {
             if ((flags as i32) & bindings::LINUX_RENAME_WHITEOUT) != 0 {
                 let (host_mode, complete) = match self.cfg.semantics {
                     PermissionSemantics::LinuxComplete => (0o600, true),
-                    PermissionSemantics::LinuxSimplified => ((libc::S_IFCHR | 0o600) as u32, true),
+                    PermissionSemantics::LinuxSimplified => ((libc::S_IFCHR | 0o600) as u32, false),
                 };
                 let fd = unsafe {
                     libc::open(
