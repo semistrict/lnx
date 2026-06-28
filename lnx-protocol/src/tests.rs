@@ -54,3 +54,22 @@ fn restore_sync_carries_entropy() {
 
     assert_eq!(decoded, message);
 }
+
+#[test]
+fn open_url_round_trips_with_result() {
+    let request = Message::OpenUrl {
+        channel_id: 9,
+        url: "http://p3773-default.lnx/pair#token=abc".into(),
+    };
+    let encoded = postcard::to_allocvec(&request).expect("encode request");
+    let decoded: Message = postcard::from_bytes(&encoded).expect("decode request");
+    assert_eq!(decoded, request);
+
+    let response = Message::OpenUrlResult {
+        channel_id: 9,
+        ok: true,
+    };
+    let encoded = postcard::to_allocvec(&response).expect("encode response");
+    let decoded: Message = postcard::from_bytes(&encoded).expect("decode response");
+    assert_eq!(decoded, response);
+}

@@ -181,6 +181,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
             config.run_as_root,
             config.no_host_shares,
             config.deterministic.as_ref(),
+            &config.layout.instance,
             Some(&run_log),
         )? {
             run_log.line(format!("run.done status={status}"));
@@ -363,6 +364,7 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
             config.run_as_root,
             config.no_host_shares,
             config.deterministic.as_ref(),
+            &config.layout.instance,
             no_daemon_reuse,
             &run_log,
         )? {
@@ -380,6 +382,7 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
             config.run_as_root,
             config.no_host_shares,
             config.deterministic.as_ref(),
+            &config.layout.instance,
             Some(&run_log),
         )? {
             drop(bootstrap_lock);
@@ -410,6 +413,7 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
         config.run_as_root,
         config.no_host_shares,
         config.deterministic.as_ref(),
+        &config.layout.instance,
         Duration::from_secs(5),
     )
     .with_context(|| console_hint(&config.layout.console_log))
@@ -739,7 +743,8 @@ fn start_vm(
         }
     }
     let restore_snapshot = if let Some(snapshot) = &config.restore_snapshot {
-        if !snapshot_initramfs_is_compatible(snapshot, &initramfs_stamp) {
+        let initramfs_compatible = snapshot_initramfs_is_compatible(snapshot, &initramfs_stamp);
+        if !initramfs_compatible {
             run_log.line(format!(
                 "snapshot.initramfs_stamp_mismatch ignored snapshot={} current={}",
                 snapshot.join("initramfs.stamp").display(),
@@ -771,7 +776,8 @@ fn start_vm(
                     config.memory_mib
                 );
             }
-            Ok(_) => Some(snapshot.clone()),
+            Ok(_) if initramfs_compatible => Some(snapshot.clone()),
+            Ok(_) => None,
             Err(e) => {
                 return Err(e).with_context(|| {
                     format!(
@@ -2531,6 +2537,7 @@ fn acquire_bootstrap_or_run_client(
     run_as_root: bool,
     no_host_shares: bool,
     deterministic: Option<&DeterministicConfig>,
+    instance: &str,
     no_daemon_reuse: bool,
     run_log: &RunLog,
 ) -> Result<BootstrapOutcome> {
@@ -2556,6 +2563,7 @@ fn acquire_bootstrap_or_run_client(
                 run_as_root,
                 no_host_shares,
                 deterministic,
+                instance,
                 Some(run_log),
             )? {
                 return Ok(BootstrapOutcome::Status(status));
@@ -2579,6 +2587,7 @@ fn run_existing_broker_client(
     run_as_root: bool,
     no_host_shares: bool,
     deterministic: Option<&DeterministicConfig>,
+    instance: &str,
     run_log: Option<&RunLog>,
 ) -> Result<Option<i32>> {
     match connect_broker(socket) {
@@ -2596,6 +2605,7 @@ fn run_existing_broker_client(
                 run_as_root,
                 no_host_shares,
                 deterministic,
+                instance,
             )
             .map(Some)
         }
@@ -2639,6 +2649,7 @@ fn run_broker_session(
     run_as_root: bool,
     no_host_shares: bool,
     deterministic: Option<&DeterministicConfig>,
+    instance: &str,
 ) -> Result<i32> {
     INTERRUPTED.store(false, Ordering::SeqCst);
     let host_home = host_home_for_cwd(cwd)?;
@@ -2674,7 +2685,9 @@ fn run_broker_session(
         (String::new(), String::new(), 1, 1)
     };
     let (uid, gid, group) = exec_identity(run_as_root, deterministic);
-    let env = exec_env(deterministic);
+    let mut env = exec_env(deterministic);
+    env.push(("LNX_INSTANCE".to_string(), instance.to_string()));
+    env.push(("LNX_INGRESS_DOMAIN".to_string(), ingress_domain()));
     let channel_id = match deterministic {
         Some(config) => deterministic_exec_request_id(
             &config.seed,
@@ -2887,6 +2900,44 @@ fn exec_env(deterministic: Option<&DeterministicConfig>) -> Vec<(String, String)
     forwarded_exec_env()
 }
 
+fn ingress_domain() -> String {
+    crate::ingress::load_config()
+        .map(|config| config.domain)
+        .unwrap_or_else(|_| "lnx".to_string())
+}
+
+fn open_url_on_host(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(url);
+        command
+    };
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", "", url]);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        bail!("opening URLs on the host is not supported on this platform");
+    }
+
+    let status = command.status().context("launch host browser")?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("host browser launcher exited with {status}")
+    }
+}
+
 fn forwarded_exec_env() -> Vec<(String, String)> {
     const EXACT: &[&str] = &[
         "TERM",
@@ -2921,6 +2972,7 @@ fn run_broker_client_retry(
     run_as_root: bool,
     no_host_shares: bool,
     deterministic: Option<&DeterministicConfig>,
+    instance: &str,
     timeout: Duration,
 ) -> Result<i32> {
     let start = Instant::now();
@@ -2935,6 +2987,7 @@ fn run_broker_client_retry(
                     run_as_root,
                     no_host_shares,
                     deterministic,
+                    instance,
                 );
             }
             Err(e) => {
@@ -3117,6 +3170,7 @@ fn run_broker_owner(
     let reader_snapshot_started = Arc::clone(&snapshot_started);
     let reader_log = Arc::clone(&run_log);
     let reader_trace = trace_log.clone();
+    let reader_agent_tx = agent_tx.clone();
     thread::spawn(move || {
         let reader_err = loop {
             let message = match read_message(&mut agent_reader) {
@@ -3130,7 +3184,8 @@ fn run_broker_owner(
                 | Message::ExitStatus { channel_id, .. }
                 | Message::Close { channel_id }
                 | Message::Error { channel_id, .. }
-                | Message::SnapshotExit { channel_id } => Some(*channel_id),
+                | Message::SnapshotExit { channel_id }
+                | Message::OpenUrl { channel_id, .. } => Some(*channel_id),
                 _ => None,
             };
             if let Message::SnapshotExit { channel_id } = message {
@@ -3141,6 +3196,29 @@ fn run_broker_owner(
                     );
                 }
                 let _ = reader_snapshot_exit_tx.send(channel_id);
+                continue;
+            }
+            if let Message::OpenUrl { channel_id, url } = message {
+                let ok = match open_url_on_host(&url) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        reader_log.line(format!(
+                            "open_url.error channel_id={channel_id:016x} error={e:#}"
+                        ));
+                        false
+                    }
+                };
+                if let Some(trace) = &reader_trace {
+                    trace.event(
+                        "guest_open_url",
+                        vec![
+                            trace_text("channel_id", format!("{channel_id:016x}")),
+                            trace_text("url", url),
+                            trace_bool("ok", ok),
+                        ],
+                    );
+                }
+                let _ = reader_agent_tx.send(Message::OpenUrlResult { channel_id, ok });
                 continue;
             }
             if let Some(channel_id) = channel_id {
@@ -3589,6 +3667,7 @@ fn run_broker_client_awaiting_owner(
                     config.run_as_root,
                     config.no_host_shares,
                     config.deterministic.as_ref(),
+                    &layout.instance,
                 );
             }
             Err(e) => last = Some(e),

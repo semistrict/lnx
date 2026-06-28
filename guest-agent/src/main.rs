@@ -83,12 +83,15 @@ const MNT_DETACH: c_int = 2;
 const SYS_PIVOT_ROOT: isize = 41;
 const FRAME_SNAPSHOT: u8 = b'K';
 const FRAME_CONTROL_SNAPSHOT_EXIT: u8 = b'X';
+const FRAME_CONTROL_OPEN_URL: u8 = b'O';
 const FRAME_CONTROL_OK: u8 = b'x';
+const MAX_CONTROL_PAYLOAD: usize = 16 * 1024;
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin";
 const AGENT_PATH: &str = "/run/lnx/lnx-agent";
 const LNXCTL_PATH: &str = "/run/lnx/lnxctl";
 const OLD_AGENT_PATH: &str = "/usr/local/lib/lnx/lnx-agent";
 const OLD_LNXCTL_PATH: &str = "/usr/local/bin/lnxctl";
+const XDG_OPEN_PATH: &str = "/usr/local/bin/xdg-open";
 const OLD_SERVICE_PATH: &str = "/etc/systemd/system/lnx-agent.service";
 const OLD_WANTS_LINK: &str = "/etc/systemd/system/multi-user.target.wants/lnx-agent.service";
 const CONTROL_SOCKET: &str = "/run/lnx-agent.sock";
@@ -111,6 +114,13 @@ enum ChannelInput {
     Close,
     SnapshotComplete,
     SnapshotFailed,
+    OpenUrlComplete,
+    OpenUrlFailed,
+}
+
+enum ChannelControlRequest {
+    SnapshotExit(c_int),
+    OpenUrl { fd: c_int, url: String },
 }
 
 struct ChannelState {
@@ -1032,6 +1042,9 @@ fn init_mode() -> ! {
     }
     let lnxctl_link = CString::new(format!("/newroot{OLD_LNXCTL_PATH}")).unwrap();
     let _ = unsafe { symlink(cstr(b"/run/lnx/lnxctl\0"), lnxctl_link.as_ptr()) };
+    let xdg_open_link = CString::new(format!("/newroot{XDG_OPEN_PATH}")).unwrap();
+    let _ = fs::remove_file(format!("/newroot{XDG_OPEN_PATH}"));
+    let _ = unsafe { symlink(cstr(b"/run/lnx/lnxctl\0"), xdg_open_link.as_ptr()) };
 
     let unit = concat!(
         "[Unit]\n",
@@ -1375,6 +1388,74 @@ fn lnxctl_mode(args: &[String]) -> ! {
     unsafe { _exit(status) }
 }
 
+fn xdg_open_mode(args: &[String]) -> ! {
+    let Some(target) = args.get(1) else {
+        write_all(STDERR_FILENO, b"usage: xdg-open URL\n");
+        unsafe { _exit(2) }
+    };
+    if !target.contains("://") {
+        write_all(STDERR_FILENO, b"xdg-open: only URL targets are supported\n");
+        unsafe { _exit(2) }
+    }
+    let instance = env::var("LNX_INSTANCE").unwrap_or_else(|_| "default".to_string());
+    let domain = env::var("LNX_INGRESS_DOMAIN").unwrap_or_else(|_| "lnx".to_string());
+    let url = rewrite_xdg_open_url(target, &instance, &domain);
+    if url.len() > MAX_CONTROL_PAYLOAD {
+        write_all(STDERR_FILENO, b"xdg-open: URL is too long\n");
+        unsafe { _exit(2) }
+    }
+    let socket = env::var(CONTROL_SOCKET_ENV).unwrap_or_else(|_| CONTROL_SOCKET.to_string());
+    let fd = connect_unix(&socket);
+    if !write_frame(fd, FRAME_CONTROL_OPEN_URL, url.as_bytes()) {
+        unsafe { _exit(1) }
+    }
+    let status = read_local_control_response(fd);
+    unsafe { _exit(status) }
+}
+
+fn rewrite_xdg_open_url(target: &str, instance: &str, domain: &str) -> String {
+    let Some((scheme, rest)) = target.split_once("://") else {
+        return target.to_string();
+    };
+    if scheme != "http" && scheme != "https" {
+        return target.to_string();
+    }
+    let authority_end = rest
+        .find(|c| matches!(c, '/' | '?' | '#'))
+        .unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let suffix = &rest[authority_end..];
+    if authority.contains('@') {
+        return target.to_string();
+    }
+    let Some((host, port)) = parse_localhost_authority(authority) else {
+        return target.to_string();
+    };
+    if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        return target.to_string();
+    }
+    let instance = if instance.is_empty() {
+        "default"
+    } else {
+        instance
+    };
+    let domain = if domain.is_empty() { "lnx" } else { domain };
+    format!("{scheme}://p{port}-{instance}.{domain}{suffix}")
+}
+
+fn parse_localhost_authority(authority: &str) -> Option<(&str, u16)> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        let port = tail.strip_prefix(':')?.parse::<u16>().ok()?;
+        return Some((host, port));
+    }
+    let (host, port) = authority.rsplit_once(':')?;
+    if host.contains(':') {
+        return None;
+    }
+    Some((host, port.parse::<u16>().ok()?))
+}
+
 fn sockaddr_un(path: &str) -> SockaddrUn {
     let mut addr = SockaddrUn {
         sun_family: AF_UNIX as u16,
@@ -1651,7 +1732,7 @@ fn vsock_addr(port: u32) -> SockaddrVm {
     }
 }
 
-fn accept_channel_control(listener_fd: c_int) -> Option<c_int> {
+fn accept_channel_control(listener_fd: c_int) -> Option<ChannelControlRequest> {
     let client_fd = unsafe { accept(listener_fd, ptr::null_mut(), ptr::null_mut()) };
     if client_fd < 0 {
         return None;
@@ -1659,20 +1740,77 @@ fn accept_channel_control(listener_fd: c_int) -> Option<c_int> {
     set_cloexec(client_fd);
     let mut frame_type = [0u8; 1];
     let mut len = [0u8; 4];
-    let ok = try_read_exact(client_fd, &mut frame_type)
-        && try_read_exact(client_fd, &mut len)
-        && frame_type[0] == FRAME_CONTROL_SNAPSHOT_EXIT
-        && u32::from_be_bytes(len) == 0;
-    if ok {
-        unsafe {
-            sync();
-        }
-        Some(client_fd)
-    } else {
+    if !try_read_exact(client_fd, &mut frame_type) || !try_read_exact(client_fd, &mut len) {
         unsafe {
             close(client_fd);
         }
-        None
+        return None;
+    }
+    let len = u32::from_be_bytes(len) as usize;
+    match (frame_type[0], len) {
+        (FRAME_CONTROL_SNAPSHOT_EXIT, 0) => {
+            unsafe {
+                sync();
+            }
+            Some(ChannelControlRequest::SnapshotExit(client_fd))
+        }
+        (FRAME_CONTROL_OPEN_URL, 1..=MAX_CONTROL_PAYLOAD) => {
+            let mut payload = vec![0u8; len];
+            if try_read_exact(client_fd, &mut payload) {
+                if let Ok(url) = String::from_utf8(payload) {
+                    return Some(ChannelControlRequest::OpenUrl { fd: client_fd, url });
+                }
+            }
+            unsafe {
+                close(client_fd);
+            }
+            None
+        }
+        _ => {
+            unsafe {
+                close(client_fd);
+            }
+            None
+        }
+    }
+}
+
+fn complete_pending_control(pending_control_fd: &mut c_int, ok: bool) {
+    if *pending_control_fd < 0 {
+        return;
+    }
+    if ok {
+        let _ = write_frame(*pending_control_fd, FRAME_CONTROL_OK, &[]);
+    }
+    unsafe {
+        close(*pending_control_fd);
+    }
+    *pending_control_fd = -1;
+}
+
+fn handle_channel_control(
+    request: ChannelControlRequest,
+    pending_control_fd: &mut c_int,
+    agent_fd: &Arc<Mutex<c_int>>,
+    channel_id: u64,
+) {
+    match request {
+        ChannelControlRequest::SnapshotExit(fd) => {
+            *pending_control_fd = fd;
+            let _ = write_message_locked(agent_fd, &Message::SnapshotExit { channel_id });
+        }
+        ChannelControlRequest::OpenUrl { fd, url } => {
+            *pending_control_fd = fd;
+            let _ = write_message_locked(agent_fd, &Message::OpenUrl { channel_id, url });
+        }
+    }
+}
+
+fn close_control_fd(fd: c_int) {
+    if fd >= 0 {
+        unsafe {
+            close(fd);
+        }
     }
 }
 
@@ -1735,6 +1873,8 @@ fn allowed_forwarded_env(name: &str) -> bool {
             | "NO_COLOR"
             | "CLICOLOR"
             | "CLICOLOR_FORCE"
+            | "LNX_INSTANCE"
+            | "LNX_INGRESS_DOMAIN"
     ) || name.starts_with("LC_")
 }
 
@@ -2157,9 +2297,8 @@ fn run_channel_pty(
             pty_eof |= drain_output_message(pty_master, &agent_fd, false, channel_id, &mut buf);
         }
         if n > 0 && pollfds[1].revents & POLLIN != 0 && pending_control_fd < 0 {
-            if let Some(fd) = accept_channel_control(control_fd) {
-                pending_control_fd = fd;
-                let _ = write_message_locked(&agent_fd, &Message::SnapshotExit { channel_id });
+            if let Some(request) = accept_channel_control(control_fd) {
+                handle_channel_control(request, &mut pending_control_fd, &agent_fd, channel_id);
             }
         }
         while let Ok(input) = rx.try_recv() {
@@ -2188,22 +2327,11 @@ fn run_channel_pty(
                     status = 130 << 8;
                     break;
                 }
-                ChannelInput::SnapshotComplete => {
-                    if pending_control_fd >= 0 {
-                        let _ = write_frame(pending_control_fd, FRAME_CONTROL_OK, &[]);
-                        unsafe {
-                            close(pending_control_fd);
-                        }
-                        pending_control_fd = -1;
-                    }
+                ChannelInput::SnapshotComplete | ChannelInput::OpenUrlComplete => {
+                    complete_pending_control(&mut pending_control_fd, true);
                 }
-                ChannelInput::SnapshotFailed => {
-                    if pending_control_fd >= 0 {
-                        unsafe {
-                            close(pending_control_fd);
-                        }
-                        pending_control_fd = -1;
-                    }
+                ChannelInput::SnapshotFailed | ChannelInput::OpenUrlFailed => {
+                    complete_pending_control(&mut pending_control_fd, false);
                 }
             }
         }
@@ -2234,11 +2362,7 @@ fn run_channel_pty(
     unsafe {
         close(pty_master);
     }
-    if pending_control_fd >= 0 {
-        unsafe {
-            close(pending_control_fd);
-        }
-    }
+    close_control_fd(pending_control_fd);
     close_channel_control_socket(control_fd, &control_socket);
     send_status(&agent_fd, channel_id, status);
 }
@@ -2370,9 +2494,8 @@ fn run_channel_pipe(
             stderr_eof |= drain_output_message(stderr_read, &agent_fd, true, channel_id, &mut buf);
         }
         if n > 0 && pollfds[2].revents & POLLIN != 0 && pending_control_fd < 0 {
-            if let Some(fd) = accept_channel_control(control_fd) {
-                pending_control_fd = fd;
-                let _ = write_message_locked(&agent_fd, &Message::SnapshotExit { channel_id });
+            if let Some(request) = accept_channel_control(control_fd) {
+                handle_channel_control(request, &mut pending_control_fd, &agent_fd, channel_id);
             }
         }
         while let Ok(input) = rx.try_recv() {
@@ -2402,22 +2525,11 @@ fn run_channel_pipe(
                     status = 130 << 8;
                     break;
                 }
-                ChannelInput::SnapshotComplete => {
-                    if pending_control_fd >= 0 {
-                        let _ = write_frame(pending_control_fd, FRAME_CONTROL_OK, &[]);
-                        unsafe {
-                            close(pending_control_fd);
-                        }
-                        pending_control_fd = -1;
-                    }
+                ChannelInput::SnapshotComplete | ChannelInput::OpenUrlComplete => {
+                    complete_pending_control(&mut pending_control_fd, true);
                 }
-                ChannelInput::SnapshotFailed => {
-                    if pending_control_fd >= 0 {
-                        unsafe {
-                            close(pending_control_fd);
-                        }
-                        pending_control_fd = -1;
-                    }
+                ChannelInput::SnapshotFailed | ChannelInput::OpenUrlFailed => {
+                    complete_pending_control(&mut pending_control_fd, false);
                 }
                 _ => {}
             }
@@ -2463,11 +2575,7 @@ fn run_channel_pipe(
         close(stdout_read);
         close(stderr_read);
     }
-    if pending_control_fd >= 0 {
-        unsafe {
-            close(pending_control_fd);
-        }
-    }
+    close_control_fd(pending_control_fd);
     close_channel_control_socket(control_fd, &control_socket);
     send_status(&agent_fd, channel_id, status);
 }
@@ -2565,7 +2673,9 @@ fn run_channel_tcp(
             }
             Ok(ChannelInput::Resize(_, _))
             | Ok(ChannelInput::SnapshotComplete)
-            | Ok(ChannelInput::SnapshotFailed) => {}
+            | Ok(ChannelInput::SnapshotFailed)
+            | Ok(ChannelInput::OpenUrlComplete)
+            | Ok(ChannelInput::OpenUrlFailed) => {}
             Ok(ChannelInput::Close) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -2717,6 +2827,16 @@ fn agent_loop() {
                     let _ = state.tx.send(ChannelInput::SnapshotFailed);
                 }
             }
+            Message::OpenUrlResult { channel_id, ok } => {
+                if let Some((_, state)) = channels.iter().find(|(id, _)| *id == channel_id) {
+                    let input = if ok {
+                        ChannelInput::OpenUrlComplete
+                    } else {
+                        ChannelInput::OpenUrlFailed
+                    };
+                    let _ = state.tx.send(input);
+                }
+            }
             Message::RestoreSync {
                 channel_id,
                 entropy,
@@ -2762,6 +2882,13 @@ pub fn main() {
     let args = env::args().collect::<Vec<_>>();
     if args
         .first()
+        .map(|arg| arg.ends_with("/xdg-open") || arg == "xdg-open")
+        .unwrap_or(false)
+    {
+        xdg_open_mode(&args);
+    }
+    if args
+        .first()
         .map(|arg| arg.ends_with("/lnxctl") || arg == "lnxctl")
         .unwrap_or(false)
     {
@@ -2780,4 +2907,53 @@ pub fn main() {
     }
     let _port = args[2].parse::<u32>().unwrap_or(AGENT_PORT);
     agent_loop();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_xdg_open_url;
+
+    #[test]
+    fn xdg_open_rewrites_localhost_http_urls_to_ingress_hosts() {
+        assert_eq!(
+            rewrite_xdg_open_url("http://localhost:3773/pair#token=abc", "default", "lnx"),
+            "http://p3773-default.lnx/pair#token=abc"
+        );
+    }
+
+    #[test]
+    fn xdg_open_rewrites_loopback_https_urls_with_query() {
+        assert_eq!(
+            rewrite_xdg_open_url(
+                "https://127.0.0.1:8443/callback?code=abc#done",
+                "work",
+                "lnx"
+            ),
+            "https://p8443-work.lnx/callback?code=abc#done"
+        );
+    }
+
+    #[test]
+    fn xdg_open_rewrites_ipv6_loopback_urls() {
+        assert_eq!(
+            rewrite_xdg_open_url("http://[::1]:5173/", "dev", "lnx"),
+            "http://p5173-dev.lnx/"
+        );
+    }
+
+    #[test]
+    fn xdg_open_leaves_non_loopback_urls_alone() {
+        assert_eq!(
+            rewrite_xdg_open_url("https://example.com:443/", "default", "lnx"),
+            "https://example.com:443/"
+        );
+    }
+
+    #[test]
+    fn xdg_open_leaves_localhost_without_explicit_port_alone() {
+        assert_eq!(
+            rewrite_xdg_open_url("http://localhost/path", "default", "lnx"),
+            "http://localhost/path"
+        );
+    }
 }

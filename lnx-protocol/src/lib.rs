@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +70,14 @@ pub enum Message {
     },
     SnapshotExit {
         channel_id: u64,
+    },
+    OpenUrl {
+        channel_id: u64,
+        url: String,
+    },
+    OpenUrlResult {
+        channel_id: u64,
+        ok: bool,
     },
     SnapshotReady,
 }

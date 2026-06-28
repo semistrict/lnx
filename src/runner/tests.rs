@@ -840,6 +840,21 @@ fn initramfs_stamp_key_prefers_source_but_keeps_sha256_compatibility() {
     assert_eq!(initramfs_stamp_key(&stamp), None);
 }
 
+#[test]
+fn snapshot_initramfs_compatibility_requires_matching_source_stamp() {
+    let temp = TempDir::new("snapshot-initramfs-compatibility");
+    let snapshot = temp.path().join("snapshot");
+    fs::create_dir(&snapshot).expect("create snapshot");
+    let current = temp.path().join("initramfs.stamp");
+
+    fs::write(snapshot.join("initramfs.stamp"), "source=old\n").expect("write snapshot stamp");
+    fs::write(&current, "source=new\n").expect("write current stamp");
+    assert!(!snapshot_initramfs_is_compatible(&snapshot, &current));
+
+    fs::write(&current, "source=old\n").expect("write matching current stamp");
+    assert!(snapshot_initramfs_is_compatible(&snapshot, &current));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn instance_macs_are_stable_local_and_unicast() {

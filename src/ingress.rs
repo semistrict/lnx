@@ -257,9 +257,6 @@ fn is_privileged_addr(addr: &str) -> bool {
 }
 
 fn ingress_user_ids() -> Option<(u32, u32)> {
-    if unsafe { libc::geteuid() } != 0 {
-        return None;
-    }
     if let (Ok(uid), Ok(gid)) = (std::env::var("SUDO_UID"), std::env::var("SUDO_GID")) {
         if let (Ok(uid), Ok(gid)) = (uid.parse::<u32>(), gid.parse::<u32>()) {
             return Some((uid, gid));
@@ -277,6 +274,13 @@ fn ingress_user_ids() -> Option<(u32, u32)> {
             Some(((*passwd).pw_uid, (*passwd).pw_gid))
         }
     }
+}
+
+fn ingress_user_name() -> Option<String> {
+    std::env::var("LNX_INGRESS_USER")
+        .or_else(|_| std::env::var("SUDO_USER"))
+        .ok()
+        .filter(|user| !user.is_empty())
 }
 
 fn chown_to_ingress_user(path: &Path) {
@@ -966,6 +970,7 @@ fn run_daemon(config: Config) -> Result<()> {
         .context("set ingress admin nonblocking")?;
 
     let network = NetworkService::start(&config);
+    drop_ingress_privileges()?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let dns_stop = Arc::clone(&stop);
@@ -1139,6 +1144,40 @@ fn peer_authorized(stream: &UnixStream) -> bool {
     let self_uid = unsafe { libc::geteuid() };
     // root, the user running the daemon, or the configured ingress user.
     uid == 0 || uid == self_uid || ingress_user_ids().map(|(u, _)| u) == Some(uid)
+}
+
+fn drop_ingress_privileges() -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    let Some((uid, gid)) = ingress_user_ids() else {
+        return Ok(());
+    };
+    if uid == 0 {
+        return Ok(());
+    }
+    if let Some(user) = ingress_user_name() {
+        let user = CString::new(user).context("ingress user contains nul")?;
+        #[cfg(target_os = "macos")]
+        let base_gid = libc::c_int::try_from(gid).context("ingress gid out of range")?;
+        #[cfg(not(target_os = "macos"))]
+        let base_gid = gid;
+        unsafe {
+            if libc::initgroups(user.as_ptr(), base_gid) != 0 {
+                return Err(std::io::Error::last_os_error()).context("init ingress groups");
+            }
+        }
+    }
+    unsafe {
+        if libc::setgid(gid) != 0 {
+            return Err(std::io::Error::last_os_error()).context("drop ingress gid");
+        }
+        if libc::setuid(uid) != 0 {
+            return Err(std::io::Error::last_os_error()).context("drop ingress uid");
+        }
+    }
+    eprintln!("ingress dropped privileges to uid={uid} gid={gid}");
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
