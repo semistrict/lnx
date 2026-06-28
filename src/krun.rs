@@ -3,8 +3,11 @@ use std::{ffi::CString, path::Path, sync::OnceLock};
 use anyhow::{Result, bail};
 
 pub const KRUN_KERNEL_FORMAT_RAW: u32 = 0;
+#[cfg(not(target_os = "macos"))]
 const COMPAT_NET_FEATURES: u32 = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1 << 11) | (1 << 14);
+#[cfg(not(target_os = "macos"))]
 const NET_FLAG_VFKIT: u32 = 1 << 0;
+#[cfg(not(target_os = "macos"))]
 const NET_FLAG_DHCP_CLIENT: u32 = 1 << 1;
 const VIRTIOFS_DAX_WINDOW_BYTES: u64 = 8 << 30;
 /// Opt back into the old host-share DAX path. Writable host-share DAX can
@@ -163,6 +166,7 @@ impl Context {
         )
     }
 
+    #[cfg(not(target_os = "macos"))]
     pub fn add_gvproxy_network(&self, socket: &Path) -> Result<()> {
         let socket = cstring_path(socket)?;
         let mut mac = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];

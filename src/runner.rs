@@ -470,9 +470,10 @@ struct VmHandles {
     trace_log: Option<Arc<TraceLog>>,
 }
 
-/// How the VM reaches the network: a routable per-VM address on the ingress
-/// daemon's vmnet network when available, else a private gvproxy NAT.
+/// How the VM reaches the network: a routable per-VM address on the macOS
+/// ingress daemon's vmnet network, or gvproxy on non-macOS hosts.
 enum NetworkBacking {
+    #[cfg(not(target_os = "macos"))]
     Gvproxy(Gvproxy),
     #[cfg(target_os = "macos")]
     Vmnet {
@@ -492,6 +493,7 @@ impl NetworkBacking {
     /// instances on the same vmnet subnet can still resume from the checkpoint.
     fn stamp_line(&self) -> String {
         match self {
+            #[cfg(not(target_os = "macos"))]
             NetworkBacking::Gvproxy(_) => "net=gvproxy".to_string(),
             #[cfg(target_os = "macos")]
             NetworkBacking::Vmnet {
@@ -504,6 +506,7 @@ impl NetworkBacking {
     /// the agent uses the gvproxy static configuration.
     fn guest_env(&self) -> (String, String) {
         match self {
+            #[cfg(not(target_os = "macos"))]
             NetworkBacking::Gvproxy(_) => (String::new(), String::new()),
             #[cfg(target_os = "macos")]
             NetworkBacking::Vmnet {
@@ -522,40 +525,46 @@ fn start_network(
     timings: &TimingLog,
 ) -> Result<NetworkBacking> {
     #[cfg(target_os = "macos")]
-    if config.deterministic.is_none() {
-        let attachment = crate::ingress::load_config()
-            .and_then(|ingress| {
-                crate::ingress::request_network_attachment(&ingress, &config.layout.instance)
-            })
-            .unwrap_or_else(|e| {
-                run_log.line(format!("network.vmnet.unavailable error={e:#}"));
-                None
-            });
-        if let Some(attachment) = attachment {
-            timings.event("network.vmnet.ready");
-            run_log.line(format!(
-                "network.vmnet ip={}/{} gateway={}",
-                attachment.ip, attachment.prefix, attachment.gateway
-            ));
-            return Ok(NetworkBacking::Vmnet {
-                fd: Some(attachment.fd),
-                ip: attachment.ip,
-                prefix: attachment.prefix,
-                gateway: attachment.gateway,
-                _keepalive: attachment.keepalive,
-            });
+    {
+        if config.deterministic.is_some() {
+            bail!(
+                "vmnet networking is required on macOS; deterministic macOS owners are not supported"
+            );
         }
-    } else {
-        timings.event("network.deterministic.gvproxy");
-        run_log.line("network.deterministic.gvproxy");
+        let ingress =
+            crate::ingress::load_config().context("load ingress config for vmnet networking")?;
+        let attachment =
+            crate::ingress::request_network_attachment(&ingress, &config.layout.instance)?
+                .with_context(|| {
+                    format!(
+                        "vmnet networking is required on macOS for instance {}; ingress did not provide an attachment",
+                        config.layout.instance
+                    )
+                })?;
+        timings.event("network.vmnet.ready");
+        run_log.line(format!(
+            "network.vmnet ip={}/{} gateway={}",
+            attachment.ip, attachment.prefix, attachment.gateway
+        ));
+        return Ok(NetworkBacking::Vmnet {
+            fd: Some(attachment.fd),
+            ip: attachment.ip,
+            prefix: attachment.prefix,
+            gateway: attachment.gateway,
+            _keepalive: attachment.keepalive,
+        });
     }
-    let gvproxy = start_gvproxy(&config.layout.run_dir)?;
-    timings.event("gvproxy.ready");
-    run_log.line(format!(
-        "gvproxy.ready socket={}",
-        config.layout.run_dir.join("gvproxy.sock").display()
-    ));
-    Ok(NetworkBacking::Gvproxy(gvproxy))
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let gvproxy = start_gvproxy(&config.layout.run_dir)?;
+        timings.event("gvproxy.ready");
+        run_log.line(format!(
+            "gvproxy.ready socket={}",
+            config.layout.run_dir.join("gvproxy.sock").display()
+        ));
+        Ok(NetworkBacking::Gvproxy(gvproxy))
+    }
 }
 
 /// A stable, locally administered unicast MAC derived from the instance
@@ -881,6 +890,7 @@ fn start_vm(
     ctx.add_vsock_connector(SNAPSHOT_PORT, &snapshot_socket)?;
     ctx.add_vsock_connector(CONTROL_PORT, &control_socket)?;
     match &mut network {
+        #[cfg(not(target_os = "macos"))]
         NetworkBacking::Gvproxy(gvproxy) => ctx.add_gvproxy_network(&gvproxy.socket)?,
         #[cfg(target_os = "macos")]
         NetworkBacking::Vmnet { fd, .. } => {
@@ -2304,11 +2314,13 @@ fn unlock_file(file: &fs::File) -> std::io::Result<()> {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 struct Gvproxy {
     socket: PathBuf,
     child: Child,
 }
 
+#[cfg(not(target_os = "macos"))]
 impl Drop for Gvproxy {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -2321,6 +2333,7 @@ impl Drop for Gvproxy {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn start_gvproxy(run_dir: &Path) -> Result<Gvproxy> {
     let gvproxy = resolve_gvproxy_path();
     if !gvproxy.exists() {
@@ -2357,6 +2370,7 @@ fn start_gvproxy(run_dir: &Path) -> Result<Gvproxy> {
     Ok(Gvproxy { socket, child })
 }
 
+#[cfg(not(target_os = "macos"))]
 fn resolve_gvproxy_path() -> PathBuf {
     if let Some(path) = std::env::var_os("GVPROXY_PATH") {
         return PathBuf::from(path);
@@ -2367,6 +2381,7 @@ fn resolve_gvproxy_path() -> PathBuf {
     PathBuf::from("/opt/homebrew/opt/podman/libexec/podman/gvproxy")
 }
 
+#[cfg(not(target_os = "macos"))]
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&paths) {
@@ -2378,11 +2393,13 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(not(target_os = "macos"))]
 fn unused_local_port() -> Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     Ok(listener.local_addr()?.port())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn wait_for_path(path: &Path, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let mut attempts = 0usize;
@@ -2407,6 +2424,7 @@ fn wait_for_path(path: &Path, timeout: Duration) -> Result<()> {
     bail!("timed out waiting for {}", path.display())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn path_is_visible(path: &Path) -> bool {
     if path.exists() {
         return true;

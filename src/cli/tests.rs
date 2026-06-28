@@ -62,6 +62,24 @@ fn init_path_accepts_default_instance_seed() {
 }
 
 #[test]
+fn default_package_bootstrap_skips_internal_builders() {
+    assert!(should_bootstrap_default_package_store(
+        "default", false, false
+    ));
+    assert!(!should_bootstrap_default_package_store(
+        "default", true, false
+    ));
+    assert!(!should_bootstrap_default_package_store(
+        "default", false, true
+    ));
+    assert!(!should_bootstrap_default_package_store(
+        "nix-builder-oci-builder",
+        false,
+        false
+    ));
+}
+
+#[test]
 fn fs_unshare_parses_path() {
     let cli = Cli::try_parse_from(["lnx", "fs", "unshare", "/Users/test/project"])
         .expect("parse fs unshare");
@@ -226,6 +244,22 @@ fn restore_snapshot_preserves_explicit_snapshot() {
     assert_eq!(
         restore_snapshot_for_run(&layout, Some(snapshot.clone()), true, true),
         Some(snapshot)
+    );
+}
+
+#[test]
+fn package_store_stamp_from_shares_defaults_to_disabled() {
+    assert_eq!(
+        package_store_stamp_from_shares(
+            "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\nnet=gvproxy\n"
+        ),
+        "disabled-v1"
+    );
+    assert_eq!(
+        package_store_stamp_from_shares(
+            "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1\npackages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64\nnet=gvproxy\n"
+        ),
+        "readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64"
     );
 }
 

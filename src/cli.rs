@@ -1453,6 +1453,7 @@ fn run_guest(
     explicit_rootfs: bool,
 ) -> Result<()> {
     ensure_image_and_instance(&layout, explicit_kernel, explicit_rootfs)?;
+    ensure_default_package_store(&layout, cpus, memory_mib, no_host_shares)?;
     ensure_vm_initialized(
         &layout,
         cpus,
@@ -1488,8 +1489,15 @@ fn run_guest(
     }
     let cwd = std::env::current_dir().context("current directory")?;
 
+    let explicit_restore_snapshot = snapshot_path.is_some();
     let restore_snapshot =
         restore_snapshot_for_run(&layout, snapshot_path, explicit_kernel, explicit_rootfs);
+    let restore_snapshot = filter_default_restore_for_package_store(
+        &layout,
+        restore_snapshot,
+        explicit_restore_snapshot,
+        no_host_shares,
+    )?;
 
     let config = runner::RunConfig {
         layout,
@@ -1511,6 +1519,48 @@ fn run_guest(
 
     let status = runner::run(config)?;
     std::process::exit(status);
+}
+
+fn ensure_default_package_store(
+    layout: &Layout,
+    cpus: u8,
+    memory_mib: u32,
+    no_host_shares: bool,
+) -> Result<()> {
+    if !should_bootstrap_default_package_store(
+        &layout.instance,
+        no_host_shares,
+        std::env::var_os("LNX_SKIP_DEFAULT_PACKAGES").is_some(),
+    ) {
+        return Ok(());
+    }
+
+    let package_layout = StoreLayout::resolve(&layout.base);
+    if package_layout.prepare_readonly()? {
+        return Ok(());
+    }
+
+    eprintln!("first run: package store missing, installing default packages");
+    run_packages_install(
+        layout,
+        PackagesInstallArgs {
+            builder: packages::DEFAULT_BUILDER_INSTANCE.to_string(),
+            builder_image: packages::DEFAULT_BUILDER_IMAGE.to_string(),
+            binaries: Vec::new(),
+            packages: Vec::new(),
+        },
+        cpus,
+        memory_mib,
+    )
+    .context("install default packages")
+}
+
+fn should_bootstrap_default_package_store(
+    instance: &str,
+    no_host_shares: bool,
+    skip_env: bool,
+) -> bool {
+    !no_host_shares && !skip_env && !instance.ends_with("-oci-builder")
 }
 
 fn run_fs_unshare(layout: &Layout, args: FsUnshareArgs) -> Result<()> {
@@ -1626,6 +1676,61 @@ fn restore_snapshot_for_run(
     }
     let latest = layout.snapshot_dir.join("latest");
     latest.exists().then_some(latest)
+}
+
+fn filter_default_restore_for_package_store(
+    layout: &Layout,
+    snapshot: Option<PathBuf>,
+    explicit_restore_snapshot: bool,
+    no_host_shares: bool,
+) -> Result<Option<PathBuf>> {
+    if explicit_restore_snapshot {
+        return Ok(snapshot);
+    }
+    let Some(snapshot) = snapshot else {
+        return Ok(None);
+    };
+    if default_restore_package_store_matches(layout, &snapshot, no_host_shares)? {
+        return Ok(Some(snapshot));
+    }
+    Ok(None)
+}
+
+fn default_restore_package_store_matches(
+    layout: &Layout,
+    snapshot: &Path,
+    no_host_shares: bool,
+) -> Result<bool> {
+    let snapshot_stamp = match fs::read_to_string(snapshot.join("shares.stamp")) {
+        Ok(stamp) => package_store_stamp_from_shares(&stamp),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(e).with_context(|| format!("read {}", snapshot.display())),
+    };
+    Ok(snapshot_stamp == current_package_store_stamp(layout, no_host_shares)?)
+}
+
+fn current_package_store_stamp(layout: &Layout, no_host_shares: bool) -> Result<String> {
+    if no_host_shares {
+        return Ok(PACKAGE_STORE_DISABLED.to_string());
+    }
+    let package_layout = StoreLayout::resolve(&layout.base);
+    if package_layout.prepare_readonly()? {
+        return Ok(format!(
+            "readonly-v1 root={}",
+            package_layout.root.display()
+        ));
+    }
+    Ok(PACKAGE_STORE_DISABLED.to_string())
+}
+
+const PACKAGE_STORE_DISABLED: &str = "disabled-v1";
+
+fn package_store_stamp_from_shares(stamp: &str) -> String {
+    stamp
+        .lines()
+        .find_map(|line| line.strip_prefix("packages="))
+        .unwrap_or(PACKAGE_STORE_DISABLED)
+        .to_string()
 }
 
 fn ensure_vm_initialized(

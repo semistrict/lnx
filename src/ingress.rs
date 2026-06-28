@@ -583,7 +583,7 @@ impl NetworkService {
                 Some(network)
             }
             Err(e) => {
-                eprintln!("vmnet network unavailable, VMs fall back to gvproxy NAT: {e:#}");
+                eprintln!("vmnet network unavailable; VM network attachments will fail: {e:#}");
                 None
             }
         };
@@ -873,9 +873,8 @@ pub struct NetworkAttachment {
     pub keepalive: UnixStream,
 }
 
-/// Asks the ingress daemon for a routable network attachment. Returns
-/// Ok(None) when the daemon is not running or has no vmnet network, in
-/// which case the VM falls back to gvproxy NAT.
+/// Asks the ingress daemon for a routable network attachment. Returns Ok(None)
+/// when the daemon is not running or has no vmnet network.
 #[cfg(target_os = "macos")]
 pub fn request_network_attachment(
     config: &Config,
