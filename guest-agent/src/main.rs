@@ -2,7 +2,7 @@ use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_ulong, c_void};
 use std::fmt;
 use std::io::{Error, Read, Write};
 use std::mem::size_of;
-use std::net::{Shutdown, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::ptr;
@@ -16,9 +16,14 @@ use user::{EXEC_HOME, EXEC_USER, ensure_exec_user};
 
 const AF_VSOCK: c_int = 40;
 const AF_UNIX: c_int = 1;
+const AF_UNSPEC: c_int = 0;
+const AF_INET: c_int = 2;
+const AF_NETLINK: c_int = 16;
 const SOCK_STREAM: c_int = 1;
+const SOCK_RAW: c_int = 3;
 const SOL_SOCKET: c_int = 1;
 const SO_RCVTIMEO: c_int = 20;
+const NETLINK_ROUTE: c_int = 0;
 const VMADDR_CID_HOST: u32 = 2;
 const AGENT_PORT: u32 = 10240;
 const SNAPSHOT_PORT: u32 = 10241;
@@ -29,6 +34,7 @@ const EIO: c_int = 5;
 const EINVAL: c_int = 22;
 const ENOENT: c_int = 2;
 const ENOTTY: c_int = 25;
+const EEXIST: c_int = 17;
 const F_GETFD: c_int = 1;
 const F_SETFD: c_int = 2;
 const F_GETFL: c_int = 3;
@@ -46,6 +52,25 @@ const POLLHUP: i16 = 0x0010;
 const POLLNVAL: i16 = 0x0020;
 const TIOCSCTTY: c_ulong = 0x540e;
 const TIOCSWINSZ: c_ulong = 0x5414;
+const IFF_UP: c_uint = 0x1;
+const NLMSG_ERROR: u16 = 2;
+const NLMSG_DONE: u16 = 3;
+const NLM_F_REQUEST: u16 = 0x0001;
+const NLM_F_ACK: u16 = 0x0004;
+const NLM_F_REPLACE: u16 = 0x0100;
+const NLM_F_CREATE: u16 = 0x0400;
+const RTM_NEWLINK: u16 = 16;
+const RTM_NEWADDR: u16 = 20;
+const RTM_NEWROUTE: u16 = 24;
+const RT_SCOPE_UNIVERSE: u8 = 0;
+const RT_TABLE_MAIN: u8 = 254;
+const RTPROT_BOOT: u8 = 3;
+const RTN_UNICAST: u8 = 1;
+const IFA_ADDRESS: u16 = 1;
+const IFA_LOCAL: u16 = 2;
+const RTA_DST: u16 = 1;
+const RTA_OIF: u16 = 4;
+const RTA_GATEWAY: u16 = 5;
 // From Linux <linux/random.h>: _IOW('R', 0x03, int[2]) and _IO('R', 0x07).
 const RNDADDENTROPY: c_ulong = 0x4008_5203;
 const RNDRESEEDCRNG: c_ulong = 0x5207;
@@ -116,6 +141,15 @@ struct SockaddrUn {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+struct SockaddrNl {
+    nl_family: u16,
+    nl_pad: u16,
+    nl_pid: u32,
+    nl_groups: u32,
+}
+
+#[repr(C)]
 struct Timespec {
     tv_sec: i64,
     tv_nsec: i64,
@@ -143,6 +177,54 @@ struct PollFd {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+struct NlMsgHdr {
+    nlmsg_len: u32,
+    nlmsg_type: u16,
+    nlmsg_flags: u16,
+    nlmsg_seq: u32,
+    nlmsg_pid: u32,
+}
+
+#[repr(C)]
+struct IfInfoMsg {
+    ifi_family: u8,
+    ifi_pad: u8,
+    ifi_type: u16,
+    ifi_index: c_int,
+    ifi_flags: c_uint,
+    ifi_change: c_uint,
+}
+
+#[repr(C)]
+struct IfAddrMsg {
+    ifa_family: u8,
+    ifa_prefixlen: u8,
+    ifa_flags: u8,
+    ifa_scope: u8,
+    ifa_index: c_uint,
+}
+
+#[repr(C)]
+struct RtMsg {
+    rtm_family: u8,
+    rtm_dst_len: u8,
+    rtm_src_len: u8,
+    rtm_tos: u8,
+    rtm_table: u8,
+    rtm_protocol: u8,
+    rtm_scope: u8,
+    rtm_type: u8,
+    rtm_flags: c_uint,
+}
+
+#[repr(C)]
+struct RtAttr {
+    rta_len: u16,
+    rta_type: u16,
+}
+
+#[repr(C)]
 struct RandPoolInfo {
     entropy_count: c_int,
     buf_size: c_int,
@@ -163,6 +245,7 @@ unsafe extern "C" {
     fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn fork() -> c_int;
+    fn if_nametoindex(ifname: *const c_char) -> c_uint;
     fn listen(fd: c_int, backlog: c_int) -> c_int;
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     fn kill(pid: c_int, sig: c_int) -> c_int;
@@ -281,6 +364,45 @@ fn mount_host_shares() {
     }
 }
 
+fn mount_package_store() {
+    if env::var("LNX_VIRTIOFS_NIX_STORE").ok().as_deref() == Some("1") {
+        mount_virtiofs("lnx-nix-store", "/nix/store", true);
+    }
+}
+
+fn mount_package_output() {
+    if env::var("LNX_VIRTIOFS_NIX_ROOT").ok().as_deref() == Some("1") {
+        mount_virtiofs("lnx-nix-root", "/run/lnx/nix", false);
+    }
+}
+
+fn mount_package_profile() {
+    let read_only = env::var("LNX_VIRTIOFS_PACKAGE_PROFILE_RW").ok().as_deref() != Some("1");
+    if env::var("LNX_VIRTIOFS_PACKAGE_PROFILE").ok().as_deref() == Some("1") {
+        mount_virtiofs("lnx-packages", "/run/lnx/packages", read_only);
+        link_package_binaries();
+    }
+}
+
+fn link_package_binaries() {
+    let binaries = env::var("LNX_PACKAGE_BINARIES").unwrap_or_default();
+    for binary in binaries.split(':').filter(|binary| !binary.is_empty()) {
+        if binary.contains('/') || binary.contains('\0') {
+            continue;
+        }
+        let target = format!("/newroot/usr/local/bin/{binary}");
+        let source = format!("/run/lnx/packages/default/bin/{binary}");
+        let _ = fs::remove_file(&target);
+        let Ok(target) = CString::new(target) else {
+            continue;
+        };
+        let Ok(source) = CString::new(source) else {
+            continue;
+        };
+        let _ = unsafe { symlink(source.as_ptr(), target.as_ptr()) };
+    }
+}
+
 fn restore_sync_guest_entropy(entropy: &[u8]) -> Result<(), String> {
     if entropy.len() < RESTORE_ENTROPY_MIN_BYTES {
         return Err(format!(
@@ -382,37 +504,6 @@ fn sync_clock_from_host() {
     let _ = unsafe { clock_settime(CLOCK_REALTIME, &ts) };
 }
 
-fn run_status(args: &[&str]) -> c_int {
-    let c_args = args
-        .iter()
-        .map(|arg| std::ffi::CString::new(*arg).unwrap())
-        .collect::<Vec<_>>();
-    let mut argv = c_args.iter().map(|arg| arg.as_ptr()).collect::<Vec<_>>();
-    argv.push(ptr::null());
-
-    let pid = unsafe { fork() };
-    if pid < 0 {
-        return -1;
-    }
-    if pid == 0 {
-        unsafe {
-            execvp(argv[0], argv.as_ptr());
-            _exit(127);
-        }
-    }
-
-    let mut status = 0;
-    loop {
-        let waited = unsafe { waitpid(pid, &mut status, 0) };
-        if waited == pid {
-            return status;
-        }
-        if waited < 0 && errno() != EINTR {
-            return -1;
-        }
-    }
-}
-
 /// The host passes a routable address when the VM sits on the shared vmnet
 /// network; without one the VM is behind its own gvproxy NAT at the fixed
 /// gvproxy addresses.
@@ -425,18 +516,380 @@ fn network_config() -> (String, String) {
 
 fn configure_network() {
     let (ip, gateway) = network_config();
-    let _ = run_status(&["/sbin/ip", "link", "set", "lo", "up"]);
-    let _ = run_status(&["/sbin/ip", "link", "set", "eth0", "up"]);
-    let _ = run_status(&["/sbin/ip", "addr", "replace", &ip, "dev", "eth0"]);
-    let _ = run_status(&[
-        "/sbin/ip", "route", "replace", "default", "via", &gateway, "dev", "eth0",
-    ]);
+    match configure_network_direct(&ip, &gateway) {
+        Ok(()) => log!("network.configured ip={ip} gateway={gateway}"),
+        Err(e) => log!("network.configure.error {e}"),
+    }
     let _ = fs::remove_file("/etc/resolv.conf");
     let _ = fs::write(
         "/etc/resolv.conf",
         format!("nameserver {gateway}\nnameserver 1.1.1.1\n"),
     );
     ensure_hosts();
+}
+
+struct OwnedFd {
+    fd: c_int,
+}
+
+impl OwnedFd {
+    fn new(fd: c_int) -> Self {
+        Self { fd }
+    }
+
+    fn raw(&self) -> c_int {
+        self.fd
+    }
+}
+
+impl Drop for OwnedFd {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            unsafe {
+                close(self.fd);
+            }
+        }
+    }
+}
+
+fn configure_network_direct(ip: &str, gateway: &str) -> Result<(), String> {
+    let (addr, prefix_len) = parse_ipv4_cidr(ip)?;
+    let gateway = gateway
+        .parse::<Ipv4Addr>()
+        .map_err(|e| format!("parse gateway {gateway}: {e}"))?;
+    let netlink = open_route_netlink()?;
+    let lo = interface_index("lo")?;
+    let eth0 = interface_index("eth0")?;
+    let mut seq = 1;
+
+    set_link_up(netlink.raw(), lo, seq)?;
+    seq += 1;
+    set_link_up(netlink.raw(), eth0, seq)?;
+    seq += 1;
+    replace_ipv4_address(netlink.raw(), eth0, addr, prefix_len, seq)?;
+    seq += 1;
+    replace_default_route(netlink.raw(), eth0, gateway, seq)
+}
+
+fn parse_ipv4_cidr(value: &str) -> Result<(Ipv4Addr, u8), String> {
+    let (addr, prefix_len) = value
+        .split_once('/')
+        .ok_or_else(|| format!("IPv4 address must include a prefix length: {value}"))?;
+    let addr = addr
+        .parse::<Ipv4Addr>()
+        .map_err(|e| format!("parse IPv4 address {addr}: {e}"))?;
+    let prefix_len = prefix_len
+        .parse::<u8>()
+        .map_err(|e| format!("parse IPv4 prefix length {prefix_len}: {e}"))?;
+    if prefix_len > 32 {
+        return Err(format!("IPv4 prefix length out of range: {prefix_len}"));
+    }
+    Ok((addr, prefix_len))
+}
+
+fn open_route_netlink() -> Result<OwnedFd, String> {
+    let fd = unsafe { socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) };
+    if fd < 0 {
+        return Err(format!("socket(AF_NETLINK): {}", Error::last_os_error()));
+    }
+    let fd = OwnedFd::new(fd);
+    let local = SockaddrNl {
+        nl_family: AF_NETLINK as u16,
+        nl_pad: 0,
+        nl_pid: 0,
+        nl_groups: 0,
+    };
+    if unsafe {
+        bind(
+            fd.raw(),
+            &local as *const SockaddrNl as *const Sockaddr,
+            size_of::<SockaddrNl>() as c_uint,
+        )
+    } < 0
+    {
+        return Err(format!("bind(AF_NETLINK): {}", Error::last_os_error()));
+    }
+    let kernel = SockaddrNl {
+        nl_family: AF_NETLINK as u16,
+        nl_pad: 0,
+        nl_pid: 0,
+        nl_groups: 0,
+    };
+    if unsafe {
+        connect(
+            fd.raw(),
+            &kernel as *const SockaddrNl as *const Sockaddr,
+            size_of::<SockaddrNl>() as c_uint,
+        )
+    } < 0
+    {
+        return Err(format!("connect(AF_NETLINK): {}", Error::last_os_error()));
+    }
+    Ok(fd)
+}
+
+fn interface_index(name: &str) -> Result<c_uint, String> {
+    let name_c = CString::new(name).map_err(|_| format!("interface name contains NUL: {name}"))?;
+    let index = unsafe { if_nametoindex(name_c.as_ptr()) };
+    if index == 0 {
+        return Err(format!(
+            "interface {name} not found: {}",
+            Error::last_os_error()
+        ));
+    }
+    Ok(index)
+}
+
+fn set_link_up(fd: c_int, ifindex: c_uint, seq: u32) -> Result<(), String> {
+    let payload = IfInfoMsg {
+        ifi_family: AF_UNSPEC as u8,
+        ifi_pad: 0,
+        ifi_type: 0,
+        ifi_index: ifindex as c_int,
+        ifi_flags: IFF_UP,
+        ifi_change: IFF_UP,
+    };
+    netlink_request(
+        fd,
+        RTM_NEWLINK,
+        NLM_F_REQUEST | NLM_F_ACK,
+        seq,
+        &payload,
+        &[],
+        false,
+        "set link up",
+    )
+}
+
+fn replace_ipv4_address(
+    fd: c_int,
+    ifindex: c_uint,
+    addr: Ipv4Addr,
+    prefix_len: u8,
+    seq: u32,
+) -> Result<(), String> {
+    let payload = IfAddrMsg {
+        ifa_family: AF_INET as u8,
+        ifa_prefixlen: prefix_len,
+        ifa_flags: 0,
+        ifa_scope: RT_SCOPE_UNIVERSE,
+        ifa_index: ifindex,
+    };
+    let addr = addr.octets();
+    netlink_request(
+        fd,
+        RTM_NEWADDR,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+        seq,
+        &payload,
+        &[(IFA_LOCAL, &addr), (IFA_ADDRESS, &addr)],
+        true,
+        "replace IPv4 address",
+    )
+}
+
+fn replace_default_route(
+    fd: c_int,
+    ifindex: c_uint,
+    gateway: Ipv4Addr,
+    seq: u32,
+) -> Result<(), String> {
+    let payload = RtMsg {
+        rtm_family: AF_INET as u8,
+        rtm_dst_len: 0,
+        rtm_src_len: 0,
+        rtm_tos: 0,
+        rtm_table: RT_TABLE_MAIN,
+        rtm_protocol: RTPROT_BOOT,
+        rtm_scope: RT_SCOPE_UNIVERSE,
+        rtm_type: RTN_UNICAST,
+        rtm_flags: 0,
+    };
+    let dst = [0u8; 4];
+    let gateway = gateway.octets();
+    let oif = (ifindex as c_int).to_ne_bytes();
+    netlink_request(
+        fd,
+        RTM_NEWROUTE,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+        seq,
+        &payload,
+        &[(RTA_OIF, &oif), (RTA_DST, &dst), (RTA_GATEWAY, &gateway)],
+        true,
+        "replace default route",
+    )
+}
+
+fn netlink_request<T>(
+    fd: c_int,
+    message_type: u16,
+    flags: u16,
+    seq: u32,
+    payload: &T,
+    attrs: &[(u16, &[u8])],
+    allow_exists: bool,
+    label: &str,
+) -> Result<(), String> {
+    let mut buf = [0u8; 4096];
+    let mut len = size_of::<NlMsgHdr>();
+    put_struct(&mut buf, len, payload)?;
+    len += size_of::<T>();
+    for (attr_type, data) in attrs {
+        add_netlink_attr(&mut buf, &mut len, *attr_type, data)?;
+    }
+    let header = NlMsgHdr {
+        nlmsg_len: len as u32,
+        nlmsg_type: message_type,
+        nlmsg_flags: flags,
+        nlmsg_seq: seq,
+        nlmsg_pid: 0,
+    };
+    put_struct(&mut buf, 0, &header)?;
+    netlink_write(fd, &buf[..len]).map_err(|e| format!("{label}: {e}"))?;
+    netlink_ack(fd, seq, allow_exists).map_err(|e| format!("{label}: {e}"))
+}
+
+fn add_netlink_attr(
+    buf: &mut [u8],
+    len: &mut usize,
+    attr_type: u16,
+    data: &[u8],
+) -> Result<(), String> {
+    let start = align4(*len);
+    let attr_len = size_of::<RtAttr>() + data.len();
+    if attr_len > u16::MAX as usize {
+        return Err("netlink attribute too large".to_string());
+    }
+    let end = start
+        .checked_add(align4(attr_len))
+        .ok_or_else(|| "netlink message length overflow".to_string())?;
+    if end > buf.len() {
+        return Err("netlink message too large".to_string());
+    }
+    let attr = RtAttr {
+        rta_len: attr_len as u16,
+        rta_type: attr_type,
+    };
+    put_struct(buf, start, &attr)?;
+    put_bytes(buf, start + size_of::<RtAttr>(), data)?;
+    *len = end;
+    Ok(())
+}
+
+fn netlink_write(fd: c_int, buf: &[u8]) -> Result<(), String> {
+    loop {
+        let written = unsafe { write(fd, buf.as_ptr() as *const c_void, buf.len()) };
+        if written < 0 {
+            if errno() == EINTR {
+                continue;
+            }
+            return Err(format!("write: {}", Error::last_os_error()));
+        }
+        if written as usize != buf.len() {
+            return Err(format!("short write: {written} of {}", buf.len()));
+        }
+        return Ok(());
+    }
+}
+
+fn netlink_read(fd: c_int, buf: &mut [u8]) -> Result<usize, String> {
+    loop {
+        let read_len = unsafe { read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+        if read_len < 0 {
+            if errno() == EINTR {
+                continue;
+            }
+            return Err(format!("read: {}", Error::last_os_error()));
+        }
+        if read_len == 0 {
+            return Err("unexpected EOF".to_string());
+        }
+        return Ok(read_len as usize);
+    }
+}
+
+fn netlink_ack(fd: c_int, seq: u32, allow_exists: bool) -> Result<(), String> {
+    let mut buf = [0u8; 4096];
+    loop {
+        let len = netlink_read(fd, &mut buf)?;
+        let mut offset = 0;
+        while offset + size_of::<NlMsgHdr>() <= len {
+            let header = read_struct::<NlMsgHdr>(&buf, offset)
+                .ok_or_else(|| "short netlink header".to_string())?;
+            if header.nlmsg_len < size_of::<NlMsgHdr>() as u32 {
+                return Err("invalid netlink message length".to_string());
+            }
+            let message_end = offset
+                .checked_add(header.nlmsg_len as usize)
+                .ok_or_else(|| "netlink message length overflow".to_string())?;
+            if message_end > len {
+                return Err("truncated netlink message".to_string());
+            }
+            if header.nlmsg_seq == seq {
+                match header.nlmsg_type {
+                    NLMSG_ERROR => {
+                        let error = read_struct::<c_int>(&buf, offset + size_of::<NlMsgHdr>())
+                            .ok_or_else(|| "short netlink error".to_string())?;
+                        if error == 0 {
+                            return Ok(());
+                        }
+                        let code = if error < 0 { -error } else { error };
+                        if allow_exists && code == EEXIST {
+                            return Ok(());
+                        }
+                        return Err(format!(
+                            "kernel error {code}: {}",
+                            Error::from_raw_os_error(code)
+                        ));
+                    }
+                    NLMSG_DONE => return Ok(()),
+                    _ => {}
+                }
+            }
+            offset += align4(header.nlmsg_len as usize);
+        }
+    }
+}
+
+fn put_struct<T>(buf: &mut [u8], offset: usize, value: &T) -> Result<(), String> {
+    let len = size_of::<T>();
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| "buffer offset overflow".to_string())?;
+    if end > buf.len() {
+        return Err("buffer too small".to_string());
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(
+            value as *const T as *const u8,
+            buf[offset..end].as_mut_ptr(),
+            len,
+        );
+    }
+    Ok(())
+}
+
+fn put_bytes(buf: &mut [u8], offset: usize, data: &[u8]) -> Result<(), String> {
+    let end = offset
+        .checked_add(data.len())
+        .ok_or_else(|| "buffer offset overflow".to_string())?;
+    if end > buf.len() {
+        return Err("buffer too small".to_string());
+    }
+    buf[offset..end].copy_from_slice(data);
+    Ok(())
+}
+
+fn read_struct<T: Copy>(buf: &[u8], offset: usize) -> Option<T> {
+    let end = offset.checked_add(size_of::<T>())?;
+    if end > buf.len() {
+        return None;
+    }
+    Some(unsafe { ptr::read_unaligned(buf[offset..end].as_ptr() as *const T) })
+}
+
+fn align4(value: usize) -> usize {
+    (value + 3) & !3
 }
 
 /// Populate /etc/hosts so the local hostname resolves. Some base images ship
@@ -520,6 +973,7 @@ fn init_mode() -> ! {
         root_options,
     );
     mount_host_shares();
+    mount_package_store();
 
     ensure_dir("/newroot/usr/local/lib/lnx");
     ensure_dir("/newroot/usr/local/bin");
@@ -545,6 +999,8 @@ fn init_mode() -> ! {
         )
     };
     ensure_dir("/newroot/run/lnx");
+    mount_package_output();
+    mount_package_profile();
     ensure_dir(&format!("/newroot{WANTS_DIR}"));
 
     for (source, target) in [
@@ -639,6 +1095,25 @@ fn init_mode() -> ! {
     } < 0
     {
         die("mount /newroot/sys");
+    }
+    ensure_dir("/newroot/dev/pts");
+    if unsafe {
+        mount(
+            cstr(b"devpts\0"),
+            cstr(b"/newroot/dev/pts\0"),
+            cstr(b"devpts\0"),
+            0,
+            cstr(b"newinstance,ptmxmode=0666,mode=0620\0") as *const c_void,
+        )
+    } < 0
+    {
+        die("mount /newroot/dev/pts");
+    }
+    let _ = fs::remove_file("/newroot/dev/ptmx");
+    if unsafe { symlink(cstr(b"pts/ptmx\0"), cstr(b"/newroot/dev/ptmx\0")) } < 0
+        && errno() != EEXIST
+    {
+        die("symlink /newroot/dev/ptmx");
     }
     ensure_dir("/newroot/dev/shm");
     let _ = unsafe {

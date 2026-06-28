@@ -284,6 +284,21 @@ fn shares_stamp_content_lists_home_cwd_and_network() {
 }
 
 #[test]
+fn shares_stamp_content_records_package_store() {
+    assert_eq!(
+        shares_stamp_content_with_cache_and_package_store(
+            Path::new("/Users/ramon"),
+            None,
+            "net=gvproxy",
+            false,
+            HOST_SHARE_CACHE_NODAX_STAMP,
+            "packages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64",
+        ),
+        "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\npackages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64\nnet=gvproxy\n"
+    );
+}
+
+#[test]
 fn snapshot_shares_compatibility_requires_identical_stamp() {
     let temp = TempDir::new("snapshot-shares");
     fs::create_dir_all(temp.path()).expect("create snapshot dir");
@@ -372,6 +387,48 @@ fn snapshot_shares_compatibility_requires_identical_stamp() {
                     .to_string()
             )
         );
+}
+
+#[test]
+fn snapshot_shares_compatibility_requires_matching_package_store() {
+    let temp = TempDir::new("snapshot-package-shares");
+    fs::create_dir_all(temp.path()).expect("create snapshot dir");
+    let disabled = shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", false);
+    let enabled = shares_stamp_content_with_cache_and_package_store(
+        Path::new("/Users/ramon"),
+        None,
+        "net=gvproxy",
+        false,
+        HOST_SHARE_CACHE_NODAX_STAMP,
+        "packages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64",
+    );
+
+    fs::write(temp.path().join("shares.stamp"), &disabled).expect("write stamp");
+    assert_eq!(
+        snapshot_shares_incompatibility(temp.path(), &enabled),
+        Some(
+            "share_mismatch: packages: snapshot=disabled-v1 current=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64"
+                .to_string()
+        )
+    );
+
+    let disabled_with_explicit_package = shares_stamp_content_with_cache_and_package_store(
+        Path::new("/Users/ramon"),
+        None,
+        "net=gvproxy",
+        false,
+        HOST_SHARE_CACHE_NODAX_STAMP,
+        PACKAGE_STORE_DISABLED_STAMP,
+    );
+    fs::write(
+        temp.path().join("shares.stamp"),
+        &disabled_with_explicit_package,
+    )
+    .expect("write stamp");
+    assert_eq!(
+        snapshot_shares_incompatibility(temp.path(), &disabled),
+        None
+    );
 }
 
 #[test]

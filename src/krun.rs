@@ -85,6 +85,24 @@ impl Context {
         )
     }
 
+    pub fn add_virtiofs(&self, tag: &str, path: &Path, read_only: bool) -> Result<()> {
+        let tag = CString::new(tag)?;
+        let path = cstring_path(path)?;
+        call(
+            unsafe {
+                libkrun::krun_add_virtiofs4(
+                    self.id,
+                    tag.as_ptr(),
+                    path.as_ptr(),
+                    host_share_dax_window_bytes(),
+                    read_only,
+                    false,
+                )
+            },
+            "krun_add_virtiofs4",
+        )
+    }
+
     pub fn add_host_virtiofs(
         &self,
         tag: &str,

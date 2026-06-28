@@ -25,7 +25,12 @@ use lnx_protocol::{MAX_MESSAGE_SIZE, Message, PROTOCOL_VERSION};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
-use crate::{initramfs, krun::Context as KrunContext, paths::Layout};
+use crate::{
+    initramfs,
+    krun::Context as KrunContext,
+    packages::{GuestStoreMode, StoreLayout},
+    paths::Layout,
+};
 
 const AGENT_PORT: u32 = 10240;
 const SNAPSHOT_PORT: u32 = 10241;
@@ -81,6 +86,8 @@ pub struct RunConfig {
     pub snapshot_output: Option<PathBuf>,
     pub run_as_root: bool,
     pub no_host_shares: bool,
+    pub package_store: GuestStoreMode,
+    pub reuse_owner: bool,
     pub deterministic: Option<DeterministicConfig>,
     pub trace_events: bool,
 }
@@ -153,7 +160,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
         config.layout.run_dir.join("gvproxy.log").display()
     ));
     let broker_socket = config.layout.run_dir.join("broker.sock");
-    let no_daemon_reuse = debug_flag_enabled("nodaemonreuse");
+    let no_daemon_reuse = !config.reuse_owner || debug_flag_enabled("nodaemonreuse");
     if no_daemon_reuse {
         run_log.line("debug.nodaemonreuse enabled");
         eprintln!(
@@ -346,6 +353,7 @@ pub fn run_owner(config: RunConfig) -> Result<()> {
 
 fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBuf) -> Result<i32> {
     let lock_path = config.layout.run_dir.join("bootstrap.lock.d");
+    let no_daemon_reuse = !config.reuse_owner || debug_flag_enabled("nodaemonreuse");
     let bootstrap_lock = if config.forwards.is_empty() {
         match acquire_bootstrap_or_run_client(
             &lock_path,
@@ -355,7 +363,7 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
             config.run_as_root,
             config.no_host_shares,
             config.deterministic.as_ref(),
-            debug_flag_enabled("nodaemonreuse"),
+            no_daemon_reuse,
             &run_log,
         )? {
             BootstrapOutcome::Lock(lock) => lock,
@@ -364,7 +372,7 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
     } else {
         acquire_bootstrap_for_forward(&lock_path, &run_log)?
     };
-    if config.forwards.is_empty() && !debug_flag_enabled("nodaemonreuse") {
+    if config.forwards.is_empty() && !no_daemon_reuse {
         if let Some(status) = run_existing_broker_client(
             &broker_socket,
             &config.command,
@@ -624,11 +632,17 @@ fn start_vm(
     let current_host_home = host_home_for_cwd(&config.cwd)?;
     let current_outside_home_cwd =
         (!config.cwd.starts_with(&current_host_home)).then(|| config.cwd.clone());
-    let current_shares_stamp = shares_stamp_content(
+    let current_package_store_stamp = package_store_stamp_line(
+        &config.layout.base,
+        config.package_store,
+        config.no_host_shares,
+    )?;
+    let current_shares_stamp = shares_stamp_content_with_package_store(
         &current_host_home,
         current_outside_home_cwd.as_deref(),
         &network.stamp_line(),
         config.no_host_shares,
+        &current_package_store_stamp,
     );
     let mut share_layout = ShareLayout {
         host_home: current_host_home,
@@ -847,6 +861,13 @@ fn start_vm(
             )?;
         }
     }
+    let package_env = configure_package_store(
+        ctx.as_ref(),
+        &config.layout.base,
+        config.package_store,
+        share_layout.no_host_shares,
+        &run_log,
+    )?;
     let mut kernel_cmdline =
         format!("console=hvc0 reboot=k panic=1 root={root_device} rw rootfstype=ext4");
     #[cfg(target_arch = "aarch64")]
@@ -887,33 +908,31 @@ fn start_vm(
             .as_secs(),
     };
     let (net_ip, net_gateway) = network.guest_env();
-    ctx.set_exec(
-        "/init",
-        &["--init".to_string()],
-        &[
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-            "container=lnx".to_string(),
-            format!("LNX_HOST_UNIX_SECS={init_unix_secs}"),
-            format!("LNX_ROOT_DEVICE={root_device}"),
-            format!("LNX_NET_IP={net_ip}"),
-            format!("LNX_NET_GATEWAY={net_gateway}"),
-            format!(
-                "LNX_VIRTIOFS_DAX={}",
-                if crate::krun::host_share_dax_enabled() {
-                    "1"
-                } else {
-                    "0"
-                }
-            ),
-            format!("LNX_VIRTIOFS_HOME={guest_home}"),
-            share_layout
-                .outside_home_cwd
-                .as_ref()
-                .filter(|_| !share_layout.no_host_shares)
-                .map(|_| format!("LNX_VIRTIOFS_CWD={guest_cwd}"))
-                .unwrap_or_else(|| "LNX_VIRTIOFS_CWD=".to_string()),
-        ],
-    )?;
+    let mut init_env = vec![
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+        "container=lnx".to_string(),
+        format!("LNX_HOST_UNIX_SECS={init_unix_secs}"),
+        format!("LNX_ROOT_DEVICE={root_device}"),
+        format!("LNX_NET_IP={net_ip}"),
+        format!("LNX_NET_GATEWAY={net_gateway}"),
+        format!(
+            "LNX_VIRTIOFS_DAX={}",
+            if crate::krun::host_share_dax_enabled() {
+                "1"
+            } else {
+                "0"
+            }
+        ),
+        format!("LNX_VIRTIOFS_HOME={guest_home}"),
+        share_layout
+            .outside_home_cwd
+            .as_ref()
+            .filter(|_| !share_layout.no_host_shares)
+            .map(|_| format!("LNX_VIRTIOFS_CWD={guest_cwd}"))
+            .unwrap_or_else(|| "LNX_VIRTIOFS_CWD=".to_string()),
+    ];
+    init_env.extend(package_env);
+    ctx.set_exec("/init", &["--init".to_string()], &init_env)?;
     timings.event("krun.exec.configured");
 
     let console_log = config.layout.console_log.clone();
@@ -1693,6 +1712,7 @@ const HOST_SHARE_CACHE_DAX_STAMP: &str =
 const HOST_SHARE_CACHE_NODAX_STAMP: &str =
     "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1";
 const HOST_SHARES_DISABLED_STAMP: &str = "host-shares=disabled-v1";
+const PACKAGE_STORE_DISABLED_STAMP: &str = "packages=disabled-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ShareLayout {
@@ -1713,6 +1733,7 @@ struct SnapshotShareLayout {
 // host directory, a drifted network would strand the guest's addresses, and an
 // old cache policy can preserve stale host-file contents or size after the
 // host changed while the VM was stopped.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn shares_stamp_content(
     host_home: &Path,
     outside_home_cwd: Option<&Path>,
@@ -1733,6 +1754,29 @@ fn shares_stamp_content(
     )
 }
 
+fn shares_stamp_content_with_package_store(
+    host_home: &Path,
+    outside_home_cwd: Option<&Path>,
+    net_stamp_line: &str,
+    no_host_shares: bool,
+    package_store_stamp_line: &str,
+) -> String {
+    let host_share_cache_stamp = if crate::krun::host_share_dax_enabled() {
+        HOST_SHARE_CACHE_DAX_STAMP
+    } else {
+        HOST_SHARE_CACHE_NODAX_STAMP
+    };
+    shares_stamp_content_with_cache_and_package_store(
+        host_home,
+        outside_home_cwd,
+        net_stamp_line,
+        no_host_shares,
+        host_share_cache_stamp,
+        package_store_stamp_line,
+    )
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn shares_stamp_content_with_cache_stamp(
     host_home: &Path,
     outside_home_cwd: Option<&Path>,
@@ -1750,6 +1794,65 @@ fn shares_stamp_content_with_cache_stamp(
     content.push_str(net_stamp_line);
     content.push('\n');
     content
+}
+
+fn shares_stamp_content_with_cache_and_package_store(
+    host_home: &Path,
+    outside_home_cwd: Option<&Path>,
+    net_stamp_line: &str,
+    no_host_shares: bool,
+    host_share_cache_stamp: &str,
+    package_store_stamp_line: &str,
+) -> String {
+    if no_host_shares {
+        return format!(
+            "{HOST_SHARES_DISABLED_STAMP}\n{package_store_stamp_line}\n{net_stamp_line}\n"
+        );
+    }
+    let mut content = format!(
+        "{host_share_cache_stamp}\nhome={}\n{package_store_stamp_line}\n",
+        host_home.display()
+    );
+    if let Some(cwd) = outside_home_cwd {
+        content.push_str(&format!("cwd={}\n", cwd.display()));
+    }
+    content.push_str(net_stamp_line);
+    content.push('\n');
+    content
+}
+
+fn package_store_stamp_line(
+    base: &Path,
+    mode: GuestStoreMode,
+    no_host_shares: bool,
+) -> Result<String> {
+    if package_store_disabled(mode, no_host_shares) {
+        return Ok(PACKAGE_STORE_DISABLED_STAMP.to_string());
+    }
+
+    let layout = StoreLayout::resolve(base);
+    let writable = matches!(mode, GuestStoreMode::Writable);
+    let enabled = if writable {
+        layout.ensure()?;
+        true
+    } else {
+        layout.prepare_readonly()?
+    };
+    if !enabled {
+        return Ok(PACKAGE_STORE_DISABLED_STAMP.to_string());
+    }
+
+    let mode = if writable {
+        "writable-v1"
+    } else {
+        "readonly-v1"
+    };
+    Ok(format!("packages={mode} root={}", layout.root.display()))
+}
+
+fn package_store_disabled(mode: GuestStoreMode, no_host_shares: bool) -> bool {
+    matches!(mode, GuestStoreMode::Disabled)
+        || (no_host_shares && !matches!(mode, GuestStoreMode::Writable))
 }
 
 pub fn snapshot_shares_incompatibility_for_import(
@@ -1831,15 +1934,9 @@ fn describe_shares_stamp_mismatch(snapshot: &str, current: &str) -> String {
         ));
     }
 
-    for key in ["host-share-cache", "home", "net"] {
-        let snapshot_value = snapshot_fields
-            .get(key)
-            .map(String::as_str)
-            .unwrap_or("<absent>");
-        let current_value = current_fields
-            .get(key)
-            .map(String::as_str)
-            .unwrap_or("<absent>");
+    for key in ["host-share-cache", "home", "packages", "net"] {
+        let snapshot_value = share_stamp_field_value(&snapshot_fields, key);
+        let current_value = share_stamp_field_value(&current_fields, key);
         if snapshot_value != current_value {
             mismatches.push(format!(
                 "{key}: snapshot={snapshot_value} current={current_value}"
@@ -1855,14 +1952,27 @@ fn describe_shares_stamp_mismatch(snapshot: &str, current: &str) -> String {
 }
 
 fn shares_stamps_match_ignoring_cwd(snapshot: &str, current: &str) -> bool {
-    parse_shares_stamp(snapshot)
-        .into_iter()
-        .filter(|(key, _)| key != "cwd")
-        .collect::<BTreeMap<_, _>>()
-        == parse_shares_stamp(current)
-            .into_iter()
-            .filter(|(key, _)| key != "cwd")
-            .collect::<BTreeMap<_, _>>()
+    comparable_share_stamp_fields(snapshot) == comparable_share_stamp_fields(current)
+}
+
+fn comparable_share_stamp_fields(stamp: &str) -> BTreeMap<String, String> {
+    let mut fields = parse_shares_stamp(stamp);
+    fields.remove("cwd");
+    fields
+        .entry("packages".to_string())
+        .or_insert_with(|| "disabled-v1".to_string());
+    fields
+}
+
+fn share_stamp_field_value<'a>(fields: &'a BTreeMap<String, String>, key: &str) -> &'a str {
+    fields
+        .get(key)
+        .map(String::as_str)
+        .unwrap_or(if key == "packages" {
+            "disabled-v1"
+        } else {
+            "<absent>"
+        })
 }
 
 fn snapshot_share_layout(snapshot_path: &Path) -> Result<Option<SnapshotShareLayout>> {
@@ -3418,7 +3528,12 @@ fn spawn_owner_process(config: &RunConfig, run_log: &RunLog) -> Result<Child> {
     for forward in &config.forwards {
         command.arg("--forward").arg(forward_spec(forward));
     }
-    command.arg("_vm-owner").arg("--cwd").arg(&config.cwd);
+    command
+        .arg("_vm-owner")
+        .arg("--cwd")
+        .arg(&config.cwd)
+        .arg("--package-store")
+        .arg(config.package_store.as_arg());
     if let Some(snapshot) = &config.restore_snapshot {
         command.arg("--restore").arg(snapshot);
     }
@@ -4461,6 +4576,46 @@ fn home_write_allowlist(cwd: &Path, host_home: &Path) -> Vec<String> {
 
 fn cwd_write_allowlist() -> Vec<String> {
     vec![".".to_string()]
+}
+
+fn configure_package_store(
+    ctx: &KrunContext,
+    base: &Path,
+    mode: GuestStoreMode,
+    no_host_shares: bool,
+    run_log: &RunLog,
+) -> Result<Vec<String>> {
+    if package_store_disabled(mode, no_host_shares) {
+        return Ok(Vec::new());
+    }
+
+    let layout = StoreLayout::resolve(base);
+    let writable = matches!(mode, GuestStoreMode::Writable);
+    if writable {
+        layout.ensure()?;
+        ctx.add_virtiofs("lnx-nix-root", &layout.mount, false)?;
+        run_log.line(format!(
+            "packages.store.mounted mode=writable root={}",
+            layout.root.display()
+        ));
+        return Ok(vec!["LNX_VIRTIOFS_NIX_ROOT=1".to_string()]);
+    }
+
+    if !layout.prepare_readonly()? {
+        return Ok(Vec::new());
+    }
+    ctx.add_virtiofs("lnx-nix-store", &layout.store, !writable)?;
+    ctx.add_virtiofs("lnx-packages", &layout.profiles, !writable)?;
+    let env = vec![
+        "LNX_VIRTIOFS_NIX_STORE=1".to_string(),
+        "LNX_VIRTIOFS_PACKAGE_PROFILE=1".to_string(),
+        format!("LNX_PACKAGE_BINARIES={}", layout.binaries()?.join(":")),
+    ];
+    run_log.line(format!(
+        "packages.store.mounted mode=readonly root={}",
+        layout.root.display()
+    ));
+    Ok(env)
 }
 
 fn host_share_unshare_dir(layout: &Layout, tag: &str) -> PathBuf {

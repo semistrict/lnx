@@ -9,7 +9,12 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
-use crate::{checkpoints, descriptor, ingress, init, paths::Layout, runner};
+use crate::{
+    checkpoints, descriptor, ingress, init,
+    packages::{self, GuestStoreMode, PackageManifest, StoreLayout},
+    paths::Layout,
+    runner,
+};
 
 const DEFAULT_CPUS: u8 = 2;
 const DEFAULT_MEMORY_MIB: u32 = 4096;
@@ -90,6 +95,7 @@ enum Command {
     Init(InitArgs),
     Run(RunArgs),
     Paths,
+    Packages(PackagesArgs),
     Checkpoint(CheckpointArgs),
     Checkpoints,
     Fork(ForkArgs),
@@ -164,6 +170,35 @@ struct InitArgs {
 struct RunArgs {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct PackagesArgs {
+    #[command(subcommand)]
+    command: PackagesCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum PackagesCommand {
+    #[command(about = "Install packages into the shared Linux Nix store")]
+    Install(PackagesInstallArgs),
+    #[command(about = "Print shared package store paths")]
+    Paths,
+}
+
+#[derive(Debug, Args)]
+struct PackagesInstallArgs {
+    #[arg(long, default_value_t = packages::DEFAULT_BUILDER_INSTANCE.to_string())]
+    builder: String,
+
+    #[arg(long, default_value_t = packages::DEFAULT_BUILDER_IMAGE.to_string())]
+    builder_image: String,
+
+    #[arg(long = "bin", value_name = "NAME")]
+    binaries: Vec<String>,
+
+    #[arg(value_name = "FLAKE_REF_OR_PACKAGE")]
+    packages: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -310,6 +345,14 @@ struct HiddenVmOwnerArgs {
 
     #[arg(long)]
     trace_events: bool,
+
+    #[arg(
+        long,
+        value_parser = parse_package_store_mode,
+        default_value = "auto",
+        hide = true
+    )]
+    package_store: GuestStoreMode,
 }
 
 #[derive(Debug, Args)]
@@ -447,6 +490,7 @@ impl Cli {
                 println!("snapshots: {}", layout.snapshot_dir.display());
                 Ok(())
             }
+            Some(Command::Packages(args)) => run_packages_command(&layout, args, cpus, memory_mib),
             Some(Command::Checkpoint(args)) => {
                 if cfg!(target_os = "macos") && deterministic.is_some() {
                     let mut subcommand = vec!["checkpoint".to_string()];
@@ -592,6 +636,8 @@ impl Cli {
                 snapshot_output: None,
                 run_as_root: false,
                 no_host_shares: effective_no_host_shares || args.no_host_shares,
+                package_store: args.package_store,
+                reuse_owner: true,
                 deterministic: args
                     .deterministic
                     .map(|seed| runner::DeterministicConfig { seed })
@@ -813,6 +859,125 @@ fn set_instance_settings(layout: &Layout, settings: &[String]) -> Result<()> {
     }
     descriptor::save(layout, &config)?;
     println!("{}", serde_json::to_string_pretty(&config)?);
+    Ok(())
+}
+
+fn run_packages_command(
+    layout: &Layout,
+    args: PackagesArgs,
+    cpus: u8,
+    memory_mib: u32,
+) -> Result<()> {
+    match args.command {
+        PackagesCommand::Install(args) => run_packages_install(layout, args, cpus, memory_mib),
+        PackagesCommand::Paths => {
+            let package_layout = StoreLayout::resolve(&layout.base);
+            println!("root: {}", package_layout.root.display());
+            println!("image: {}", package_layout.image.display());
+            println!("mount: {}", package_layout.mount.display());
+            println!("store: {}", package_layout.store.display());
+            println!("var: {}", package_layout.var.display());
+            println!("profiles: {}", package_layout.profiles.display());
+            println!("profile: {}", package_layout.profile_link().display());
+            println!("manifest: {}", package_layout.manifest.display());
+            Ok(())
+        }
+    }
+}
+
+fn run_packages_install(
+    layout: &Layout,
+    args: PackagesInstallArgs,
+    cpus: u8,
+    memory_mib: u32,
+) -> Result<()> {
+    let package_refs = if args.packages.is_empty() {
+        packages::default_packages()
+    } else {
+        args.packages
+    };
+    let binaries = if args.binaries.is_empty() {
+        packages::default_binaries()
+    } else {
+        args.binaries
+    };
+    validate_package_binaries(&binaries)?;
+
+    let package_layout = StoreLayout::resolve(&layout.base);
+    package_layout.write_manifest(&PackageManifest {
+        packages: package_refs.clone(),
+        binaries: binaries.clone(),
+    })?;
+
+    let builder_layout = Layout::resolve_in_base(&args.builder, layout.base.clone(), None, None);
+    ensure_package_builder_instance(&builder_layout, &args.builder, &args.builder_image)?;
+    let cwd = std::env::current_dir().context("current directory")?;
+    let status = runner::run(runner::RunConfig {
+        layout: builder_layout,
+        command: vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            packages::install_script(&package_refs, &binaries),
+        ],
+        cwd,
+        cpus,
+        memory_mib,
+        nested_kvm: false,
+        restore_snapshot: None,
+        forwards: Vec::new(),
+        snapshot_output: None,
+        run_as_root: true,
+        no_host_shares: true,
+        package_store: GuestStoreMode::Writable,
+        reuse_owner: false,
+        deterministic: None,
+        trace_events: false,
+    })?;
+    if status != 0 {
+        bail!("package install exited with status {status}");
+    }
+    Ok(())
+}
+
+fn ensure_package_builder_instance(
+    layout: &Layout,
+    builder: &str,
+    builder_image: &str,
+) -> Result<()> {
+    let expected_image = format!("oci:{builder_image}");
+    let descriptor = descriptor::load(layout)?;
+    if layout.rootfs.exists() && descriptor.image.as_deref() == Some(expected_image.as_str()) {
+        init::ensure_kernel(layout)?;
+        init::ensure_instance(layout)?;
+        return Ok(());
+    }
+
+    if layout.rootfs.exists() || layout.instance_dir.exists() {
+        if builder != packages::DEFAULT_BUILDER_INSTANCE {
+            bail!(
+                "builder instance {builder} already exists and is not image {builder_image}; choose another --builder or remove it"
+            );
+        }
+        let _ = fs::remove_dir_all(&layout.run_dir);
+        if layout.run_dir != layout.instance_dir {
+            let _ = fs::remove_dir_all(&layout.instance_dir);
+        }
+    }
+
+    crate::oci::import_image(layout, builder_image, None)
+        .with_context(|| format!("initialize package builder from {builder_image}"))
+}
+
+fn validate_package_binaries(binaries: &[String]) -> Result<()> {
+    for binary in binaries {
+        if binary.is_empty()
+            || !binary
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            bail!("invalid package binary name {binary:?}");
+        }
+    }
     Ok(())
 }
 
@@ -1338,6 +1503,8 @@ fn run_guest(
         run_as_root,
         snapshot_output: None,
         no_host_shares,
+        package_store: GuestStoreMode::Auto,
+        reuse_owner: true,
         deterministic,
         trace_events,
     };
@@ -1611,6 +1778,8 @@ fn run_nested_deterministic_on_macos(
         snapshot_output: None,
         run_as_root: false,
         no_host_shares: false,
+        package_store: GuestStoreMode::Disabled,
+        reuse_owner: true,
         deterministic: None,
         trace_events: false,
     })
@@ -1836,6 +2005,8 @@ fn initialize_vm_instance(
         snapshot_output: Some(layout.snapshot_dir.join("latest")),
         run_as_root: false,
         no_host_shares,
+        package_store: GuestStoreMode::Auto,
+        reuse_owner: true,
         deterministic,
         trace_events,
     })
@@ -2147,6 +2318,8 @@ fn create_checkpoint(
             snapshot_output: Some(path.clone()),
             run_as_root: false,
             no_host_shares,
+            package_store: GuestStoreMode::Auto,
+            reuse_owner: true,
             deterministic,
             trace_events,
         })?;
@@ -2258,6 +2431,8 @@ fn create_internal_fork_checkpoint(
             snapshot_output: Some(path.clone()),
             run_as_root: false,
             no_host_shares,
+            package_store: GuestStoreMode::Auto,
+            reuse_owner: true,
             deterministic,
             trace_events,
         })?;
@@ -2292,6 +2467,11 @@ fn parse_port(value: &str) -> Result<u16, String> {
     value
         .parse::<u16>()
         .map_err(|_| format!("invalid port: {value}"))
+}
+
+fn parse_package_store_mode(value: &str) -> Result<GuestStoreMode, String> {
+    GuestStoreMode::parse(value)
+        .ok_or_else(|| format!("expected auto, disabled, or writable, got {value}"))
 }
 
 #[cfg(test)]
