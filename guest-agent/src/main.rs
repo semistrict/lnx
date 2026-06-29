@@ -92,6 +92,7 @@ const LNXCTL_PATH: &str = "/run/lnx/lnxctl";
 const OLD_AGENT_PATH: &str = "/usr/local/lib/lnx/lnx-agent";
 const OLD_LNXCTL_PATH: &str = "/usr/local/bin/lnxctl";
 const XDG_OPEN_PATH: &str = "/usr/local/bin/xdg-open";
+const DEFAULT_BROWSER: &str = XDG_OPEN_PATH;
 const OLD_SERVICE_PATH: &str = "/etc/systemd/system/lnx-agent.service";
 const OLD_WANTS_LINK: &str = "/etc/systemd/system/multi-user.target.wants/lnx-agent.service";
 const CONTROL_SOCKET: &str = "/run/lnx-agent.sock";
@@ -1852,6 +1853,7 @@ fn set_default_exec_environment() {
     set_env("HOME", EXEC_HOME);
     set_env("USER", EXEC_USER);
     set_env("LOGNAME", EXEC_USER);
+    set_env("BROWSER", DEFAULT_BROWSER);
 }
 
 fn set_forwarded_environment(env: &[(String, String)]) {
@@ -2029,6 +2031,7 @@ fn make_child_exec(
     push_env(&mut env_storage, "HOME", EXEC_HOME);
     push_env(&mut env_storage, "USER", EXEC_USER);
     push_env(&mut env_storage, "LOGNAME", EXEC_USER);
+    push_env(&mut env_storage, "BROWSER", DEFAULT_BROWSER);
     push_env(
         &mut env_storage,
         "LNX_REQUEST_ID",
@@ -2911,7 +2914,7 @@ pub fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::rewrite_xdg_open_url;
+    use super::{DEFAULT_BROWSER, make_child_exec, rewrite_xdg_open_url};
 
     #[test]
     fn xdg_open_rewrites_localhost_http_urls_to_ingress_hosts() {
@@ -2955,5 +2958,24 @@ mod tests {
             rewrite_xdg_open_url("http://localhost/path", "default", "lnx"),
             "http://localhost/path"
         );
+    }
+
+    #[test]
+    fn child_exec_sets_browser_to_guest_xdg_open_shim() {
+        let child = make_child_exec(
+            &["env".to_string()],
+            "/tmp",
+            &[],
+            0x1234,
+            "/run/lnx-agent.sock",
+        );
+        let browser = child
+            .env_storage
+            .iter()
+            .map(|entry| entry.to_str().expect("env entry is utf-8"))
+            .find_map(|entry| entry.strip_prefix("BROWSER="))
+            .expect("BROWSER is set");
+
+        assert_eq!(browser, DEFAULT_BROWSER);
     }
 }
