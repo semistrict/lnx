@@ -86,7 +86,7 @@ const FRAME_CONTROL_SNAPSHOT_EXIT: u8 = b'X';
 const FRAME_CONTROL_OPEN_URL: u8 = b'O';
 const FRAME_CONTROL_OK: u8 = b'x';
 const MAX_CONTROL_PAYLOAD: usize = 16 * 1024;
-const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin";
+const DEFAULT_PATH: &str = "/home/lnxuser/.local/bin:/home/lnxuser/go/bin:/home/lnxuser/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin";
 const AGENT_PATH: &str = "/run/lnx/lnx-agent";
 const LNXCTL_PATH: &str = "/run/lnx/lnxctl";
 const OLD_AGENT_PATH: &str = "/usr/local/lib/lnx/lnx-agent";
@@ -2914,7 +2914,7 @@ pub fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_BROWSER, make_child_exec, rewrite_xdg_open_url};
+    use super::{DEFAULT_BROWSER, DEFAULT_PATH, EXEC_HOME, make_child_exec, rewrite_xdg_open_url};
 
     #[test]
     fn xdg_open_rewrites_localhost_http_urls_to_ingress_hosts() {
@@ -2977,5 +2977,12 @@ mod tests {
             .expect("BROWSER is set");
 
         assert_eq!(browser, DEFAULT_BROWSER);
+    }
+
+    #[test]
+    fn default_path_starts_with_exec_user_tool_bins() {
+        assert!(DEFAULT_PATH.starts_with(&format!(
+            "{EXEC_HOME}/.local/bin:{EXEC_HOME}/go/bin:{EXEC_HOME}/.cargo/bin:"
+        )));
     }
 }
