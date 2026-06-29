@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use crate::{
-    checkpoints, descriptor, ingress, init,
+    checkpoints, descriptor, host_share, ingress, init,
     packages::{self, GuestStoreMode, PackageManifest, StoreLayout},
     paths::Layout,
     runner,
@@ -368,6 +368,9 @@ struct HiddenIngressArgs {
 
     #[arg(long)]
     uninstall_service: bool,
+
+    #[arg(long)]
+    refresh_if_running: bool,
 }
 
 impl Cli {
@@ -608,6 +611,7 @@ impl Cli {
                     args.cleanup,
                     args.install_service,
                     args.uninstall_service,
+                    args.refresh_if_running,
                     config,
                 )
             }
@@ -891,23 +895,54 @@ fn run_packages_install(
     cpus: u8,
     memory_mib: u32,
 ) -> Result<()> {
-    let package_refs = if args.packages.is_empty() {
+    let installing_defaults = args.packages.is_empty();
+    let requested_packages = if installing_defaults {
         packages::default_packages()
     } else {
         args.packages
     };
-    let binaries = if args.binaries.is_empty() {
-        packages::default_binaries()
+    let requested_binaries = if args.binaries.is_empty() {
+        if installing_defaults {
+            packages::default_binaries()
+        } else {
+            infer_package_binaries(&requested_packages)
+        }
     } else {
         args.binaries
     };
-    validate_package_binaries(&binaries)?;
+    validate_package_binaries(&requested_binaries)?;
 
     let package_layout = StoreLayout::resolve(&layout.base);
-    package_layout.write_manifest(&PackageManifest {
-        packages: package_refs.clone(),
-        binaries: binaries.clone(),
-    })?;
+    let store_ready = package_layout.prepare_readonly()?;
+    let existing = package_layout.read_manifest()?;
+    let use_existing = existing
+        .as_ref()
+        .is_some_and(|manifest| store_ready && package_layout.manifest_is_coherent(manifest));
+    let mut package_refs = if use_existing {
+        existing
+            .as_ref()
+            .map(|manifest| manifest.packages.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut binaries = if use_existing {
+        existing
+            .as_ref()
+            .map(|manifest| manifest.binaries.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    append_unique(&mut package_refs, requested_packages);
+    append_unique(&mut binaries, requested_binaries);
+    if package_refs.is_empty() {
+        package_refs = packages::default_packages();
+    }
+    if binaries.is_empty() && installing_defaults {
+        binaries = packages::default_binaries();
+    }
+    validate_package_binaries(&binaries)?;
 
     let builder_layout = Layout::resolve_in_base(&args.builder, layout.base.clone(), None, None);
     ensure_package_builder_instance(&builder_layout, &args.builder, &args.builder_image)?;
@@ -936,7 +971,41 @@ fn run_packages_install(
     if status != 0 {
         bail!("package install exited with status {status}");
     }
+    let manifest = PackageManifest {
+        packages: package_refs,
+        binaries,
+    };
+    package_layout.write_manifest(&manifest)?;
+    println!("packages installed");
+    println!("profile: {}", package_layout.profile_link().display());
+    println!("binaries: {}", manifest.binaries.join(", "));
     Ok(())
+}
+
+fn append_unique(values: &mut Vec<String>, new_values: Vec<String>) {
+    for value in new_values {
+        if !values.iter().any(|existing| existing == &value) {
+            values.push(value);
+        }
+    }
+}
+
+fn infer_package_binaries(packages: &[String]) -> Vec<String> {
+    packages
+        .iter()
+        .filter_map(|package| {
+            let attr = package
+                .rsplit_once('#')
+                .map(|(_, attr)| attr)
+                .unwrap_or(package);
+            let name = attr.rsplit(['.', '/']).next().unwrap_or(attr);
+            (!name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
+            .then(|| name.to_string())
+        })
+        .collect()
 }
 
 fn ensure_package_builder_instance(
@@ -1564,16 +1633,25 @@ fn should_bootstrap_default_package_store(
 }
 
 fn run_fs_unshare(layout: &Layout, args: FsUnshareArgs) -> Result<()> {
-    let state = layout.instance_dir.join("host-share-state");
+    let state = host_share::state_root(&layout.instance_dir);
+    let cwd = std::env::current_dir().context("current directory")?;
     if args.list {
-        if !state.exists() {
+        let entries = host_share::list_state_entries(&state, &cwd)?;
+        if entries.is_empty() {
+            println!(
+                "no host-share copy-on-write state for instance {}",
+                layout.instance
+            );
             return Ok(());
         }
-        for tag in ["home", "cwd"] {
-            let tag_state = state.join(tag);
-            if tag_state.exists() {
-                println!("{}", tag_state.display());
-            }
+        for entry in entries {
+            println!(
+                "{}\t{}\tshare={}\tstate={}",
+                entry.kind.as_str(),
+                entry.logical_path.display(),
+                entry.tag,
+                entry.state_path.display()
+            );
         }
         return Ok(());
     }
@@ -1581,49 +1659,84 @@ fn run_fs_unshare(layout: &Layout, args: FsUnshareArgs) -> Result<()> {
     let Some(path) = args.path else {
         bail!("fs unshare requires PATH unless --list is used");
     };
-    if !args.remove {
-        println!(
-            "gitignored host-share paths are copy-on-write automatically; state: {}",
-            state.display()
-        );
-        return Ok(());
-    }
-
-    let targets = host_share_state_targets(&path)?;
+    let targets = host_share::targets_for_path(&path, &cwd)?;
     if targets.is_empty() {
         bail!("path is not on a host share: {}", path.display());
     }
-    for (tag, suffix) in targets {
-        if suffix.as_os_str().is_empty() {
+    if !args.remove {
+        for target in targets {
+            let path_state = host_share::path_state(&state, &target)?;
+            print_host_share_path_state(&path_state);
+        }
+        return Ok(());
+    }
+
+    for target in targets {
+        if target.suffix.as_os_str().is_empty() {
             bail!("refusing to remove all host-share copy-on-write state");
         }
-        let upper = state.join(tag).join("upper").join(&suffix);
+        let upper = state.join(target.tag).join("upper").join(&target.suffix);
         remove_path_if_exists(&upper)?;
-        let whiteout = state.join(tag).join("whiteouts").join(&suffix);
+        let whiteout = state
+            .join(target.tag)
+            .join("whiteouts")
+            .join(&target.suffix);
         remove_path_if_exists(&whiteout)?;
+        println!("cleared {}", target.absolute.display());
     }
     Ok(())
 }
 
-fn host_share_state_targets(path: &Path) -> Result<Vec<(&'static str, PathBuf)>> {
-    let cwd = std::env::current_dir().context("current directory")?;
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
+fn print_host_share_path_state(state: &host_share::PathState) {
+    let status = if let Some(covering) = &state.covering_whiteout {
+        format!(
+            "hidden by {}",
+            state.target.share_root.join(covering).display()
+        )
+    } else if state.upper_exists {
+        "copied".to_string()
+    } else if state.descendant_state {
+        "descendant-state".to_string()
     } else {
-        cwd.join(path)
+        "clean".to_string()
     };
-    let mut targets = Vec::new();
-    let home = dirs::home_dir();
-    if let Some(home) = &home
-        && let Ok(suffix) = absolute.strip_prefix(&home)
-    {
-        targets.push(("home", suffix.to_path_buf()));
+    println!("path: {}", state.target.absolute.display());
+    println!("share: {}", state.target.tag);
+    println!("rule: gitignored writes are isolated from the host with copy-on-write");
+    if let Some(reason) = git_ignore_reason(&state.target.absolute) {
+        println!("match: {reason}");
     }
-    let cwd_is_under_home = home.as_ref().is_some_and(|home| cwd.starts_with(home));
-    if !cwd_is_under_home && let Ok(suffix) = absolute.strip_prefix(&cwd) {
-        targets.push(("cwd", suffix.to_path_buf()));
+    println!("state: {status}");
+    println!("upper: {}", state.upper_path.display());
+    println!("whiteout: {}", state.whiteout_path.display());
+    if let Some(covering) = &state.covering_whiteout {
+        println!(
+            "restore: lnx fs unshare --remove {}",
+            state.target.share_root.join(covering).display()
+        );
+    } else {
+        println!(
+            "clear: lnx fs unshare --remove {}",
+            state.target.absolute.display()
+        );
     }
-    Ok(targets)
+}
+
+fn git_ignore_reason(path: &Path) -> Option<String> {
+    let output = ProcessCommand::new("git")
+        .arg("check-ignore")
+        .arg("-v")
+        .arg("--")
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().next().map(str::to_string)
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<()> {

@@ -1,4 +1,6 @@
 use super::*;
+use std::ffi::CString;
+use std::os::unix::{ffi::OsStrExt, process::CommandExt};
 use std::{
     io::{Seek, SeekFrom, Write},
     time::{SystemTime, UNIX_EPOCH},
@@ -76,6 +78,225 @@ fn write_vmstate_header_with_version(
 
 fn write_vmstate_header(snapshot: &Path, memory_bytes: u64, vcpu_count: u32) {
     write_vmstate_header_with_version(snapshot, SNAPSHOT_VMSTATE_VERSION, memory_bytes, vcpu_count);
+}
+
+fn write_snapshot_state_files(snapshot: &Path) {
+    fs::create_dir_all(snapshot).expect("create snapshot");
+    fs::write(snapshot.join("pages.img"), b"pages").expect("write pages");
+    write_vmstate_header(snapshot, 4 * 1024 * 1024 * 1024, 2);
+}
+
+fn set_mtime(path: &Path, unix_secs: i64) {
+    let c_path = CString::new(path.as_os_str().as_bytes()).expect("cstring path");
+    let times = [
+        libc::timespec {
+            tv_sec: unix_secs,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: unix_secs,
+            tv_nsec: 0,
+        },
+    ];
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(rc, 0, "utimensat {}", path.display());
+}
+
+#[test]
+fn prepare_restore_clones_snapshot_into_bounded_work_dir() {
+    let temp = TempDir::new("restore-snapshot-clone");
+    let layout = temp_layout(&temp, "default");
+    let snapshot = layout.snapshot_dir.join("latest");
+    write_snapshot_state_files(&snapshot);
+    write_fake_ext4(&snapshot.join("rootfs.ext4"), 4, b"snapshot-rootfs");
+    set_mtime(&snapshot.join("rootfs.ext4"), 100);
+    set_mtime(&snapshot.join("pages.img"), 101);
+    set_mtime(&snapshot.join("vmstate.bin"), 101);
+    let run_log = RunLog::open(&layout).expect("run log");
+
+    let restore =
+        prepare_restore_for_start(&layout, Some(&snapshot), Some("snapshot-test"), &run_log)
+            .unwrap()
+            .expect("restore work");
+
+    assert_eq!(
+        restore.snapshot,
+        layout.snapshot_dir.join(RESTORE_WORK_SNAPSHOT)
+    );
+    assert_eq!(restore.rootfs, restore.snapshot.join("rootfs.ext4"));
+    assert_eq!(restore.generation_id, "snapshot-test");
+    assert!(restore.snapshot.join("vmstate.bin").exists());
+    assert!(restore.snapshot.join("pages.img").exists());
+    assert!(restore.rootfs.exists());
+    assert_ne!(restore.rootfs, snapshot.join("rootfs.ext4"));
+}
+
+#[test]
+fn snapshot_lifecycle_manifest_records_generation_and_file_state() {
+    let temp = TempDir::new("snapshot-lifecycle-meta");
+    let layout = temp_layout(&temp, "default");
+    let snapshot = layout.snapshot_dir.join("latest");
+    write_snapshot_state_files(&snapshot);
+    write_fake_ext4(&snapshot.join("rootfs.ext4"), 4, b"snapshot-rootfs");
+
+    write_snapshot_lifecycle_manifest(&snapshot, "snapshot-test", "run-test", &layout.rootfs)
+        .expect("write snapshot manifest");
+    let manifest =
+        fs::read_to_string(snapshot.join(SNAPSHOT_LIFECYCLE_META)).expect("read manifest");
+
+    assert!(manifest.contains("version=1\n"));
+    assert!(manifest.contains("generation_id=snapshot-test\n"));
+    assert!(manifest.contains("source_run_id=run-test\n"));
+    assert!(manifest.contains("vmstate.bin.size="));
+    assert!(manifest.contains("pages.img.size="));
+    assert!(manifest.contains("rootfs.ext4.size="));
+    assert_eq!(
+        read_snapshot_generation_id(&snapshot).as_deref(),
+        Some("snapshot-test")
+    );
+}
+
+#[test]
+fn restore_rootfs_clone_log_includes_snapshot_generation() {
+    let temp = TempDir::new("restore-rootfs-log");
+    let layout = temp_layout(&temp, "default");
+    let snapshot = layout.snapshot_dir.join("latest");
+    write_snapshot_state_files(&snapshot);
+    write_fake_ext4(&snapshot.join("rootfs.ext4"), 4, b"snapshot-rootfs");
+    set_mtime(&snapshot.join("rootfs.ext4"), 100);
+    set_mtime(&snapshot.join("pages.img"), 101);
+    set_mtime(&snapshot.join("vmstate.bin"), 101);
+    write_snapshot_lifecycle_manifest(&snapshot, "snapshot-test", "run-test", &layout.rootfs)
+        .expect("write snapshot manifest");
+    let run_log = RunLog::open(&layout).expect("run log");
+
+    prepare_restore_for_start(&layout, Some(&snapshot), None, &run_log)
+        .unwrap()
+        .expect("restore work");
+
+    let log = fs::read_to_string(layout.run_dir.join("lnx.log")).expect("read run log");
+    assert!(log.contains("snapshot.restore.clone generation_id=snapshot-test"));
+    assert!(log.contains(&format!("source={}", snapshot.display())));
+    assert!(log.contains(&format!(
+        "work={}",
+        layout.snapshot_dir.join(RESTORE_WORK_SNAPSHOT).display()
+    )));
+}
+
+#[test]
+fn snapshot_publish_replaces_latest_without_accumulating_temp_dirs() {
+    let temp = TempDir::new("snapshot-publish");
+    let layout = temp_layout(&temp, "default");
+    let latest = layout.snapshot_dir.join("latest");
+    let next = snapshot_publish_temp(&latest).expect("next path");
+    fs::create_dir_all(&latest).expect("create latest");
+    fs::write(latest.join("rootfs.ext4"), b"old").expect("old rootfs");
+    fs::create_dir_all(&next).expect("create next");
+    fs::write(next.join("rootfs.ext4"), b"new").expect("new rootfs");
+    let run_log = RunLog::open(&layout).expect("run log");
+
+    publish_snapshot_dir(&latest, &next, &run_log, "run-test", "snapshot-test")
+        .expect("publish snapshot");
+
+    assert_eq!(
+        fs::read(latest.join("rootfs.ext4")).expect("read latest"),
+        b"new"
+    );
+    assert!(!next.exists());
+    assert!(
+        !snapshot_publish_previous(&latest)
+            .expect("previous path")
+            .exists()
+    );
+}
+
+#[test]
+fn snapshot_runtime_cleanup_removes_only_fixed_work_and_publish_dirs() {
+    let temp = TempDir::new("snapshot-cleanup");
+    let layout = temp_layout(&temp, "default");
+    let latest = layout.snapshot_dir.join("latest");
+    let work = layout.snapshot_dir.join(RESTORE_WORK_SNAPSHOT);
+    let next = snapshot_publish_temp(&latest).expect("next path");
+    let previous = snapshot_publish_previous(&latest).expect("previous path");
+    for path in [&latest, &work, &next, &previous] {
+        fs::create_dir_all(path).expect("create snapshot dir");
+        fs::write(path.join("marker"), path.display().to_string()).expect("write marker");
+    }
+    let run_log = RunLog::open(&layout).expect("run log");
+
+    cleanup_snapshot_runtime_state(&layout, &run_log).expect("cleanup");
+
+    assert!(latest.exists());
+    assert!(!work.exists());
+    assert!(!next.exists());
+    assert!(!previous.exists());
+}
+
+#[test]
+fn restore_snapshot_rootfs_newer_than_memory_is_rejected() {
+    let temp = TempDir::new("restore-rootfs-stale");
+    let layout = temp_layout(&temp, "default");
+    let snapshot = layout.snapshot_dir.join("latest");
+    write_snapshot_state_files(&snapshot);
+    write_fake_ext4(&snapshot.join("rootfs.ext4"), 4, b"snapshot-rootfs");
+    set_mtime(&snapshot.join("pages.img"), 100);
+    set_mtime(&snapshot.join("vmstate.bin"), 100);
+    set_mtime(&snapshot.join("rootfs.ext4"), 103);
+    let run_log = RunLog::open(&layout).expect("run log");
+
+    let err = prepare_restore_for_start(&layout, Some(&snapshot), Some("snapshot-test"), &run_log)
+        .unwrap_err();
+    let message = format!("{err:#}");
+
+    assert!(err.downcast_ref::<RestoreRefused>().is_some());
+    assert!(message.contains("snapshot rootfs was modified after memory state was captured"));
+    assert!(!layout.snapshot_dir.join(RESTORE_WORK_SNAPSHOT).exists());
+}
+
+#[test]
+fn preflight_host_share_cwd_reports_hidden_working_directory() {
+    let temp = TempDir::new("hidden-cwd");
+    let layout = temp_layout(&temp, "default");
+    let home = temp.path().join("home");
+    let cwd = home.join("src/project");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::create_dir_all(
+        layout
+            .instance_dir
+            .join("host-share-state/home/whiteouts/src"),
+    )
+    .expect("create whiteout dir");
+    fs::write(
+        layout
+            .instance_dir
+            .join("host-share-state/home/whiteouts/src/.lnx-whiteout"),
+        b"whiteout\n",
+    )
+    .expect("write whiteout marker");
+
+    let err = preflight_host_share_cwd_with_home(&layout, &cwd, false, &home).unwrap_err();
+    let message = err.to_string();
+
+    assert!(message.contains("working directory is hidden"));
+    assert!(message.contains("lnx fs unshare --remove"));
+    assert!(message.contains(&home.join("src").display().to_string()));
+}
+
+#[test]
+fn preflight_host_share_cwd_allows_descendant_whiteout_namespace() {
+    let temp = TempDir::new("cwd-namespace");
+    let layout = temp_layout(&temp, "default");
+    let home = temp.path().join("home");
+    let cwd = home.join("src/project");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::create_dir_all(
+        layout
+            .instance_dir
+            .join("host-share-state/home/whiteouts/src/project"),
+    )
+    .expect("create namespace dir");
+
+    preflight_host_share_cwd_with_home(&layout, &cwd, false, &home).unwrap();
 }
 
 #[test]
@@ -157,6 +378,31 @@ fn fresh_owner_slot_removes_stale_bootstrap_lock() {
 }
 
 #[test]
+fn fresh_owner_slot_replace_stops_recorded_owner() {
+    let temp = TempDir::new("fresh-owner-replace");
+    let layout = temp_layout(&temp, "vm");
+    fs::create_dir_all(&layout.run_dir).expect("create run dir");
+    let lock = layout.run_dir.join("bootstrap.lock.d");
+    fs::create_dir(&lock).expect("create lock");
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("trap 'exit 0' TERM; while :; do sleep 1; done")
+        .process_group(0)
+        .spawn()
+        .expect("spawn child owner");
+    fs::write(lock.join("owner.pid"), child.id().to_string()).expect("write owner pid");
+    fs::write(layout.run_dir.join("broker.sock"), "").expect("write broker socket placeholder");
+    let run_log = RunLog::open(&layout).expect("open run log");
+
+    prepare_fresh_owner_slot(&layout, true, &run_log).expect("replace owner");
+
+    let _ = child.wait();
+    assert!(!process_alive(child.id() as libc::pid_t));
+    assert!(!lock.exists());
+    assert!(!layout.run_dir.join("broker.sock").exists());
+}
+
+#[test]
 fn owner_attempt_log_reset_truncates_stale_diagnostics() {
     let temp = TempDir::new("owner-log-reset");
     let layout = temp_layout(&temp, "vm");
@@ -191,8 +437,15 @@ fn snapshot_rootfs_promotion_replaces_cold_boot_rootfs() {
     let timings = TimingLog::open(&layout, &["true".to_string()], None).expect("open timings");
     let run_log = RunLog::open(&layout).expect("open run log");
 
-    promote_snapshot_rootfs(&snapshot, &layout.rootfs, &timings, &run_log)
-        .expect("promote snapshot rootfs");
+    promote_snapshot_rootfs(
+        &snapshot,
+        &layout.rootfs,
+        &timings,
+        &run_log,
+        Some("snapshot-test"),
+        Some("run-test"),
+    )
+    .expect("promote snapshot rootfs");
 
     let promoted = fs::read(&layout.rootfs).expect("read promoted rootfs");
     assert!(
@@ -226,8 +479,15 @@ fn snapshot_rootfs_promotion_rejects_ext4_errors() {
     let timings = TimingLog::open(&layout, &["true".to_string()], None).expect("open timings");
     let run_log = RunLog::open(&layout).expect("open run log");
 
-    let error = promote_snapshot_rootfs(&snapshot, &layout.rootfs, &timings, &run_log)
-        .expect_err("bad snapshot rootfs should not be promoted");
+    let error = promote_snapshot_rootfs(
+        &snapshot,
+        &layout.rootfs,
+        &timings,
+        &run_log,
+        Some("snapshot-test"),
+        Some("run-test"),
+    )
+    .expect_err("bad snapshot rootfs should not be promoted");
 
     assert!(
         error.to_string().contains("marked with ext4 errors"),
@@ -255,11 +515,11 @@ fn shares_stamp_content_lists_home_cwd_and_network() {
         shares_stamp_content_with_cache_stamp(
             Path::new("/Users/ramon"),
             Some(Path::new("/tmp/build")),
-            "net=vmnet:prefix=24:gateway=192.168.106.0",
+            "net=other",
             false,
             HOST_SHARE_CACHE_NODAX_STAMP,
         ),
-        "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\ncwd=/tmp/build\nnet=vmnet:prefix=24:gateway=192.168.106.0\n"
+        "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\ncwd=/tmp/build\nnet=other\n"
     );
     assert_eq!(
         shares_stamp_content_with_cache_stamp(
@@ -335,18 +595,10 @@ fn snapshot_shares_compatibility_requires_identical_stamp() {
     );
 
     // The same shares on a different network backing must not restore.
-    let renetworked = shares_stamp_content(
-        Path::new("/Users/ramon"),
-        None,
-        "net=vmnet:prefix=24:gateway=192.168.106.0",
-        false,
-    );
+    let renetworked = shares_stamp_content(Path::new("/Users/ramon"), None, "net=other", false);
     assert_eq!(
         snapshot_shares_incompatibility(temp.path(), &renetworked),
-        Some(
-            "share_mismatch: net: snapshot=gvproxy current=vmnet:prefix=24:gateway=192.168.106.0"
-                .to_string()
-        )
+        Some("share_mismatch: net: snapshot=gvproxy current=other".to_string())
     );
 
     let disabled = shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", true);
@@ -855,17 +1107,6 @@ fn snapshot_initramfs_compatibility_requires_matching_source_stamp() {
     assert!(snapshot_initramfs_is_compatible(&snapshot, &current));
 }
 
-#[cfg(target_os = "macos")]
-#[test]
-fn instance_macs_are_stable_local_and_unicast() {
-    let mac = instance_mac("default");
-    assert_eq!(mac, instance_mac("default"));
-    assert_ne!(mac, instance_mac("other"));
-    // Locally administered, unicast.
-    assert_eq!(mac[0] & 0x02, 0x02);
-    assert_eq!(mac[0] & 0x01, 0x00);
-}
-
 #[test]
 fn snapshot_vm_config_rejects_bad_magic_and_version() {
     let temp = TempDir::new("snapshot-bad");
@@ -988,6 +1229,61 @@ fn forward_spec_round_trips_the_cli_format() {
         guest_port: 6080,
     };
     assert_eq!(forward_spec(&forward), "127.0.0.1:16081:localhost:6080");
+}
+
+#[test]
+fn localhost_url_forward_keeps_loopback_family() {
+    assert_eq!(
+        localhost_url_forward("http://localhost:3773/pair"),
+        Some(("127.0.0.1", 3773))
+    );
+    assert_eq!(
+        localhost_url_forward("https://127.0.0.1:8443/callback"),
+        Some(("127.0.0.1", 8443))
+    );
+    assert_eq!(
+        localhost_url_forward("http://[::1]:5173/"),
+        Some(("::1", 5173))
+    );
+    assert_eq!(localhost_url_forward("https://example.com:443/"), None);
+}
+
+#[test]
+fn existing_broker_client_propagates_protocol_mismatch() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let socket = PathBuf::from(format!("/tmp/lnx-bp-{}-{unique}.sock", std::process::id()));
+    let _ = fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket).expect("listen broker");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept broker");
+        let _ = read_message(&mut stream).expect("read client hello");
+        write_message(
+            &mut stream,
+            &Message::Hello {
+                version: PROTOCOL_VERSION - 1,
+            },
+        )
+        .expect("write stale hello");
+    });
+
+    let err = run_existing_broker_client(
+        &socket,
+        &["true".to_string()],
+        Path::new("/"),
+        true,
+        true,
+        None,
+        "default",
+        None,
+    )
+    .expect_err("protocol mismatch should fail fast");
+    server.join().expect("broker thread");
+    let _ = fs::remove_file(&socket);
+
+    assert!(err.downcast_ref::<BrokerProtocolMismatch>().is_some());
 }
 
 #[test]

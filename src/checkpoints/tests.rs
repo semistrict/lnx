@@ -99,6 +99,11 @@ fn fork_clones_checkpoint_files_to_destination_layout() {
     fs::write(checkpoint.path.join("vmstate.bin"), b"vmstate").expect("vmstate");
     fs::write(checkpoint.path.join("pages.img"), b"pages").expect("pages");
     fs::write(checkpoint.path.join("initramfs.stamp"), b"stamp").expect("stamp");
+    fs::write(
+        checkpoint.path.join("snapshot.meta"),
+        b"generation_id=snapshot-1\n",
+    )
+    .expect("snapshot meta");
     fs::create_dir_all(checkpoint.path.join("host-share-state/home/upper/src/app"))
         .expect("create host-share state");
     fs::write(
@@ -125,6 +130,10 @@ fn fork_clones_checkpoint_files_to_destination_layout() {
     assert_eq!(
         fs::read(dest.snapshot_dir.join("latest/initramfs.stamp")).expect("read stamp"),
         b"stamp"
+    );
+    assert_eq!(
+        fs::read(dest.snapshot_dir.join("latest/snapshot.meta")).expect("read snapshot meta"),
+        b"generation_id=snapshot-1\n"
     );
     assert!(dest.snapshot_dir.join("latest/checkpoint.meta").exists());
     assert_eq!(

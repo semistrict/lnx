@@ -104,7 +104,7 @@ try {
     }
     assertContains(
       failure.stderr,
-      "lnx VM owner exited with exit status: 86 before the broker came up",
+      "VM memory snapshot restore was refused before the broker came up",
       "restore refusal fails hard",
     );
     const log = await run(["bash", "-lc", `cat ${join(ctx.runDir, "lnx.log")}`]);

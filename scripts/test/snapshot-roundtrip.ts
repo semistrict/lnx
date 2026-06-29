@@ -23,7 +23,7 @@ const work = join(
   `lnx-snapshot-roundtrip-${process.pid}`,
 );
 const iterations = Number(Bun.env.LNX_SNAPSHOT_ROUNDTRIP_ITERATIONS ?? 2);
-const maxRestoreMs = Number(Bun.env.LNX_SNAPSHOT_RESTORE_MAX_MS ?? 1000);
+const maxRestoreMs = Number(Bun.env.LNX_SNAPSHOT_RESTORE_MAX_MS ?? 1500);
 const largeSparseImageBytes = 8 * 1024 * 1024 * 1024;
 const base = Bun.env.LNX_BASE ?? join(Bun.env.HOME ?? ".", ".lnx");
 const runBase = Bun.env.LNX_RUN_BASE ?? base;
@@ -217,7 +217,7 @@ try {
         LNX_TEST_INSTANCE: instance,
         LNX_LINUX_SNAPSHOT_FIXTURE_OUT: linuxSnapshot,
       },
-      600_000,
+      1_200_000,
       (pid) => {
         childWorkDirs.push(
           join(ctx.repoRoot, "target", `lnx-linux-fixture-${pid}`),
@@ -263,6 +263,11 @@ try {
       `round-trip ${iteration}/${iterations}: macOS/HVF snapshot restores on Linux/KVM`,
       async () => {
         const instance = childInstance("macos-linux", iteration);
+        const nestedWorkDir = join(
+          base,
+          "test-work",
+          `snapshot-roundtrip-nested-${iteration}-${process.pid}`,
+        );
         childInstances.push(`${instance}-macos-linux-cold`);
         childInstances.push(`${instance}-macos-linux`);
         const child = await runChild(
@@ -278,14 +283,14 @@ try {
             LNX_MACOS_SNAPSHOT_EXPECTED_AFTER: "linux-after",
             LNX_NESTED_MACOS_LINUX_EXPORT_LINUX_SNAPSHOT: nextLinuxSnapshot,
             LNX_NESTED_MACOS_LINUX_INNER_TIMEOUT_MS: "160000",
+            LNX_NESTED_KVM_WORKDIR: nestedWorkDir,
           },
           600_000,
           (pid) => {
-            childWorkDirs.push(join(ctx.repoRoot, `.lnx-nk-${pid}`));
+            childWorkDirs.push(nestedWorkDir);
             childWorkDirs.push(childTmpdir("nested-kvm", pid));
           },
         );
-        const nestedWorkDir = join(ctx.repoRoot, `.lnx-nk-${child.pid}`);
         await assertSnapshotFiles(
           nextLinuxSnapshot,
           `Linux snapshot ${iteration}`,

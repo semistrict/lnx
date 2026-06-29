@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     net::{Shutdown, TcpListener, TcpStream},
@@ -9,7 +9,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex, Once,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -20,13 +20,13 @@ use std::{
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use lnx_protocol::{MAX_MESSAGE_SIZE, Message, PROTOCOL_VERSION};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    initramfs,
+    host_share, initramfs,
     krun::Context as KrunContext,
     packages::{GuestStoreMode, StoreLayout},
     paths::Layout,
@@ -54,6 +54,8 @@ const MIN_OWNER_IDLE_TTL: Duration = Duration::from_millis(250);
 const OWNER_BOOT_TIMEOUT: Duration = Duration::from_secs(120);
 const FRESH_OWNER_SLOT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_AGENT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(90);
+const BROKER_HELLO_TIMEOUT: Duration = Duration::from_secs(1);
+const OWNER_REPLACE_GRACE: Duration = Duration::from_secs(5);
 const ROOTFS_BACKEND_ENV: &str = "LNX_ROOTFS_BACKEND";
 const RESTORE_ENTROPY_BYTES: usize = 64;
 const DETERMINISTIC_EXEC_UID: u32 = 1000;
@@ -66,8 +68,12 @@ const DETERMINISTIC_COLS: u16 = 80;
 const DETERMINISTIC_CLOCK_STATE: &str = "deterministic-clock.state";
 const DETERMINISTIC_TIMER_JUMPS: &str = "deterministic-timer-jumps.log";
 const DETERMINISTIC_TIMER_JUMPS_CURSOR: &str = "deterministic-timer-jumps.cursor";
+const RESTORE_WORK_SNAPSHOT: &str = ".restore-work";
+const RUN_ID_ENV: &str = "LNX_RUN_ID";
+const SNAPSHOT_LIFECYCLE_META: &str = "snapshot.meta";
 static SIGNAL_INIT: Once = Once::new();
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static LIFECYCLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 extern "C" fn handle_sigint(_: libc::c_int) {
     INTERRUPTED.store(true, Ordering::SeqCst);
@@ -121,6 +127,38 @@ impl std::fmt::Display for RestoreRefused {
 
 impl std::error::Error for RestoreRefused {}
 
+#[derive(Debug)]
+struct BrokerProtocolMismatch {
+    expected: u16,
+    actual: u16,
+}
+
+impl std::fmt::Display for BrokerProtocolMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "running VM owner protocol version {} is incompatible with this client protocol version {}; stop the instance and retry",
+            self.actual, self.expected
+        )
+    }
+}
+
+impl std::error::Error for BrokerProtocolMismatch {}
+
+#[derive(Debug)]
+struct BrokerHelloFailed;
+
+impl std::fmt::Display for BrokerHelloFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "running VM owner did not complete the broker protocol hello; stop the instance and retry"
+        )
+    }
+}
+
+impl std::error::Error for BrokerHelloFailed {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortForward {
     pub listen_host: String,
@@ -140,8 +178,10 @@ pub fn run(config: RunConfig) -> Result<i32> {
     fs::create_dir_all(&config.layout.snapshot_dir)
         .with_context(|| format!("create {}", config.layout.snapshot_dir.display()))?;
     let run_log = Arc::new(RunLog::open(&config.layout)?);
+    let run_id = current_run_id();
     run_log.line(format!(
-        "run.start pid={} instance={} cmd={:?} cwd={} restore={}",
+        "run.start run_id={} pid={} instance={} cmd={:?} cwd={} restore={}",
+        run_id,
         std::process::id(),
         config.layout.instance,
         config.command,
@@ -159,12 +199,13 @@ pub fn run(config: RunConfig) -> Result<i32> {
         config.layout.console_log.display(),
         config.layout.run_dir.join("gvproxy.log").display()
     ));
+    preflight_host_share_cwd(&config.layout, &config.cwd, config.no_host_shares)?;
     let broker_socket = config.layout.run_dir.join("broker.sock");
     let no_daemon_reuse = !config.reuse_owner || debug_flag_enabled("nodaemonreuse");
     if no_daemon_reuse {
         run_log.line("debug.nodaemonreuse enabled");
         eprintln!(
-            "debug[nodaemonreuse]: daemon reuse disabled; this command will start a fresh VM owner and will not keep it running for reuse."
+            "debug[nodaemonreuse]: replacing any existing VM owner for this instance before starting a fresh owner."
         );
     }
     if config.forwards.is_empty() && !no_daemon_reuse {
@@ -184,19 +225,39 @@ pub fn run(config: RunConfig) -> Result<i32> {
             &config.layout.instance,
             Some(&run_log),
         )? {
-            run_log.line(format!("run.done status={status}"));
+            run_log.line(format!("run.done run_id={run_id} status={status}"));
             return Ok(status);
         }
     } else {
-        wait_for_fresh_owner_slot(&config.layout, &run_log)?;
+        preflight_fresh_owner_network(&config, &run_log)?;
+        prepare_fresh_owner_slot(&config.layout, no_daemon_reuse, &run_log)?;
     }
     if config.snapshot_output.is_some() {
         // Checkpoint and vm-init runs need the snapshot written before they
         // return, so they keep the VM in the foreground.
-        return run_foreground(config, run_log, broker_socket);
+        return run_foreground(config, run_log, broker_socket, run_id);
     }
 
-    let mut owner = spawn_owner_process(&config, &run_log)?;
+    preflight_fresh_owner_network(&config, &run_log)?;
+    let start_lock = match acquire_owner_start_or_run_client(
+        &config.layout.run_dir.join("owner-start.lock.d"),
+        &broker_socket,
+        &config.command,
+        &config.cwd,
+        config.run_as_root,
+        config.no_host_shares,
+        config.deterministic.as_ref(),
+        &config.layout.instance,
+        config.forwards.is_empty() && !no_daemon_reuse,
+        &run_log,
+    )? {
+        OwnerStartOutcome::Lock(lock) => lock,
+        OwnerStartOutcome::Status(status) => {
+            run_log.line(format!("run.done run_id={run_id} status={status}"));
+            return Ok(status);
+        }
+    };
+    let mut owner = spawn_owner_process(&config, &run_log, &run_id)?;
     let status = match run_broker_client_awaiting_owner(
         &broker_socket,
         &config.command,
@@ -205,6 +266,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
         &config,
         &config.layout,
         &run_log,
+        &run_id,
     ) {
         Ok(status) => status,
         Err(e) => {
@@ -212,7 +274,8 @@ pub fn run(config: RunConfig) -> Result<i32> {
             return Err(e);
         }
     };
-    run_log.line(format!("run.done status={status}"));
+    drop(start_lock);
+    run_log.line(format!("run.done run_id={run_id} status={status}"));
     Ok(status)
 }
 
@@ -241,6 +304,17 @@ pub fn validate_runtime_deterministic_compatibility(
         ),
         Err(e) => Err(e).with_context(|| format!("read {}", stamp_path.display())),
     }
+}
+
+fn prepare_fresh_owner_slot(
+    layout: &Layout,
+    replace_existing: bool,
+    run_log: &RunLog,
+) -> Result<()> {
+    if replace_existing {
+        replace_existing_owner(layout, run_log)?;
+    }
+    wait_for_fresh_owner_slot(layout, run_log)
 }
 
 fn wait_for_fresh_owner_slot(layout: &Layout, run_log: &RunLog) -> Result<()> {
@@ -275,6 +349,77 @@ fn wait_for_fresh_owner_slot(layout: &Layout, run_log: &RunLog) -> Result<()> {
     Ok(())
 }
 
+fn replace_existing_owner(layout: &Layout, run_log: &RunLog) -> Result<()> {
+    let lock_path = layout.run_dir.join("bootstrap.lock.d");
+    let broker_socket = layout.run_dir.join("broker.sock");
+    let Some(pid) = owner_pid_from_lock(&lock_path) else {
+        if bootstrap_lock_is_stale(&lock_path).unwrap_or(false) {
+            run_log.line(format!(
+                "owner.replace.stale_lock.remove lock={}",
+                lock_path.display()
+            ));
+            let _ = fs::remove_dir_all(&lock_path);
+        }
+        let _ = fs::remove_file(&broker_socket);
+        return Ok(());
+    };
+    run_log.line(format!(
+        "owner.replace.term pid={pid} instance={}",
+        layout.instance
+    ));
+    signal_process_group(pid, libc::SIGTERM)?;
+    let deadline = Instant::now() + OWNER_REPLACE_GRACE;
+    while Instant::now() < deadline {
+        if !process_alive(pid) {
+            run_log.line(format!("owner.replace.exited pid={pid}"));
+            let _ = fs::remove_dir_all(&lock_path);
+            let _ = fs::remove_file(&broker_socket);
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    run_log.line(format!("owner.replace.kill pid={pid}"));
+    signal_process_group(pid, libc::SIGKILL)?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if !process_alive(pid) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if process_alive(pid) {
+        run_log.line(format!(
+            "owner.replace.kill_delivered pid={pid} still_observable=true"
+        ));
+    }
+    let _ = fs::remove_dir_all(&lock_path);
+    let _ = fs::remove_file(&broker_socket);
+    Ok(())
+}
+
+fn owner_pid_from_lock(lock_path: &Path) -> Option<libc::pid_t> {
+    let pid = fs::read_to_string(lock_path.join("owner.pid")).ok()?;
+    let pid = pid.trim().parse::<libc::pid_t>().ok()?;
+    process_alive(pid).then_some(pid)
+}
+
+fn signal_process_group(pid: libc::pid_t, signal: libc::c_int) -> Result<()> {
+    if pid <= 0 {
+        bail!("invalid owner pid: {pid}");
+    }
+    let pgid = -pid;
+    let rc = unsafe { libc::kill(pgid, signal) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let group_error = std::io::Error::last_os_error();
+    let rc = unsafe { libc::kill(pid, signal) };
+    if rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(group_error).with_context(|| format!("signal process group {pid}"))
+}
+
 fn acquire_bootstrap_for_forward(lock_path: &Path, run_log: &RunLog) -> Result<BootstrapLock> {
     match BootstrapLock::try_acquire(lock_path)? {
         Some(lock) => {
@@ -299,8 +444,10 @@ pub fn run_owner(config: RunConfig) -> Result<()> {
     fs::create_dir_all(&config.layout.snapshot_dir)
         .with_context(|| format!("create {}", config.layout.snapshot_dir.display()))?;
     let run_log = Arc::new(RunLog::open(&config.layout)?);
+    let owner_run_id = current_run_id();
     run_log.line(format!(
-        "owner.start pid={} instance={} cwd={} restore={}",
+        "owner.start owner_run_id={} pid={} instance={} cwd={} restore={}",
+        owner_run_id,
         std::process::id(),
         config.layout.instance,
         config.cwd.display(),
@@ -333,7 +480,7 @@ pub fn run_owner(config: RunConfig) -> Result<()> {
         ttl: owner_idle_ttl(),
         starts_idle: !debug_flag_enabled("nodaemonreuse"),
     };
-    let vm = match start_vm(&config, &run_log, &broker_socket, idle) {
+    let vm = match start_vm(&config, &run_log, &broker_socket, idle, &owner_run_id) {
         Ok(vm) => vm,
         // Keep restore refusals distinct from unrelated boot failures so
         // the client can report a hard memory-restore failure.
@@ -346,15 +493,24 @@ pub fn run_owner(config: RunConfig) -> Result<()> {
     };
     let _ = vm.owner.join();
     flush_deterministic_trace_events(&config.layout, vm.trace_log.as_deref())?;
-    run_log.line("owner.done");
+    run_log.line(format!("owner.done owner_run_id={owner_run_id}"));
     drop(vm.network);
     drop(bootstrap_lock);
     Ok(())
 }
 
-fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBuf) -> Result<i32> {
+fn run_foreground(
+    config: RunConfig,
+    run_log: Arc<RunLog>,
+    broker_socket: PathBuf,
+    owner_run_id: String,
+) -> Result<i32> {
     let lock_path = config.layout.run_dir.join("bootstrap.lock.d");
     let no_daemon_reuse = !config.reuse_owner || debug_flag_enabled("nodaemonreuse");
+    if no_daemon_reuse {
+        preflight_fresh_owner_network(&config, &run_log)?;
+        prepare_fresh_owner_slot(&config.layout, true, &run_log)?;
+    }
     let bootstrap_lock = if config.forwards.is_empty() {
         match acquire_bootstrap_or_run_client(
             &lock_path,
@@ -397,6 +553,7 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
         let _ = fs::remove_file(&broker_socket);
     }
 
+    preflight_fresh_owner_network(&config, &run_log)?;
     let vm = start_vm(
         &config,
         &run_log,
@@ -405,6 +562,7 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
             ttl: broker_idle_ttl(),
             starts_idle: false,
         },
+        &owner_run_id,
     )?;
     let status = match run_broker_client_retry(
         &broker_socket,
@@ -429,7 +587,7 @@ fn run_foreground(config: RunConfig, run_log: Arc<RunLog>, broker_socket: PathBu
     let _ = vm.owner.join();
     flush_deterministic_trace_events(&config.layout, vm.trace_log.as_deref())?;
     vm.timings.event(&format!("run.done status={status}"));
-    run_log.line(format!("run.done status={status}"));
+    run_log.line(format!("run.done run_id={owner_run_id} status={status}"));
     drop(vm.network);
     drop(bootstrap_lock);
     Ok(status)
@@ -474,35 +632,16 @@ struct VmHandles {
     trace_log: Option<Arc<TraceLog>>,
 }
 
-/// How the VM reaches the network: a routable per-VM address on the macOS
-/// ingress daemon's vmnet network, or gvproxy on non-macOS hosts.
 enum NetworkBacking {
-    #[cfg(not(target_os = "macos"))]
     Gvproxy(Gvproxy),
-    #[cfg(target_os = "macos")]
-    Vmnet {
-        fd: Option<std::os::fd::OwnedFd>,
-        ip: std::net::Ipv4Addr,
-        prefix: u8,
-        gateway: std::net::Ipv4Addr,
-        // Held for the VM's lifetime; closing it tells the ingress daemon to
-        // tear down the vmnet interface and free the address.
-        _keepalive: std::os::unix::net::UnixStream,
-    },
 }
 
 impl NetworkBacking {
     /// One line of network backing identity. Part of the snapshot stamp: a
-    /// snapshot taken on one backing must not restore on another, while forked
-    /// instances on the same vmnet subnet can still resume from the checkpoint.
+    /// snapshot taken on one backing must not restore on another.
     fn stamp_line(&self) -> String {
         match self {
-            #[cfg(not(target_os = "macos"))]
             NetworkBacking::Gvproxy(_) => "net=gvproxy".to_string(),
-            #[cfg(target_os = "macos")]
-            NetworkBacking::Vmnet {
-                prefix, gateway, ..
-            } => format!("net=vmnet:prefix={prefix}:gateway={gateway}"),
         }
     }
 
@@ -510,15 +649,7 @@ impl NetworkBacking {
     /// the agent uses the gvproxy static configuration.
     fn guest_env(&self) -> (String, String) {
         match self {
-            #[cfg(not(target_os = "macos"))]
             NetworkBacking::Gvproxy(_) => (String::new(), String::new()),
-            #[cfg(target_os = "macos")]
-            NetworkBacking::Vmnet {
-                ip,
-                prefix,
-                gateway,
-                ..
-            } => (format!("{ip}/{prefix}"), gateway.to_string()),
         }
     }
 }
@@ -528,62 +659,20 @@ fn start_network(
     run_log: &RunLog,
     timings: &TimingLog,
 ) -> Result<NetworkBacking> {
-    #[cfg(target_os = "macos")]
-    {
-        if config.deterministic.is_some() {
-            bail!(
-                "vmnet networking is required on macOS; deterministic macOS owners are not supported"
-            );
-        }
-        let ingress =
-            crate::ingress::load_config().context("load ingress config for vmnet networking")?;
-        let attachment =
-            crate::ingress::request_network_attachment(&ingress, &config.layout.instance)?
-                .with_context(|| {
-                    format!(
-                        "vmnet networking is required on macOS for instance {}; ingress did not provide an attachment",
-                        config.layout.instance
-                    )
-                })?;
-        timings.event("network.vmnet.ready");
-        run_log.line(format!(
-            "network.vmnet ip={}/{} gateway={}",
-            attachment.ip, attachment.prefix, attachment.gateway
-        ));
-        return Ok(NetworkBacking::Vmnet {
-            fd: Some(attachment.fd),
-            ip: attachment.ip,
-            prefix: attachment.prefix,
-            gateway: attachment.gateway,
-            _keepalive: attachment.keepalive,
-        });
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let gvproxy = start_gvproxy(&config.layout.run_dir)?;
-        timings.event("gvproxy.ready");
-        run_log.line(format!(
-            "gvproxy.ready socket={}",
-            config.layout.run_dir.join("gvproxy.sock").display()
-        ));
-        Ok(NetworkBacking::Gvproxy(gvproxy))
-    }
+    let _ = config;
+    let gvproxy = start_gvproxy(&config.layout.run_dir)?;
+    timings.event("gvproxy.ready");
+    run_log.line(format!(
+        "gvproxy.ready socket={}",
+        config.layout.run_dir.join("gvproxy.sock").display()
+    ));
+    Ok(NetworkBacking::Gvproxy(gvproxy))
 }
 
-/// A stable, locally administered unicast MAC derived from the instance
-/// name. All instances share the vmnet network's L2 segment, so each needs
-/// its own address, and keeping it stable preserves neighbor caches across
-/// reboots and restores.
-#[cfg(target_os = "macos")]
-fn instance_mac(instance: &str) -> [u8; 6] {
-    use sha2::{Digest, Sha256};
-
-    let digest = Sha256::digest(format!("lnx-mac:{instance}"));
-    let mut mac = [0u8; 6];
-    mac.copy_from_slice(&digest[..6]);
-    mac[0] = (mac[0] & 0xFE) | 0x02;
-    mac
+fn preflight_fresh_owner_network(config: &RunConfig, run_log: &RunLog) -> Result<()> {
+    let _ = config;
+    let _ = run_log;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -613,6 +702,7 @@ fn start_vm(
     run_log: &Arc<RunLog>,
     broker_socket: &Path,
     idle: IdlePolicy,
+    owner_run_id: &str,
 ) -> Result<VmHandles> {
     let timings = Arc::new(TimingLog::open(
         &config.layout,
@@ -793,7 +883,37 @@ fn start_vm(
     if let Some(snapshot) = &requested_restore_snapshot {
         log_snapshot_summary(&run_log, "snapshot.requested", snapshot);
     }
-    configure_snapshot_restore_compat(restore_snapshot.as_deref(), &run_log);
+    let restore_generation = restore_snapshot.as_deref().map(snapshot_generation_id);
+    match (&requested_restore_snapshot, &restore_snapshot, &restore_generation) {
+        (Some(requested), Some(accepted), Some(generation_id)) => run_log.line(format!(
+            "snapshot.restore.accepted owner_run_id={owner_run_id} generation_id={generation_id} requested={} accepted={}",
+            requested.display(),
+            accepted.display()
+        )),
+        (Some(requested), None, _) => run_log.line(format!(
+            "snapshot.restore.ignored owner_run_id={owner_run_id} requested={} reason=compatibility_check",
+            requested.display()
+        )),
+        (None, None, _) => run_log.line(format!(
+            "snapshot.restore.none owner_run_id={owner_run_id}"
+        )),
+        (None, Some(accepted), Some(generation_id)) => run_log.line(format!(
+            "snapshot.restore.accepted owner_run_id={owner_run_id} generation_id={generation_id} requested=<implicit> accepted={}",
+            accepted.display()
+        )),
+        _ => {}
+    }
+    let prepared_restore = prepare_restore_for_start(
+        &config.layout,
+        restore_snapshot.as_deref(),
+        restore_generation.as_deref(),
+        &run_log,
+    )
+    .context("prepare restore snapshot")?;
+    let vm_restore_snapshot = prepared_restore
+        .as_ref()
+        .map(|restore| restore.snapshot.clone());
+    configure_snapshot_restore_compat(vm_restore_snapshot.as_deref(), &run_log);
 
     let socket = config.layout.run_dir.join("lnx-agent.sock");
     let snapshot_socket = config.layout.run_dir.join("lnx-snapshot.sock");
@@ -821,11 +941,23 @@ fn start_vm(
     if config.nested_kvm {
         ctx.set_nested_virt(true)?;
     }
-    let rootfs = requested_restore_snapshot
+    let rootfs = prepared_restore
         .as_ref()
-        .map(|snapshot| snapshot.join("rootfs.ext4"))
-        .filter(|path| path.exists())
+        .map(|restore| restore.rootfs.clone())
         .unwrap_or_else(|| config.layout.rootfs.clone());
+    let rootfs_role = if prepared_restore.is_some() {
+        "restore-live-clone"
+    } else {
+        "canonical"
+    };
+    run_log.line(format!(
+        "rootfs.live owner_run_id={owner_run_id} role={rootfs_role} writable=true path={} source_generation={}",
+        rootfs.display(),
+        prepared_restore
+            .as_ref()
+            .map(|restore| restore.generation_id.as_str())
+            .unwrap_or("none")
+    ));
     let rootfs_label = if rootfs != config.layout.rootfs {
         "snapshot rootfs"
     } else {
@@ -896,21 +1028,19 @@ fn start_vm(
     ctx.add_vsock_connector(SNAPSHOT_PORT, &snapshot_socket)?;
     ctx.add_vsock_connector(CONTROL_PORT, &control_socket)?;
     match &mut network {
-        #[cfg(not(target_os = "macos"))]
         NetworkBacking::Gvproxy(gvproxy) => ctx.add_gvproxy_network(&gvproxy.socket)?,
-        #[cfg(target_os = "macos")]
-        NetworkBacking::Vmnet { fd, .. } => {
-            let fd = fd.take().context("vmnet attachment fd already consumed")?;
-            ctx.add_fd_network(fd, instance_mac(&config.layout.instance))?;
-        }
     }
     timings.event("krun.devices.configured");
 
-    if let Some(snapshot) = &restore_snapshot {
+    if let Some(snapshot) = &vm_restore_snapshot {
         ctx.set_snapshot_path(snapshot)?;
         timings.event("snapshot.restore.configured");
         run_log.line(format!(
-            "snapshot.restore.configured path={}",
+            "snapshot.restore.configured owner_run_id={owner_run_id} generation_id={} path={}",
+            prepared_restore
+                .as_ref()
+                .map(|restore| restore.generation_id.as_str())
+                .unwrap_or("unknown"),
             snapshot.display()
         ));
     }
@@ -978,7 +1108,7 @@ fn start_vm(
         .clone()
         .unwrap_or_else(|| config.layout.snapshot_dir.join("latest"));
     let latest_snapshot = config.layout.snapshot_dir.join("latest");
-    let promote_rootfs_after_snapshot = rootfs != config.layout.rootfs
+    let promote_rootfs_after_snapshot = prepared_restore.is_some()
         && snapshot_output == latest_snapshot
         && requested_restore_snapshot.as_deref() == Some(latest_snapshot.as_path());
     let owner = run_broker_owner(
@@ -995,7 +1125,7 @@ fn start_vm(
         broker_listener,
         broker_socket.to_path_buf(),
         initramfs_stamp,
-        restore_snapshot,
+        vm_restore_snapshot,
         config.forwards.clone(),
         share_layout.host_home.clone(),
         share_layout.no_host_shares,
@@ -1005,6 +1135,7 @@ fn start_vm(
         Arc::clone(&run_log),
         trace_log.clone(),
         vm_error_rx,
+        owner_run_id.to_string(),
     );
     let owner = match owner {
         Ok(owner) => owner,
@@ -1235,8 +1366,17 @@ struct BootstrapLock {
     path: PathBuf,
 }
 
+struct OwnerStartLock {
+    path: PathBuf,
+}
+
 enum BootstrapOutcome {
     Lock(BootstrapLock),
+    Status(i32),
+}
+
+enum OwnerStartOutcome {
+    Lock(OwnerStartLock),
     Status(i32),
 }
 
@@ -1309,8 +1449,7 @@ impl BootstrapLock {
     fn try_acquire(path: &Path) -> Result<Option<Self>> {
         match fs::create_dir(path) {
             Ok(()) => {
-                fs::write(path.join("owner.pid"), std::process::id().to_string())
-                    .with_context(|| format!("write {}", path.join("owner.pid").display()))?;
+                write_owner_lease(path)?;
                 Ok(Some(Self {
                     path: path.to_path_buf(),
                 }))
@@ -1320,10 +1459,7 @@ impl BootstrapLock {
                     let _ = fs::remove_dir_all(path);
                     match fs::create_dir(path) {
                         Ok(()) => {
-                            fs::write(path.join("owner.pid"), std::process::id().to_string())
-                                .with_context(|| {
-                                    format!("write {}", path.join("owner.pid").display())
-                                })?;
+                            write_owner_lease(path)?;
                             return Ok(Some(Self {
                                 path: path.to_path_buf(),
                             }));
@@ -1344,8 +1480,85 @@ impl BootstrapLock {
 impl Drop for BootstrapLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(self.path.join("owner.pid"));
+        let _ = fs::remove_file(self.path.join("owner.json"));
         let _ = fs::remove_dir(&self.path);
     }
+}
+
+impl OwnerStartLock {
+    fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        match fs::create_dir(path) {
+            Ok(()) => {
+                write_pid_file(path, "starter.pid")?;
+                Ok(Some(Self {
+                    path: path.to_path_buf(),
+                }))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if owner_start_lock_is_stale(path)? {
+                    let _ = fs::remove_dir_all(path);
+                    match fs::create_dir(path) {
+                        Ok(()) => {
+                            write_pid_file(path, "starter.pid")?;
+                            return Ok(Some(Self {
+                                path: path.to_path_buf(),
+                            }));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(e) => {
+                            return Err(e).with_context(|| format!("create {}", path.display()));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Err(e) => Err(e).with_context(|| format!("create {}", path.display())),
+        }
+    }
+}
+
+impl Drop for OwnerStartLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.path.join("starter.pid"));
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+fn write_pid_file(path: &Path, name: &str) -> Result<()> {
+    let file = path.join(name);
+    fs::write(&file, std::process::id().to_string())
+        .with_context(|| format!("write {}", file.display()))
+}
+
+fn write_owner_lease(path: &Path) -> Result<()> {
+    let pid = std::process::id();
+    write_pid_file(path, "owner.pid")?;
+    let exe = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| String::new());
+    let lease = format!(
+        "{{\"pid\":{pid},\"protocol_version\":{},\"agent_source_stamp\":\"{}\",\"binary_path\":\"{}\"}}\n",
+        PROTOCOL_VERSION,
+        json_escape(env!("LNX_AGENT_SOURCE_STAMP")),
+        json_escape(&exe)
+    );
+    fs::write(path.join("owner.json"), lease)
+        .with_context(|| format!("write {}", path.join("owner.json").display()))?;
+    Ok(())
+}
+
+fn json_escape(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| match ch {
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\r' => "\\r".chars().collect::<Vec<_>>(),
+            '\t' => "\\t".chars().collect::<Vec<_>>(),
+            ch => vec![ch],
+        })
+        .collect()
 }
 
 fn install_signal_handlers() {
@@ -1357,9 +1570,156 @@ fn install_signal_handlers() {
     });
 }
 
+fn current_run_id() -> String {
+    std::env::var(RUN_ID_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|value| log_value(&value))
+        .unwrap_or_else(|| new_lifecycle_id("run"))
+}
+
+fn new_lifecycle_id(prefix: &str) -> String {
+    let sequence = LIFECYCLE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    format!(
+        "{prefix}-{}-{}-{sequence}",
+        unix_nanos(),
+        std::process::id()
+    )
+}
+
+fn log_value(value: &str) -> String {
+    value.replace(['\r', '\n', '\t', ' '], "_")
+}
+
+fn snapshot_generation_id(snapshot: &Path) -> String {
+    read_snapshot_generation_id(snapshot).unwrap_or_else(|| legacy_snapshot_generation_id(snapshot))
+}
+
+fn read_snapshot_generation_id(snapshot: &Path) -> Option<String> {
+    let meta = fs::read_to_string(snapshot.join(SNAPSHOT_LIFECYCLE_META)).ok()?;
+    meta.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key == "generation_id" && !value.is_empty()).then(|| log_value(value))
+    })
+}
+
+fn legacy_snapshot_generation_id(snapshot: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(snapshot.to_string_lossy().as_bytes());
+    for name in ["vmstate.bin", "pages.img", "rootfs.ext4"] {
+        hasher.update([0]);
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        match snapshot_file_fingerprint(&snapshot.join(name)) {
+            Ok(fingerprint) => hasher.update(fingerprint.as_bytes()),
+            Err(e) => hasher.update(format!("error={e}").as_bytes()),
+        }
+    }
+    let digest = hasher.finalize();
+    let prefix = u64::from_le_bytes(digest[..8].try_into().unwrap());
+    format!("legacy-{prefix:016x}")
+}
+
+fn snapshot_file_fingerprint(path: &Path) -> Result<String> {
+    let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(system_time_unix_nanos)
+        .map(|nanos| nanos.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    #[cfg(unix)]
+    {
+        Ok(format!(
+            "size={} modified_unix_nanos={} dev={} ino={} blocks={}",
+            meta.len(),
+            modified,
+            meta.dev(),
+            meta.ino(),
+            meta.blocks()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(format!(
+            "size={} modified_unix_nanos={}",
+            meta.len(),
+            modified
+        ))
+    }
+}
+
+fn write_snapshot_lifecycle_manifest(
+    snapshot_path: &Path,
+    generation_id: &str,
+    source_run_id: &str,
+    source_rootfs: &Path,
+) -> Result<()> {
+    let mut content = String::new();
+    content.push_str("version=1\n");
+    content.push_str(&format!("generation_id={}\n", log_value(generation_id)));
+    content.push_str(&format!("source_run_id={}\n", log_value(source_run_id)));
+    content.push_str(&format!("created_unix_nanos={}\n", unix_nanos()));
+    content.push_str(&format!("source_rootfs={}\n", source_rootfs.display()));
+    for name in ["vmstate.bin", "pages.img", "rootfs.ext4"] {
+        append_snapshot_file_manifest(&mut content, snapshot_path, name);
+    }
+    fs::write(snapshot_path.join(SNAPSHOT_LIFECYCLE_META), content).with_context(|| {
+        format!(
+            "write {}",
+            snapshot_path.join(SNAPSHOT_LIFECYCLE_META).display()
+        )
+    })
+}
+
+fn append_snapshot_file_manifest(content: &mut String, snapshot_path: &Path, name: &str) {
+    let path = snapshot_path.join(name);
+    match fs::metadata(&path) {
+        Ok(meta) => {
+            content.push_str(&format!("{name}.size={}\n", meta.len()));
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(system_time_unix_nanos)
+                .map(|nanos| nanos.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            content.push_str(&format!("{name}.modified_unix_nanos={modified}\n"));
+            #[cfg(unix)]
+            {
+                content.push_str(&format!("{name}.dev={}\n", meta.dev()));
+                content.push_str(&format!("{name}.ino={}\n", meta.ino()));
+                content.push_str(&format!("{name}.blocks={}\n", meta.blocks()));
+            }
+        }
+        Err(e) => content.push_str(&format!("{name}.stat_error={e}\n")),
+    }
+}
+
+fn system_time_unix_nanos(time: SystemTime) -> Option<u128> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|time| time.as_nanos())
+}
+
 fn bootstrap_lock_is_stale(path: &Path) -> Result<bool> {
     let owner_pid = path.join("owner.pid");
     if let Ok(pid) = fs::read_to_string(&owner_pid) {
+        if let Ok(pid) = pid.trim().parse::<libc::pid_t>() {
+            return Ok(!process_alive(pid));
+        }
+        return Ok(true);
+    }
+
+    let modified = fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .modified()
+        .with_context(|| format!("stat modified time {}", path.display()))?;
+    Ok(modified.elapsed().unwrap_or_default() > Duration::from_secs(10))
+}
+
+fn owner_start_lock_is_stale(path: &Path) -> Result<bool> {
+    let starter_pid = path.join("starter.pid");
+    if let Ok(pid) = fs::read_to_string(&starter_pid) {
         if let Ok(pid) = pid.trim().parse::<libc::pid_t>() {
             return Ok(!process_alive(pid));
         }
@@ -1876,30 +2236,18 @@ pub fn snapshot_shares_incompatibility_for_import(
     cwd: &Path,
     no_host_shares: bool,
 ) -> Result<Option<String>> {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = (snapshot_path, cwd, no_host_shares);
-        // macOS may restore through vmnet when ingress is available, and the
-        // vmnet stamp is allocated by the ingress daemon at VM start time.
-        // Keep import validation conservative there and let start perform the
-        // definitive restore check.
-        Ok(None)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let host_home = host_home_for_cwd(cwd)?;
-        let outside_home_cwd = (!cwd.starts_with(&host_home)).then(|| cwd.to_path_buf());
-        let shares_stamp = shares_stamp_content(
-            &host_home,
-            outside_home_cwd.as_deref(),
-            "net=gvproxy",
-            no_host_shares,
-        );
-        Ok(snapshot_shares_incompatibility(
-            snapshot_path,
-            &shares_stamp,
-        ))
-    }
+    let host_home = host_home_for_cwd(cwd)?;
+    let outside_home_cwd = (!cwd.starts_with(&host_home)).then(|| cwd.to_path_buf());
+    let shares_stamp = shares_stamp_content(
+        &host_home,
+        outside_home_cwd.as_deref(),
+        "net=gvproxy",
+        no_host_shares,
+    );
+    Ok(snapshot_shares_incompatibility(
+        snapshot_path,
+        &shares_stamp,
+    ))
 }
 
 fn snapshot_shares_incompatibility(snapshot_path: &Path, current: &str) -> Option<String> {
@@ -2320,17 +2668,25 @@ fn unlock_file(file: &fs::File) -> std::io::Result<()> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
 struct Gvproxy {
     socket: PathBuf,
+    #[cfg(target_os = "macos")]
+    embedded: Option<crate::gvproxy_embedded::EmbeddedGvproxy>,
+    #[cfg(not(target_os = "macos"))]
     child: Child,
 }
 
-#[cfg(not(target_os = "macos"))]
 impl Drop for Gvproxy {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        #[cfg(target_os = "macos")]
+        {
+            drop(self.embedded.take());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
         let _ = fs::remove_file(&self.socket);
         if let (Some(parent), Some(name)) = (self.socket.parent(), self.socket.file_name()) {
             let krun_socket = parent.join(format!("{}-krun.sock", name.to_string_lossy()));
@@ -2339,41 +2695,56 @@ impl Drop for Gvproxy {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
 fn start_gvproxy(run_dir: &Path) -> Result<Gvproxy> {
-    let gvproxy = resolve_gvproxy_path();
-    if !gvproxy.exists() {
-        bail!(
-            "gvproxy not found at {}. Install gvproxy or set GVPROXY_PATH.",
-            gvproxy.display()
-        );
-    }
-
     let socket = run_dir.join("gvproxy.sock");
     let api_socket = run_dir.join("gvproxy-api.sock");
     let log = run_dir.join("gvproxy.log");
     let _ = fs::remove_file(&socket);
     let _ = fs::remove_file(&api_socket);
-    let log_file = fs::File::create(&log).with_context(|| format!("create {}", log.display()))?;
     let ssh_port = unused_local_port().context("find unused localhost port for gvproxy ssh")?;
-    let child = Command::new(&gvproxy)
-        .arg("--listen")
-        .arg(format!("unix://{}", api_socket.display()))
-        .arg("--listen-vfkit")
-        .arg(format!("unixgram:{}", socket.display()))
-        .arg("--ssh-port")
-        .arg(ssh_port.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(log_file)
-        .spawn()
-        .with_context(|| format!("start {}", gvproxy.display()))?;
 
-    // Generous: in a freshly restored nested guest, process startup and
-    // socket creation on virtiofs can take well over the usual instant.
-    wait_for_path(&socket, Duration::from_secs(30))
-        .with_context(|| format!("gvproxy did not create {}", socket.display()))?;
-    Ok(Gvproxy { socket, child })
+    #[cfg(target_os = "macos")]
+    {
+        let embedded = crate::gvproxy_embedded::EmbeddedGvproxy::start(&socket, &log, ssh_port)?;
+        wait_for_path(&socket, Duration::from_secs(30))
+            .with_context(|| format!("embedded gvproxy did not create {}", socket.display()))?;
+        return Ok(Gvproxy {
+            socket,
+            embedded: Some(embedded),
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let gvproxy = resolve_gvproxy_path();
+        if !gvproxy.exists() {
+            bail!(
+                "gvproxy not found at {}. Install gvproxy or set GVPROXY_PATH.",
+                gvproxy.display()
+            );
+        }
+
+        let log_file =
+            fs::File::create(&log).with_context(|| format!("create {}", log.display()))?;
+        let child = Command::new(&gvproxy)
+            .arg("--listen")
+            .arg(format!("unix://{}", api_socket.display()))
+            .arg("--listen-vfkit")
+            .arg(format!("unixgram:{}", socket.display()))
+            .arg("--ssh-port")
+            .arg(ssh_port.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log_file)
+            .spawn()
+            .with_context(|| format!("start {}", gvproxy.display()))?;
+
+        // Generous: in a freshly restored nested guest, process startup and
+        // socket creation on virtiofs can take well over the usual instant.
+        wait_for_path(&socket, Duration::from_secs(30))
+            .with_context(|| format!("gvproxy did not create {}", socket.display()))?;
+        Ok(Gvproxy { socket, child })
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2399,13 +2770,11 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-#[cfg(not(target_os = "macos"))]
 fn unused_local_port() -> Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     Ok(listener.local_addr()?.port())
 }
 
-#[cfg(not(target_os = "macos"))]
 fn wait_for_path(path: &Path, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let mut attempts = 0usize;
@@ -2430,7 +2799,6 @@ fn wait_for_path(path: &Path, timeout: Duration) -> Result<()> {
     bail!("timed out waiting for {}", path.display())
 }
 
-#[cfg(not(target_os = "macos"))]
 fn path_is_visible(path: &Path) -> bool {
     if path.exists() {
         return true;
@@ -2580,6 +2948,60 @@ fn acquire_bootstrap_or_run_client(
     }
 }
 
+fn acquire_owner_start_or_run_client(
+    lock_path: &Path,
+    socket: &Path,
+    command: &[String],
+    cwd: &Path,
+    run_as_root: bool,
+    no_host_shares: bool,
+    deterministic: Option<&DeterministicConfig>,
+    instance: &str,
+    allow_existing_broker: bool,
+    run_log: &RunLog,
+) -> Result<OwnerStartOutcome> {
+    let start = Instant::now();
+    let mut logged_wait = false;
+    loop {
+        if let Some(lock) = OwnerStartLock::try_acquire(lock_path)? {
+            run_log.line(format!(
+                "owner_start.lock.acquired path={}",
+                lock_path.display()
+            ));
+            return Ok(OwnerStartOutcome::Lock(lock));
+        }
+        if !logged_wait {
+            run_log.line(format!(
+                "owner_start.lock.busy path={}",
+                lock_path.display()
+            ));
+            logged_wait = true;
+        }
+        if allow_existing_broker {
+            if let Some(status) = run_existing_broker_client(
+                socket,
+                command,
+                cwd,
+                run_as_root,
+                no_host_shares,
+                deterministic,
+                instance,
+                Some(run_log),
+            )? {
+                return Ok(OwnerStartOutcome::Status(status));
+            }
+        }
+        if start.elapsed() > Duration::from_secs(120) {
+            run_log.line(format!(
+                "owner_start.lock.timeout path={}",
+                lock_path.display()
+            ));
+            bail!("timed out waiting for {}", lock_path.display());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn run_existing_broker_client(
     socket: &Path,
     command: &[String],
@@ -2610,6 +3032,11 @@ fn run_existing_broker_client(
             .map(Some)
         }
         Err(e) => {
+            if e.downcast_ref::<BrokerProtocolMismatch>().is_some()
+                || e.downcast_ref::<BrokerHelloFailed>().is_some()
+            {
+                return Err(e);
+            }
             if socket.exists() {
                 if let Some(log) = run_log {
                     log.line(format!(
@@ -2629,16 +3056,39 @@ pub(crate) fn connect_broker(socket: &Path) -> Result<UnixStream> {
     stream
         .set_nonblocking(false)
         .context("set broker stream blocking")?;
+    stream
+        .set_read_timeout(Some(BROKER_HELLO_TIMEOUT))
+        .context("set broker hello read timeout")?;
+    stream
+        .set_write_timeout(Some(BROKER_HELLO_TIMEOUT))
+        .context("set broker hello write timeout")?;
     write_message(
         &mut stream,
         &Message::Hello {
             version: PROTOCOL_VERSION,
         },
     )?;
-    match read_message(&mut stream).context("read broker hello")? {
+    let hello = match read_message(&mut stream) {
+        Ok(message) => message,
+        Err(_) => return Err(BrokerHelloFailed.into()),
+    };
+    match hello {
         Message::Hello { version } if version == PROTOCOL_VERSION => {}
+        Message::Hello { version } => {
+            return Err(BrokerProtocolMismatch {
+                expected: PROTOCOL_VERSION,
+                actual: version,
+            }
+            .into());
+        }
         other => bail!("bad broker hello: {other:?}"),
     }
+    stream
+        .set_read_timeout(None)
+        .context("clear broker hello read timeout")?;
+    stream
+        .set_write_timeout(None)
+        .context("clear broker hello write timeout")?;
     Ok(stream)
 }
 
@@ -2938,6 +3388,80 @@ fn open_url_on_host(url: &str) -> Result<()> {
     }
 }
 
+fn localhost_url_forward(url: &str) -> Option<(&'static str, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority_end = rest
+        .find(|c| matches!(c, '/' | '?' | '#'))
+        .unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.contains('@') {
+        return None;
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        if host != "::1" {
+            return None;
+        }
+        return Some(("::1", tail.strip_prefix(':')?.parse().ok()?));
+    }
+    let (host, port) = authority.rsplit_once(':')?;
+    if host.contains(':') || !matches!(host, "localhost" | "127.0.0.1") {
+        return None;
+    }
+    Some(("127.0.0.1", port.parse().ok()?))
+}
+
+fn ensure_auto_forward_port(
+    listen_host: &str,
+    port: u16,
+    agent_tx: mpsc::Sender<Message>,
+    clients: Arc<Mutex<HashMap<u64, BrokerChannel>>>,
+    active: Arc<AtomicUsize>,
+    seen_active: Arc<AtomicBool>,
+    auto_forward_ports: Arc<Mutex<HashSet<(String, u16)>>>,
+    run_log: Arc<RunLog>,
+) -> Result<bool> {
+    if port <= 1024 {
+        return Ok(false);
+    }
+    let key = (listen_host.to_string(), port);
+    {
+        let mut ports = auto_forward_ports
+            .lock()
+            .map_err(|_| anyhow!("auto-forward ports lock poisoned"))?;
+        if ports.contains(&key) {
+            return Ok(false);
+        }
+        ports.insert(key.clone());
+    }
+    let forward = PortForward {
+        listen_host: listen_host.to_string(),
+        listen_port: port,
+        guest_host: listen_host.to_string(),
+        guest_port: port,
+    };
+    if let Err(e) = start_forward_listener(
+        forward,
+        agent_tx,
+        clients,
+        active,
+        seen_active,
+        Arc::clone(&run_log),
+    ) {
+        if let Ok(mut ports) = auto_forward_ports.lock() {
+            ports.remove(&key);
+        }
+        return Err(e);
+    }
+    run_log.line(format!(
+        "auto_forward.listen host={listen_host} port={port} guest_port={port}"
+    ));
+    Ok(true)
+}
+
 fn forwarded_exec_env() -> Vec<(String, String)> {
     const EXACT: &[&str] = &[
         "TERM",
@@ -2991,6 +3515,11 @@ fn run_broker_client_retry(
                 );
             }
             Err(e) => {
+                if e.downcast_ref::<BrokerProtocolMismatch>().is_some()
+                    || e.downcast_ref::<BrokerHelloFailed>().is_some()
+                {
+                    return Err(e);
+                }
                 last = Some(e);
                 thread::sleep(Duration::from_millis(10));
             }
@@ -3026,6 +3555,7 @@ fn run_broker_owner(
     run_log: Arc<RunLog>,
     trace_log: Option<Arc<TraceLog>>,
     vm_error_rx: mpsc::Receiver<i32>,
+    owner_run_id: String,
 ) -> Result<thread::JoinHandle<()>> {
     listener
         .set_nonblocking(true)
@@ -3033,7 +3563,8 @@ fn run_broker_owner(
     let agent_timeout = agent_accept_timeout_from_env(std::env::var("LNX_AGENT_TIMEOUT_MS").ok());
     timings.event("agent.accept.begin");
     run_log.line(format!(
-        "agent.accept.begin timeout_ms={} restore={}",
+        "agent.accept.begin owner_run_id={} timeout_ms={} restore={}",
+        owner_run_id,
         agent_timeout.as_millis(),
         restore_snapshot
             .as_ref()
@@ -3146,6 +3677,7 @@ fn run_broker_owner(
     let (checkpoint_tx, checkpoint_rx) = mpsc::channel::<CheckpointRequest>();
     let (snapshot_exit_tx, snapshot_exit_rx) = mpsc::channel::<u64>();
     let client_senders = Arc::new(Mutex::new(HashMap::<u64, BrokerChannel>::new()));
+    let auto_forward_ports = Arc::new(Mutex::new(HashSet::<(String, u16)>::new()));
     let active = Arc::new(AtomicUsize::new(0));
     let seen_active = Arc::new(AtomicBool::new(idle.starts_idle));
     let agent_failed_before_snapshot = Arc::new(AtomicBool::new(false));
@@ -3164,7 +3696,9 @@ fn run_broker_owner(
 
     let mut agent_reader = agent_stream;
     let reader_clients = Arc::clone(&client_senders);
+    let reader_auto_forward_ports = Arc::clone(&auto_forward_ports);
     let reader_active = Arc::clone(&active);
+    let reader_seen_active = Arc::clone(&seen_active);
     let reader_snapshot_exit_tx = snapshot_exit_tx.clone();
     let reader_agent_failed_before_snapshot = Arc::clone(&agent_failed_before_snapshot);
     let reader_snapshot_started = Arc::clone(&snapshot_started);
@@ -3199,6 +3733,22 @@ fn run_broker_owner(
                 continue;
             }
             if let Message::OpenUrl { channel_id, url } = message {
+                if let Some((host, port)) = localhost_url_forward(&url) {
+                    if let Err(e) = ensure_auto_forward_port(
+                        host,
+                        port,
+                        reader_agent_tx.clone(),
+                        Arc::clone(&reader_clients),
+                        Arc::clone(&reader_active),
+                        Arc::clone(&reader_seen_active),
+                        Arc::clone(&reader_auto_forward_ports),
+                        Arc::clone(&reader_log),
+                    ) {
+                        reader_log.line(format!(
+                            "open_url.forward_error channel_id={channel_id:016x} host={host} port={port} error={e:#}"
+                        ));
+                    }
+                }
                 let ok = match open_url_on_host(&url) {
                     Ok(()) => true,
                     Err(e) => {
@@ -3219,6 +3769,23 @@ fn run_broker_owner(
                     );
                 }
                 let _ = reader_agent_tx.send(Message::OpenUrlResult { channel_id, ok });
+                continue;
+            }
+            if let Message::PortListeners { ports } = message {
+                for port in ports.into_iter().filter(|port| *port > 1024) {
+                    if let Err(e) = ensure_auto_forward_port(
+                        "127.0.0.1",
+                        port,
+                        reader_agent_tx.clone(),
+                        Arc::clone(&reader_clients),
+                        Arc::clone(&reader_active),
+                        Arc::clone(&reader_seen_active),
+                        Arc::clone(&reader_auto_forward_ports),
+                        Arc::clone(&reader_log),
+                    ) {
+                        reader_log.line(format!("auto_forward.skip port={port} reason={e:#}"));
+                    }
+                }
                 continue;
             }
             if let Some(channel_id) = channel_id {
@@ -3266,8 +3833,14 @@ fn run_broker_owner(
     let owner_timings = Arc::clone(&timings);
     let owner_log = Arc::clone(&run_log);
     let force_full_snapshot = restore_snapshot.is_none();
+    let restore_generation = restore_snapshot.as_deref().map(snapshot_generation_id);
     let broker_idle_ttl = idle.ttl;
     for forward in forwards {
+        if forward.listen_host == "127.0.0.1" && forward.listen_port > 1024 {
+            if let Ok(mut ports) = auto_forward_ports.lock() {
+                ports.insert((forward.listen_host.clone(), forward.listen_port));
+            }
+        }
         start_forward_listener(
             forward,
             agent_tx.clone(),
@@ -3320,9 +3893,12 @@ fn run_broker_owner(
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     while let Ok(request) = checkpoint_rx.try_recv() {
+                        let generation_id = new_lifecycle_id("snapshot");
                         owner_timings.event("checkpoint.request.begin");
                         owner_log.line(format!(
-                            "checkpoint.request path={}",
+                            "checkpoint.request owner_run_id={} generation_id={} path={}",
+                            owner_run_id,
+                            generation_id,
                             request.path.display()
                         ));
                         if let Some(trace) = &trace_log {
@@ -3339,13 +3915,19 @@ fn run_broker_owner(
                                 &owner_log,
                             )?;
                             owner_log.line(format!(
-                                "checkpoint.capture.begin path={}",
-                                request.path.display()
+                                "checkpoint.capture.begin owner_run_id={} generation_id={} path={} source_rootfs={} source_generation={}",
+                                owner_run_id,
+                                generation_id,
+                                request.path.display(),
+                                rootfs.display(),
+                                restore_generation.as_deref().unwrap_or("none")
                             ));
                             ctx.snapshot_with_file_copy(&request.path, &rootfs, "rootfs.ext4")?;
                             validate_snapshot_rootfs(&request.path)?;
                             owner_log.line(format!(
-                                "checkpoint.capture.done path={}",
+                                "checkpoint.capture.done owner_run_id={} generation_id={} path={}",
+                                owner_run_id,
+                                generation_id,
                                 request.path.display()
                             ));
                             copy_snapshot_stamp(
@@ -3354,16 +3936,28 @@ fn run_broker_owner(
                                 trace_log.as_deref(),
                             )?;
                             copy_host_share_state_to_snapshot(&layout, &request.path)?;
+                            write_snapshot_lifecycle_manifest(
+                                &request.path,
+                                &generation_id,
+                                &owner_run_id,
+                                &rootfs,
+                            )?;
                             owner_log.line(format!(
-                                "checkpoint.stamp.done path={}",
+                                "checkpoint.stamp.done owner_run_id={} generation_id={} path={}",
+                                owner_run_id,
+                                generation_id,
                                 request.path.display()
                             ));
                             Ok(())
                         })()
                         .map_err(|e| format!("{e:#}"));
                         if result.is_ok() {
-                            owner_log
-                                .line(format!("checkpoint.done path={}", request.path.display()));
+                            owner_log.line(format!(
+                                "checkpoint.done owner_run_id={} generation_id={} path={}",
+                                owner_run_id,
+                                generation_id,
+                                request.path.display()
+                            ));
                             if let Some(trace) = &trace_log {
                                 trace.event(
                                     "checkpoint_done",
@@ -3375,19 +3969,27 @@ fn run_broker_owner(
                         let _ = request.reply.send(result);
                     }
                     while let Ok(channel_id) = snapshot_exit_rx.try_recv() {
+                        let generation_id = new_lifecycle_id("snapshot");
                         owner_timings.event("snapshot_exit.request.begin");
                         owner_log.line(format!(
-                            "snapshot_exit.request channel_id={channel_id} path={}",
+                            "snapshot_exit.request owner_run_id={} generation_id={} channel_id={channel_id} path={}",
+                            owner_run_id,
+                            generation_id,
                             snapshot_path.display()
                         ));
-                        let result = snapshot_with_file_copy_full(
+                        let result = capture_snapshot_for_publish(
                             &ctx,
                             &snapshot_path,
                             &rootfs,
                             &initramfs_stamp,
+                            &layout,
                             trace_log.as_deref(),
+                            restore_snapshot.as_deref(),
+                            false,
+                            &owner_log,
+                            &owner_run_id,
+                            &generation_id,
                         )
-                        .and_then(|()| copy_host_share_state_to_snapshot(&layout, &snapshot_path))
                         .and_then(|()| {
                             if promote_rootfs_after_snapshot {
                                 promote_snapshot_rootfs(
@@ -3395,6 +3997,8 @@ fn run_broker_owner(
                                     &canonical_rootfs,
                                     &owner_timings,
                                     &owner_log,
+                                    Some(&generation_id),
+                                    Some(&owner_run_id),
                                 )
                             } else {
                                 Ok(())
@@ -3403,7 +4007,9 @@ fn run_broker_owner(
                         match result {
                             Ok(()) => {
                                 owner_log.line(format!(
-                                    "snapshot_exit.done channel_id={channel_id} path={}",
+                                    "snapshot_exit.done owner_run_id={} generation_id={} channel_id={channel_id} path={}",
+                                    owner_run_id,
+                                    generation_id,
                                     snapshot_path.display()
                                 ));
                                 if let Some(trace) = &trace_log {
@@ -3420,7 +4026,9 @@ fn run_broker_owner(
                             }
                             Err(e) => {
                                 owner_log.line(format!(
-                                    "snapshot_exit.error channel_id={channel_id} error={e:#}"
+                                    "snapshot_exit.error owner_run_id={} generation_id={} channel_id={channel_id} error={e:#}",
+                                    owner_run_id,
+                                    generation_id
                                 ));
                                 let _ = agent_tx.send(Message::Error {
                                     channel_id,
@@ -3463,10 +4071,16 @@ fn run_broker_owner(
             return;
         }
         snapshot_started.store(true, Ordering::SeqCst);
+        let generation_id = new_lifecycle_id("snapshot");
         owner_timings.event("snapshot.request.guest");
         owner_log.line(format!(
-            "snapshot.request.guest path={} full={force_full_snapshot}",
-            snapshot_path.display()
+            "snapshot.request.guest owner_run_id={} generation_id={} path={} full={} source_rootfs={} source_generation={}",
+            owner_run_id,
+            generation_id,
+            snapshot_path.display(),
+            force_full_snapshot,
+            rootfs.display(),
+            restore_generation.as_deref().unwrap_or("none")
         ));
         if let Some(trace) = &trace_log {
             trace.event(
@@ -3486,13 +4100,21 @@ fn run_broker_owner(
             &initramfs_stamp,
             &layout,
             trace_log.as_deref(),
+            restore_snapshot.as_deref(),
             force_full_snapshot,
             promote_rootfs_after_snapshot.then_some(canonical_rootfs.as_path()),
             &owner_timings,
             &owner_log,
+            &owner_run_id,
+            &generation_id,
         ) {
             Ok(()) => {
-                owner_log.line("snapshot.done");
+                owner_log.line(format!(
+                    "snapshot.done owner_run_id={} generation_id={} path={}",
+                    owner_run_id,
+                    generation_id,
+                    snapshot_path.display()
+                ));
                 if let Some(trace) = &trace_log {
                     trace.event(
                         "snapshot_done",
@@ -3501,7 +4123,10 @@ fn run_broker_owner(
                 }
                 log_snapshot_summary(&owner_log, "snapshot.latest", &snapshot_path);
             }
-            Err(e) => owner_log.line(format!("snapshot.error {e:#}")),
+            Err(e) => owner_log.line(format!(
+                "snapshot.error owner_run_id={} generation_id={} error={e:#}",
+                owner_run_id, generation_id
+            )),
         }
     }))
 }
@@ -3589,7 +4214,7 @@ fn forward_spec(forward: &PortForward) -> String {
     )
 }
 
-fn spawn_owner_process(config: &RunConfig, run_log: &RunLog) -> Result<Child> {
+fn spawn_owner_process(config: &RunConfig, run_log: &RunLog, run_id: &str) -> Result<Child> {
     let exe = std::env::current_exe().context("current executable")?;
     let log_path = config.layout.run_dir.join("owner.log");
     let log = OpenOptions::new()
@@ -3637,9 +4262,10 @@ fn spawn_owner_process(config: &RunConfig, run_log: &RunLog) -> Result<Child> {
         .stdin(Stdio::null())
         .stdout(log.try_clone().context("clone owner log handle")?)
         .stderr(log)
+        .env(RUN_ID_ENV, run_id)
         .process_group(0);
     let child = command.spawn().context("spawn lnx _vm-owner")?;
-    run_log.line(format!("owner.spawned pid={}", child.id()));
+    run_log.line(format!("owner.spawned run_id={run_id} pid={}", child.id()));
     Ok(child)
 }
 
@@ -3651,6 +4277,7 @@ fn run_broker_client_awaiting_owner(
     config: &RunConfig,
     layout: &Layout,
     run_log: &RunLog,
+    run_id: &str,
 ) -> Result<i32> {
     let deadline = Instant::now() + OWNER_BOOT_TIMEOUT;
     let mut last = None;
@@ -3670,14 +4297,30 @@ fn run_broker_client_awaiting_owner(
                     &layout.instance,
                 );
             }
-            Err(e) => last = Some(e),
+            Err(e) => {
+                if e.downcast_ref::<BrokerProtocolMismatch>().is_some()
+                    || e.downcast_ref::<BrokerHelloFailed>().is_some()
+                {
+                    return Err(e);
+                }
+                last = Some(e);
+            }
         }
         if let Some(status) = owner.try_wait().context("check lnx _vm-owner")? {
             // An owner that exits zero lost the bootstrap race to another
             // owner, so keep retrying until that one's broker comes up.
             if status.success() {
                 run_log.line("owner.exited.early status=0 retry=spawn");
-                *owner = spawn_owner_process(config, run_log)?;
+                *owner = spawn_owner_process(config, run_log, run_id)?;
+            } else if status.code() == Some(EXIT_RESTORE_FAILED) {
+                run_log.line(format!(
+                    "owner.exited.early status={status} restore_failed=true"
+                ));
+                bail!(
+                    "VM memory snapshot restore was refused before the broker came up{}{}",
+                    owner_log_hint(layout),
+                    console_hint(&layout.console_log)
+                );
             } else {
                 run_log.line(format!("owner.exited.early status={status}"));
                 bail!(
@@ -3797,6 +4440,13 @@ fn handle_broker_client(
         .context("set broker client blocking")?;
     match read_message(&mut client)? {
         Message::Hello { version } if version == PROTOCOL_VERSION => {}
+        Message::Hello { version } => {
+            run_log.line(format!(
+                "broker.client.protocol_mismatch expected={} actual={} action=close",
+                PROTOCOL_VERSION, version
+            ));
+            return Ok(());
+        }
         other => bail!("bad client hello: {other:?}"),
     }
     write_message(
@@ -4695,15 +5345,20 @@ fn configure_package_store(
             "packages.store.mounted mode=writable root={}",
             layout.root.display()
         ));
-        return Ok(vec!["LNX_VIRTIOFS_NIX_ROOT=1".to_string()]);
+        return Ok(vec![
+            "LNX_VIRTIOFS_NIX_ROOT=1".to_string(),
+            "LNX_VIRTIOFS_NIX_ROOT_RW=1".to_string(),
+        ]);
     }
 
     if !layout.prepare_readonly()? {
         return Ok(Vec::new());
     }
+    ctx.add_virtiofs("lnx-nix-root", &layout.mount, true)?;
     ctx.add_virtiofs("lnx-nix-store", &layout.store, !writable)?;
     ctx.add_virtiofs("lnx-packages", &layout.profiles, !writable)?;
     let env = vec![
+        "LNX_VIRTIOFS_NIX_ROOT=1".to_string(),
         "LNX_VIRTIOFS_NIX_STORE=1".to_string(),
         "LNX_VIRTIOFS_PACKAGE_PROFILE=1".to_string(),
         format!("LNX_PACKAGE_BINARIES={}", layout.binaries()?.join(":")),
@@ -4721,6 +5376,252 @@ fn host_share_unshare_dir(layout: &Layout, tag: &str) -> PathBuf {
 
 fn host_share_state_root(layout: &Layout) -> PathBuf {
     layout.instance_dir.join("host-share-state")
+}
+
+#[derive(Debug)]
+struct PreparedRestore {
+    snapshot: PathBuf,
+    rootfs: PathBuf,
+    generation_id: String,
+}
+
+fn restore_work_snapshot(layout: &Layout) -> PathBuf {
+    layout.snapshot_dir.join(RESTORE_WORK_SNAPSHOT)
+}
+
+fn prepare_restore_for_start(
+    layout: &Layout,
+    restore_snapshot: Option<&Path>,
+    restore_generation: Option<&str>,
+    run_log: &RunLog,
+) -> Result<Option<PreparedRestore>> {
+    cleanup_snapshot_runtime_state(layout, run_log)?;
+    let work_snapshot = restore_work_snapshot(layout);
+    let Some(snapshot) = restore_snapshot else {
+        return Ok(None);
+    };
+    validate_restore_snapshot_rootfs(snapshot, run_log)?;
+    remove_path_if_exists(&work_snapshot)?;
+    clone_restore_snapshot(snapshot, &work_snapshot)?;
+    let snapshot_rootfs = snapshot.join("rootfs.ext4");
+    let work_rootfs = work_snapshot.join("rootfs.ext4");
+    crate::init::ensure_ext4_has_no_errors(&work_rootfs, "live restore rootfs")?;
+    let generation = restore_generation
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| snapshot_generation_id(snapshot));
+    run_log.line(format!(
+        "snapshot.restore.clone generation_id={} source={} work={} rootfs_source={} rootfs_work={}",
+        generation,
+        snapshot.display(),
+        work_snapshot.display(),
+        snapshot_rootfs.display(),
+        work_rootfs.display()
+    ));
+    Ok(Some(PreparedRestore {
+        snapshot: work_snapshot,
+        rootfs: work_rootfs,
+        generation_id: generation,
+    }))
+}
+
+fn clone_restore_snapshot(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst).with_context(|| format!("create {}", dst.display()))?;
+    for name in [
+        "vmstate.bin",
+        "pages.img",
+        "rootfs.ext4",
+        "initramfs.stamp",
+        "shares.stamp",
+        "deterministic.stamp",
+        DETERMINISTIC_CLOCK_STATE,
+        SNAPSHOT_LIFECYCLE_META,
+    ] {
+        let src_file = src.join(name);
+        if src_file.exists() {
+            clone_or_copy_file(&src_file, &dst.join(name)).with_context(|| {
+                format!(
+                    "clone {} to {}",
+                    src_file.display(),
+                    dst.join(name).display()
+                )
+            })?;
+        }
+    }
+    let host_share_state = src.join("host-share-state");
+    if host_share_state.exists() {
+        clone_tree(&host_share_state, &dst.join("host-share-state"))?;
+    }
+    Ok(())
+}
+
+fn clone_tree(src: &Path, dest: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(src).with_context(|| format!("stat {}", src.display()))?;
+    if metadata.is_dir() {
+        fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
+        for entry in fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
+            let entry = entry.with_context(|| format!("read {}", src.display()))?;
+            clone_tree(&entry.path(), &dest.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    if metadata.file_type().is_symlink() {
+        let link = fs::read_link(src).with_context(|| format!("readlink {}", src.display()))?;
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::os::unix::fs::symlink(&link, dest)
+            .with_context(|| format!("symlink {} to {}", link.display(), dest.display()))?;
+        return Ok(());
+    }
+    clone_or_copy_file(src, dest)
+}
+
+fn cleanup_snapshot_runtime_state(layout: &Layout, run_log: &RunLog) -> Result<()> {
+    let work = restore_work_snapshot(layout);
+    if work.exists() {
+        run_log.line(format!("snapshot.work.remove path={}", work.display()));
+        remove_path_if_exists(&work)?;
+    }
+    cleanup_snapshot_publish_paths(&layout.snapshot_dir.join("latest"), run_log)
+}
+
+fn snapshot_publish_temp(snapshot_path: &Path) -> Result<PathBuf> {
+    sibling_dot_path(snapshot_path, "next")
+}
+
+fn snapshot_publish_previous(snapshot_path: &Path) -> Result<PathBuf> {
+    sibling_dot_path(snapshot_path, "previous")
+}
+
+fn sibling_dot_path(path: &Path, suffix: &str) -> Result<PathBuf> {
+    let parent = path.parent().context("snapshot path has no parent")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("snapshot path has no file name")?;
+    Ok(parent.join(format!(".{name}.{suffix}")))
+}
+
+fn cleanup_snapshot_publish_paths(snapshot_path: &Path, run_log: &RunLog) -> Result<()> {
+    let temp = snapshot_publish_temp(snapshot_path)?;
+    let previous = snapshot_publish_previous(snapshot_path)?;
+    if previous.exists() && !snapshot_path.exists() {
+        run_log.line(format!(
+            "snapshot.publish.recover previous={} latest={}",
+            previous.display(),
+            snapshot_path.display()
+        ));
+        fs::rename(&previous, snapshot_path).with_context(|| {
+            format!(
+                "recover {} to {}",
+                previous.display(),
+                snapshot_path.display()
+            )
+        })?;
+    }
+    if temp.exists() {
+        run_log.line(format!(
+            "snapshot.publish.temp.remove path={}",
+            temp.display()
+        ));
+        remove_path_if_exists(&temp)?;
+    }
+    if previous.exists() {
+        run_log.line(format!(
+            "snapshot.publish.previous.remove path={}",
+            previous.display()
+        ));
+        remove_path_if_exists(&previous)?;
+    }
+    Ok(())
+}
+
+fn validate_restore_snapshot_rootfs(snapshot: &Path, run_log: &RunLog) -> Result<()> {
+    let rootfs = snapshot.join("rootfs.ext4");
+    if !rootfs.exists() {
+        bail!(
+            "snapshot cannot be restored because its rootfs is missing: {}",
+            rootfs.display()
+        );
+    }
+    crate::init::ensure_ext4_has_no_errors(&rootfs, "snapshot rootfs")?;
+    if let Some(reason) = snapshot_rootfs_pair_incoherent(snapshot)? {
+        run_log.line(format!(
+            "snapshot.rootfs.incoherent path={} reason={reason}",
+            snapshot.display()
+        ));
+        return Err(anyhow!(reason)).context(RestoreRefused);
+    }
+    Ok(())
+}
+
+fn snapshot_rootfs_pair_incoherent(snapshot: &Path) -> Result<Option<String>> {
+    let rootfs = snapshot.join("rootfs.ext4");
+    let vmstate = snapshot.join("vmstate.bin");
+    let pages = snapshot.join("pages.img");
+    let rootfs_modified = file_modified_time(&rootfs)?;
+    let vmstate_modified = file_modified_time(&vmstate)?;
+    let pages_modified = file_modified_time(&pages)?;
+    let state_modified = vmstate_modified.max(pages_modified);
+    if rootfs_modified
+        .duration_since(state_modified)
+        .is_ok_and(|delta| delta > Duration::from_secs(1))
+    {
+        return Ok(Some(format!(
+            "snapshot rootfs was modified after memory state was captured; refusing to pair {} with stale {}/{}",
+            rootfs.display(),
+            vmstate.display(),
+            pages.display()
+        )));
+    }
+    Ok(None)
+}
+
+fn file_modified_time(path: &Path) -> Result<SystemTime> {
+    fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .modified()
+        .with_context(|| format!("read modification time for {}", path.display()))
+}
+
+fn preflight_host_share_cwd(layout: &Layout, cwd: &Path, no_host_shares: bool) -> Result<()> {
+    if no_host_shares {
+        return Ok(());
+    }
+    let host_home = host_home_for_cwd(cwd)?;
+    preflight_host_share_cwd_with_home(layout, cwd, no_host_shares, &host_home)
+}
+
+fn preflight_host_share_cwd_with_home(
+    layout: &Layout,
+    cwd: &Path,
+    no_host_shares: bool,
+    host_home: &Path,
+) -> Result<()> {
+    if no_host_shares {
+        return Ok(());
+    }
+    if !cwd.exists() {
+        bail!(
+            "working directory does not exist on macOS: {}",
+            cwd.display()
+        );
+    }
+    let state_root = host_share::state_root(&layout.instance_dir);
+    for target in host_share::targets_for_absolute_path(cwd, cwd, Some(host_home)) {
+        let path_state = host_share::path_state(&state_root, &target)?;
+        if let Some(covering) = path_state.covering_whiteout {
+            let hidden_path = target.share_root.join(&covering);
+            bail!(
+                "working directory is hidden by host-share copy-on-write state before the command can start: {}\nhidden path: {}\ninspect: lnx fs unshare {}\nrestore visibility: lnx fs unshare --remove {}",
+                cwd.display(),
+                hidden_path.display(),
+                cwd.display(),
+                hidden_path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -4741,10 +5642,13 @@ fn serve_snapshot(
     initramfs_stamp: &Path,
     layout: &Layout,
     trace_log: Option<&TraceLog>,
+    base_snapshot: Option<&Path>,
     force_full: bool,
     promote_rootfs_to: Option<&Path>,
     timings: &TimingLog,
     run_log: &RunLog,
+    owner_run_id: &str,
+    generation_id: &str,
 ) -> Result<()> {
     listener
         .set_nonblocking(true)
@@ -4792,19 +5696,28 @@ fn serve_snapshot(
     }
     timings.event("snapshot.ready.read");
     timings.event("snapshot.capture.begin");
-    if force_full {
-        snapshot_with_file_copy_full(ctx, snapshot_path, rootfs, initramfs_stamp, trace_log)?;
-    } else {
-        ctx.snapshot_with_file_copy(snapshot_path, rootfs, "rootfs.ext4")?;
-        if let Err(e) = validate_snapshot_rootfs(snapshot_path) {
-            quarantine_snapshot(snapshot_path, run_log, "rootfs_ext4_errors");
-            return Err(e);
-        }
-        copy_snapshot_stamp(snapshot_path, initramfs_stamp, trace_log)?;
-    }
-    copy_host_share_state_to_snapshot(layout, snapshot_path)?;
+    capture_snapshot_for_publish(
+        ctx,
+        snapshot_path,
+        rootfs,
+        initramfs_stamp,
+        layout,
+        trace_log,
+        base_snapshot,
+        force_full,
+        run_log,
+        owner_run_id,
+        generation_id,
+    )?;
     if let Some(canonical_rootfs) = promote_rootfs_to {
-        promote_snapshot_rootfs(snapshot_path, canonical_rootfs, timings, run_log)?;
+        promote_snapshot_rootfs(
+            snapshot_path,
+            canonical_rootfs,
+            timings,
+            run_log,
+            Some(generation_id),
+            Some(owner_run_id),
+        )?;
     }
     timings.event("snapshot.done");
     Ok(())
@@ -4815,6 +5728,8 @@ fn promote_snapshot_rootfs(
     canonical_rootfs: &Path,
     timings: &TimingLog,
     run_log: &RunLog,
+    generation_id: Option<&str>,
+    owner_run_id: Option<&str>,
 ) -> Result<()> {
     let snapshot_rootfs = snapshot_path.join("rootfs.ext4");
     if snapshot_rootfs == canonical_rootfs {
@@ -4837,7 +5752,9 @@ fn promote_snapshot_rootfs(
     let temp = parent.join(format!(".{file_name}.promote"));
     timings.event("snapshot.rootfs.promote.begin");
     run_log.line(format!(
-        "snapshot.rootfs.promote source={} dest={}",
+        "snapshot.rootfs.promote owner_run_id={} generation_id={} source={} dest={}",
+        owner_run_id.unwrap_or("unknown"),
+        generation_id.unwrap_or("unknown"),
         snapshot_rootfs.display(),
         canonical_rootfs.display()
     ));
@@ -4851,68 +5768,98 @@ fn promote_snapshot_rootfs(
         )
     })?;
     timings.event("snapshot.rootfs.promote.done");
+    run_log.line(format!(
+        "snapshot.rootfs.promote.done owner_run_id={} generation_id={} dest={}",
+        owner_run_id.unwrap_or("unknown"),
+        generation_id.unwrap_or("unknown"),
+        canonical_rootfs.display()
+    ));
     Ok(())
 }
 
-fn snapshot_with_file_copy_full(
+fn capture_snapshot_for_publish(
     ctx: &KrunContext,
     snapshot_path: &Path,
     rootfs: &Path,
     initramfs_stamp: &Path,
+    layout: &Layout,
     trace_log: Option<&TraceLog>,
+    base_snapshot: Option<&Path>,
+    force_full: bool,
+    run_log: &RunLog,
+    owner_run_id: &str,
+    generation_id: &str,
 ) -> Result<()> {
-    let parent = snapshot_path
-        .parent()
-        .context("snapshot path has no parent")?;
-    let name = snapshot_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("snapshot path has no file name")?;
-    let temp = parent.join(format!(".{name}.full"));
+    cleanup_snapshot_publish_paths(snapshot_path, run_log)?;
+    let temp = snapshot_publish_temp(snapshot_path)?;
     remove_path_if_exists(&temp)?;
+    if !force_full {
+        seed_incremental_snapshot(&temp, base_snapshot, snapshot_path, run_log)?;
+    }
     ctx.snapshot_with_file_copy(&temp, rootfs, "rootfs.ext4")?;
     if let Err(e) = validate_snapshot_rootfs(&temp) {
         let _ = remove_path_if_exists(&temp);
         return Err(e);
     }
-    remove_path_if_exists(snapshot_path)?;
-    fs::rename(&temp, snapshot_path)
-        .with_context(|| format!("rename {} to {}", temp.display(), snapshot_path.display()))?;
-    copy_snapshot_stamp(snapshot_path, initramfs_stamp, trace_log)?;
+    copy_snapshot_stamp(&temp, initramfs_stamp, trace_log)?;
+    copy_host_share_state_to_snapshot(layout, &temp)?;
+    write_snapshot_lifecycle_manifest(&temp, generation_id, owner_run_id, rootfs)?;
+    publish_snapshot_dir(snapshot_path, &temp, run_log, owner_run_id, generation_id)?;
+    Ok(())
+}
+
+fn publish_snapshot_dir(
+    snapshot_path: &Path,
+    temp: &Path,
+    run_log: &RunLog,
+    owner_run_id: &str,
+    generation_id: &str,
+) -> Result<()> {
+    let previous = snapshot_publish_previous(snapshot_path)?;
+    run_log.line(format!(
+        "snapshot.publish.begin owner_run_id={} generation_id={} temp={} dest={} previous={}",
+        owner_run_id,
+        generation_id,
+        temp.display(),
+        snapshot_path.display(),
+        previous.display()
+    ));
+    remove_path_if_exists(&previous)?;
+    let had_previous = snapshot_path.exists();
+    if had_previous {
+        fs::rename(snapshot_path, &previous).with_context(|| {
+            format!(
+                "move previous snapshot {} to {}",
+                snapshot_path.display(),
+                previous.display()
+            )
+        })?;
+    }
+    match fs::rename(temp, snapshot_path) {
+        Ok(()) => {}
+        Err(e) => {
+            if had_previous && previous.exists() && !snapshot_path.exists() {
+                let _ = fs::rename(&previous, snapshot_path);
+            }
+            return Err(e).with_context(|| {
+                format!("publish {} to {}", temp.display(), snapshot_path.display())
+            });
+        }
+    }
+    if previous.exists() {
+        remove_path_if_exists(&previous)?;
+    }
+    run_log.line(format!(
+        "snapshot.publish.done owner_run_id={} generation_id={} dest={}",
+        owner_run_id,
+        generation_id,
+        snapshot_path.display()
+    ));
     Ok(())
 }
 
 fn validate_snapshot_rootfs(snapshot_path: &Path) -> Result<()> {
     crate::init::ensure_ext4_has_no_errors(&snapshot_path.join("rootfs.ext4"), "snapshot rootfs")
-}
-
-fn quarantine_snapshot(snapshot_path: &Path, run_log: &RunLog, reason: &str) {
-    if !snapshot_path.exists() {
-        return;
-    }
-    let Some(parent) = snapshot_path.parent() else {
-        return;
-    };
-    let Some(name) = snapshot_path.file_name().and_then(|name| name.to_str()) else {
-        return;
-    };
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let quarantine = parent.join(format!("{name}.bad.{stamp}"));
-    match fs::rename(snapshot_path, &quarantine) {
-        Ok(()) => run_log.line(format!(
-            "snapshot.quarantine path={} dest={} reason={reason}",
-            snapshot_path.display(),
-            quarantine.display()
-        )),
-        Err(e) => run_log.line(format!(
-            "snapshot.quarantine.error path={} dest={} reason={reason} error={e}",
-            snapshot_path.display(),
-            quarantine.display()
-        )),
-    }
 }
 
 fn seed_incremental_snapshot(

@@ -73,3 +73,14 @@ fn open_url_round_trips_with_result() {
     let decoded: Message = postcard::from_bytes(&encoded).expect("decode response");
     assert_eq!(decoded, response);
 }
+
+#[test]
+fn port_listeners_round_trip() {
+    let message = Message::PortListeners {
+        ports: vec![3000, 5173, 3773],
+    };
+    let encoded = postcard::to_allocvec(&message).expect("encode");
+    let decoded: Message = postcard::from_bytes(&encoded).expect("decode");
+
+    assert_eq!(decoded, message);
+}

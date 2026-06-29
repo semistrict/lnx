@@ -57,7 +57,6 @@ function collectOutput(stream: ReadableStream<Uint8Array>) {
 const portableEnv = {
   LNX_BROKER_IDLE_TTL_MS: "30000",
   LNX_INGRESS_STATE_DIR: join(ctx.tmpdir, "disabled-ingress"),
-  LNX_ROOTFS_BACKEND: "block",
 };
 
 try {

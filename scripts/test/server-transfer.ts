@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { link, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { assertEq, repoRoot, run, sleep, spawn, testStep } from "./lib";
 
 const root = repoRoot();
@@ -13,6 +13,12 @@ const sourceInstance = "server-source";
 const targetInstance = "server-target";
 const port = await freePort();
 const url = `http://127.0.0.1:${port}`;
+const sharesStamp = [
+  "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1",
+  `home=${homedir()}`,
+  "net=gvproxy",
+  "",
+].join("\n");
 
 try {
   await rm(base, { recursive: true, force: true });
@@ -27,7 +33,7 @@ try {
   );
   await writeFile(join(sourceBase, "instances", sourceInstance, "memory-snapshots", "latest", "pages.img"), "pages");
   await writeFile(join(sourceBase, "instances", sourceInstance, "memory-snapshots", "latest", "vmstate.bin"), "vmstate");
-  await writeFile(join(sourceBase, "instances", sourceInstance, "memory-snapshots", "latest", "shares.stamp"), "shares");
+  await writeFile(join(sourceBase, "instances", sourceInstance, "memory-snapshots", "latest", "shares.stamp"), sharesStamp);
   await writeFile(join(sourceBase, "instances", sourceInstance, "memory-snapshots", "latest", "initramfs.stamp"), "stamp");
 
   const server = spawn([lnxBin, "server", "--listen", `127.0.0.1:${port}`], {

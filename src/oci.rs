@@ -340,6 +340,13 @@ fn build_rootfs_with_instance(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+    let built = staging.join("rootfs.ext4");
+    if !built.exists() {
+        bail!(
+            "rootfs build completed but {} is not visible on the host; use a staging directory that is not isolated by host-share copy-on-write",
+            built.display()
+        );
+    }
     Ok(())
 }
 

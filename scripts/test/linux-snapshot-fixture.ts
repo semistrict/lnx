@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { chmod, mkdir, readdir, readFile, rm } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
   assertContains,
@@ -21,7 +21,8 @@ const ctx = defaultContext("linux-snapshot-fixture");
 const output =
   Bun.env.LNX_LINUX_SNAPSHOT_FIXTURE_OUT ??
   join(ctx.repoRoot, "target", "linux-macos-snapshot-fixture");
-const cwd = join(ctx.repoRoot, "target", `lnx-linux-fixture-${process.pid}`);
+const hostHome = Bun.env.HOME ?? "";
+const cwd = join(hostHome, ".lnx", "test-work", `linux-snapshot-fixture-${process.pid}`);
 const linuxTarget = "aarch64-unknown-linux-musl";
 const linuxLnx = join(ctx.repoRoot, "target", linuxTarget, "debug", "lnx");
 const linuxLinker =
@@ -31,7 +32,6 @@ const linuxLinker =
 const linuxGvproxy = join(ctx.repoRoot, "target", "gvproxy-linux-arm64");
 const gvproxyUrl =
   "https://github.com/containers/gvisor-tap-vsock/releases/download/v0.8.9/gvproxy-linux-arm64";
-const hostHome = Bun.env.HOME ?? "";
 const kernel = Bun.env.LNX_NESTED_INNER_KERNEL ?? join(hostHome, ".lnx", "vmlinuz");
 const outerKernel = Bun.env.LNX_NESTED_OUTER_KERNEL ?? join(hostHome, ".lnx", "vmlinuz");
 const rootfs =
@@ -70,6 +70,16 @@ async function shrinkRootfsToMinimum(path: string) {
   await run([resize2fs, "-M", path], {
     timeoutMs: 180_000,
   });
+  await alignRootfsForPmem(path);
+}
+
+async function alignRootfsForPmem(path: string) {
+  await run([
+    "python3",
+    "-c",
+    "import os, sys\nalign = 2 * 1024 * 1024\npath = sys.argv[1]\nsize = os.path.getsize(path)\nos.truncate(path, ((size + align - 1) // align) * align)\n",
+    path,
+  ]);
 }
 
 async function cloneShrunkRootfs(src: string, dest: string) {
@@ -157,6 +167,20 @@ print("linux-source-after", flush=True)
     `checkpointName=${quoteShell(checkpointName)}`,
     "source_out=/tmp/lnx-linux-fixture-source.out",
     "source_err=/tmp/lnx-linux-fixture-source.err",
+    "dump_inner_logs() {",
+    "  status=$?",
+    "  echo '--- inner source stdout ---' >&2",
+    "  cat \"$source_out\" >&2 2>/dev/null || true",
+    "  echo '--- inner source stderr ---' >&2",
+    "  cat \"$source_err\" >&2 2>/dev/null || true",
+    "  for log in \"$LNX_RUN_BASE/instances/$inner_instance/lnx.log\" \"$LNX_RUN_BASE/instances/$inner_instance/owner.log\" \"$LNX_RUN_BASE/instances/$inner_instance/console.log\"; do",
+    "    [ -e \"$log\" ] || continue",
+    "    echo \"--- $log ---\" >&2",
+    "    tail -n 200 \"$log\" >&2 || true",
+    "  done",
+    "  exit \"$status\"",
+    "}",
+    "trap dump_inner_logs ERR",
     "rm -f \"$source_out\" \"$source_err\"",
     "\"$LNX_BIN\" --instance \"$inner_instance\" --no-host-shares --memory-mib 512 --cpus 1 python3 - >\"$source_out\" 2>\"$source_err\" <<'PY' &",
     sourcePython,
@@ -199,6 +223,7 @@ try {
   const innerRootfs = join(innerBase, "instances", innerInstance, "rootfs.ext4");
   await cloneSparseImage(rootfs, innerRootfs);
   await shrinkRootfsToMinimum(innerRootfs);
+  await writeFile(join(innerBase, "instances", innerInstance, "vm-initialized"), "1\n");
 
   await run(
     [
@@ -218,10 +243,9 @@ try {
     ],
     {
       cwd,
-      timeoutMs: 180_000,
+      timeoutMs: 600_000,
       env: {
         LNX_BROKER_IDLE_TTL_MS: "250",
-        LNX_ROOTFS_BACKEND: "block",
       },
     },
   );
@@ -252,10 +276,9 @@ try {
     ],
     {
       cwd,
-      timeoutMs: 420_000,
+      timeoutMs: 900_000,
       env: {
         LNX_BROKER_IDLE_TTL_MS: "250",
-        LNX_ROOTFS_BACKEND: "block",
       },
     },
   );

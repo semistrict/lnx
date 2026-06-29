@@ -548,6 +548,68 @@ mod tests {
     }
 
     #[test]
+    fn descendant_whiteout_directory_does_not_hide_ancestor() {
+        let temp = TempRoot::new("descendant-whiteout");
+        let share = temp.path().join("share");
+        let state = temp.path().join("state");
+        fs::create_dir(&share).unwrap();
+        fs::create_dir(share.join("src")).unwrap();
+        fs::create_dir(share.join("src/artifact-fs")).unwrap();
+        fs::write(share.join("src/artifact-fs/main.go"), b"package main\n").unwrap();
+        init_git_repo(&share, "src/artifact-fs/artifact-fs\n");
+        let fs = new_fs_with_unshare(&share, &state);
+        let ctx = test_ctx();
+
+        fs::create_dir_all(state.join("whiteouts/src/artifact-fs")).unwrap();
+
+        let src = fs.lookup(ctx, fuse::ROOT_ID, &cstr("src")).unwrap();
+        let project = fs.lookup(ctx, src.inode, &cstr("artifact-fs")).unwrap();
+        fs.lookup(ctx, project.inode, &cstr("main.go")).unwrap();
+        let (handle, _) = fs
+            .opendir(ctx, project.inode, libc::O_RDONLY as u32)
+            .unwrap();
+        let handle = handle.unwrap();
+        let mut names = Vec::new();
+        fs.readdir(ctx, project.inode, handle, 4096, 0, |entry| {
+            names.push(String::from_utf8_lossy(entry.name).into_owned());
+            Ok(1)
+        })
+        .unwrap();
+        assert!(names.iter().any(|name| name == "main.go"));
+
+        let entries = fs.overlay_dir_entries_from_paths(Path::new("src")).unwrap();
+        assert!(entries.contains_key(b"artifact-fs".as_slice()));
+    }
+
+    #[test]
+    fn direct_whiteout_can_coexist_with_descendant_whiteout_directory() {
+        let temp = TempRoot::new("direct-descendant-whiteout");
+        let share = temp.path().join("share");
+        let state = temp.path().join("state");
+        fs::create_dir(&share).unwrap();
+        fs::create_dir(share.join("src")).unwrap();
+        fs::create_dir(share.join("src/artifact-fs")).unwrap();
+        init_git_repo(&share, "src/artifact-fs/\n");
+        let fs = new_fs_with_unshare(&share, &state);
+        let ctx = test_ctx();
+
+        fs::create_dir_all(state.join("whiteouts/src/artifact-fs/nested")).unwrap();
+        let src = fs.lookup(ctx, fuse::ROOT_ID, &cstr("src")).unwrap();
+        fs.rmdir(ctx, src.inode, &cstr("artifact-fs")).unwrap();
+
+        assert!(
+            state
+                .join("whiteouts/src/artifact-fs/.lnx-whiteout")
+                .exists()
+        );
+        let err = match fs.lookup(ctx, src.inode, &cstr("artifact-fs")) {
+            Ok(_) => panic!("direct whiteout should hide lower directory"),
+            Err(err) => err,
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+    }
+
+    #[test]
     fn gitignored_rmdir_lower_file_returns_enotdir() {
         let temp = TempRoot::new("gitignored-rmdir-file");
         let share = temp.path().join("share");
@@ -1313,6 +1375,8 @@ pub struct PassthroughFs {
 }
 
 impl PassthroughFs {
+    const WHITEOUT_MARKER: &'static str = ".lnx-whiteout";
+
     pub fn new(cfg: Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<PassthroughFs> {
         let root = CString::new(cfg.root_dir.as_str()).expect("CString::new failed");
 
@@ -1599,7 +1663,13 @@ impl PassthroughFs {
         let Some(path) = self.whiteout_path(rel_path) else {
             return Ok(false);
         };
-        Self::has_path(&path)
+        match Self::path_metadata(&path)? {
+            Some(metadata) if metadata.file_type().is_dir() => {
+                Self::has_path(&path.join(Self::WHITEOUT_MARKER))
+            }
+            Some(_) => Ok(true),
+            None => Ok(false),
+        }
     }
 
     fn whiteout_covers(&self, rel_path: &Path) -> io::Result<bool> {
@@ -1621,6 +1691,13 @@ impl PassthroughFs {
         let Some(path) = self.whiteout_path(rel_path) else {
             return Ok(());
         };
+        if Self::path_metadata(&path)?.is_some_and(|metadata| metadata.file_type().is_dir()) {
+            match fs::remove_file(path.join(Self::WHITEOUT_MARKER)) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => return Err(linux_error(err)),
+            }
+        }
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1632,6 +1709,10 @@ impl PassthroughFs {
         let Some(path) = self.whiteout_path(rel_path) else {
             return Ok(());
         };
+        if Self::path_metadata(&path)?.is_some_and(|metadata| metadata.file_type().is_dir()) {
+            fs::write(path.join(Self::WHITEOUT_MARKER), b"whiteout\n").map_err(linux_error)?;
+            return Ok(());
+        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(linux_error)?;
         }
@@ -1702,6 +1783,17 @@ impl PassthroughFs {
         if let Some(upper) = self.upper_path(rel_path)
             && Self::has_path(&upper)?
         {
+            let upper_metadata = Self::path_metadata(&upper)?;
+            let lower = self.lower_path(rel_path);
+            if upper_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.file_type().is_dir())
+                && Self::path_metadata(&lower)?
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.file_type().is_dir())
+            {
+                return Ok(OverlayPath::Lower(self.rel_path_to_cstring(rel_path)?));
+            }
             return Ok(OverlayPath::Upper(self.path_to_cstring(&upper)?));
         }
         let _ = name;
@@ -2367,6 +2459,13 @@ impl PassthroughFs {
         {
             for entry in fs::read_dir(whiteouts).map_err(linux_error)? {
                 let entry = entry.map_err(linux_error)?;
+                if entry.file_name() == Self::WHITEOUT_MARKER {
+                    continue;
+                }
+                let rel_entry = rel_path.join(entry.file_name());
+                if !self.direct_whiteout_exists(&rel_entry)? {
+                    continue;
+                }
                 hidden.insert(
                     entry
                         .file_name()

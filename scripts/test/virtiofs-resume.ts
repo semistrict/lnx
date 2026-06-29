@@ -34,7 +34,11 @@ async function discardLatestSnapshot() {
 async function waitForSourceReady(): Promise<void> {
   const deadline = Date.now() + 120_000;
   while (Date.now() < deadline) {
-    const result = await lnx(ctx, ["bash", "-lc", "test -e /tmp/virtiofs-fork-ready"], { check: false, cwd });
+    const result = await lnx(ctx, ["bash", "-lc", "test -e /tmp/virtiofs-fork-ready"], {
+      check: false,
+      cwd,
+      env: { LNX_HOST_SHARE_DAX: "1" },
+    });
     if (result.status === 0) return;
     await sleep(250);
   }
@@ -58,6 +62,7 @@ try {
       {
         cwd,
         timeoutMs: 180_000,
+        env: { LNX_HOST_SHARE_DAX: "1" },
         stdin: String.raw`
 import mmap
 import os
@@ -104,6 +109,8 @@ finally:
   });
 
   await testStep("restored virtiofs sees host edits after prior guest read", async () => {
+    await waitForVmSuspend(ctx);
+    await discardLatestSnapshot();
     await write(join(cwd, "host-edited.txt"), "before\n");
 
     const before = await lnx(ctx, ["cat", "host-edited.txt"], { cwd, timeoutMs: 180_000 });
@@ -147,7 +154,7 @@ finally:
         "python3",
         "-",
       ],
-      { cwd, stdin: "pipe" },
+      { cwd, stdin: "pipe", env: { LNX_HOST_SHARE_DAX: "1" } },
     );
     const ownerScript = String.raw`
 import mmap
@@ -200,7 +207,14 @@ finally:
 
     try {
       await waitForSourceReady();
-      assertEq((await run([ctx.lnxBin, "--instance", ctx.instance, "fork", forkInstance], { timeoutMs: 240_000 })).stdout, forkInstance, "fork name");
+      assertEq(
+        (await run([ctx.lnxBin, "--instance", ctx.instance, "fork", forkInstance], {
+          timeoutMs: 240_000,
+          env: { LNX_HOST_SHARE_DAX: "1" },
+        })).stdout,
+        forkInstance,
+        "fork name",
+      );
       const forked = await run(
         [
           ctx.lnxBin,
@@ -210,7 +224,7 @@ finally:
           "-lc",
           "touch /tmp/virtiofs-fork-go; for i in $(seq 1 600); do test -e /tmp/virtiofs-fork-result && break; sleep 0.1; done; cat /tmp/virtiofs-fork-result",
         ],
-        { cwd, timeoutMs: 180_000 },
+        { cwd, timeoutMs: 180_000, env: { LNX_HOST_SHARE_DAX: "1" } },
       );
       assertEq(forked.stdout, "ok", "fork restored process kept fd and mmap usable");
       const host = await read(join(cwd, "fork-open.bin"));

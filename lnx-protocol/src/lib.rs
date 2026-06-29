@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +78,9 @@ pub enum Message {
     OpenUrlResult {
         channel_id: u64,
         ok: bool,
+    },
+    PortListeners {
+        ports: Vec<u16>,
     },
     SnapshotReady,
 }

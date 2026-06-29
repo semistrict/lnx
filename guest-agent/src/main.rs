@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 use std::{env, fs, thread};
 
 use lnx_protocol::{MAX_MESSAGE_SIZE, Message, PROTOCOL_VERSION};
@@ -107,6 +108,7 @@ const WANTS_LINK_C: &[u8] =
 const SNAPSHOT_RESUME_READ_TIMEOUT_USECS: i64 = 500_000;
 const RESTORE_ENTROPY_MIN_BYTES: usize = 32;
 const RESTORE_ENTROPY_MAX_BYTES: usize = 1024;
+const LISTENER_MONITOR_INTERVAL_MS: u64 = 1000;
 
 enum ChannelInput {
     Data(Vec<u8>),
@@ -383,7 +385,8 @@ fn mount_package_store() {
 
 fn mount_package_output() {
     if env::var("LNX_VIRTIOFS_NIX_ROOT").ok().as_deref() == Some("1") {
-        mount_virtiofs("lnx-nix-root", "/run/lnx/nix", false);
+        let read_only = env::var("LNX_VIRTIOFS_NIX_ROOT_RW").ok().as_deref() != Some("1");
+        mount_virtiofs("lnx-nix-root", "/run/lnx/nix", read_only);
     }
 }
 
@@ -515,9 +518,8 @@ fn sync_clock_from_host() {
     let _ = unsafe { clock_settime(CLOCK_REALTIME, &ts) };
 }
 
-/// The host passes a routable address when the VM sits on the shared vmnet
-/// network; without one the VM is behind its own gvproxy NAT at the fixed
-/// gvproxy addresses.
+/// The host can pass an explicit address override; without one the VM is
+/// behind gvproxy NAT at the fixed gvproxy addresses.
 fn network_config() -> (String, String) {
     match (env::var("LNX_NET_IP"), env::var("LNX_NET_GATEWAY")) {
         (Ok(ip), Ok(gateway)) if !ip.is_empty() && !gateway.is_empty() => (ip, gateway),
@@ -972,9 +974,9 @@ fn init_mode() -> ! {
     let root_device =
         CString::new(root_device).unwrap_or_else(|_| CString::new("/dev/pmem0").unwrap());
     let root_options = if root_device.as_bytes() == b"/dev/pmem0" {
-        b"errors=continue,dax\0".as_slice()
+        b"errors=panic,dax\0".as_slice()
     } else {
-        b"errors=continue\0".as_slice()
+        b"errors=panic\0".as_slice()
     };
     mount_fs(
         root_device.as_bytes_with_nul(),
@@ -1398,63 +1400,17 @@ fn xdg_open_mode(args: &[String]) -> ! {
         write_all(STDERR_FILENO, b"xdg-open: only URL targets are supported\n");
         unsafe { _exit(2) }
     }
-    let instance = env::var("LNX_INSTANCE").unwrap_or_else(|_| "default".to_string());
-    let domain = env::var("LNX_INGRESS_DOMAIN").unwrap_or_else(|_| "lnx".to_string());
-    let url = rewrite_xdg_open_url(target, &instance, &domain);
-    if url.len() > MAX_CONTROL_PAYLOAD {
+    if target.len() > MAX_CONTROL_PAYLOAD {
         write_all(STDERR_FILENO, b"xdg-open: URL is too long\n");
         unsafe { _exit(2) }
     }
     let socket = env::var(CONTROL_SOCKET_ENV).unwrap_or_else(|_| CONTROL_SOCKET.to_string());
     let fd = connect_unix(&socket);
-    if !write_frame(fd, FRAME_CONTROL_OPEN_URL, url.as_bytes()) {
+    if !write_frame(fd, FRAME_CONTROL_OPEN_URL, target.as_bytes()) {
         unsafe { _exit(1) }
     }
     let status = read_local_control_response(fd);
     unsafe { _exit(status) }
-}
-
-fn rewrite_xdg_open_url(target: &str, instance: &str, domain: &str) -> String {
-    let Some((scheme, rest)) = target.split_once("://") else {
-        return target.to_string();
-    };
-    if scheme != "http" && scheme != "https" {
-        return target.to_string();
-    }
-    let authority_end = rest
-        .find(|c| matches!(c, '/' | '?' | '#'))
-        .unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    let suffix = &rest[authority_end..];
-    if authority.contains('@') {
-        return target.to_string();
-    }
-    let Some((host, port)) = parse_localhost_authority(authority) else {
-        return target.to_string();
-    };
-    if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
-        return target.to_string();
-    }
-    let instance = if instance.is_empty() {
-        "default"
-    } else {
-        instance
-    };
-    let domain = if domain.is_empty() { "lnx" } else { domain };
-    format!("{scheme}://p{port}-{instance}.{domain}{suffix}")
-}
-
-fn parse_localhost_authority(authority: &str) -> Option<(&str, u16)> {
-    if let Some(rest) = authority.strip_prefix('[') {
-        let (host, tail) = rest.split_once(']')?;
-        let port = tail.strip_prefix(':')?.parse::<u16>().ok()?;
-        return Some((host, port));
-    }
-    let (host, port) = authority.rsplit_once(':')?;
-    if host.contains(':') {
-        return None;
-    }
-    Some((host, port.parse::<u16>().ok()?))
 }
 
 fn sockaddr_un(path: &str) -> SockaddrUn {
@@ -1680,6 +1636,91 @@ fn write_message_locked(agent_fd: &Arc<Mutex<c_int>>, message: &Message) -> bool
         return false;
     };
     write_message(*fd, message)
+}
+
+fn publish_agent_fd_and_hello(agent_fd: &Arc<Mutex<c_int>>, fd: c_int) -> bool {
+    let Ok(mut shared) = agent_fd.lock() else {
+        return false;
+    };
+    *shared = fd;
+    write_message(
+        *shared,
+        &Message::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )
+}
+
+fn listening_tcp_ports() -> Vec<u16> {
+    let mut ports = Vec::new();
+    collect_listening_tcp_ports("/proc/net/tcp", false, &mut ports);
+    collect_listening_tcp_ports("/proc/net/tcp6", true, &mut ports);
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+fn collect_listening_tcp_ports(path: &str, ipv6: bool, ports: &mut Vec<u16>) {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return;
+    };
+    for line in raw.lines().skip(1) {
+        if let Some(port) = parse_proc_net_tcp_listener(line, ipv6) {
+            ports.push(port);
+        }
+    }
+}
+
+fn parse_proc_net_tcp_listener(line: &str, ipv6: bool) -> Option<u16> {
+    let mut fields = line.split_whitespace();
+    let _sl = fields.next()?;
+    let local = fields.next()?;
+    let _remote = fields.next()?;
+    let state = fields.next()?;
+    if state != "0A" {
+        return None;
+    }
+    let (addr, port_hex) = local.split_once(':')?;
+    let port = u16::from_str_radix(port_hex, 16).ok()?;
+    if port <= 1024 {
+        return None;
+    }
+    let local = if ipv6 {
+        is_local_tcp6_addr(addr)
+    } else {
+        is_local_tcp4_addr(addr)
+    };
+    local.then_some(port)
+}
+
+fn is_local_tcp4_addr(addr: &str) -> bool {
+    matches!(addr, "00000000" | "0100007F")
+}
+
+fn is_local_tcp6_addr(addr: &str) -> bool {
+    if addr.len() != 32 {
+        return false;
+    }
+    addr == "00000000000000000000000000000000" || addr == "00000000000000000000000001000000"
+}
+
+fn start_listener_monitor(agent_fd: Arc<Mutex<c_int>>) {
+    thread::spawn(move || {
+        let mut last = Vec::new();
+        loop {
+            let ports = listening_tcp_ports();
+            if ports != last {
+                let _ = write_message_locked(
+                    &agent_fd,
+                    &Message::PortListeners {
+                        ports: ports.clone(),
+                    },
+                );
+                last = ports;
+            }
+            thread::sleep(Duration::from_millis(LISTENER_MONITOR_INTERVAL_MS));
+        }
+    });
 }
 
 fn set_nonblocking(fd: c_int) -> bool {
@@ -2430,6 +2471,11 @@ fn run_channel_pipe(
                     write_decimal(STDERR_FILENO, errno() as u64);
                     write_all(STDERR_FILENO, b" cwd=");
                     write_all(STDERR_FILENO, cwd.as_bytes());
+                    write_all(
+                        STDERR_FILENO,
+                        b"\nlnx: working directory is not visible inside the VM; if this is a host-shared path, run: lnx fs unshare ",
+                    );
+                    write_all(STDERR_FILENO, cwd.as_bytes());
                     child_die(b"\n");
                 }
             }
@@ -2693,12 +2739,8 @@ fn agent_loop() {
     let mut fd = connect_vsock(AGENT_PORT);
     log!("agent.loop.connected fd={fd}");
     let agent_fd = Arc::new(Mutex::new(fd));
-    let _ = write_message_locked(
-        &agent_fd,
-        &Message::Hello {
-            version: PROTOCOL_VERSION,
-        },
-    );
+    let _ = publish_agent_fd_and_hello(&agent_fd, fd);
+    start_listener_monitor(Arc::clone(&agent_fd));
     let mut channels: Vec<(u64, ChannelState)> = Vec::new();
     loop {
         let message = read_message(fd);
@@ -2709,15 +2751,7 @@ fn agent_loop() {
             }
             fd = reconnect_after_snapshot_point();
             log!("agent.loop.reconnected fd={fd}");
-            if let Ok(mut shared) = agent_fd.lock() {
-                *shared = fd;
-            }
-            let _ = write_message_locked(
-                &agent_fd,
-                &Message::Hello {
-                    version: PROTOCOL_VERSION,
-                },
-            );
+            let _ = publish_agent_fd_and_hello(&agent_fd, fd);
             continue;
         };
         match message {
@@ -2914,49 +2948,61 @@ pub fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_BROWSER, DEFAULT_PATH, EXEC_HOME, make_child_exec, rewrite_xdg_open_url};
+    use super::{
+        DEFAULT_BROWSER, DEFAULT_PATH, EXEC_HOME, make_child_exec, parse_proc_net_tcp_listener,
+    };
 
     #[test]
-    fn xdg_open_rewrites_localhost_http_urls_to_ingress_hosts() {
+    fn proc_net_tcp_listener_parser_keeps_loopback_and_wildcard_high_ports() {
         assert_eq!(
-            rewrite_xdg_open_url("http://localhost:3773/pair#token=abc", "default", "lnx"),
-            "http://p3773-default.lnx/pair#token=abc"
-        );
-    }
-
-    #[test]
-    fn xdg_open_rewrites_loopback_https_urls_with_query() {
-        assert_eq!(
-            rewrite_xdg_open_url(
-                "https://127.0.0.1:8443/callback?code=abc#done",
-                "work",
-                "lnx"
+            parse_proc_net_tcp_listener(
+                "  0: 0100007F:0EBB 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000 0 1 1 0000000000000000 100 0 0 10 0",
+                false,
             ),
-            "https://p8443-work.lnx/callback?code=abc#done"
+            Some(3771)
+        );
+        assert_eq!(
+            parse_proc_net_tcp_listener(
+                "  0: 00000000:1455 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000 0 1 1 0000000000000000 100 0 0 10 0",
+                false,
+            ),
+            Some(5205)
         );
     }
 
     #[test]
-    fn xdg_open_rewrites_ipv6_loopback_urls() {
+    fn proc_net_tcp_listener_parser_rejects_low_ports_and_non_listeners() {
         assert_eq!(
-            rewrite_xdg_open_url("http://[::1]:5173/", "dev", "lnx"),
-            "http://p5173-dev.lnx/"
+            parse_proc_net_tcp_listener(
+                "  0: 0100007F:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000 0 1 1 0000000000000000 100 0 0 10 0",
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            parse_proc_net_tcp_listener(
+                "  0: 0100007F:0EBB 00000000:0000 01 00000000:00000000 00:00000000 00000000  1000 0 1 1 0000000000000000 100 0 0 10 0",
+                false,
+            ),
+            None
         );
     }
 
     #[test]
-    fn xdg_open_leaves_non_loopback_urls_alone() {
+    fn proc_net_tcp6_listener_parser_keeps_loopback_and_wildcard() {
         assert_eq!(
-            rewrite_xdg_open_url("https://example.com:443/", "default", "lnx"),
-            "https://example.com:443/"
+            parse_proc_net_tcp_listener(
+                "  0: 00000000000000000000000000000000:1455 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 1 1 0000000000000000 100 0 0 10 0",
+                true,
+            ),
+            Some(5205)
         );
-    }
-
-    #[test]
-    fn xdg_open_leaves_localhost_without_explicit_port_alone() {
         assert_eq!(
-            rewrite_xdg_open_url("http://localhost/path", "default", "lnx"),
-            "http://localhost/path"
+            parse_proc_net_tcp_listener(
+                "  0: 00000000000000000000000001000000:0EBB 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 1 1 0000000000000000 100 0 0 10 0",
+                true,
+            ),
+            Some(3771)
         );
     }
 

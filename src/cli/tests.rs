@@ -80,6 +80,18 @@ fn default_package_bootstrap_skips_internal_builders() {
 }
 
 #[test]
+fn explicit_package_install_infers_binary_from_flake_attr() {
+    assert_eq!(
+        infer_package_binaries(&["nixpkgs#go".to_string()]),
+        vec!["go".to_string()]
+    );
+    assert_eq!(
+        infer_package_binaries(&["github:NixOS/nixpkgs/nixos-unstable#nodejs_latest".to_string()]),
+        vec!["nodejs_latest".to_string()]
+    );
+}
+
+#[test]
 fn fs_unshare_parses_path() {
     let cli = Cli::try_parse_from(["lnx", "fs", "unshare", "/Users/test/project"])
         .expect("parse fs unshare");

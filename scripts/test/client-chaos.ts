@@ -5,6 +5,11 @@ const ctx = defaultContext("client-chaos");
 try {
   await prepareContext(ctx);
 
+  await testStep("warm up instance", async () => {
+    const ready = await lnx(ctx, ["echo", "ready"], { timeoutMs: 180_000 });
+    assertEq(ready.stdout, "ready", "warmup boot");
+  });
+
   await testStep("disconnecting non-pty client does not poison broker", async () => {
     const proc = spawnLnx(ctx, ["bash", "-lc", "trap 'exit 0' TERM; sleep 60"], {
       stdout: "pipe",

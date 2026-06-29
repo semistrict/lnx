@@ -190,6 +190,7 @@ fn clone_snapshot_dir(src: &Path, dest: &Path) -> Result<()> {
         "vmstate.bin",
         "pages.img",
         "rootfs.ext4",
+        "snapshot.meta",
         "checkpoint.meta",
         "initramfs.stamp",
         "shares.stamp",

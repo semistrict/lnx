@@ -12,6 +12,16 @@ Tests must encode intended correct behavior. Do not add normal-suite tests that
 pass because a known bug reproduces; keep temporary repros outside the passing
 suite until their expectations are flipped to the fixed behavior.
 
+## Signed Builds
+
+Always build, test, and install local binaries through the signing-aware Bun
+scripts. Use `bun run build`, `bun run release`, `bun run install`, and
+`bun run test` instead of raw `cargo build`, `cargo install`, or unscripted
+copies from `target/` when the resulting binary may run VMs or HVF
+code paths. If a direct Cargo command is unavoidable for a narrow check, do not
+treat its output as an installable or runnable VM binary until it has gone
+through the repo signing step.
+
 ## Kernel Builds
 
 The Depot kernel build is `.depot/workflows/kernel.yml`. It is manually

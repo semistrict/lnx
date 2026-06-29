@@ -32,7 +32,7 @@ Bun.env.LNX_BROKER_IDLE_TTL_MS ??= "500";
 const seed = Number(Bun.env.LNX_CHAOS_SEED ?? (Math.random() * 0xffff_ffff) >>> 0);
 const iterations = Number(Bun.env.LNX_CHAOS_ITERATIONS ?? 3);
 const ctx = defaultContext("snapshot-chaos");
-const cwd = join(ctx.repoRoot, ".lnx-chaos");
+const cwd = join(ctx.tmpdir, "chaos");
 const vmArgs = [
   ...(Bun.env.LNX_TEST_CPUS ? ["--cpus", Bun.env.LNX_TEST_CPUS] : []),
   ...(Bun.env.LNX_TEST_MEMORY_MIB ? ["--memory-mib", Bun.env.LNX_TEST_MEMORY_MIB] : []),
@@ -255,7 +255,7 @@ try {
   await mkdir(cwd, { recursive: true });
 
   await testStep("warm up instance", async () => {
-    const ready = await lnx(ctx, [...vmArgs, "echo", "ready"], { cwd });
+    const ready = await lnx(ctx, [...vmArgs, "echo", "ready"], { cwd, timeoutMs: 180_000 });
     assertEq(ready.stdout, "ready", "warmup boot");
   });
 

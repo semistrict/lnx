@@ -79,6 +79,16 @@ async function shrinkRootfsToMinimum(path: string) {
     );
   }
   await run([e2fsTool("resize2fs"), "-M", path], { timeoutMs: 180_000 });
+  await alignRootfsForPmem(path);
+}
+
+async function alignRootfsForPmem(path: string) {
+  await run([
+    "python3",
+    "-c",
+    "import os, sys\nalign = 2 * 1024 * 1024\npath = sys.argv[1]\nsize = os.path.getsize(path)\nos.truncate(path, ((size + align - 1) // align) * align)\n",
+    path,
+  ]);
 }
 
 async function cloneShrunkRootfs(src: string, dest: string) {
@@ -223,7 +233,6 @@ try {
         env: {
           LNX_BROKER_IDLE_TTL_MS: "250",
           LNX_INGRESS_STATE_DIR: join(cwd, "disabled-ingress"),
-          LNX_ROOTFS_BACKEND: "block",
         },
       },
     );

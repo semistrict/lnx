@@ -76,7 +76,6 @@ try {
           timeoutMs: 300_000,
           env: {
             LNX_BROKER_IDLE_TTL_MS: "250",
-            LNX_ROOTFS_BACKEND: "block",
             LNX_INGRESS_STATE_DIR: join(ctx.tmpdir, "disabled-ingress"),
           },
         },

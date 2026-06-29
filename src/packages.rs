@@ -87,7 +87,52 @@ impl StoreLayout {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.store.is_dir() && fs::symlink_metadata(self.profile_link()).is_ok()
+        self.store.is_dir()
+            && fs::symlink_metadata(self.profile_link()).is_ok()
+            && self
+                .resolve_profile_path("bin")
+                .is_some_and(|path| path.is_dir())
+    }
+
+    pub fn manifest_is_coherent(&self, manifest: &PackageManifest) -> bool {
+        manifest
+            .binaries
+            .iter()
+            .all(|binary| self.profile_binary_exists(binary))
+    }
+
+    pub fn profile_binary_exists(&self, binary: &str) -> bool {
+        self.resolve_profile_path(&format!("bin/{binary}"))
+            .is_some_and(|path| path.is_file())
+    }
+
+    fn resolve_profile_path(&self, suffix: &str) -> Option<PathBuf> {
+        let profile = self.resolve_store_link(&self.profile_link())?;
+        let mut path = profile;
+        for part in suffix.split('/').filter(|part| !part.is_empty()) {
+            path.push(part);
+            path = self.resolve_store_link(&path)?;
+        }
+        Some(path)
+    }
+
+    fn resolve_store_link(&self, path: &Path) -> Option<PathBuf> {
+        let link = match fs::read_link(path) {
+            Ok(link) => link,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                return Some(path.to_path_buf());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) => return Some(path.to_path_buf()),
+        };
+        if let Ok(store_relative) = link.strip_prefix("/nix/store") {
+            return Some(self.store.join(store_relative));
+        }
+        if link.is_absolute() {
+            Some(link)
+        } else {
+            path.parent().map(|parent| parent.join(link))
+        }
     }
 
     pub fn ensure(&self) -> Result<()> {
@@ -250,11 +295,17 @@ pub fn default_binaries() -> Vec<String> {
 
 pub fn install_script(packages: &[String], binaries: &[String]) -> String {
     let packages = shell_words(packages);
-    let version_checks = binaries
+    let binary_checks = binaries
         .iter()
         .map(|binary| {
-            let path = shell_quote(&format!("/run/lnx/nix/profiles/default/bin/{binary}"));
-            format!("{path} --version\n")
+            let path = format!("\"$profile/bin/{binary}\"");
+            format!(
+                r#"if [ ! -x {path} ]; then
+  echo "package profile does not provide executable: {binary}" >&2
+  exit 127
+fi
+"#
+            )
         })
         .collect::<String>();
     format!(
@@ -270,6 +321,7 @@ if ! command -v nix >/dev/null 2>&1; then
   exit 125
 fi
 nix --extra-experimental-features 'nix-command flakes' profile install --refresh --profile "$profile" {packages}
+{binary_checks}
 nix --extra-experimental-features 'nix-command flakes' path-info -r "$profile" | while IFS= read -r path; do
   name="${{path##*/}}"
   dest="$out/store/$name"
@@ -286,8 +338,10 @@ case "$target" in
   /nix/store/*) ;;
   *) echo "unexpected package profile target: $target" >&2; exit 1 ;;
 esac
-ln -sfn "$target" "$out/profiles/default"
-{version_checks}
+tmp_link="$out/profiles/.default.$$"
+rm -f "$tmp_link"
+ln -s "$target" "$tmp_link"
+mv -Tf "$tmp_link" "$out/profiles/default"
 "#
     )
 }
@@ -337,11 +391,33 @@ mod tests {
     fn is_ready_accepts_guest_absolute_profile_link() {
         let temp = tempfile::tempdir().unwrap();
         let layout = StoreLayout::resolve(temp.path());
-        fs::create_dir_all(&layout.store).unwrap();
+        fs::create_dir_all(layout.store.join("example-profile/bin")).unwrap();
         fs::create_dir_all(&layout.profiles).unwrap();
         std::os::unix::fs::symlink("/nix/store/example-profile", layout.profile_link()).unwrap();
 
         assert!(layout.is_ready());
+    }
+
+    #[test]
+    fn manifest_coherence_resolves_guest_store_symlinks_on_host() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = StoreLayout::resolve(temp.path());
+        fs::create_dir_all(layout.store.join("go-1/bin")).unwrap();
+        fs::write(layout.store.join("go-1/bin/go"), b"").unwrap();
+        fs::create_dir_all(layout.store.join("profile")).unwrap();
+        std::os::unix::fs::symlink("/nix/store/go-1/bin", layout.store.join("profile/bin"))
+            .unwrap();
+        fs::create_dir_all(&layout.profiles).unwrap();
+        std::os::unix::fs::symlink("/nix/store/profile", layout.profile_link()).unwrap();
+
+        assert!(layout.manifest_is_coherent(&PackageManifest {
+            packages: vec!["nixpkgs#go".to_string()],
+            binaries: vec!["go".to_string()],
+        }));
+        assert!(!layout.manifest_is_coherent(&PackageManifest {
+            packages: vec!["nixpkgs#go".to_string()],
+            binaries: vec!["node".to_string()],
+        }));
     }
 
     #[test]
@@ -354,7 +430,10 @@ mod tests {
         assert!(script.contains("'weird'\\''pkg'"));
         assert!(script.contains("--profile \"$profile\""));
         assert!(script.contains("readlink -f \"$profile\""));
-        assert!(script.contains("'/run/lnx/nix/profiles/default/bin/node' --version"));
+        assert!(script.contains("\"$profile/bin/node\""));
+        assert!(script.contains("package profile does not provide executable: node"));
+        assert!(script.contains("mv -Tf \"$tmp_link\" \"$out/profiles/default\""));
+        assert!(!script.contains("--version"));
         assert!(!script.contains("apt-get"));
         assert!(!script.contains("nixos.org/nix/install"));
         assert!(!script.contains("cp -a"));

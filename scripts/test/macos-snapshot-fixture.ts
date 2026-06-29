@@ -97,7 +97,6 @@ try {
       env: {
         LNX_BROKER_IDLE_TTL_MS: "250",
         LNX_INGRESS_STATE_DIR: join(ctx.tmpdir, "disabled-ingress"),
-        LNX_ROOTFS_BACKEND: "block",
       },
     },
   );
@@ -144,7 +143,6 @@ print("mac-source-after", flush=True)
         timeoutMs: 240_000,
         env: {
           LNX_INGRESS_STATE_DIR: join(ctx.tmpdir, "disabled-ingress"),
-          LNX_ROOTFS_BACKEND: "block",
         },
       },
     );
@@ -167,7 +165,6 @@ print("mac-source-after", flush=True)
         check: false,
         env: {
           LNX_INGRESS_STATE_DIR: join(ctx.tmpdir, "disabled-ingress"),
-          LNX_ROOTFS_BACKEND: "block",
         },
       },
     ).catch(() => ({ status: 1 }));

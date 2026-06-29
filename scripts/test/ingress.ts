@@ -26,8 +26,8 @@ try {
     assertContains(status.stdout, "enabled", "ingress status");
     assertContains(status.stdout, "domain: .lnxtest", "ingress domain");
     assertContains(status.stdout, "https: 127.0.0.1:18443", "ingress https");
-    // vmnet needs root; the unprivileged daemon must degrade, not die.
-    assertContains(status.stdout, "network: disabled", "network disabled without root");
+    assertContains(status.stdout, "protocol: ", "ingress protocol status");
+    assertContains(status.stdout, "network: disabled", "ingress does not reserve per-VM addresses");
     assertEq((await run(["test", "-f", `${ctx.tmpdir}/lnxtest`], { check: false })).status, 0, "resolver exists");
     assertEq((await run(["test", "-f", `${ctx.tmpdir}/state/ca/lnx-ca.crt`], { check: false })).status, 0, "ca exists");
   });
@@ -39,13 +39,13 @@ try {
     assertContains(instance.stdout, "status: NXDOMAIN", "unallocated instance is NXDOMAIN");
   });
 
-  await testStep("network attach reports unavailable without vmnet", async () => {
+  await testStep("network attach reports unavailable", async () => {
     const response = await run([
       "bash",
       "-lc",
       `printf 'POST /network/attach?instance=foo HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n' | nc -U -w 5 ${ctx.tmpdir}/state/ingress.sock`,
     ], { timeoutMs: 15_000 });
-    assertContains(response.stdout, "503 Service Unavailable", "attach is unavailable without vmnet");
+    assertContains(response.stdout, "503 Service Unavailable", "attach is unavailable");
   });
 
   await testStep("unprivileged ingress disable", async () => {

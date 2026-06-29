@@ -22,7 +22,10 @@ import {
 } from "./lib";
 
 const ctx = defaultContext("nested-kvm");
-const cwd = join(ctx.repoRoot, `.lnx-nk-${process.pid}`);
+const hostHome = Bun.env.HOME ?? "";
+const cwd =
+  Bun.env.LNX_NESTED_KVM_WORKDIR ??
+  join(hostHome, ".lnx", "test-work", `nested-kvm-${process.pid}`);
 const linuxTarget = "aarch64-unknown-linux-musl";
 const linuxLnx = join(ctx.repoRoot, "target", linuxTarget, "debug", "lnx");
 const linuxGvproxy = join(ctx.repoRoot, "target", "gvproxy-linux-arm64");
@@ -36,7 +39,6 @@ const linuxLinker =
   Bun.env.CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER ??
   Bun.env.CC_LINUX ??
   "/opt/homebrew/bin/aarch64-linux-musl-gcc";
-const hostHome = Bun.env.HOME ?? "";
 const kernel = join(hostHome, ".lnx", "vmlinuz");
 const fixtureKernel = Bun.env.LNX_MACOS_SNAPSHOT_FIXTURE
   ? join(Bun.env.LNX_MACOS_SNAPSHOT_FIXTURE, "vmlinuz")
@@ -55,6 +57,9 @@ const rootfs =
   join(hostHome, ".lnx", "instances", "default", "rootfs.ext4");
 const outerRootfs = join(cwd, "outer-rootfs.ext4");
 const snapshotInnerRootfs = join(cwd, "snapshot-inner-rootfs.ext4");
+const outerRootfsBytes = Number(
+  Bun.env.LNX_NESTED_OUTER_ROOTFS_BYTES ?? 16 * 1024 * 1024 * 1024,
+);
 const nestedCheckpointInstance = "lnx-checkpoint-nested";
 const nestedSnapshotInstance = "lnx-nested-snapshot";
 const nestedScriptInstances = new Map([
@@ -404,7 +409,6 @@ function outerLnx(
     env: {
       LNX_BROKER_IDLE_TTL_MS: "250",
       LNX_INGRESS_STATE_DIR: join(cwd, "disabled-ingress"),
-      LNX_ROOTFS_BACKEND: "block",
       ...options.env,
     },
   });
@@ -417,7 +421,6 @@ async function prepareColdOuter(instance: string) {
     env: {
       LNX_BROKER_IDLE_TTL_MS: "250",
       LNX_INGRESS_STATE_DIR: join(cwd, "disabled-ingress"),
-      LNX_ROOTFS_BACKEND: "block",
     },
   });
   await waitForOuterExit(instance);
@@ -632,11 +635,32 @@ async function shrinkRootfsToMinimum(path: string) {
   await run([resize2fs, "-M", path], {
     timeoutMs: 180_000,
   });
+  await alignRootfsForPmem(path);
+}
+
+async function alignRootfsForPmem(path: string) {
+  await run([
+    "python3",
+    "-c",
+    "import os, sys\nalign = 2 * 1024 * 1024\npath = sys.argv[1]\nsize = os.path.getsize(path)\nos.truncate(path, ((size + align - 1) // align) * align)\n",
+    path,
+  ]);
 }
 
 async function cloneShrunkRootfs(src: string, dest: string) {
   await cloneImage(src, dest);
   await shrinkRootfsToMinimum(dest);
+}
+
+async function growRootfs(path: string, sizeBytes: number) {
+  const resize2fs = e2fsTool("resize2fs");
+  await run(["truncate", "-s", String(sizeBytes), path], {
+    timeoutMs: 180_000,
+  });
+  await run([resize2fs, path], {
+    timeoutMs: 180_000,
+  });
+  await alignRootfsForPmem(path);
 }
 
 async function prepareInnerBase(base: string, instance: string) {
@@ -691,6 +715,9 @@ async function runInnerViaOuter(
   innerArgs: string[],
   options: {
     prelude?: string[];
+    postlude?: string[];
+    sharedInnerDir?: string;
+    hostVisibleInnerBase?: boolean;
     runBase?: string;
     innerTimeoutMs?: number;
     timeoutMs?: number;
@@ -704,9 +731,12 @@ async function runInnerViaOuter(
   } = {},
 ) {
   const waitForInnerOwnerExit = options.waitForInnerOwnerExit ?? true;
+  const hostVisibleInnerBase = options.hostVisibleInnerBase ?? true;
   const brokerIdleTtlMs =
     options.brokerIdleTtlMs ?? (waitForInnerOwnerExit ? 250 : 600_000);
-  const before = (await innerOwnerCounts(innerBase, innerInstance)).dones;
+  const before = hostVisibleInnerBase
+    ? (await innerOwnerCounts(innerBase, innerInstance)).dones
+    : 0;
   const runBaseExport = options.runBase
     ? [`export LNX_RUN_BASE=${quoteShell(options.runBase)}`]
     : [];
@@ -718,7 +748,8 @@ async function runInnerViaOuter(
   const krunLogLevelExport = Bun.env.LNX_NESTED_KRUN_LOG_LEVEL
     ? [`export LNX_KRUN_LOG_LEVEL=${quoteShell(Bun.env.LNX_NESTED_KRUN_LOG_LEVEL)}`]
     : [];
-  const sharedInnerDir = join(innerBase, "instances", innerInstance);
+  const sharedInnerDir =
+    options.sharedInnerDir ?? join(innerBase, "instances", innerInstance);
   const tracePath = join(sharedInnerDir, "kvm-trace.log");
   const traceHelpers = traceKvm
     ? [
@@ -863,6 +894,7 @@ async function runInnerViaOuter(
           "fi",
         ]
       : ['stop_inner_owner "$inner_instance"']),
+    ...(options.postlude ?? []),
     "copy_inner_logs",
   ].join("\n");
   const result = await outerLnx(
@@ -870,7 +902,7 @@ async function runInnerViaOuter(
     ["--root", ...outerVmArgs, "bash", "-lc", script],
     { cwd, timeoutMs: options.timeoutMs ?? 300_000 },
   );
-  if (waitForInnerOwnerExit) {
+  if (waitForInnerOwnerExit && hostVisibleInnerBase) {
     await waitForInnerOwnerDone(innerBase, innerInstance, before);
   }
   await waitForOuterExit(outer);
@@ -933,6 +965,7 @@ try {
       throw new Error(`missing rootfs image: ${rootfs}`);
     }
     await cloneShrunkRootfs(rootfs, outerRootfs);
+    await growRootfs(outerRootfs, outerRootfsBytes);
     await cloneShrunkRootfs(rootfs, snapshotInnerRootfs);
   });
 
@@ -992,7 +1025,6 @@ try {
             env: {
               LNX_BROKER_IDLE_TTL_MS: "250",
               LNX_INGRESS_STATE_DIR: join(cwd, "disabled-ingress"),
-              LNX_ROOTFS_BACKEND: "block",
             },
           },
         );
@@ -1041,7 +1073,6 @@ print("mac-source-after", flush=True)
               timeoutMs: 240_000,
               env: {
                 LNX_INGRESS_STATE_DIR: join(cwd, "disabled-ingress"),
-                LNX_ROOTFS_BACKEND: "block",
               },
             },
           );
@@ -1069,7 +1100,6 @@ print("mac-source-after", flush=True)
               check: false,
               env: {
                 LNX_INGRESS_STATE_DIR: join(cwd, "disabled-ingress"),
-                LNX_ROOTFS_BACKEND: "block",
               },
             },
           ).catch(() => ({ status: 1 }));
@@ -1201,11 +1231,36 @@ print("mac-source-after", flush=True)
         );
       }
 
-      await prepareInnerBase(innerBase, innerInstance);
       const hostProbe = startHostHttpProbe("macos-linux");
       const relayPort = 20_000 + Math.floor(Math.random() * 20_000);
       const exportSnapshot =
         Bun.env.LNX_NESTED_MACOS_LINUX_EXPORT_LINUX_SNAPSHOT;
+      const outerLocalInnerBase = `/root/lnx-macos-linux-inner-${process.pid}`;
+      const outerLocalSnapshot = `/root/lnx-macos-linux-snapshot-${process.pid}`;
+      const sharedInnerDir = join(innerBase, "instances", innerInstance);
+      const exportedLatest = join(sharedInnerDir, "memory-snapshots", "latest");
+      const outerLocalLatest = `${outerLocalInnerBase}/instances/${innerInstance}/memory-snapshots/latest`;
+      const outerLocalSetup = [
+        `rm -rf ${quoteShell(outerLocalInnerBase)} ${quoteShell(outerLocalSnapshot)}`,
+        `mkdir -p ${quoteShell(`${outerLocalInnerBase}/instances/${innerInstance}`)} ${quoteShell(outerLocalSnapshot)}`,
+        `cp ${quoteShell(innerKernel)} ${quoteShell(`${outerLocalInnerBase}/vmlinuz`)}`,
+        `cp --sparse=always ${quoteShell(join(stagedSnapshot, "rootfs.ext4"))} ${quoteShell(`${outerLocalSnapshot}/rootfs.ext4`)}`,
+        `cp --sparse=always ${quoteShell(join(stagedSnapshot, "pages.img"))} ${quoteShell(`${outerLocalSnapshot}/pages.img`)}`,
+        `cp ${quoteShell(join(stagedSnapshot, "vmstate.bin"))} ${quoteShell(`${outerLocalSnapshot}/vmstate.bin`)}`,
+        `cp ${quoteShell(join(stagedSnapshot, "shares.stamp"))} ${quoteShell(`${outerLocalSnapshot}/shares.stamp`)}`,
+        `cp ${quoteShell(join(stagedSnapshot, "initramfs.stamp"))} ${quoteShell(`${outerLocalSnapshot}/initramfs.stamp`)}`,
+      ];
+      const exportPostlude = exportSnapshot
+        ? [
+            `rm -rf ${quoteShell(exportedLatest)}`,
+            `mkdir -p ${quoteShell(exportedLatest)}`,
+            `"$LNX_BIN" _sparse-copy ${quoteShell(`${outerLocalLatest}/rootfs.ext4`)} ${quoteShell(join(exportedLatest, "rootfs.ext4"))}`,
+            `"$LNX_BIN" _sparse-copy ${quoteShell(`${outerLocalLatest}/pages.img`)} ${quoteShell(join(exportedLatest, "pages.img"))}`,
+            `cp ${quoteShell(`${outerLocalLatest}/vmstate.bin`)} ${quoteShell(join(exportedLatest, "vmstate.bin"))}`,
+            `cp ${quoteShell(`${outerLocalLatest}/shares.stamp`)} ${quoteShell(join(exportedLatest, "shares.stamp"))}`,
+            `cp ${quoteShell(`${outerLocalLatest}/initramfs.stamp`)} ${quoteShell(join(exportedLatest, "initramfs.stamp"))}`,
+          ]
+        : [];
       const restoredProbeCommands = [
         "set -euo pipefail",
         "sudo sh -c 'printf go >/run/lnx-cross-host-go'",
@@ -1222,26 +1277,32 @@ print("mac-source-after", flush=True)
       try {
         const restored = await runInnerViaOuter(
           outerInstance("macos-linux"),
-          innerBase,
+          outerLocalInnerBase,
           innerInstance,
           [
             "--no-host-shares",
             "--rootfs",
-            join(stagedSnapshot, "rootfs.ext4"),
+            `${outerLocalSnapshot}/rootfs.ext4`,
             "--snapshot",
-            stagedSnapshot,
+            outerLocalSnapshot,
             "bash",
             "-lc",
             restoredProbeCommands.join("; "),
           ],
           {
-            prelude: macHostProbeRelayPrelude(
-              hostProbe.port,
-              relayPort,
-              hostProbe.token,
-              hostProbe.expected,
-            ),
-            runBase: `/tmp/lnx-run-macos-linux-${process.pid}`,
+            prelude: [
+              ...macHostProbeRelayPrelude(
+                hostProbe.port,
+                relayPort,
+                hostProbe.token,
+                hostProbe.expected,
+              ),
+              ...outerLocalSetup,
+            ],
+            runBase: `/root/lnx-run-macos-linux-${process.pid}`,
+            postlude: exportPostlude,
+            sharedInnerDir,
+            hostVisibleInnerBase: false,
             innerTimeoutMs: Number(
               Bun.env.LNX_NESTED_MACOS_LINUX_INNER_TIMEOUT_MS ?? 90_000,
             ),

@@ -1,5 +1,30 @@
 use super::*;
 
+fn test_config(http_addr: &str, https_addr: &str, dns_addr: &str, resolver_dir: &str) -> Config {
+    Config {
+        domain: "lnx".to_string(),
+        dns_addr: dns_addr.to_string(),
+        http_addr: http_addr.to_string(),
+        https_addr: https_addr.to_string(),
+        resolver_dir: PathBuf::from(resolver_dir),
+        state_dir: PathBuf::from("/tmp/lnx-ingress-test"),
+    }
+}
+
+fn status_with_binary(binary_path: Option<&str>) -> Status {
+    Status {
+        domain: "lnx".to_string(),
+        dns_addr: "127.0.0.1:5354".to_string(),
+        http_addr: "127.0.0.1:80".to_string(),
+        https_addr: "127.0.0.1:443".to_string(),
+        resolver_path: "/etc/resolver/lnx".to_string(),
+        network: None,
+        network_error: None,
+        protocol_version: Some(PROTOCOL_VERSION),
+        binary_path: binary_path.map(str::to_string),
+    }
+}
+
 #[test]
 fn parses_ingress_hosts() {
     let route = parse_host("p8080-dev.lnx", "lnx").expect("parse");
@@ -54,23 +79,6 @@ fn parses_attach_requests() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
-fn derives_vmnet_gateway_from_assigned_ip() {
-    assert_eq!(
-        gateway_for_assigned_ip(Ipv4Addr::new(192, 168, 106, 207), 24),
-        Some(Ipv4Addr::new(192, 168, 106, 0))
-    );
-    assert_eq!(
-        gateway_for_assigned_ip(Ipv4Addr::new(10, 42, 19, 10), 16),
-        Some(Ipv4Addr::new(10, 42, 0, 0))
-    );
-    assert_eq!(
-        gateway_for_assigned_ip(Ipv4Addr::new(10, 0, 0, 2), 31),
-        None
-    );
-}
-
-#[test]
 fn parses_json_number_fields() {
     assert_eq!(
         json_number_field("{\"prefix\":24,\"x\":\"y\"}", "prefix"),
@@ -78,6 +86,166 @@ fn parses_json_number_fields() {
     );
     assert_eq!(json_number_field("{\"prefix\":\"24\"}", "prefix"), None);
     assert_eq!(json_number_field("{}", "prefix"), None);
+}
+
+#[test]
+fn escapes_status_json_strings() {
+    assert_eq!(json_escape("plain"), "plain");
+    assert_eq!(json_escape("quote\"slash\\"), "quote\\\"slash\\\\");
+    assert_eq!(json_escape("line\n tab\t"), "line\\n tab\\t");
+}
+
+#[test]
+fn privileged_launchd_uses_system_helper() {
+    let config = test_config(
+        "127.0.0.1:80",
+        "127.0.0.1:443",
+        "127.0.0.1:5354",
+        "/etc/resolver",
+    );
+
+    let plist = launchd_plist(&config).expect("plist");
+
+    assert!(plist.contains(SYSTEM_HELPER_PATH));
+}
+
+#[test]
+fn unprivileged_launchd_uses_current_executable() {
+    let config = test_config(
+        "127.0.0.1:8080",
+        "127.0.0.1:8443",
+        "127.0.0.1:5354",
+        "/tmp/lnx-resolver-test",
+    );
+    let exe = std::env::current_exe()
+        .expect("current exe")
+        .display()
+        .to_string();
+
+    let plist = launchd_plist(&config).expect("plist");
+
+    assert!(plist.contains(&xml_escape(&exe)));
+    assert!(!plist.contains(SYSTEM_HELPER_PATH));
+}
+
+#[test]
+fn privileged_service_rejects_user_home_binary() {
+    let config = test_config(
+        "127.0.0.1:80",
+        "127.0.0.1:443",
+        "127.0.0.1:5354",
+        "/etc/resolver",
+    );
+    let status = status_with_binary(Some("/Users/test/.cargo/bin/lnx"));
+
+    let error = privileged_service_binary_error(&config, &status).expect("error");
+
+    assert!(error.contains("/Users/test/.cargo/bin/lnx"));
+    assert!(error.contains(SYSTEM_HELPER_PATH));
+}
+
+#[test]
+fn privileged_service_accepts_system_helper() {
+    let config = test_config(
+        "127.0.0.1:80",
+        "127.0.0.1:443",
+        "127.0.0.1:5354",
+        "/etc/resolver",
+    );
+    let status = status_with_binary(Some(SYSTEM_HELPER_PATH));
+
+    assert!(privileged_service_binary_error(&config, &status).is_none());
+}
+
+#[test]
+fn privileged_service_accepts_matching_helper_contents() {
+    let config = test_config(
+        "127.0.0.1:80",
+        "127.0.0.1:443",
+        "127.0.0.1:5354",
+        "/etc/resolver",
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let current = dir.path().join("current");
+    let helper = dir.path().join("helper");
+    fs::write(&current, b"same").expect("write current");
+    fs::write(&helper, b"same").expect("write helper");
+
+    assert!(
+        privileged_service_helper_stale_error_with_paths(&config, &current, &helper)
+            .expect("stale check")
+            .is_none()
+    );
+}
+
+#[test]
+fn privileged_service_rejects_stale_helper_contents() {
+    let config = test_config(
+        "127.0.0.1:80",
+        "127.0.0.1:443",
+        "127.0.0.1:5354",
+        "/etc/resolver",
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let current = dir.path().join("current");
+    let helper = dir.path().join("helper");
+    fs::write(&current, b"new").expect("write current");
+    fs::write(&helper, b"old").expect("write helper");
+
+    let error = privileged_service_helper_stale_error_with_paths(&config, &current, &helper)
+        .expect("stale check")
+        .expect("error");
+
+    assert!(error.contains("ingress system helper is stale"));
+    assert!(error.contains(&helper.display().to_string()));
+    assert!(error.contains(&current.display().to_string()));
+}
+
+#[test]
+fn privileged_service_status_reports_stale_helper_contents() {
+    let config = test_config(
+        "127.0.0.1:80",
+        "127.0.0.1:443",
+        "127.0.0.1:5354",
+        "/etc/resolver",
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let current = dir.path().join("current");
+    let helper = dir.path().join("helper");
+    fs::write(&current, b"new").expect("write current");
+    fs::write(&helper, b"old").expect("write helper");
+    let mut status = status_with_binary(Some(SYSTEM_HELPER_PATH));
+    status.binary_path = Some(helper.display().to_string());
+
+    let helper_status = privileged_service_status_with_paths(&config, &status, &current, &helper)
+        .expect("helper status");
+
+    assert_eq!(
+        helper_status.as_deref(),
+        Some("stale; run `sudo lnx ingress enable` from a terminal")
+    );
+}
+
+#[test]
+fn privileged_service_status_reports_current_helper_contents() {
+    let config = test_config(
+        "127.0.0.1:80",
+        "127.0.0.1:443",
+        "127.0.0.1:5354",
+        "/etc/resolver",
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let current = dir.path().join("current");
+    let helper = dir.path().join("helper");
+    fs::write(&current, b"same").expect("write current");
+    fs::write(&helper, b"same").expect("write helper");
+    let mut status = status_with_binary(Some(SYSTEM_HELPER_PATH));
+    status.binary_path = Some(helper.display().to_string());
+
+    let helper_status = privileged_service_status_with_paths(&config, &status, &current, &helper)
+        .expect("helper status");
+
+    assert_eq!(helper_status.as_deref(), Some("current"));
 }
 
 fn dns_query(host: &str) -> Vec<u8> {

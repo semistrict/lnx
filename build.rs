@@ -25,6 +25,9 @@ fn main() {
     if server_ui_enabled() {
         build_server_ui(&out_dir);
     }
+    if target_os() == "macos" {
+        build_gvproxy_bridge(&out_dir);
+    }
     let agent = out_dir.join("lnx-agent");
     let agent_target_dir = env::var_os("LNX_AGENT_TARGET_DIR")
         .map(PathBuf::from)
@@ -75,6 +78,44 @@ fn main() {
 
     println!("cargo:rustc-env=LNX_AGENT={}", agent.display());
     println!("cargo:rustc-env=LNX_AGENT_SOURCE_STAMP={source_stamp}");
+}
+
+fn target_os() -> String {
+    env::var("CARGO_CFG_TARGET_OS").unwrap_or_default()
+}
+
+fn target_arch() -> String {
+    env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default()
+}
+
+fn build_gvproxy_bridge(out_dir: &Path) {
+    println!("cargo:rerun-if-changed=third_party/gvproxy-bridge/bridge.go");
+    println!("cargo:rerun-if-changed=third_party/gvproxy-bridge/go.mod");
+    println!("cargo:rerun-if-changed=third_party/gvproxy-bridge/go.sum");
+    let goarch = match target_arch().as_str() {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => panic!("unsupported gvproxy bridge target arch {other}"),
+    };
+    let archive = out_dir.join("liblnx_gvproxy_bridge.a");
+    let status = Command::new("go")
+        .arg("build")
+        .arg("-buildmode=c-archive")
+        .arg("-o")
+        .arg(&archive)
+        .arg(".")
+        .env("GOOS", "darwin")
+        .env("GOARCH", goarch)
+        .env("CGO_ENABLED", "1")
+        .current_dir("third_party/gvproxy-bridge")
+        .status()
+        .expect("run go build for embedded gvproxy bridge");
+    if !status.success() {
+        panic!("embedded gvproxy bridge build failed with {status}");
+    }
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=lnx_gvproxy_bridge");
+    println!("cargo:rustc-link-lib=dylib=resolv");
 }
 
 fn server_ui_enabled() -> bool {

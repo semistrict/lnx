@@ -1,6 +1,8 @@
 mod checkpoints;
 mod cli;
 mod descriptor;
+mod gvproxy_embedded;
+mod host_share;
 mod ingress;
 mod init;
 mod initramfs;
@@ -11,8 +13,6 @@ mod paths;
 mod runner;
 mod server;
 mod sparse_copy;
-#[cfg(target_os = "macos")]
-mod vmnet;
 
 use anyhow::Result;
 use clap::Parser;

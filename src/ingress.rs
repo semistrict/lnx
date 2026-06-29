@@ -1,12 +1,10 @@
-#[cfg(target_os = "macos")]
-use std::os::fd::FromRawFd;
 use std::{
     collections::HashMap,
     ffi::CString,
     fs,
     io::{BufReader, ErrorKind, Read, Write},
     net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket},
-    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+    os::fd::AsRawFd,
     os::unix::{
         ffi::OsStrExt,
         net::{UnixListener, UnixStream},
@@ -23,7 +21,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use lnx_protocol::Message;
+use lnx_protocol::{Message, PROTOCOL_VERSION};
 use rustls::{
     ServerConfig as TlsServerConfig, ServerConnection,
     crypto::ring::sign::any_supported_type,
@@ -38,12 +36,12 @@ const DEFAULT_DOMAIN: &str = "lnx";
 const DEFAULT_DNS_ADDR: &str = "127.0.0.1:5354";
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:80";
 const DEFAULT_HTTPS_ADDR: &str = "127.0.0.1:443";
-const DEFAULT_SUBNET: &str = "192.168.106.0/24";
 const AUTOSTART_IDLE_TTL_MS: &str = "30000";
 const CA_COMMON_NAME: &str = "lnx local ingress CA";
 const SERVICE_LABEL: &str = "com.semistrict.lnx.ingress";
 const LAUNCH_DAEMON_PATH: &str = "/Library/LaunchDaemons/com.semistrict.lnx.ingress.plist";
 const LAUNCH_AGENT_NAME: &str = "com.semistrict.lnx.ingress.plist";
+const SYSTEM_HELPER_PATH: &str = "/usr/local/libexec/lnx/lnx-ingress";
 const CHROME_DEVTOOLS_PORT: u16 = 9222;
 
 #[derive(Debug, Clone)]
@@ -52,7 +50,6 @@ pub struct Config {
     pub dns_addr: String,
     pub http_addr: String,
     pub https_addr: String,
-    pub subnet: String,
     pub resolver_dir: PathBuf,
     pub state_dir: PathBuf,
 }
@@ -70,7 +67,6 @@ pub fn load_config() -> Result<Config> {
         dns_addr: env_or("LNX_INGRESS_DNS_ADDR", DEFAULT_DNS_ADDR),
         http_addr: env_or("LNX_INGRESS_HTTP_ADDR", DEFAULT_HTTP_ADDR),
         https_addr: env_or("LNX_INGRESS_HTTPS_ADDR", DEFAULT_HTTPS_ADDR),
-        subnet: env_or("LNX_INGRESS_SUBNET", DEFAULT_SUBNET),
         resolver_dir: PathBuf::from(env_or("LNX_INGRESS_RESOLVER_DIR", "/etc/resolver")),
         state_dir: PathBuf::from(env_or(
             "LNX_INGRESS_STATE_DIR",
@@ -80,6 +76,9 @@ pub fn load_config() -> Result<Config> {
 }
 
 pub fn enable(config: &Config) -> Result<()> {
+    if config.needs_privileges() {
+        ensure_sudo_can_prompt_or_is_cached()?;
+    }
     regenerate_ca(config)?;
     println!("writing {}", config.resolver_path().display());
     println!("starting dns on {}", config.dns_addr);
@@ -129,6 +128,19 @@ pub fn print_status(config: &Config) -> Result<()> {
                 "network: {}",
                 status.network.as_deref().unwrap_or("disabled")
             );
+            if let Some(error) = &status.network_error {
+                println!("network-error: {error}");
+            }
+            match status.protocol_version {
+                Some(version) => println!("protocol: {version}"),
+                None => println!("protocol: stale"),
+            }
+            if let Some(binary) = &status.binary_path {
+                println!("binary: {binary}");
+            }
+            if let Some(binary_status) = privileged_service_status(config, &status)? {
+                println!("binary-status: {binary_status}");
+            }
         }
         Err(_) => println!("disabled"),
     }
@@ -140,12 +152,16 @@ pub fn run_hidden(
     cleanup: bool,
     install_service_flag: bool,
     uninstall_service_flag: bool,
+    refresh_if_running: bool,
     config: Config,
 ) -> Result<()> {
     if cleanup {
         let _ = fs::remove_file(config.resolver_path());
         let _ = fs::remove_file(config.socket_path());
         return Ok(());
+    }
+    if refresh_if_running {
+        return refresh_if_running_service(&config);
     }
     if uninstall_service_flag {
         return uninstall_service(&config);
@@ -243,6 +259,9 @@ struct Status {
     https_addr: String,
     resolver_path: String,
     network: Option<String>,
+    network_error: Option<String>,
+    protocol_version: Option<u16>,
+    binary_path: Option<String>,
 }
 
 fn env_or(key: &str, fallback: &str) -> String {
@@ -311,6 +330,7 @@ fn ensure_user_owned_lnx_dirs(config: &Config) {
 fn start_helper(config: &Config, args: &[&str]) -> Result<()> {
     let exe = std::env::current_exe().context("current executable")?;
     let mut command = if config.needs_privileges() {
+        ensure_sudo_can_prompt_or_is_cached()?;
         let mut command = Command::new("sudo");
         command.arg(format!(
             "HOME={}",
@@ -321,11 +341,9 @@ fn start_helper(config: &Config, args: &[&str]) -> Result<()> {
             "LNX_INGRESS_DNS_ADDR",
             "LNX_INGRESS_HTTP_ADDR",
             "LNX_INGRESS_HTTPS_ADDR",
-            "LNX_INGRESS_SUBNET",
             "LNX_INGRESS_RESOLVER_DIR",
             "LNX_INGRESS_STATE_DIR",
             "LNX_INGRESS_USER",
-            "LNX_VMNET_DEBUG",
         ] {
             if let Ok(value) = std::env::var(key) {
                 command.arg(format!("{key}={value}"));
@@ -345,12 +363,31 @@ fn start_helper(config: &Config, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+fn ensure_sudo_can_prompt_or_is_cached() -> Result<()> {
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 0 {
+        return Ok(());
+    }
+    match Command::new("sudo")
+        .arg("-n")
+        .arg("true")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => Ok(()),
+        _ => bail!(
+            "installing ingress needs sudo from an interactive terminal; run `sudo lnx ingress enable` from a terminal"
+        ),
+    }
+}
+
 fn install_service(config: &Config) -> Result<()> {
     fs::create_dir_all(&config.state_dir)
         .with_context(|| format!("create {}", config.state_dir.display()))?;
     ensure_user_owned_lnx_dirs(config);
     ensure_ca(config)?;
     if config.requires_privileged_service() {
+        install_system_helper()?;
         eprintln!("trusting local CA in System keychain");
         trust_ca(config)?;
     }
@@ -381,11 +418,77 @@ fn install_service(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn install_system_helper() -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("installing the ingress helper requires root");
+    }
+    let source = std::env::current_exe().context("current executable")?;
+    let dest = PathBuf::from(SYSTEM_HELPER_PATH);
+    let parent = dest.parent().context("system helper path has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let temp = parent.join(format!(
+        ".{}.{}.tmp",
+        dest.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("lnx-ingress"),
+        std::process::id()
+    ));
+    let copy_result = (|| -> Result<()> {
+        fs::copy(&source, &temp)
+            .with_context(|| format!("copy {} to {}", source.display(), temp.display()))?;
+        fs::set_permissions(
+            &temp,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .with_context(|| format!("chmod {}", temp.display()))?;
+        let temp_c =
+            CString::new(temp.as_os_str().as_bytes()).context("helper path contains nul")?;
+        unsafe {
+            if libc::chown(temp_c.as_ptr(), 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("chown {}", temp.display()));
+            }
+        }
+        fs::rename(&temp, &dest)
+            .with_context(|| format!("install {} to {}", temp.display(), dest.display()))?;
+        Ok(())
+    })();
+    if copy_result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    copy_result?;
+    eprintln!("installed ingress helper {}", dest.display());
+    Ok(())
+}
+
+fn refresh_if_running_service(config: &Config) -> Result<()> {
+    let Ok(status) = status(config) else {
+        return Ok(());
+    };
+    if let Some(error) = privileged_service_binary_error(config, &status) {
+        bail!("{error}");
+    }
+    if let Some(error) = privileged_service_helper_stale_error(config)? {
+        bail!("{error}");
+    }
+    if status.protocol_version == Some(PROTOCOL_VERSION) {
+        return Ok(());
+    }
+    eprintln!("refreshing stale ingress service");
+    stop(config)?;
+    let _ = wait_for_ready_status(config, Duration::from_secs(10))?;
+    eprintln!("ingress service refreshed");
+    Ok(())
+}
+
 fn uninstall_service(config: &Config) -> Result<()> {
     unload_service(config);
     let _ = fs::remove_file(config.launchd_path());
     let _ = fs::remove_file(config.resolver_path());
     let _ = fs::remove_file(config.socket_path());
+    if config.requires_privileged_service() {
+        let _ = fs::remove_file(SYSTEM_HELPER_PATH);
+    }
     // Leave the CA trusted: re-trusting on the next enable would re-open the
     // Security auth dialog. The local dev CA persists like mkcert's.
     Ok(())
@@ -426,7 +529,7 @@ fn run_launchctl_quiet(args: &[&str]) -> Result<()> {
 }
 
 fn launchd_plist(config: &Config) -> Result<String> {
-    let exe = std::env::current_exe().context("current executable")?;
+    let exe = service_executable(config)?;
     let home = std::env::var("HOME").unwrap_or_default();
     let user = std::env::var("LNX_INGRESS_USER")
         .or_else(|_| std::env::var("SUDO_USER"))
@@ -456,14 +559,12 @@ fn launchd_plist(config: &Config) -> Result<String> {
     <string>{http_addr}</string>
     <key>LNX_INGRESS_HTTPS_ADDR</key>
     <string>{https_addr}</string>
-    <key>LNX_INGRESS_SUBNET</key>
-    <string>{subnet}</string>
     <key>LNX_INGRESS_RESOLVER_DIR</key>
     <string>{resolver_dir}</string>
     <key>LNX_INGRESS_STATE_DIR</key>
     <string>{state_dir}</string>
     <key>LNX_INGRESS_USER</key>
-    <string>{user}</string>{debug_env}
+    <string>{user}</string>
   </dict>
   <key>StandardErrorPath</key>
   <string>{log}</string>
@@ -483,19 +584,124 @@ fn launchd_plist(config: &Config) -> Result<String> {
         dns_addr = xml_escape(&config.dns_addr),
         http_addr = xml_escape(&config.http_addr),
         https_addr = xml_escape(&config.https_addr),
-        subnet = xml_escape(&config.subnet),
         log = xml_escape(&config.log_path().display().to_string()),
-        debug_env = match std::env::var("LNX_VMNET_DEBUG") {
-            Ok(value) => format!(
-                "\n    <key>LNX_VMNET_DEBUG</key>\n    <string>{}</string>",
-                xml_escape(&value)
-            ),
-            Err(_) => String::new(),
-        },
         resolver_dir = xml_escape(&config.resolver_dir.display().to_string()),
         state_dir = xml_escape(&config.state_dir.display().to_string()),
         user = xml_escape(&user),
     ))
+}
+
+fn service_executable(config: &Config) -> Result<PathBuf> {
+    if config.requires_privileged_service() {
+        Ok(PathBuf::from(SYSTEM_HELPER_PATH))
+    } else {
+        std::env::current_exe().context("current executable")
+    }
+}
+
+fn privileged_service_binary_error(config: &Config, status: &Status) -> Option<String> {
+    privileged_service_binary_error_with_expected(config, status, Path::new(SYSTEM_HELPER_PATH))
+}
+
+fn privileged_service_binary_error_with_expected(
+    config: &Config,
+    status: &Status,
+    expected: &Path,
+) -> Option<String> {
+    if !config.requires_privileged_service() {
+        return None;
+    }
+    match status.binary_path.as_deref() {
+        Some(binary) if Path::new(binary) == expected => None,
+        Some(binary) => Some(format!(
+            "ingress is running from {binary}; expected the system helper at {}; run `sudo lnx ingress enable` from a terminal",
+            expected.display()
+        )),
+        None => Some(format!(
+            "ingress status did not report its binary; expected the system helper at {}; run `sudo lnx ingress enable` from a terminal",
+            expected.display()
+        )),
+    }
+}
+
+fn privileged_service_helper_stale_error(config: &Config) -> Result<Option<String>> {
+    let current = std::env::current_exe().context("current executable")?;
+    privileged_service_helper_stale_error_with_paths(
+        config,
+        &current,
+        Path::new(SYSTEM_HELPER_PATH),
+    )
+}
+
+fn privileged_service_helper_stale_error_with_paths(
+    config: &Config,
+    current: &Path,
+    helper: &Path,
+) -> Result<Option<String>> {
+    if !config.requires_privileged_service() {
+        return Ok(None);
+    }
+    if current == helper || !helper.exists() {
+        return Ok(None);
+    }
+    if files_same_contents(&current, helper)? {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "ingress system helper is stale: {} differs from {}; run `sudo lnx ingress enable` from a terminal",
+        helper.display(),
+        current.display()
+    )))
+}
+
+fn privileged_service_status(config: &Config, status: &Status) -> Result<Option<String>> {
+    let current = std::env::current_exe().context("current executable")?;
+    privileged_service_status_with_paths(config, status, &current, Path::new(SYSTEM_HELPER_PATH))
+}
+
+fn privileged_service_status_with_paths(
+    config: &Config,
+    status: &Status,
+    current: &Path,
+    helper: &Path,
+) -> Result<Option<String>> {
+    if !config.requires_privileged_service() {
+        return Ok(None);
+    }
+    if let Some(error) = privileged_service_binary_error_with_expected(config, status, helper) {
+        return Ok(Some(format!("wrong-helper ({error})")));
+    }
+    if privileged_service_helper_stale_error_with_paths(config, current, helper)?.is_some() {
+        return Ok(Some(
+            "stale; run `sudo lnx ingress enable` from a terminal".to_string(),
+        ));
+    }
+    Ok(Some("current".to_string()))
+}
+
+fn files_same_contents(left: &Path, right: &Path) -> Result<bool> {
+    let left_meta = fs::metadata(left).with_context(|| format!("stat {}", left.display()))?;
+    let right_meta = fs::metadata(right).with_context(|| format!("stat {}", right.display()))?;
+    if left_meta.len() != right_meta.len() {
+        return Ok(false);
+    }
+    let mut left = fs::File::open(left).with_context(|| format!("open {}", left.display()))?;
+    let mut right = fs::File::open(right).with_context(|| format!("open {}", right.display()))?;
+    let mut left_buf = [0u8; 64 * 1024];
+    let mut right_buf = [0u8; 64 * 1024];
+    loop {
+        let left_n = left.read(&mut left_buf).context("read left file")?;
+        let right_n = right.read(&mut right_buf).context("read right file")?;
+        if left_n != right_n {
+            return Ok(false);
+        }
+        if left_n == 0 {
+            return Ok(true);
+        }
+        if left_buf[..left_n] != right_buf[..right_n] {
+            return Ok(false);
+        }
+    }
 }
 
 fn xml_escape(value: &str) -> String {
@@ -505,6 +711,22 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+fn json_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => escaped.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn spawn_daemon(config: &Config) -> Result<()> {
@@ -534,214 +756,8 @@ fn spawn_daemon(config: &Config) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
-struct AttachInfo {
-    ip: Ipv4Addr,
-    prefix: u8,
-    gateway: Ipv4Addr,
-}
-
-/// Distinguishes a re-attach of the same instance so a stale keepalive
-/// thread's detach cannot remove a newer attachment.
-#[cfg(target_os = "macos")]
-static ATTACH_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// Routable per-VM networking, mirroring Apple's container tool: one
-/// NAT-mode vmnet network with a dedicated subnet, DHCP disabled, and
-/// addresses allocated here per instance. Lives in the ingress daemon
-/// because creating vmnet interfaces requires root.
-#[cfg(target_os = "macos")]
-struct ActiveAttachment {
-    generation: u64,
-    ip: Ipv4Addr,
-    // Dropped (stopping the vmnet interface) when removed from `active`.
-    _attachment: crate::vmnet::Attachment,
-}
-
-#[cfg(target_os = "macos")]
-struct NetworkService {
-    network: Option<crate::vmnet::Network>,
-    state_path: PathBuf,
-    // Persisted per-instance address reservations (stable across restarts).
-    allocations: std::sync::Mutex<HashMap<String, Ipv4Addr>>,
-    // Live interfaces, keyed by instance. Removed when the owner exits, which
-    // stops the interface and frees its pump thread.
-    active: std::sync::Mutex<HashMap<String, ActiveAttachment>>,
-}
-
-#[cfg(target_os = "macos")]
-impl NetworkService {
-    fn start(config: &Config) -> Arc<NetworkService> {
-        let state_path = config.state_dir.join("network.json");
-        let allocations = Self::load_allocations(&state_path);
-        let network = match crate::vmnet::parse_subnet(&config.subnet)
-            .and_then(|(subnet, prefix)| crate::vmnet::Network::create(subnet, prefix))
-        {
-            Ok(network) => {
-                eprintln!(
-                    "vmnet network ready subnet={}/{} gateway={}",
-                    network.subnet(),
-                    network.prefix(),
-                    network.gateway()
-                );
-                Some(network)
-            }
-            Err(e) => {
-                eprintln!("vmnet network unavailable; VM network attachments will fail: {e:#}");
-                None
-            }
-        };
-        Arc::new(NetworkService {
-            network,
-            state_path,
-            allocations: std::sync::Mutex::new(allocations),
-            active: std::sync::Mutex::new(HashMap::new()),
-        })
-    }
-
-    fn subnet_json(&self) -> String {
-        match &self.network {
-            Some(network) => format!("\"{}/{}\"", network.subnet(), network.prefix()),
-            None => "null".to_string(),
-        }
-    }
-
-    /// Names resolve only for instances with a live attachment, so a stopped
-    /// or gvproxy-fallback VM returns NXDOMAIN rather than a black-hole IP.
-    fn instance_ips(&self) -> HashMap<String, Ipv4Addr> {
-        self.active
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(instance, active)| (instance.clone(), active.ip))
-            .collect()
-    }
-
-    fn attach(&self, instance: &str) -> Result<(OwnedFd, AttachInfo, u64)> {
-        let network = self
-            .network
-            .as_ref()
-            .context("vmnet network is not available")?;
-        let ip = self.allocate(instance, network)?;
-        let mut attachment = network.attach(instance)?;
-        let fd = attachment
-            .take_guest_fd()
-            .context("vmnet attachment has no guest fd")?;
-        let generation = ATTACH_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Replacing an existing attachment stops the previous interface; the
-        // bootstrap lock guarantees at most one live owner per instance.
-        self.active.lock().unwrap().insert(
-            instance.to_string(),
-            ActiveAttachment {
-                generation,
-                ip,
-                _attachment: attachment,
-            },
-        );
-        Ok((
-            fd,
-            AttachInfo {
-                ip,
-                prefix: network.prefix(),
-                gateway: network.gateway(),
-            },
-            generation,
-        ))
-    }
-
-    /// Removes a live attachment (stopping its interface) if it is still the
-    /// generation that the calling keepalive thread created.
-    fn detach(&self, instance: &str, generation: u64) {
-        let mut active = self.active.lock().unwrap();
-        if active.get(instance).map(|a| a.generation) == Some(generation) {
-            active.remove(instance);
-        }
-    }
-
-    fn allocate(&self, instance: &str, network: &crate::vmnet::Network) -> Result<Ipv4Addr> {
-        let mut allocations = self.allocations.lock().unwrap();
-        if let Some(ip) = allocations.get(instance).copied() {
-            if subnet_contains(network, ip) {
-                return Ok(ip);
-            }
-            // The subnet changed under a persisted reservation; reallocate.
-            allocations.remove(instance);
-        }
-        let subnet = u32::from(network.subnet());
-        let broadcast = subnet | !u32::from(crate::vmnet::mask_for_prefix(network.prefix()));
-        let used: std::collections::HashSet<Ipv4Addr> = allocations.values().copied().collect();
-        // vmnet uses .0 as the host-side gateway; keep .1 reserved so
-        // existing allocations and route stamps stay conservative.
-        let ip = match (subnet + 2..broadcast)
-            .map(Ipv4Addr::from)
-            .find(|candidate| !used.contains(candidate))
-        {
-            Some(ip) => ip,
-            None => {
-                // Out of addresses: reclaim a reservation with no live VM
-                // rather than failing, so churned instance names don't
-                // exhaust the subnet.
-                let active = self.active.lock().unwrap();
-                let victim = allocations
-                    .keys()
-                    .find(|name| !active.contains_key(*name))
-                    .cloned();
-                drop(active);
-                match victim.and_then(|name| allocations.remove(&name)) {
-                    Some(ip) => ip,
-                    None => bail!("subnet {} is out of addresses", network.subnet()),
-                }
-            }
-        };
-        allocations.insert(instance.to_string(), ip);
-        if let Err(e) = Self::save_allocations(&self.state_path, &allocations) {
-            eprintln!("failed to persist {}: {e:#}", self.state_path.display());
-        }
-        Ok(ip)
-    }
-
-    fn load_allocations(path: &Path) -> HashMap<String, Ipv4Addr> {
-        let Ok(raw) = fs::read_to_string(path) else {
-            return HashMap::new();
-        };
-        match serde_json::from_str::<HashMap<String, Ipv4Addr>>(&raw) {
-            Ok(allocations) => allocations,
-            Err(e) => {
-                eprintln!("ignoring malformed {}: {e}", path.display());
-                HashMap::new()
-            }
-        }
-    }
-
-    fn save_allocations(path: &Path, allocations: &HashMap<String, Ipv4Addr>) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-        }
-        let raw = serde_json::to_string_pretty(allocations).context("encode network state")?;
-        // Atomic: a crash mid-write must not truncate the reservation file and
-        // silently reassign every instance's address on the next start.
-        let temp = path.with_extension("json.tmp");
-        fs::write(&temp, raw).with_context(|| format!("write {}", temp.display()))?;
-        fs::rename(&temp, path).with_context(|| format!("rename {}", path.display()))?;
-        chown_to_ingress_user(path);
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn subnet_contains(network: &crate::vmnet::Network, ip: Ipv4Addr) -> bool {
-    let subnet = u32::from(network.subnet());
-    let broadcast = subnet | !u32::from(crate::vmnet::mask_for_prefix(network.prefix()));
-    let ip = u32::from(ip);
-    ip > subnet + 1 && ip < broadcast
-}
-
-/// Per-VM networking needs vmnet; elsewhere the daemon only serves DNS and
-/// the HTTP ingress, and VMs keep their gvproxy NAT.
-#[cfg(not(target_os = "macos"))]
 struct NetworkService;
 
-#[cfg(not(target_os = "macos"))]
 impl NetworkService {
     fn start(_config: &Config) -> Arc<NetworkService> {
         Arc::new(NetworkService)
@@ -751,15 +767,13 @@ impl NetworkService {
         "null".to_string()
     }
 
+    fn error_json(&self) -> String {
+        "null".to_string()
+    }
+
     fn instance_ips(&self) -> HashMap<String, Ipv4Addr> {
         HashMap::new()
     }
-
-    fn attach(&self, _instance: &str) -> Result<(OwnedFd, AttachInfo, u64)> {
-        anyhow::bail!("per-VM networking requires macOS")
-    }
-
-    fn detach(&self, _instance: &str, _generation: u64) {}
 }
 
 fn valid_instance_name(name: &str) -> bool {
@@ -779,168 +793,6 @@ fn attach_instance_from_request(request: &str) -> Option<String> {
     // Normalize case so the allocation key matches DNS lookups, which are
     // lowercased.
     valid_instance_name(target).then(|| target.to_ascii_lowercase())
-}
-
-/// SCM_RIGHTS control buffer aligned for `cmsghdr`. A plain `[u8; N]` has
-/// alignment 1, so reading/writing cmsghdr fields through it is UB.
-#[repr(C, align(8))]
-struct CmsgBuf([u8; 64]);
-
-impl CmsgBuf {
-    fn zeroed() -> Self {
-        CmsgBuf([0u8; 64])
-    }
-}
-
-fn send_bytes_with_fd(
-    stream: &UnixStream,
-    bytes: &[u8],
-    fd: BorrowedFd<'_>,
-) -> std::io::Result<()> {
-    let mut iov = libc::iovec {
-        iov_base: bytes.as_ptr() as *mut libc::c_void,
-        iov_len: bytes.len(),
-    };
-    let mut control = CmsgBuf::zeroed();
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control.0.as_mut_ptr().cast();
-    msg.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as _;
-    let raw_fd: i32 = fd.as_raw_fd();
-    unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        (*cmsg).cmsg_level = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(4) as _;
-        std::ptr::copy_nonoverlapping(
-            (&raw const raw_fd).cast::<u8>(),
-            libc::CMSG_DATA(cmsg),
-            std::mem::size_of::<i32>(),
-        );
-    }
-    let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, 0) };
-    if sent < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn recv_bytes_with_fd(
-    stream: &UnixStream,
-    buf: &mut [u8],
-) -> std::io::Result<(usize, Option<OwnedFd>)> {
-    let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr().cast(),
-        iov_len: buf.len(),
-    };
-    let mut control = CmsgBuf::zeroed();
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control.0.as_mut_ptr().cast();
-    msg.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as _;
-    let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
-    if received < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut fd = None;
-    unsafe {
-        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-        while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let mut raw_fd: i32 = -1;
-                std::ptr::copy_nonoverlapping(
-                    libc::CMSG_DATA(cmsg),
-                    (&raw mut raw_fd).cast::<u8>(),
-                    std::mem::size_of::<i32>(),
-                );
-                if raw_fd >= 0 {
-                    fd = Some(OwnedFd::from_raw_fd(raw_fd));
-                }
-            }
-            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-        }
-    }
-    Ok((received as usize, fd))
-}
-
-#[cfg(target_os = "macos")]
-pub struct NetworkAttachment {
-    pub fd: OwnedFd,
-    pub ip: Ipv4Addr,
-    pub prefix: u8,
-    pub gateway: Ipv4Addr,
-    /// Held open for the VM's lifetime; the daemon detaches the interface and
-    /// frees the address slot when this closes (owner exit).
-    pub keepalive: UnixStream,
-}
-
-/// Asks the ingress daemon for a routable network attachment. Returns Ok(None)
-/// when the daemon is not running or has no vmnet network.
-#[cfg(target_os = "macos")]
-pub fn request_network_attachment(
-    config: &Config,
-    instance: &str,
-) -> Result<Option<NetworkAttachment>> {
-    let Ok(mut stream) = UnixStream::connect(config.socket_path()) else {
-        return Ok(None);
-    };
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .context("set ingress attach timeout")?;
-    stream
-        .write_all(
-            format!("POST /network/attach?instance={instance} HTTP/1.1\r\nHost: localhost\r\n\r\n")
-                .as_bytes(),
-        )
-        .context("send ingress attach request")?;
-    // The daemon replies once (fd + headers + JSON in a single message) and
-    // then holds the connection open as a liveness channel, so read exactly
-    // that one message rather than to EOF.
-    let mut buf = vec![0u8; 4096];
-    let (received, fd) = recv_bytes_with_fd(&stream, &mut buf).context("read ingress attach")?;
-    let response = String::from_utf8_lossy(&buf[..received]).into_owned();
-    if !response.starts_with("HTTP/1.1 200") {
-        return Ok(None);
-    }
-    let Some(fd) = fd else {
-        return Ok(None);
-    };
-    let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
-    let ip: Ipv4Addr = json_field(body, "ip")
-        .context("attach response missing ip")?
-        .parse()
-        .context("parse attach ip")?;
-    let reported_gateway: Ipv4Addr = json_field(body, "gateway")
-        .context("attach response missing gateway")?
-        .parse()
-        .context("parse attach gateway")?;
-    let prefix: u8 = json_number_field(body, "prefix")
-        .context("attach response missing prefix")?
-        .parse()
-        .context("parse attach prefix")?;
-    let gateway = gateway_for_assigned_ip(ip, prefix).unwrap_or(reported_gateway);
-    // No further reads; keep the stream solely as a liveness signal.
-    let _ = stream.set_read_timeout(None);
-    Ok(Some(NetworkAttachment {
-        fd,
-        ip,
-        prefix,
-        gateway,
-        keepalive: stream,
-    }))
-}
-
-#[cfg(target_os = "macos")]
-fn gateway_for_assigned_ip(ip: Ipv4Addr, prefix: u8) -> Option<Ipv4Addr> {
-    if !(8..=29).contains(&prefix) {
-        return None;
-    }
-    let mask = u32::from(crate::vmnet::mask_for_prefix(prefix));
-    let subnet = Ipv4Addr::from(u32::from(ip) & mask);
-    Some(crate::vmnet::gateway_for_subnet(subnet))
 }
 
 fn run_daemon(config: Config) -> Result<()> {
@@ -1053,15 +905,21 @@ fn handle_admin(
     let n = stream.read(&mut buf).unwrap_or(0);
     let request = String::from_utf8_lossy(&buf[..n]);
     if request.starts_with("GET /status ") {
+        let binary_path = std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
         let body = format!(
-            "{{\"enabled\":true,\"domain\":\"{}\",\"dns_addr\":\"{}\",\"http_addr\":\"{}\",\"https_addr\":\"{}\",\"resolver_path\":\"{}\",\"network\":{},\"pid\":{}}}",
-            config.domain,
-            config.dns_addr,
-            config.http_addr,
-            config.https_addr,
-            config.resolver_path().display(),
+            "{{\"enabled\":true,\"domain\":\"{}\",\"dns_addr\":\"{}\",\"http_addr\":\"{}\",\"https_addr\":\"{}\",\"resolver_path\":\"{}\",\"network\":{},\"network_error\":{},\"pid\":{},\"protocol_version\":{},\"binary_path\":\"{}\"}}",
+            json_escape(&config.domain),
+            json_escape(&config.dns_addr),
+            json_escape(&config.http_addr),
+            json_escape(&config.https_addr),
+            json_escape(&config.resolver_path().display().to_string()),
             network.subnet_json(),
-            std::process::id()
+            network.error_json(),
+            std::process::id(),
+            PROTOCOL_VERSION,
+            json_escape(&binary_path)
         );
         let _ = write_http_response(&mut stream, "200 OK", "application/json", body.as_bytes());
     } else if let Some(instance) = attach_instance_from_request(&request) {
@@ -1087,52 +945,18 @@ fn handle_admin(
     }
 }
 
-/// Attaches the instance to the vmnet network, sends the guest fd to the
-/// requester, and holds the connection open as a liveness channel: when the
-/// VM owner exits and the connection closes, the interface is torn down and
-/// its address slot freed.
-fn serve_network_attachment(stream: UnixStream, instance: String, network: Arc<NetworkService>) {
-    match network.attach(&instance) {
-        Ok((fd, info, generation)) => {
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\r\n{{\"ip\":\"{}\",\"prefix\":{},\"gateway\":\"{}\"}}",
-                info.ip, info.prefix, info.gateway
-            );
-            if let Err(e) = send_bytes_with_fd(&stream, response.as_bytes(), fd.as_fd()) {
-                eprintln!("network attach reply for {instance} failed: {e}");
-                network.detach(&instance, generation);
-                return;
-            }
-            // The fd is now duplicated into the owner; drop our copy.
-            drop(fd);
-            wait_for_peer_close(&stream);
-            network.detach(&instance, generation);
-        }
-        Err(e) => {
-            eprintln!("network attach for {instance} failed: {e:#}");
-            let mut stream = stream;
-            let _ = write_http_response(
-                &mut stream,
-                "503 Service Unavailable",
-                "text/plain",
-                format!("{e:#}\n").as_bytes(),
-            );
-        }
-    }
-}
-
-/// Blocks until the peer closes the connection (the VM owner exits).
-fn wait_for_peer_close(stream: &UnixStream) {
-    let mut stream = stream;
-    let mut buf = [0u8; 64];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => return,
-            Ok(_) => continue,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => return,
-        }
-    }
+fn serve_network_attachment(
+    mut stream: UnixStream,
+    instance: String,
+    _network: Arc<NetworkService>,
+) {
+    eprintln!("network attach for {instance} rejected: VM networking uses embedded gvproxy");
+    let _ = write_http_response(
+        &mut stream,
+        "503 Service Unavailable",
+        "text/plain",
+        b"VM network attachments are not used; VM networking uses embedded gvproxy\n",
+    );
 }
 
 /// The effective uid of the connected peer, used to authorize fd-granting
@@ -1219,6 +1043,10 @@ fn status(config: &Config) -> Result<Status> {
         resolver_path: json_field(body, "resolver_path")
             .unwrap_or_else(|| config.resolver_path().display().to_string()),
         network: json_field(body, "network"),
+        network_error: json_field(body, "network_error"),
+        protocol_version: json_number_field(body, "protocol_version")
+            .and_then(|value| value.parse::<u16>().ok()),
+        binary_path: json_field(body, "binary_path"),
     })
 }
 
@@ -1242,6 +1070,25 @@ fn wait_for_status(config: &Config, timeout: Duration) -> Result<()> {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
+    }
+    bail!("timed out waiting for ingress")
+}
+
+fn wait_for_ready_status(config: &Config, timeout: Duration) -> Result<Status> {
+    let deadline = Instant::now() + timeout;
+    let mut last = None;
+    while Instant::now() < deadline {
+        match status(config) {
+            Ok(status) if status.protocol_version == Some(PROTOCOL_VERSION) => return Ok(status),
+            Ok(status) => last = Some(status),
+            Err(_) => {}
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    if let Some(status) = last {
+        if status.protocol_version != Some(PROTOCOL_VERSION) {
+            bail!("ingress restarted but is still running a stale protocol");
+        }
     }
     bail!("timed out waiting for ingress")
 }
@@ -1734,7 +1581,26 @@ fn handle_http(mut stream: TcpStream, config: Config) -> Result<()> {
         return Ok(());
     };
     let request = rewrite_proxy_request_host(request, route.port);
-    runner::proxy_stream_to_guest(&broker_socket, stream, request, "127.0.0.1", route.port)
+    let proxy_stream = stream.try_clone().context("clone http proxy stream")?;
+    match runner::proxy_stream_to_guest(
+        &broker_socket,
+        proxy_stream,
+        request,
+        "127.0.0.1",
+        route.port,
+    ) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let body = format!("bad gateway: {e:#}\n");
+            let _ = write_http_response(
+                &mut stream,
+                "502 Bad Gateway",
+                "text/plain",
+                body.as_bytes(),
+            );
+            Err(e)
+        }
+    }
 }
 
 fn rewrite_proxy_request_host(request: Vec<u8>, guest_port: u16) -> Vec<u8> {

@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertContains,
@@ -18,7 +18,7 @@ import {
 const ctx = defaultContext("oci-import");
 const image = "alpine:3.21";
 const noInitInstance = `${ctx.instance}-noinit`;
-const scratch = join(ctx.repoRoot, ".lnx-oci-test");
+const scratch = join(ctx.repoRoot, `oci-whiteout-test-${process.pid}`);
 
 function debugfsTool(): string {
   for (const dir of ["/opt/homebrew/opt/e2fsprogs/sbin", "/usr/local/opt/e2fsprogs/sbin", "/usr/sbin", "/sbin"]) {
@@ -30,6 +30,7 @@ function debugfsTool(): string {
 }
 
 async function debugfsHas(image: string, path: string): Promise<boolean> {
+  await stat(image);
   const result = await run([debugfsTool(), "-R", `stat ${path}`, image], { check: false });
   return !`${result.stdout}\n${result.stderr}`.includes("File not found");
 }
@@ -85,9 +86,10 @@ try {
   });
 
   await testStep("layer whiteouts delete and mask files", async () => {
-    // Stage inside the repo so the builder VM keeps the same share
-    // topology as production imports (a cwd outside $HOME changes the
-    // virtio device count and invalidates the builder's snapshot).
+    // Stage inside the repo so the builder VM keeps the same share topology
+    // as production imports. The directory must not be gitignored, otherwise
+    // host-share copy-on-write intentionally keeps guest build output off the
+    // host path this test inspects.
     const staging = join(scratch, "whiteout-staging");
     const lower = join(scratch, "layer-lower");
     const upper = join(scratch, "layer-upper");
