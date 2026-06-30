@@ -1,6 +1,14 @@
-import { existsSync } from "node:fs";
+import {
+  existsSync } from "node:fs";
 import { join } from "node:path";
-import { assertEq, cleanupContext, defaultContext, lnx, prepareContext, run, skip, testStep } from "./lib";
+import { assertEq,
+  cleanupContext,
+  defaultContext,
+  prepareContext,
+  run,
+  skip,
+  testStep,
+} from "./lib";
 
 const ctx = defaultContext("dirty-fs");
 const forkName = `${ctx.instance}-dirty-fork`;
@@ -17,7 +25,7 @@ try {
   await run(["rm", "-rf", join(ctx.base, "instances", forkName), join(ctx.base, "instances", forkName)], { check: false });
 
   await testStep("write dirty workload and checkpoint", async () => {
-    await lnx(ctx, [
+    await ctx.vm.cli([
       "bash",
       "-lc",
       "rm -rf /root/dirty; mkdir /root/dirty; for i in $(seq 1 250); do printf file-$i >/root/dirty/file-$i; done; sync",

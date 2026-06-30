@@ -1,0 +1,3 @@
+	if _, err := syscall.Write(vq.CallFD, payload[:]); err != nil {
+		log.Panicf("eventfd write: %v", err)
+	}

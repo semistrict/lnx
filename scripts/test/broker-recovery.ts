@@ -1,6 +1,15 @@
-import { existsSync } from "node:fs";
+import {
+  existsSync } from "node:fs";
 import { join } from "node:path";
-import { assertEq, cleanupContext, defaultContext, lnx, prepareContext, sleep, spawn, testStep } from "./lib";
+import { assertEq,
+  cleanupContext,
+  defaultContext,
+  prepareContext,
+  sleep,
+  spawn,
+  testStep,
+  type LnxCliOptions,
+} from "./lib";
 
 const ctx = defaultContext("broker-recovery");
 const vmArgs = [
@@ -8,8 +17,8 @@ const vmArgs = [
   ...(Bun.env.LNX_TEST_MEMORY_MIB ? ["--memory-mib", Bun.env.LNX_TEST_MEMORY_MIB] : []),
 ];
 
-function lnxVm(args: string[], options: Parameters<typeof lnx>[1] = {}) {
-  return lnx(ctx, [...vmArgs, ...args], options);
+function lnxVm(args: string[], options: LnxCliOptions = {}) {
+  return ctx.vm.cli([...vmArgs, ...args], options);
 }
 
 function spawnLnxVm(args: string[], options: Parameters<typeof spawn>[1] = {}) {

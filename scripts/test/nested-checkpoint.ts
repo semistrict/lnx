@@ -1,14 +1,16 @@
-import { readdir, readFile } from "node:fs/promises";
+import {
+  readdir,
+  readFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertEq,
   cleanupContext,
   defaultContext,
-  lnx,
   prepareContext,
   run,
   testStep,
   waitForOwnerExit,
+  type LnxCliOptions,
 } from "./lib";
 
 const ctx = defaultContext("nested-checkpoint");
@@ -18,8 +20,8 @@ const vmArgs = [
   ...(Bun.env.LNX_TEST_MEMORY_MIB ? ["--memory-mib", Bun.env.LNX_TEST_MEMORY_MIB] : []),
 ];
 
-function lnxVm(args: string[], options: Parameters<typeof lnx>[1] = {}) {
-  return lnx(ctx, [...vmArgs, ...args], options);
+function lnxVm(args: string[], options: LnxCliOptions = {}) {
+  return ctx.vm.cli([...vmArgs, ...args], options);
 }
 
 function lnxCommand(instance: string, args: string[], options: Parameters<typeof run>[1] = {}) {

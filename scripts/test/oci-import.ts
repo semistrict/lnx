@@ -1,5 +1,10 @@
-import { existsSync } from "node:fs";
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+  existsSync } from "node:fs";
+import { mkdir,
+  readFile,
+  rm,
+  stat,
+  writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertContains,
@@ -8,7 +13,6 @@ import {
   cleanupContext,
   cleanupInstance,
   defaultContext,
-  lnx,
   prepareContext,
   run,
   testStep,
@@ -48,38 +52,38 @@ try {
   });
 
   await testStep("alpine boots busybox init with a supervised agent", async () => {
-    const release = await lnx(ctx, ["cat", "/etc/alpine-release"], {
+    const release = await ctx.vm.cli(["cat", "/etc/alpine-release"], {
       timeoutMs: 180_000,
     });
     assertContains(release.stdout, "3.21.", "alpine release file");
     assertEq(
-      (await lnx(ctx, ["sh", "-c", "tr -d '\\0' < /proc/1/cmdline"])).stdout,
+      (await ctx.vm.cli(["sh", "-c", "tr -d '\\0' < /proc/1/cmdline"])).stdout,
       "/sbin/init",
       "busybox init owns pid 1",
     );
-    assertEq((await lnx(ctx, ["id", "-un"])).stdout, "lnxuser", "exec user provisioned");
+    assertEq((await ctx.vm.cli(["id", "-un"])).stdout, "lnxuser", "exec user provisioned");
     const hostGroup = (await run(["id", "-gn"])).stdout;
-    assertEq((await lnx(ctx, ["id", "-gn"])).stdout, hostGroup, "primary group named like host");
+    assertEq((await ctx.vm.cli(["id", "-gn"])).stdout, hostGroup, "primary group named like host");
   });
 
   await testStep("login shell resolves to the image shell", async () => {
     assertEq(
-      (await lnx(ctx, [], { stdin: "echo shell-ok; exit\n" })).stdout,
+      (await ctx.vm.cli([], { stdin: "echo shell-ok; exit\n" })).stdout,
       "shell-ok",
       "default login shell over stdin",
     );
     assertEq(
-      (await lnx(ctx, ["sh", "-c", 'grep "^lnxuser:" /etc/passwd | cut -d: -f7'])).stdout,
+      (await ctx.vm.cli(["sh", "-c", 'grep "^lnxuser:" /etc/passwd | cut -d: -f7'])).stdout,
       "/bin/sh",
       "lnxuser shell is the image default",
     );
   });
 
   await testStep("snapshot restore works for the imported image", async () => {
-    await lnx(ctx, ["sh", "-c", "echo oci-memory > /tmp/oci-marker"]);
+    await ctx.vm.cli(["sh", "-c", "echo oci-memory > /tmp/oci-marker"]);
     await waitForVmSuspend(ctx);
     assertEq(
-      (await lnx(ctx, ["cat", "/tmp/oci-marker"])).stdout,
+      (await ctx.vm.cli(["cat", "/tmp/oci-marker"])).stdout,
       "oci-memory",
       "restored guest keeps memory state",
     );

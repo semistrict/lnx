@@ -1,4 +1,6 @@
-import { readFile, rm } from "node:fs/promises";
+import {
+  readFile,
+  rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertContains,
@@ -6,10 +8,8 @@ import {
   assertFile,
   cleanupContext,
   defaultContext,
-  lnx,
   prepareContext,
   run,
-  spawnLnx,
   testStep,
   waitForOwnerExit,
   waitForVmSuspend,
@@ -37,7 +37,7 @@ try {
 
   await testStep("persisted settings drive the VM", async () => {
     assertEq(
-      (await lnx(ctx, ["nproc"])).stdout,
+      (await ctx.vm.cli(["nproc"])).stdout,
       "1",
       "nproc honors persisted cpus",
     );
@@ -53,19 +53,19 @@ try {
   });
 
   await testStep("explicit flags override persisted settings", async () => {
-    const mismatch = await lnx(ctx, ["--cpus", "2", "nproc"], { check: false });
+    const mismatch = await ctx.vm.cli(["--cpus", "2", "nproc"], { check: false });
     assertEq(mismatch.status === 0, false, "incompatible snapshot rejects restore");
     assertContains(mismatch.stderr, "snapshot VM config mismatch", "snapshot mismatch is explicit");
     await rm(join(ctx.snapshotDir, "latest"), { recursive: true, force: true });
     assertEq(
-      (await lnx(ctx, ["--cpus", "2", "nproc"])).stdout,
+      (await ctx.vm.cli(["--cpus", "2", "nproc"])).stdout,
       "2",
       "explicit cpus override",
     );
   });
 
   await testStep("inspect sees a running instance", async () => {
-    const running = spawnLnx(ctx, ["bash", "-lc", "echo inspect-ready; sleep 30"], {
+    const running = ctx.vm.spawnCli(["bash", "-lc", "echo inspect-ready; sleep 30"], {
       stdout: "pipe",
     });
     for await (const chunk of running.stdout) {

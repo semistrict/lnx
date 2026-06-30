@@ -1,4 +1,6 @@
-import { cp, mkdir } from "node:fs/promises";
+import {
+  cp,
+  mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { platform } from "node:process";
 import {
@@ -7,7 +9,6 @@ import {
   cleanupContext,
   cleanupInstance,
   defaultContext,
-  lnx,
   prepareContext,
   testStep,
 } from "./lib";
@@ -41,9 +42,7 @@ function deterministicEnv(instance: string) {
 }
 
 async function prepareDeterministicCheckpoint(instance: string) {
-  const probeCtx = { ...ctx, instance };
-  await lnx(
-    probeCtx,
+  await ctx.client.instance(instance).cli(
     [...vmArgs, "--deterministic=seed42", "--trace-events", "true"],
     {
       timeoutMs: 180_000,
@@ -53,10 +52,8 @@ async function prepareDeterministicCheckpoint(instance: string) {
 }
 
 async function deterministicProbe(instance: string) {
-  const probeCtx = { ...ctx, instance };
   const started = performance.now();
-  const result = await lnx(
-    probeCtx,
+  const result = await ctx.client.instance(instance).cli(
     [
       ...vmArgs,
       "--deterministic=seed42",

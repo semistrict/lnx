@@ -1,9 +1,9 @@
-import { join } from "node:path";
+import {
+  join } from "node:path";
 import {
   assertContains,
   cleanupContext,
   defaultContext,
-  lnx,
   prepareContext,
   testStep,
 } from "./lib";
@@ -14,9 +14,7 @@ try {
   await prepareContext(ctx);
 
   await testStep("guest starts without host virtiofs shares", async () => {
-    await lnx(
-      ctx,
-      [
+    await ctx.vm.cli([
         "--no-host-shares",
         "bash",
         "-lc",

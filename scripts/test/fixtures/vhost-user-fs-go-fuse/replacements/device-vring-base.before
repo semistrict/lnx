@@ -1,0 +1,6 @@
+func (d *Device) SetVringBase(state *VhostVringState) {
+	p := d.vqs[state.Index]
+	p.ShadowAvailIdx = uint16(state.Num)
+	p.LastAvailIdx = uint16(state.Num)
+}
+

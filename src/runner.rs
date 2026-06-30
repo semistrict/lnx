@@ -93,9 +93,18 @@ pub struct RunConfig {
     pub run_as_root: bool,
     pub no_host_shares: bool,
     pub package_store: GuestStoreMode,
+    pub vhost_user_fs: Vec<VhostUserFsMount>,
     pub reuse_owner: bool,
     pub deterministic: Option<DeterministicConfig>,
     pub trace_events: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VhostUserFsMount {
+    pub tag: String,
+    pub mountpoint: String,
+    pub socket: PathBuf,
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +180,9 @@ pub fn run(config: RunConfig) -> Result<i32> {
     if config.trace_events && config.deterministic.is_none() {
         bail!("trace events require deterministic mode");
     }
+    if config.vhost_user_fs.iter().any(|mount| !mount.read_only) {
+        bail!("vhost-user fs mounts are read-only only");
+    }
     install_signal_handlers();
     INTERRUPTED.store(false, Ordering::SeqCst);
     fs::create_dir_all(&config.layout.run_dir)
@@ -214,6 +226,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
                 &config.layout,
                 config.deterministic.as_ref(),
             )?;
+            validate_runtime_share_compatibility(&config)?;
         }
         if let Some(status) = run_existing_broker_client(
             &broker_socket,
@@ -304,6 +317,43 @@ pub fn validate_runtime_deterministic_compatibility(
         ),
         Err(e) => Err(e).with_context(|| format!("read {}", stamp_path.display())),
     }
+}
+
+fn validate_runtime_share_compatibility(config: &RunConfig) -> Result<()> {
+    let current = current_shares_stamp_for_config(config, "net=gvproxy")?;
+    let stamp_path = config.layout.run_dir.join("shares.stamp");
+    match fs::read_to_string(&stamp_path) {
+        Ok(stamp) if shares_stamps_match_ignoring_cwd(&stamp, &current) => Ok(()),
+        Ok(stamp) => bail!(
+            "running VM host-share/network stamp is incompatible ({}): {}",
+            describe_shares_stamp_mismatch(&stamp, &current),
+            stamp_path.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
+            "running VM has no host-share/network compatibility stamp: {}",
+            stamp_path.display()
+        ),
+        Err(e) => Err(e).with_context(|| format!("read {}", stamp_path.display())),
+    }
+}
+
+fn current_shares_stamp_for_config(config: &RunConfig, net_stamp_line: &str) -> Result<String> {
+    let host_home = host_home_for_cwd(&config.cwd)?;
+    let outside_home_cwd = (!config.cwd.starts_with(&host_home)).then(|| config.cwd.clone());
+    let package_store_stamp = package_store_stamp_line(
+        &config.layout.base,
+        config.package_store,
+        config.no_host_shares,
+    )?;
+    let mut stamp = shares_stamp_content_with_package_store(
+        &host_home,
+        outside_home_cwd.as_deref(),
+        net_stamp_line,
+        config.no_host_shares,
+        &package_store_stamp,
+    );
+    append_vhost_user_fs_stamp(&mut stamp, &config.vhost_user_fs);
+    Ok(stamp)
 }
 
 fn prepare_fresh_owner_slot(
@@ -735,18 +785,7 @@ fn start_vm(
     let current_host_home = host_home_for_cwd(&config.cwd)?;
     let current_outside_home_cwd =
         (!config.cwd.starts_with(&current_host_home)).then(|| config.cwd.clone());
-    let current_package_store_stamp = package_store_stamp_line(
-        &config.layout.base,
-        config.package_store,
-        config.no_host_shares,
-    )?;
-    let current_shares_stamp = shares_stamp_content_with_package_store(
-        &current_host_home,
-        current_outside_home_cwd.as_deref(),
-        &network.stamp_line(),
-        config.no_host_shares,
-        &current_package_store_stamp,
-    );
+    let current_shares_stamp = current_shares_stamp_for_config(config, &network.stamp_line())?;
     let mut share_layout = ShareLayout {
         host_home: current_host_home,
         outside_home_cwd: current_outside_home_cwd,
@@ -843,8 +882,9 @@ fn start_vm(
         }
         if let Some(reason) = snapshot_shares_incompatibility(snapshot, &shares_stamp) {
             bail!(
-                "snapshot host-share/network stamp is incompatible ({reason}): {}",
-                snapshot.join("shares.stamp").display()
+                "snapshot host-share/network stamp is incompatible ({reason}): {}\nrecovery: lnx --instance {} snapshots clear",
+                snapshot.join("shares.stamp").display(),
+                config.layout.instance
             );
         }
         if let Some(reason) = snapshot_deterministic_incompatibility(snapshot, &deterministic_stamp)
@@ -1008,6 +1048,16 @@ fn start_vm(
             )?;
         }
     }
+    for mount in &config.vhost_user_fs {
+        ctx.add_vhost_user_virtiofs(&mount.tag, &mount.socket)?;
+        run_log.line(format!(
+            "vhost_user_fs.added tag={} mount={} socket={} read_only={}",
+            mount.tag,
+            mount.mountpoint,
+            mount.socket.display(),
+            mount.read_only
+        ));
+    }
     let package_env = configure_package_store(
         ctx.as_ref(),
         &config.layout.base,
@@ -1076,6 +1126,10 @@ fn start_vm(
             .filter(|_| !share_layout.no_host_shares)
             .map(|_| format!("LNX_VIRTIOFS_CWD={guest_cwd}"))
             .unwrap_or_else(|| "LNX_VIRTIOFS_CWD=".to_string()),
+        format!(
+            "LNX_VHOST_USER_FS={}",
+            vhost_user_fs_guest_env(&config.vhost_user_fs)
+        ),
     ];
     init_env.extend(package_env);
     ctx.set_exec("/init", &["--init".to_string()], &init_env)?;
@@ -2084,8 +2138,12 @@ fn snapshot_initramfs_is_compatible(snapshot_path: &Path, current_stamp: &Path) 
 }
 
 const HOST_SHARE_CACHE_DAX_STAMP: &str =
-    "host-share-cache=dax+keep-cache+writeback+restore-sync-v1";
+    "host-share-cache=dax+close-to-open+writeback+restore-sync-v2";
 const HOST_SHARE_CACHE_NODAX_STAMP: &str =
+    "host-share-cache=nodax+close-to-open+writeback+restore-sync-v2";
+const LEGACY_HOST_SHARE_CACHE_DAX_KEEP_CACHE_STAMP: &str =
+    "host-share-cache=dax+keep-cache+writeback+restore-sync-v1";
+const LEGACY_HOST_SHARE_CACHE_NODAX_KEEP_CACHE_STAMP: &str =
     "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1";
 const HOST_SHARES_DISABLED_STAMP: &str = "host-shares=disabled-v1";
 const PACKAGE_STORE_DISABLED_STAMP: &str = "packages=disabled-v1";
@@ -2150,6 +2208,47 @@ fn shares_stamp_content_with_package_store(
         host_share_cache_stamp,
         package_store_stamp_line,
     )
+}
+
+fn append_vhost_user_fs_stamp(stamp: &mut String, mounts: &[VhostUserFsMount]) {
+    if mounts.is_empty() {
+        return;
+    }
+    stamp.push_str("vhost-user-fs=");
+    stamp.push_str(&vhost_user_fs_stamp_value(mounts));
+    stamp.push('\n');
+}
+
+fn vhost_user_fs_stamp_value(mounts: &[VhostUserFsMount]) -> String {
+    let mut entries = mounts
+        .iter()
+        .map(|mount| {
+            format!(
+                "{}:{}:{}:{}",
+                mount.tag,
+                mount.mountpoint,
+                mount.socket.display(),
+                if mount.read_only { "ro" } else { "rw" }
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries.join(";")
+}
+
+fn vhost_user_fs_guest_env(mounts: &[VhostUserFsMount]) -> String {
+    mounts
+        .iter()
+        .map(|mount| {
+            format!(
+                "{}:{}:{}",
+                mount.tag,
+                mount.mountpoint,
+                if mount.read_only { "ro" } else { "rw" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -2257,6 +2356,8 @@ fn snapshot_shares_incompatibility(snapshot_path: &Path, current: &str) -> Optio
             if !stamp.lines().any(|line| {
                 line == HOST_SHARE_CACHE_DAX_STAMP
                     || line == HOST_SHARE_CACHE_NODAX_STAMP
+                    || line == LEGACY_HOST_SHARE_CACHE_DAX_KEEP_CACHE_STAMP
+                    || line == LEGACY_HOST_SHARE_CACHE_NODAX_KEEP_CACHE_STAMP
                     || line == HOST_SHARES_DISABLED_STAMP
             }) =>
         {
@@ -2298,7 +2399,13 @@ fn describe_shares_stamp_mismatch(snapshot: &str, current: &str) -> String {
         ));
     }
 
-    for key in ["host-share-cache", "home", "packages", "net"] {
+    for key in [
+        "host-share-cache",
+        "home",
+        "packages",
+        "net",
+        "vhost-user-fs",
+    ] {
         let snapshot_value = share_stamp_field_value(&snapshot_fields, key);
         let current_value = share_stamp_field_value(&current_fields, key);
         if snapshot_value != current_value {
@@ -3032,9 +3139,7 @@ fn run_existing_broker_client(
             .map(Some)
         }
         Err(e) => {
-            if e.downcast_ref::<BrokerProtocolMismatch>().is_some()
-                || e.downcast_ref::<BrokerHelloFailed>().is_some()
-            {
+            if e.downcast_ref::<BrokerProtocolMismatch>().is_some() {
                 return Err(e);
             }
             if socket.exists() {
@@ -3515,9 +3620,7 @@ fn run_broker_client_retry(
                 );
             }
             Err(e) => {
-                if e.downcast_ref::<BrokerProtocolMismatch>().is_some()
-                    || e.downcast_ref::<BrokerHelloFailed>().is_some()
-                {
+                if e.downcast_ref::<BrokerProtocolMismatch>().is_some() {
                     return Err(e);
                 }
                 last = Some(e);
@@ -4249,6 +4352,9 @@ fn spawn_owner_process(config: &RunConfig, run_log: &RunLog, run_id: &str) -> Re
     for forward in &config.forwards {
         command.arg("--forward").arg(forward_spec(forward));
     }
+    for mount in &config.vhost_user_fs {
+        command.arg("--vhost-user-fs").arg(vhost_user_fs_arg(mount));
+    }
     command
         .arg("_vm-owner")
         .arg("--cwd")
@@ -4267,6 +4373,16 @@ fn spawn_owner_process(config: &RunConfig, run_log: &RunLog, run_id: &str) -> Re
     let child = command.spawn().context("spawn lnx _vm-owner")?;
     run_log.line(format!("owner.spawned run_id={run_id} pid={}", child.id()));
     Ok(child)
+}
+
+pub(crate) fn vhost_user_fs_arg(mount: &VhostUserFsMount) -> String {
+    format!(
+        "tag={},mount={},socket={}{}",
+        mount.tag,
+        mount.mountpoint,
+        mount.socket.display(),
+        if mount.read_only { ",ro" } else { "" }
+    )
 }
 
 fn run_broker_client_awaiting_owner(
@@ -4298,9 +4414,7 @@ fn run_broker_client_awaiting_owner(
                 );
             }
             Err(e) => {
-                if e.downcast_ref::<BrokerProtocolMismatch>().is_some()
-                    || e.downcast_ref::<BrokerHelloFailed>().is_some()
-                {
+                if e.downcast_ref::<BrokerProtocolMismatch>().is_some() {
                     return Err(e);
                 }
                 last = Some(e);

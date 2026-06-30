@@ -108,17 +108,7 @@ fn guest_addr_to_file_offset(layout: &RamLayout, guest_addr: u64) -> Option<u64>
 pub fn restore_pages_img(dir: &Path, layout: &RamLayout) -> Result<GuestMemoryMmap> {
     let pages_path = pages_img_path(dir);
     let file = Arc::new(File::open(&pages_path)?);
-    let file_len = file.metadata()?.len();
-    for r in &layout.regions {
-        let end = r
-            .file_offset
-            .checked_add(r.size)
-            .ok_or(SnapshotError::Truncated)?;
-        // Mapping past EOF turns guest RAM accesses into SIGBUS; refuse early.
-        if end > file_len {
-            return Err(SnapshotError::Truncated);
-        }
-    }
+    validate_pages_len(&file, layout)?;
     if !fs_supports_kvm_file_backing(&file) {
         info!(
             "snapshot.ram.copy_restore reason=fuse_backed path={}",
@@ -133,6 +123,43 @@ pub fn restore_pages_img(dir: &Path, layout: &RamLayout) -> Result<GuestMemoryMm
             restore_copied(&file, &pages_path, layout)
         }
     }
+}
+
+/// Build shared writable guest RAM backed by `<dir>/pages.img`.
+///
+/// Vhost-user backends mmap guest RAM through the memory table, so restored RAM
+/// must be file-backed and shared for those runs.
+pub fn restore_pages_img_shared(dir: &Path, layout: &RamLayout) -> Result<GuestMemoryMmap> {
+    let pages_path = pages_img_path(dir);
+    let file = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pages_path)?,
+    );
+    validate_pages_len(&file, layout)?;
+    if !fs_supports_kvm_file_backing(&file) {
+        return Err(SnapshotError::Io(std::io::Error::other(format!(
+            "snapshot RAM cannot be shared from this filesystem: {}",
+            pages_path.display()
+        ))));
+    }
+    restore_mapped_with_flags(&file, layout, libc::MAP_SHARED | libc::MAP_NORESERVE)
+}
+
+fn validate_pages_len(file: &File, layout: &RamLayout) -> Result<()> {
+    let file_len = file.metadata()?.len();
+    for r in &layout.regions {
+        let end = r
+            .file_offset
+            .checked_add(r.size)
+            .ok_or(SnapshotError::Truncated)?;
+        // Mapping past EOF turns guest RAM accesses into SIGBUS; refuse early.
+        if end > file_len {
+            return Err(SnapshotError::Truncated);
+        }
+    }
+    Ok(())
 }
 
 /// KVM stage-2 faults cannot pin pages of FUSE-backed private file mappings:
@@ -153,12 +180,20 @@ fn fs_supports_kvm_file_backing(file: &File) -> bool {
 }
 
 fn restore_mapped(file: &Arc<File>, layout: &RamLayout) -> Result<GuestMemoryMmap> {
+    restore_mapped_with_flags(file, layout, libc::MAP_PRIVATE | libc::MAP_NORESERVE)
+}
+
+fn restore_mapped_with_flags(
+    file: &Arc<File>,
+    layout: &RamLayout,
+    mmap_flags: i32,
+) -> Result<GuestMemoryMmap> {
     let mut regions = Vec::new();
     for r in &layout.regions {
         let mapping = MmapRegionBuilder::new(r.size as usize)
             .with_file_offset(FileOffset::from_arc(Arc::clone(file), r.file_offset))
             .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
-            .with_mmap_flags(libc::MAP_PRIVATE | libc::MAP_NORESERVE)
+            .with_mmap_flags(mmap_flags)
             .build()
             .map_err(|e| SnapshotError::Io(std::io::Error::other(format!("{e:?}"))))?;
         let region = GuestRegionMmap::new(mapping, GuestAddress(r.guest_addr))

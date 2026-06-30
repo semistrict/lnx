@@ -1,9 +1,9 @@
-import { join } from "node:path";
+import {
+  join } from "node:path";
 import {
   assertEq,
   cleanupContext,
   defaultContext,
-  lnx,
   prepareContext,
   quoteShell,
   skip,
@@ -26,9 +26,7 @@ try {
   await prepareContext(ctx);
 
   await testStep("macOS snapshot restores disk and memory on Linux", async () => {
-    const restored = await lnx(
-      ctx,
-      [
+    const restored = await ctx.vm.cli([
         "--no-host-shares",
         "--rootfs",
         rootfs,

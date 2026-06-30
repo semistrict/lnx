@@ -1,4 +1,5 @@
-import { readFile } from "node:fs/promises";
+import {
+  readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
@@ -7,7 +8,6 @@ import {
   cleanupInstance,
   cleanupContext,
   defaultContext,
-  lnx,
   prepareContext,
   run,
   testStep,
@@ -30,7 +30,7 @@ try {
   await prepareContext(ctx);
 
   await testStep("virtio balloon negotiates free page reporting without memory pressure", async () => {
-    const result = await lnx(ctx, [
+    const result = await ctx.vm.cli([
       ...vmArgs,
       "bash",
       "-lc",
@@ -83,7 +83,7 @@ printf 'mem_total_kib=%s\n' "$mem_total_kib"
   });
 
   await testStep("freeing guest memory remains healthy with reporting enabled", async () => {
-    const result = await lnx(ctx, [
+    const result = await ctx.vm.cli([
       ...vmArgs,
       "bash",
       "-lc",

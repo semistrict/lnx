@@ -104,6 +104,54 @@ fn fs_unshare_parses_path() {
 }
 
 #[test]
+fn snapshots_clear_parses() {
+    let cli = Cli::try_parse_from(["lnx", "snapshots", "clear"]).expect("parse snapshots clear");
+    let Some(Command::Snapshots(args)) = cli.command else {
+        panic!("expected snapshots command");
+    };
+
+    assert!(matches!(args.command, SnapshotsCommand::Clear));
+}
+
+#[test]
+fn vhost_user_fs_mount_parses() {
+    let cli = Cli::try_parse_from([
+        "lnx",
+        "--vhost-user-fs",
+        "tag=testfs,mount=/mnt/testfs,socket=/tmp/testfs.sock",
+        "true",
+    ])
+    .expect("parse vhost-user fs mount");
+
+    assert_eq!(
+        cli.vhost_user_fs,
+        vec![runner::VhostUserFsMount {
+            tag: "testfs".to_string(),
+            mountpoint: "/mnt/testfs".to_string(),
+            socket: PathBuf::from("/tmp/testfs.sock"),
+            read_only: true,
+        }]
+    );
+}
+
+#[test]
+fn vhost_user_fs_rejects_writable_mounts() {
+    let err = Cli::try_parse_from([
+        "lnx",
+        "--vhost-user-fs",
+        "tag=testfs,mount=/mnt/testfs,socket=/tmp/testfs.sock,rw",
+        "true",
+    ])
+    .expect_err("reject writable vhost-user fs mount");
+
+    assert!(
+        err.to_string()
+            .contains("vhost-user fs mounts are read-only only"),
+        "{err}"
+    );
+}
+
+#[test]
 fn init_local_target_normalizes_relative_path() {
     let target = init_local_target(Some(Path::new("project")))
         .expect("target")
@@ -257,6 +305,28 @@ fn restore_snapshot_preserves_explicit_snapshot() {
         restore_snapshot_for_run(&layout, Some(snapshot.clone()), true, true),
         Some(snapshot)
     );
+}
+
+#[test]
+fn clear_latest_snapshot_removes_snapshot_runtime_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+    let paths = [
+        layout.snapshot_dir.join("latest"),
+        layout.snapshot_dir.join(".latest.next"),
+        layout.snapshot_dir.join(".latest.previous"),
+        layout.snapshot_dir.join(".restore-work"),
+    ];
+    for path in &paths {
+        fs::create_dir_all(path).expect("create snapshot path");
+        fs::write(path.join("marker"), b"x").expect("write marker");
+    }
+
+    clear_latest_snapshot(&layout).expect("clear latest snapshot");
+
+    for path in &paths {
+        assert!(!path.exists(), "{} should be removed", path.display());
+    }
 }
 
 #[test]

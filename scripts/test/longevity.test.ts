@@ -1,6 +1,13 @@
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import {
+  afterAll,
+  beforeAll,
+  expect,
+  test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir,
+  readFile,
+  rm,
+  writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import {
@@ -9,11 +16,10 @@ import {
   defaultContext,
   diskUsageBytes,
   fileSize,
-  lnx,
   prepareContext,
   run,
   sleep,
-  spawnLnx,
+  type LnxCliOptions,
 } from "./lib";
 
 const ctx = defaultContext("longevity");
@@ -63,8 +69,8 @@ async function writeDebugBundle(name: string, message: string): Promise<string> 
   return dir;
 }
 
-async function lnxExpect(args: string[], options: Parameters<typeof lnx>[2] = {}) {
-  const result = await lnx(ctx, args, { timeoutMs: 240_000, ...options });
+async function lnxExpect(args: string[], options: LnxCliOptions = {}) {
+  const result = await ctx.vm.cli(args, { timeoutMs: 240_000, ...options });
   expect(result.status).toBe(0);
   return result;
 }
@@ -149,7 +155,7 @@ test("port forward restore", async () => {
       "-lc",
       "mkdir -p /tmp/lnx-forward; printf forward-ok >/tmp/lnx-forward/index.html; cat >/etc/systemd/system/lnx-forward-test.service <<'UNIT'\n[Service]\nWorkingDirectory=/tmp/lnx-forward\nExecStart=/usr/bin/python3 -m http.server 8080 --bind 127.0.0.1\n[Install]\nWantedBy=multi-user.target\nUNIT\nsystemctl daemon-reload; systemctl enable --now lnx-forward-test.service; sleep 1; curl -fsS http://127.0.0.1:8080",
     ]);
-    const proc = spawnLnx(ctx, [
+    const proc = ctx.vm.spawnCli([
       "--forward",
       `${forwardPort}:8080`,
       "sleep",
@@ -159,7 +165,7 @@ test("port forward restore", async () => {
     expect((await run(["curl", "-fsS", `http://127.0.0.1:${forwardPort}`], { timeoutMs: 30_000 })).stdout).toBe("forward-ok");
     proc.kill("SIGTERM");
     await proc.exited.catch(() => {});
-    const restored = spawnLnx(ctx, [
+    const restored = ctx.vm.spawnCli([
       "--forward",
       `${forwardPort}:8080`,
       "sleep",
@@ -189,12 +195,12 @@ test("ingress restore", async () => {
       "mkdir -p /tmp/lnx-ingress; printf ingress-ok >/tmp/lnx-ingress/index.html; cat >/etc/systemd/system/lnx-ingress-test.service <<'UNIT'\n[Service]\nWorkingDirectory=/tmp/lnx-ingress\nExecStart=/usr/bin/python3 -m http.server 8080 --bind 127.0.0.1\n[Install]\nWantedBy=multi-user.target\nUNIT\nsystemctl daemon-reload; systemctl enable --now lnx-ingress-test.service; sleep 1; curl -fsS http://127.0.0.1:8080",
     ]);
     expect((await lnxExpect(["curl", "-fsS", "http://127.0.0.1:8080"])).stdout).toBe("ingress-ok");
-    const proc = spawnLnx(ctx, ["sleep", "300"]);
+    const proc = ctx.vm.spawnCli(["sleep", "300"]);
     await sleep(5_000);
     expect((await run(["curl", "-fsS", "-H", `Host: p8080.${ctx.instance}.lnxtest`, `http://127.0.0.1:${ingressPort}`], { env, timeoutMs: 30_000 })).stdout).toBe("ingress-ok");
     proc.kill("SIGTERM");
     await proc.exited.catch(() => {});
-    const restored = spawnLnx(ctx, ["sleep", "300"]);
+    const restored = ctx.vm.spawnCli(["sleep", "300"]);
     await sleep(5_000);
     expect((await run(["curl", "-fsS", "-H", `Host: p8080.${ctx.instance}.lnxtest`, `http://127.0.0.1:${ingressPort}`], { env, timeoutMs: 30_000 })).stdout).toBe("ingress-ok");
     restored.kill("SIGTERM");
@@ -206,7 +212,7 @@ test("ingress restore", async () => {
 test("concurrent snapshot pressure", async () => {
   await maybe("concurrent snapshot pressure", async () => {
     await lnxExpect(["true"]);
-    const workers = Array.from({ length: 10 }, (_, i) => lnx(ctx, ["bash", "-lc", `sleep 0.$(( ${i} % 5 )); echo worker-${i}`]));
+    const workers = Array.from({ length: 10 }, (_, i) => ctx.vm.cli(["bash", "-lc", `sleep 0.$(( ${i} % 5 )); echo worker-${i}`]));
     const checkpoints = Array.from({ length: 5 }, (_, i) =>
       run([ctx.lnxBin, "--instance", ctx.instance, "checkpoint", "-m", `pressure-${i}`], { timeoutMs: 240_000 }),
     );
@@ -299,11 +305,11 @@ test("file descriptor and process tree longevity", async () => {
 test("host kill during snapshot recovers or fails cleanly", async () => {
   await maybe("host kill during snapshot", async () => {
     await lnxExpect(["bash", "-lc", "dd if=/dev/zero of=/root/kill-snapshot bs=1M count=64 status=none; sync"]);
-    const proc = spawnLnx(ctx, ["checkpoint", "-m", "kill-during-snapshot"]);
+    const proc = ctx.vm.spawnCli(["checkpoint", "-m", "kill-during-snapshot"]);
     await sleep(250);
     proc.kill("SIGKILL");
     await proc.exited.catch(() => {});
-    const next = await lnx(ctx, ["echo", "after-kill"], { timeoutMs: 240_000, check: false });
+    const next = await ctx.vm.cli(["echo", "after-kill"], { timeoutMs: 240_000, check: false });
     expect(next.status).toBe(0);
     expect(next.stdout).toBe("after-kill");
   });

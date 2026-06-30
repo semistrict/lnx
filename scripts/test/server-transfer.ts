@@ -1,8 +1,20 @@
-import { existsSync } from "node:fs";
-import { link, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  existsSync } from "node:fs";
+import { link,
+  mkdir,
+  readFile,
+  rm,
+  writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { homedir, tmpdir } from "node:os";
-import { assertEq, repoRoot, run, sleep, spawn, testStep } from "./lib";
+import { homedir,
+  tmpdir } from "node:os";
+import { assertEq,
+  repoRoot,
+  run,
+  sleep,
+  spawn,
+  testStep,
+} from "./lib";
 
 const root = repoRoot();
 const lnxBin = Bun.env.LNX_BIN ?? join(root, "target/debug/lnx");
@@ -14,7 +26,7 @@ const targetInstance = "server-target";
 const port = await freePort();
 const url = `http://127.0.0.1:${port}`;
 const sharesStamp = [
-  "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1",
+  "host-share-cache=nodax+close-to-open+writeback+restore-sync-v2",
   `home=${homedir()}`,
   "net=gvproxy",
   "",

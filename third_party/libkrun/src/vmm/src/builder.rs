@@ -52,7 +52,7 @@ use devices::virtio::{MmioTransport, PortDescription, VirtioDevice, Vsock, port_
 use kbs_types::Tee;
 
 use crate::device_manager;
-#[cfg(all(feature = "vhost-user", target_os = "linux"))]
+#[cfg(feature = "vhost-user")]
 use crate::resources::VhostUserDeviceConfig;
 #[cfg(target_os = "linux")]
 use crate::signal_handler::register_sigint_handler;
@@ -94,7 +94,7 @@ use utils::worker_message::WorkerMessage;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use vm_memory::Address;
 use vm_memory::Bytes;
-#[cfg(all(feature = "vhost-user", target_os = "linux"))]
+#[cfg(feature = "vhost-user")]
 use vm_memory::FileOffset;
 use vm_memory::GuestMemory;
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
@@ -553,6 +553,16 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
     }
 }
 
+#[cfg(feature = "vhost-user")]
+fn vhost_user_restore_needs_shared_ram(vm_resources: &VmResources) -> bool {
+    !vm_resources.vhost_user_devices.is_empty()
+}
+
+#[cfg(not(feature = "vhost-user"))]
+fn vhost_user_restore_needs_shared_ram(_vm_resources: &VmResources) -> bool {
+    false
+}
+
 /// Builds and starts a microVM based on the current Firecracker VmResources configuration.
 ///
 /// This is the default build recipe, one could build other microVM flavors by using the
@@ -589,7 +599,10 @@ pub fn build_microvm(
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if let Some(snap_path) = &vm_resources.snapshot_restore_path {
         use crate::macos::snapshot::{
-            SectionId, container::SnapshotReader, orchestrator::MetaSection, ram::restore_pages_img,
+            SectionId,
+            container::SnapshotReader,
+            orchestrator::MetaSection,
+            ram::{restore_pages_img, restore_pages_img_shared},
         };
         crate::timing_event("build_microvm.snapshot.reader.open.begin");
         let reader = SnapshotReader::open(snap_path)
@@ -599,8 +612,12 @@ pub fn build_microvm(
             .get_bincode(SectionId::Meta, 0)
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("snapshot meta: {e}")))?;
         crate::timing_event("build_microvm.snapshot.meta.loaded");
-        guest_memory = restore_pages_img(snap_path, &meta.ram)
-            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("pages.img: {e}")))?;
+        guest_memory = if vhost_user_restore_needs_shared_ram(vm_resources) {
+            restore_pages_img_shared(snap_path, &meta.ram)
+        } else {
+            restore_pages_img(snap_path, &meta.ram)
+        }
+        .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("pages.img: {e}")))?;
         crate::timing_event("build_microvm.snapshot.ram.mapped");
         guest_memory = insert_shm_regions_for_guest(guest_memory, &_shm_manager)?;
         crate::timing_event("build_microvm.snapshot.shm.mapped");
@@ -621,7 +638,9 @@ pub fn build_microvm(
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     if let Some(snap_path) = &vm_resources.snapshot_restore_path {
         use crate::linux::snapshot::{
-            SectionId, SnapshotReader, orchestrator::MetaSection, ram::restore_pages_img,
+            SectionId, SnapshotReader,
+            orchestrator::MetaSection,
+            ram::{restore_pages_img, restore_pages_img_shared},
         };
         crate::timing_event("build_microvm.snapshot.reader.open.begin");
         let reader = SnapshotReader::open(snap_path)
@@ -631,8 +650,12 @@ pub fn build_microvm(
             .get_bincode(SectionId::Meta, 0)
             .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("snapshot meta: {e}")))?;
         crate::timing_event("build_microvm.snapshot.meta.loaded");
-        guest_memory = restore_pages_img(snap_path, &meta.ram)
-            .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("pages.img: {e}")))?;
+        guest_memory = if vhost_user_restore_needs_shared_ram(vm_resources) {
+            restore_pages_img_shared(snap_path, &meta.ram)
+        } else {
+            restore_pages_img(snap_path, &meta.ram)
+        }
+        .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("pages.img: {e}")))?;
         crate::timing_event("build_microvm.snapshot.ram.mapped");
         guest_memory = insert_shm_regions_for_guest(guest_memory, &_shm_manager)?;
         crate::timing_event("build_microvm.snapshot.shm.mapped");
@@ -1085,7 +1108,7 @@ pub fn build_microvm(
     attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
     #[cfg(not(feature = "tee"))]
     {
-        #[cfg(all(feature = "vhost-user", target_os = "linux"))]
+        #[cfg(feature = "vhost-user")]
         {
             const VIRTIO_ID_RNG: u32 = 4;
             for device_config in &vm_resources.vhost_user_devices {
@@ -1102,7 +1125,7 @@ pub fn build_microvm(
             }
         }
 
-        #[cfg(not(all(feature = "vhost-user", target_os = "linux")))]
+        #[cfg(not(feature = "vhost-user"))]
         {
             attach_rng_device(&mut vmm, event_manager, intc.clone())?;
             crate::timing_event("build_microvm.rng.attached");
@@ -1874,9 +1897,9 @@ pub fn create_guest_memory(
     }
 
     // For vhost-user devices, we need file-backed memory so the backend can mmap it
-    #[cfg(all(feature = "vhost-user", target_os = "linux"))]
+    #[cfg(feature = "vhost-user")]
     let use_vhost_user = !vm_resources.vhost_user_devices.is_empty();
-    #[cfg(not(all(feature = "vhost-user", target_os = "linux")))]
+    #[cfg(not(feature = "vhost-user"))]
     let use_vhost_user = false;
 
     let ram_ranges = arch_mem_regions
@@ -1890,47 +1913,13 @@ pub fn create_guest_memory(
     arch_mem_regions.extend(shm_manager.guest_memory_regions());
 
     let mut guest_mem = if use_vhost_user {
-        #[cfg(all(feature = "vhost-user", target_os = "linux"))]
+        #[cfg(feature = "vhost-user")]
         {
             debug!(
                 "Creating file-backed memory for vhost-user (regions: {})",
                 arch_mem_regions.len()
             );
-            // Create file-backed memory regions using memfd
-            let regions_with_files: Vec<_> = arch_mem_regions
-                .iter()
-                .map(|(addr, size)| {
-                    debug!(
-                        "Creating memfd for region: addr=0x{:x}, size=0x{:x}",
-                        addr.0, size
-                    );
-                    // SAFETY: memfd_create is called with a valid null-terminated C string and valid flags.
-                    // File descriptor ownership is transferred to File::from_raw_fd below.
-                    let memfd = unsafe {
-                        let fd = libc::memfd_create(c"guest_mem".as_ptr(), libc::MFD_CLOEXEC);
-                        if fd < 0 {
-                            error!("Failed to create memfd: {:?}", io::Error::last_os_error());
-                            return Err(io::Error::last_os_error());
-                        }
-                        if libc::ftruncate(fd, *size as i64) < 0 {
-                            error!(
-                                "Failed to ftruncate memfd: {:?}",
-                                io::Error::last_os_error()
-                            );
-                            libc::close(fd);
-                            return Err(io::Error::last_os_error());
-                        }
-                        debug!("Created memfd with fd={}", fd);
-                        File::from_raw_fd(fd)
-                    };
-
-                    let file_offset = FileOffset::new(memfd, 0);
-                    Ok((*addr, *size, Some(file_offset)))
-                })
-                .collect::<Result<Vec<_>, io::Error>>()
-                .map_err(|e| {
-                    StartMicrovmError::GuestMemoryMmap(format!("memfd creation failed: {e:?}"))
-                })?;
+            let regions_with_files = create_vhost_user_memory_regions(&arch_mem_regions)?;
 
             debug!(
                 "Created {} file-backed memory regions",
@@ -1939,7 +1928,7 @@ pub fn create_guest_memory(
             GuestMemoryMmap::from_ranges_with_files(&regions_with_files)
                 .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
         }
-        #[cfg(not(all(feature = "vhost-user", target_os = "linux")))]
+        #[cfg(not(feature = "vhost-user"))]
         unreachable!()
     } else {
         GuestMemoryMmap::from_ranges(&arch_mem_regions)
@@ -2010,6 +1999,85 @@ fn build_pmem_regions_for_guest(
         arch_mem_info.page_size,
     )
     .map_err(StartMicrovmError::GuestMemoryMmap)
+}
+
+#[cfg(feature = "vhost-user")]
+fn create_vhost_user_memory_regions(
+    arch_mem_regions: &[(GuestAddress, usize)],
+) -> std::result::Result<Vec<(GuestAddress, usize, Option<FileOffset>)>, StartMicrovmError> {
+    arch_mem_regions
+        .iter()
+        .enumerate()
+        .map(|(index, (addr, size))| {
+            debug!(
+                "Creating file-backed region for vhost-user: addr=0x{:x}, size=0x{:x}",
+                addr.0, size
+            );
+            let file = create_vhost_user_memory_file(index, *size)?;
+            let file_offset = FileOffset::new(file, 0);
+            Ok((*addr, *size, Some(file_offset)))
+        })
+        .collect::<std::result::Result<Vec<_>, io::Error>>()
+        .map_err(|e| {
+            StartMicrovmError::GuestMemoryMmap(format!(
+                "vhost-user memory file creation failed: {e:?}"
+            ))
+        })
+}
+
+#[cfg(all(feature = "vhost-user", target_os = "linux"))]
+fn create_vhost_user_memory_file(_index: usize, size: usize) -> io::Result<File> {
+    // SAFETY: memfd_create is called with a valid null-terminated C string and valid flags.
+    // File descriptor ownership is transferred to File::from_raw_fd below.
+    let fd = unsafe { libc::memfd_create(c"guest_mem".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        error!("Failed to create memfd: {:?}", io::Error::last_os_error());
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::ftruncate(fd, size as i64) } < 0 {
+        error!(
+            "Failed to ftruncate memfd: {:?}",
+            io::Error::last_os_error()
+        );
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(io::Error::last_os_error());
+    }
+    debug!("Created memfd with fd={fd}");
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(all(feature = "vhost-user", target_os = "macos"))]
+fn create_vhost_user_memory_file(index: usize, size: usize) -> io::Result<File> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for attempt in 0..16 {
+        let path = std::env::temp_dir().join(format!(
+            "libkrun-vhost-user-ram-{}-{unique}-{index}-{attempt}",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                file.set_len(size as u64)?;
+                let _ = std::fs::remove_file(&path);
+                return Ok(file);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "unable to create unique vhost-user RAM backing file",
+    ))
 }
 
 fn insert_shm_regions_for_guest(
@@ -2791,7 +2859,7 @@ fn attach_rng_device(
 }
 
 #[cfg(not(feature = "tee"))]
-#[cfg(all(feature = "vhost-user", target_os = "linux"))]
+#[cfg(feature = "vhost-user")]
 fn attach_vhost_user_device(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,
@@ -2805,13 +2873,21 @@ fn attach_vhost_user_device(
         .clone()
         .unwrap_or_else(|| format!("vhost-user-{}", device_config.device_type));
 
+    let shared_memory_ranges =
+        if device_config.device_type == 26 && device_config.config_space.is_some() {
+            Some(vmm.ram_ranges.clone())
+        } else {
+            None
+        };
     let device = Arc::new(Mutex::new(
-        devices::virtio::VhostUserDevice::new(
+        devices::virtio::VhostUserDevice::with_config_space_and_memory_ranges(
             &device_config.socket_path,
             device_config.device_type,
             device_name.clone(),
             device_config.num_queues,
             &device_config.queue_sizes,
+            device_config.config_space.clone(),
+            shared_memory_ranges,
         )
         .map_err(|e| RegisterVhostUserDevice(device_manager::mmio::Error::VhostUserDevice(e)))?,
     ));

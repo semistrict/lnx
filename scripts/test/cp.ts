@@ -1,6 +1,16 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  readFile,
+  writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { assertEq, cleanupContext, defaultContext, lnx, prepareContext, run, testStep } from "./lib";
+import { assertEq,
+  cleanupContext,
+  defaultContext,
+  prepareContext,
+  run,
+  testStep,
+  type LnxCliOptions,
+} from "./lib";
 
 const ctx = defaultContext("cp");
 const vmArgs = [
@@ -8,8 +18,8 @@ const vmArgs = [
   ...(Bun.env.LNX_TEST_MEMORY_MIB ? ["--memory-mib", Bun.env.LNX_TEST_MEMORY_MIB] : []),
 ];
 
-function lnxVm(args: string[], options: Parameters<typeof lnx>[1] = {}) {
-  return lnx(ctx, [...vmArgs, ...args], options);
+function lnxVm(args: string[], options: LnxCliOptions = {}) {
+  return ctx.vm.cli([...vmArgs, ...args], options);
 }
 
 function lnxCommand(args: string[], options: Parameters<typeof run>[1] = {}) {

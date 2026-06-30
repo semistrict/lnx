@@ -1,4 +1,8 @@
-import { mkdir, readdir, readFile, rm } from "node:fs/promises";
+import {
+  mkdir,
+  readdir,
+  readFile,
+  rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertContains,
@@ -6,7 +10,6 @@ import {
   cleanupContext,
   cleanupInstance,
   defaultContext,
-  lnx,
   prepareContext,
   read,
   run,
@@ -42,9 +45,7 @@ try {
   await mkdir(cwdB, { recursive: true });
 
   await testStep("home virtiofs allows current cwd writes and denies sibling writes", async () => {
-    const result = await lnx(
-      ctx,
-      [
+    const result = await ctx.vm.cli([
       "bash",
         "-lc",
         [
@@ -64,9 +65,7 @@ try {
 
   await testStep("snapshot restore updates writable cwd allowlist", async () => {
     const checkpointName = "virtiofs-policy-memory";
-    await lnx(
-      ctx,
-      [
+    await ctx.vm.cli([
       "bash",
         "-lc",
         "printf memory-policy | sudo tee /run/virtiofs-policy-memory >/dev/null; printf snapshot-root | sudo tee /root/virtiofs-policy-root >/dev/null; printf before > before-snapshot.txt",
@@ -79,9 +78,7 @@ try {
       "checkpoint name",
     );
     const snapshot = await checkpointPathByName(checkpointName);
-    const restored = await lnx(
-      ctx,
-      [
+    const restored = await ctx.vm.cli([
         "--snapshot",
         snapshot,
         "bash",
@@ -100,9 +97,7 @@ try {
   });
 
   await testStep("copy_file_range and hole punching work through APFS virtiofs", async () => {
-    const result = await lnx(
-      ctx,
-      [
+    const result = await ctx.vm.cli([
       "bash",
         "-lc",
         String.raw`

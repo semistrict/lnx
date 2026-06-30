@@ -1,0 +1,4 @@
+	if _, err := syscall.Write(vq.CallFD, payload[:]); err != nil {
+		log.Printf("eventfd write: %v", err)
+		return
+	}

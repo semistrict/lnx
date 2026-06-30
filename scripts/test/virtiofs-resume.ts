@@ -1,4 +1,6 @@
-import { mkdir, rm } from "node:fs/promises";
+import {
+  mkdir,
+  rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertContains,
@@ -6,12 +8,10 @@ import {
   cleanupContext,
   cleanupInstance,
   defaultContext,
-  lnx,
   prepareContext,
   read,
   run,
   sleep,
-  spawnLnx,
   testStep,
   waitForVmSuspend,
   write,
@@ -34,7 +34,7 @@ async function discardLatestSnapshot() {
 async function waitForSourceReady(): Promise<void> {
   const deadline = Date.now() + 120_000;
   while (Date.now() < deadline) {
-    const result = await lnx(ctx, ["bash", "-lc", "test -e /tmp/virtiofs-fork-ready"], {
+    const result = await ctx.vm.cli(["bash", "-lc", "test -e /tmp/virtiofs-fork-ready"], {
       check: false,
       cwd,
       env: { LNX_HOST_SHARE_DAX: "1" },
@@ -53,9 +53,7 @@ try {
   await mkdir(outsideCwd, { recursive: true });
 
   await testStep("open virtiofs fd and mmap survive snapshot-exit", async () => {
-    const result = await lnx(
-      ctx,
-      [
+    const result = await ctx.vm.cli([
         "python3",
         "-",
       ],
@@ -113,13 +111,13 @@ finally:
     await discardLatestSnapshot();
     await write(join(cwd, "host-edited.txt"), "before\n");
 
-    const before = await lnx(ctx, ["cat", "host-edited.txt"], { cwd, timeoutMs: 180_000 });
+    const before = await ctx.vm.cli(["cat", "host-edited.txt"], { cwd, timeoutMs: 180_000 });
     assertEq(before.stdout, "before", "guest read initial host file");
     await waitForVmSuspend(ctx);
 
     await write(join(cwd, "host-edited.txt"), "after-after-after\n");
 
-    const after = await lnx(ctx, ["cat", "host-edited.txt"], { cwd, timeoutMs: 180_000 });
+    const after = await ctx.vm.cli(["cat", "host-edited.txt"], { cwd, timeoutMs: 180_000 });
     assertEq(after.stdout, "after-after-after", "restored guest read host-edited file");
   });
 
@@ -128,7 +126,7 @@ finally:
     await discardLatestSnapshot();
     await write(join(outsideCwd, "outside-host-edited.txt"), "outside-before\n");
 
-    const before = await lnx(ctx, ["cat", "outside-host-edited.txt"], {
+    const before = await ctx.vm.cli(["cat", "outside-host-edited.txt"], {
       cwd: outsideCwd,
       timeoutMs: 180_000,
     });
@@ -137,7 +135,7 @@ finally:
 
     await write(join(outsideCwd, "outside-host-edited.txt"), "outside-after-after\n");
 
-    const after = await lnx(ctx, ["cat", "outside-host-edited.txt"], {
+    const after = await ctx.vm.cli(["cat", "outside-host-edited.txt"], {
       cwd: outsideCwd,
       timeoutMs: 180_000,
     });
@@ -148,9 +146,7 @@ finally:
     await waitForVmSuspend(ctx);
     await discardLatestSnapshot();
 
-    const owner = spawnLnx(
-      ctx,
-      [
+    const owner = ctx.vm.spawnCli([
         "python3",
         "-",
       ],

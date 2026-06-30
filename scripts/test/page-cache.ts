@@ -1,7 +1,16 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  rm,
+  writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { assertEq, cleanupContext, defaultContext, lnx, prepareContext, testStep, waitForVmSuspend } from "./lib";
+import { assertEq,
+  cleanupContext,
+  defaultContext,
+  prepareContext,
+  testStep,
+  waitForVmSuspend,
+} from "./lib";
 
 Bun.env.LNX_BROKER_IDLE_TTL_MS ??= "500";
 
@@ -21,9 +30,7 @@ try {
   await writeFile(join(cwd, "virtiofs-cache.bin"), Buffer.alloc(fileSizeMiB * 1024 * 1024, 0x5a));
 
   await testStep("DAX-backed virtiofs and rootfs reads do not populate guest page cache", async () => {
-    const result = await lnx(
-      ctx,
-      [
+    const result = await ctx.vm.cli([
         "bash",
         "-lc",
         String.raw`

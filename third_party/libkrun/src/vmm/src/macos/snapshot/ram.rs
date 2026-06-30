@@ -376,13 +376,53 @@ fn guest_addr_to_file_offset(layout: &RamLayout, guest_addr: u64) -> Option<u64>
 pub fn restore_pages_img(dir: &Path, layout: &RamLayout) -> Result<GuestMemoryMmap> {
     crate::timing_event("snapshot.ram.restore_pages_img.begin");
     let file = Arc::new(File::open(pages_img_path(dir))?);
+    validate_pages_len(&file, layout)?;
+    restore_pages_img_mapped(file, layout, libc::MAP_PRIVATE | libc::MAP_NORESERVE)
+}
+
+/// Build shared writable guest RAM backed by `<dir>/pages.img`.
+///
+/// Vhost-user backends must mmap the same live guest RAM as the VM, so private
+/// COW restore memory is not sufficient for those runs. The path passed here is
+/// the per-owner restore-work snapshot, not the published snapshot directory.
+pub fn restore_pages_img_shared(dir: &Path, layout: &RamLayout) -> Result<GuestMemoryMmap> {
+    crate::timing_event("snapshot.ram.restore_pages_img_shared.begin");
+    let file = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(pages_img_path(dir))?,
+    );
+    validate_pages_len(&file, layout)?;
+    restore_pages_img_mapped(file, layout, libc::MAP_SHARED | libc::MAP_NORESERVE)
+}
+
+fn validate_pages_len(file: &File, layout: &RamLayout) -> Result<()> {
+    let file_len = file.metadata()?.len();
+    for r in &layout.regions {
+        let end = r
+            .file_offset
+            .checked_add(r.size)
+            .ok_or(SnapshotError::Truncated)?;
+        if end > file_len {
+            return Err(SnapshotError::Truncated);
+        }
+    }
+    Ok(())
+}
+
+fn restore_pages_img_mapped(
+    file: Arc<File>,
+    layout: &RamLayout,
+    mmap_flags: i32,
+) -> Result<GuestMemoryMmap> {
     crate::timing_event("snapshot.ram.pages_img.opened");
     let mut regions = Vec::new();
     for (index, r) in layout.regions.iter().enumerate() {
         let mapping = MmapRegionBuilder::new(r.size as usize)
             .with_file_offset(FileOffset::from_arc(file.clone(), r.file_offset))
             .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
-            .with_mmap_flags(libc::MAP_PRIVATE | libc::MAP_NORESERVE)
+            .with_mmap_flags(mmap_flags)
             .build()
             .map_err(|e| SnapshotError::Io(std::io::Error::other(format!("{e:?}"))))?;
         let region = GuestRegionMmap::new(mapping, GuestAddress(r.guest_addr))

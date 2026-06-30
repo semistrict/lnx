@@ -880,6 +880,22 @@ int32_t krun_add_vhost_user_device(uint32_t ctx_id,
                                    const uint16_t *queue_sizes);
 
 /**
+ * Add a vhost-user virtio-fs device to the VM.
+ *
+ * The backend must be running and listening on "socket_path" before the VM
+ * starts. The device is exposed to Linux with the provided virtio-fs tag.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ *  -EINVAL  - Invalid parameters
+ *  -ENOENT  - Context doesn't exist
+ *  -ENOTSUP - vhost-user support not compiled in
+ */
+int32_t krun_add_vhost_user_virtiofs(uint32_t ctx_id,
+                                     const char *tag,
+                                     const char *socket_path);
+
+/**
  * Configures a map of rlimits to be set in the guest before starting the isolated binary.
  *
  * Arguments:

@@ -1,5 +1,8 @@
-import { existsSync } from "node:fs";
-import { readdir, readFile, rm } from "node:fs/promises";
+import {
+  existsSync } from "node:fs";
+import { readdir,
+  readFile,
+  rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertEq,

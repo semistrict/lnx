@@ -1,0 +1,22 @@
+func (d *Device) SetVringBase(state *VhostVringState) {
+	p := d.vqs[state.Index]
+	p.ShadowAvailIdx = uint16(state.Num)
+	p.LastAvailIdx = uint16(state.Num)
+}
+
+func (d *Device) GetVringBase(index uint32) *VhostVringState {
+	p := d.vqs[index]
+	if p.control != nil {
+		close(p.control.cancel)
+		if p.KickFD >= 0 {
+			syscall.Close(p.KickFD)
+			p.KickFD = -1
+		}
+		<-p.control.done
+		p.control = nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return &VhostVringState{Index: index, Num: uint32(p.LastAvailIdx)}
+}
+

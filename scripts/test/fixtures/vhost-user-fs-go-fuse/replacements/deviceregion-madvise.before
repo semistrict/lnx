@@ -1,0 +1,1 @@
+	syscall.Madvise(data, unix.MADV_DONTDUMP)

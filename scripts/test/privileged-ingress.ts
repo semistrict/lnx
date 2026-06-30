@@ -6,7 +6,6 @@ import {
   run,
   skip,
   sleep,
-  spawnLnx,
   testStep,
 } from "./lib";
 
@@ -54,7 +53,7 @@ try {
 
   await testStep("trusted .lnx ingress proxy reachability", async () => {
     // Cold-boot a VM that serves http inline; hold it alive for every check.
-    const holder = spawnLnx(ctx, ["bash", "-lc", SERVE]);
+    const holder = ctx.vm.spawnCli(["bash", "-lc", SERVE]);
     try {
       const url = `https://p8080-${ctx.instance}.lnx/`;
       const https = await waitForHttp(url, 120_000);

@@ -1,11 +1,11 @@
-import { join } from "node:path";
+import {
+  join } from "node:path";
 import {
   assertContains,
   assertEq,
   assertFile,
   cleanupContext,
   defaultContext,
-  lnx,
   prepareContext,
   read,
   run,
@@ -58,68 +58,68 @@ try {
   });
 
   await testStep("basic exec and snapshots", async () => {
-    assertEq((await lnx(ctx, ["echo", "cold"])).stdout, "cold", "cold exec");
+    assertEq((await ctx.vm.cli(["echo", "cold"])).stdout, "cold", "cold exec");
     assertFile(join(ctx.base, "vmlinuz"), "auto-init kernel");
     assertFile(join(ctx.imageDir, "rootfs.ext4"), "auto-init rootfs");
     await waitForVmSuspend(ctx);
     assertFile(join(ctx.snapshotDir, "latest", "vmstate.bin"), "full snapshot vmstate");
     assertFile(join(ctx.snapshotDir, "latest", "pages.img"), "full snapshot pages");
     assertFile(join(ctx.snapshotDir, "latest", "rootfs.ext4"), "full snapshot rootfs");
-    assertEq((await lnx(ctx, ["echo", "restored"])).stdout, "restored", "restored exec");
-    assertEq((await lnx(ctx, ["run", "echo", "run-subcommand"])).stdout, "run-subcommand", "run subcommand exec");
+    assertEq((await ctx.vm.cli(["echo", "restored"])).stdout, "restored", "restored exec");
+    assertEq((await ctx.vm.cli(["run", "echo", "run-subcommand"])).stdout, "run-subcommand", "run subcommand exec");
     await waitForVmSuspend(ctx);
-    assertEq((await lnx(ctx, ["--snapshot", join(ctx.snapshotDir, "latest"), "echo", "explicit-snapshot"])).stdout, "explicit-snapshot", "explicit snapshot restore");
+    assertEq((await ctx.vm.cli(["--snapshot", join(ctx.snapshotDir, "latest"), "echo", "explicit-snapshot"])).stdout, "explicit-snapshot", "explicit snapshot restore");
   });
 
   await testStep("stdio and status", async () => {
-    assertEq((await lnx(ctx, ["cat"], { stdin: "stdin-ok" })).stdout, "stdin-ok", "non-pty stdin");
-    assertEq((await lnx(ctx, [], { stdin: "echo noargs-shell; exit\n" })).stdout, "noargs-shell", "default shell over stdin");
-    const failed = await lnx(ctx, ["bash", "-lc", "echo stdout-line; echo stderr-line >&2; exit 7"], { check: false });
+    assertEq((await ctx.vm.cli(["cat"], { stdin: "stdin-ok" })).stdout, "stdin-ok", "non-pty stdin");
+    assertEq((await ctx.vm.cli([], { stdin: "echo noargs-shell; exit\n" })).stdout, "noargs-shell", "default shell over stdin");
+    const failed = await ctx.vm.cli(["bash", "-lc", "echo stdout-line; echo stderr-line >&2; exit 7"], { check: false });
     assertEq(failed.status, 7, "exit status propagation");
     assertEq(failed.stdout, "stdout-line", "stdout propagation");
     assertEq(failed.stderr, "stderr-line", "stderr propagation");
-    const notFound = await lnx(ctx, ["definitely-not-a-command"], { check: false });
+    const notFound = await ctx.vm.cli(["definitely-not-a-command"], { check: false });
     assertEq(notFound.status, 127, "command-not-found status");
     assertContains(notFound.stderr, "command not found: definitely-not-a-command", "command-not-found stderr");
   });
 
   await testStep("guest shape", async () => {
-    assertEq((await lnx(ctx, ["id", "-un"])).stdout, "lnxuser", "exec runs as lnxuser");
-    assertEq((await lnx(ctx, ["bash", "-lc", 'printf "%s:%s:%s" "$USER" "$LOGNAME" "$HOME"'])).stdout, "lnxuser:lnxuser:/home/lnxuser", "exec user environment");
-    assertContains((await lnx(ctx, ["bash", "-lc", "id -u; id -g"])).stdout, `${process.getuid?.() ?? 0}\n${process.getgid?.() ?? 0}`, "exec uid/gid match host");
+    assertEq((await ctx.vm.cli(["id", "-un"])).stdout, "lnxuser", "exec runs as lnxuser");
+    assertEq((await ctx.vm.cli(["bash", "-lc", 'printf "%s:%s:%s" "$USER" "$LOGNAME" "$HOME"'])).stdout, "lnxuser:lnxuser:/home/lnxuser", "exec user environment");
+    assertContains((await ctx.vm.cli(["bash", "-lc", "id -u; id -g"])).stdout, `${process.getuid?.() ?? 0}\n${process.getgid?.() ?? 0}`, "exec uid/gid match host");
     const hostGroup = (await run(["id", "-gn"])).stdout;
-    assertEq((await lnx(ctx, ["id", "-gn"])).stdout, hostGroup, "exec primary group named like host");
-    assertEq((await lnx(ctx, ["--root", "id", "-un"])).stdout, "root", "--root runs as root");
-    assertEq((await lnx(ctx, ["getconf", "PAGESIZE"])).stdout, "16384", "guest page size");
-    assertEq((await lnx(ctx, ["nproc"])).stdout, "2", "default cpu count");
-    assertContains((await lnx(ctx, ["bash", "-lc", "printf %s \"$PATH\""])).stdout, "/snap/bin", "exec PATH includes snap commands");
-    const pid1 = await lnx(ctx, ["bash", "-lc", "cat /proc/1/comm; sudo readlink /proc/1/root; test ! -e /newroot; test ! -e /oldroot; echo clean"]);
+    assertEq((await ctx.vm.cli(["id", "-gn"])).stdout, hostGroup, "exec primary group named like host");
+    assertEq((await ctx.vm.cli(["--root", "id", "-un"])).stdout, "root", "--root runs as root");
+    assertEq((await ctx.vm.cli(["getconf", "PAGESIZE"])).stdout, "16384", "guest page size");
+    assertEq((await ctx.vm.cli(["nproc"])).stdout, "2", "default cpu count");
+    assertContains((await ctx.vm.cli(["bash", "-lc", "printf %s \"$PATH\""])).stdout, "/snap/bin", "exec PATH includes snap commands");
+    const pid1 = await ctx.vm.cli(["bash", "-lc", "cat /proc/1/comm; sudo readlink /proc/1/root; test ! -e /newroot; test ! -e /oldroot; echo clean"]);
     assertEq(pid1.stdout, "systemd\n/\nclean", "systemd owns final root");
-    const rootMount = await lnx(ctx, ["findmnt", "-n", "-o", "FSTYPE,OPTIONS", "/"]);
+    const rootMount = await ctx.vm.cli(["findmnt", "-n", "-o", "FSTYPE,OPTIONS", "/"]);
     assertContains(rootMount.stdout, "ext4", "root is ext4");
     assertContains(rootMount.stdout, "dax=always", "root is dax mounted");
     // udev's standard rule (static_node) sets /dev/fuse world-rw so
     // unprivileged FUSE (e.g. ArtifactFS) works, the same as a desktop distro.
     assertEq(
-      (await lnx(ctx, ["bash", "-lc", "stat -c %a /dev/fuse"])).stdout,
+      (await ctx.vm.cli(["bash", "-lc", "stat -c %a /dev/fuse"])).stdout,
       "666",
       "/dev/fuse is world-rw for unprivileged FUSE",
     );
   });
 
   await testStep("network and lnxctl", async () => {
-    const probe = await lnx(ctx, [
+    const probe = await ctx.vm.cli([
       "bash",
       "-lc",
       'tmp=/tmp/lnx-network-probe; rm -f "$tmp"; curl -fsS --max-time 20 -o "$tmp" http://ports.ubuntu.com/ubuntu-ports/dists/resolute/InRelease; sed -n "1p" "$tmp"',
     ]);
     assertEq(probe.stdout, "-----BEGIN PGP SIGNED MESSAGE-----", "outbound networking");
 
-    const help = await lnx(ctx, ["lnxctl", "--help"], { check: false });
+    const help = await ctx.vm.cli(["lnxctl", "--help"], { check: false });
     assertEq(help.status, 2, "lnxctl usage status");
     assertContains(help.stderr, "usage: lnxctl snapshot-exit", "lnxctl usage text");
-    assertEq((await lnx(ctx, ["lnxctl", "snapshot-exit"])).status, 0, "lnxctl snapshot-exit status");
-    assertEq((await lnx(ctx, ["echo", "post-lnxctl"])).stdout, "post-lnxctl", "exec after lnxctl snapshot-exit");
+    assertEq((await ctx.vm.cli(["lnxctl", "snapshot-exit"])).status, 0, "lnxctl snapshot-exit status");
+    assertEq((await ctx.vm.cli(["echo", "post-lnxctl"])).stdout, "post-lnxctl", "exec after lnxctl snapshot-exit");
   });
 } finally {
   await cleanupContext(ctx);

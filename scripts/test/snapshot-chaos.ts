@@ -10,13 +10,16 @@
 //
 // Reproduce a failure with LNX_CHAOS_SEED=<seed from the log>. Scale soak
 // runs with LNX_CHAOS_ITERATIONS (default 3).
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  readFile,
+  rm,
+  writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertEq,
   cleanupContext,
   defaultContext,
-  lnx,
   prepareContext,
   skip,
   spawn,
@@ -255,7 +258,7 @@ try {
   await mkdir(cwd, { recursive: true });
 
   await testStep("warm up instance", async () => {
-    const ready = await lnx(ctx, [...vmArgs, "echo", "ready"], { cwd, timeoutMs: 180_000 });
+    const ready = await ctx.vm.cli([...vmArgs, "echo", "ready"], { cwd, timeoutMs: 180_000 });
     assertEq(ready.stdout, "ready", "warmup boot");
   });
 
@@ -273,16 +276,14 @@ try {
       ];
 
       await new Promise((resolve) => setTimeout(resolve, triggerDelayMs));
-      const first = await lnx(ctx, [...vmArgs, "bash", "-lc", "lnxctl snapshot-exit && echo SNAP:1"], {
+      const first = await ctx.vm.cli([...vmArgs, "bash", "-lc", "lnxctl snapshot-exit && echo SNAP:1"], {
         cwd,
         timeoutMs: 240_000,
       });
       assertEq(first.stdout, "SNAP:1", `first snapshot trigger (seed=${seed})`);
       if (doubleSnapshot) {
         await new Promise((resolve) => setTimeout(resolve, randInt(200, 800)));
-        const second = await lnx(
-          ctx,
-          [...vmArgs, "bash", "-lc", "lnxctl snapshot-exit && echo SNAP:2"],
+        const second = await ctx.vm.cli([...vmArgs, "bash", "-lc", "lnxctl snapshot-exit && echo SNAP:2"],
           { cwd, timeoutMs: 240_000 },
         );
         assertEq(second.stdout, "SNAP:2", `second snapshot trigger (seed=${seed})`);

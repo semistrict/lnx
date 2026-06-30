@@ -69,7 +69,7 @@ dependencies = [
 
 [[package]]
 name = "lnx-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "lnx-protocol",
  "postcard",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "lnx-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
 ]

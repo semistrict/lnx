@@ -1,15 +1,18 @@
-import { cp, readFile, writeFile } from "node:fs/promises";
+import {
+  cp,
+  readFile,
+  writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertContains,
   assertEq,
   cleanupContext,
   defaultContext,
-  lnx,
   prepareContext,
   testStep,
   waitForOwnerExit,
   waitForVmSuspend,
+  type LnxCliOptions,
 } from "./lib";
 
 const ctx = defaultContext("nested-snapshot");
@@ -19,8 +22,8 @@ const vmArgs = [
   ...(Bun.env.LNX_TEST_MEMORY_MIB ? ["--memory-mib", Bun.env.LNX_TEST_MEMORY_MIB] : []),
 ];
 
-function lnxVm(args: string[], options: Parameters<typeof lnx>[1] = {}) {
-  return lnx(ctx, [...vmArgs, ...args], options);
+function lnxVm(args: string[], options: LnxCliOptions = {}) {
+  return ctx.vm.cli([...vmArgs, ...args], options);
 }
 
 try {

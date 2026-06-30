@@ -509,7 +509,7 @@ fn shares_stamp_content_lists_home_cwd_and_network() {
             false,
             HOST_SHARE_CACHE_NODAX_STAMP,
         ),
-        "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\nnet=gvproxy\n"
+        "host-share-cache=nodax+close-to-open+writeback+restore-sync-v2\nhome=/Users/ramon\nnet=gvproxy\n"
     );
     assert_eq!(
         shares_stamp_content_with_cache_stamp(
@@ -519,7 +519,7 @@ fn shares_stamp_content_lists_home_cwd_and_network() {
             false,
             HOST_SHARE_CACHE_NODAX_STAMP,
         ),
-        "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\ncwd=/tmp/build\nnet=other\n"
+        "host-share-cache=nodax+close-to-open+writeback+restore-sync-v2\nhome=/Users/ramon\ncwd=/tmp/build\nnet=other\n"
     );
     assert_eq!(
         shares_stamp_content_with_cache_stamp(
@@ -539,7 +539,7 @@ fn shares_stamp_content_lists_home_cwd_and_network() {
             false,
             HOST_SHARE_CACHE_DAX_STAMP,
         ),
-        "host-share-cache=dax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\nnet=gvproxy\n"
+        "host-share-cache=dax+close-to-open+writeback+restore-sync-v2\nhome=/Users/ramon\nnet=gvproxy\n"
     );
 }
 
@@ -554,7 +554,55 @@ fn shares_stamp_content_records_package_store() {
             HOST_SHARE_CACHE_NODAX_STAMP,
             "packages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64",
         ),
-        "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\npackages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64\nnet=gvproxy\n"
+        "host-share-cache=nodax+close-to-open+writeback+restore-sync-v2\nhome=/Users/ramon\npackages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64\nnet=gvproxy\n"
+    );
+}
+
+#[test]
+fn shares_stamp_content_records_vhost_user_fs() {
+    let temp = TempDir::new("snapshot-vhost-user-fs");
+    fs::create_dir_all(temp.path()).expect("create snapshot dir");
+    let mounts = vec![VhostUserFsMount {
+        tag: "testfs".to_string(),
+        mountpoint: "/mnt/testfs".to_string(),
+        socket: PathBuf::from("/tmp/testfs.sock"),
+        read_only: true,
+    }];
+    let mut current = shares_stamp_content_with_cache_and_package_store(
+        Path::new("/Users/ramon"),
+        None,
+        "net=gvproxy",
+        false,
+        HOST_SHARE_CACHE_NODAX_STAMP,
+        PACKAGE_STORE_DISABLED_STAMP,
+    );
+    append_vhost_user_fs_stamp(&mut current, &mounts);
+
+    assert!(current.contains("vhost-user-fs=testfs:/mnt/testfs:/tmp/testfs.sock:ro\n"));
+    fs::write(temp.path().join("shares.stamp"), &current).expect("write stamp");
+    assert_eq!(snapshot_shares_incompatibility(temp.path(), &current), None);
+
+    let mut changed_socket = shares_stamp_content_with_cache_and_package_store(
+        Path::new("/Users/ramon"),
+        None,
+        "net=gvproxy",
+        false,
+        HOST_SHARE_CACHE_NODAX_STAMP,
+        PACKAGE_STORE_DISABLED_STAMP,
+    );
+    append_vhost_user_fs_stamp(
+        &mut changed_socket,
+        &[VhostUserFsMount {
+            socket: PathBuf::from("/tmp/other.sock"),
+            ..mounts[0].clone()
+        }],
+    );
+    assert_eq!(
+        snapshot_shares_incompatibility(temp.path(), &changed_socket),
+        Some(
+            "share_mismatch: vhost-user-fs: snapshot=testfs:/mnt/testfs:/tmp/testfs.sock:ro current=testfs:/mnt/testfs:/tmp/other.sock:ro"
+                .to_string()
+        )
     );
 }
 
@@ -576,6 +624,16 @@ fn snapshot_shares_compatibility_requires_identical_stamp() {
 
     fs::write(temp.path().join("shares.stamp"), &current).expect("write stamp");
     assert_eq!(snapshot_shares_incompatibility(temp.path(), &current), None);
+
+    let legacy_keep_cache = "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\nnet=gvproxy\n";
+    fs::write(temp.path().join("shares.stamp"), legacy_keep_cache).expect("write stamp");
+    assert_eq!(
+        snapshot_shares_incompatibility(temp.path(), &current),
+        Some(
+            "share_mismatch: host-share-cache: snapshot=nodax+keep-cache+writeback+restore-sync-v1 current=nodax+close-to-open+writeback+restore-sync-v2"
+                .to_string()
+        )
+    );
 
     let legacy_cache_policy = "home=/Users/ramon\nnet=gvproxy\n";
     fs::write(temp.path().join("shares.stamp"), legacy_cache_policy).expect("write stamp");
@@ -611,7 +669,7 @@ fn snapshot_shares_compatibility_requires_identical_stamp() {
     assert_eq!(
             snapshot_shares_incompatibility(temp.path(), &current),
             Some(
-                "share_mismatch: host-shares: snapshot=disabled current=enabled; host-share-cache: snapshot=<absent> current=nodax+keep-cache+writeback+restore-sync-v1; home: snapshot=<absent> current=/Users/ramon"
+                "share_mismatch: host-shares: snapshot=disabled current=enabled; host-share-cache: snapshot=<absent> current=nodax+close-to-open+writeback+restore-sync-v2; home: snapshot=<absent> current=/Users/ramon"
                     .to_string()
             )
         );
@@ -620,7 +678,7 @@ fn snapshot_shares_compatibility_requires_identical_stamp() {
     assert_eq!(
             snapshot_shares_incompatibility(temp.path(), &disabled),
             Some(
-                "share_mismatch: host-shares: snapshot=enabled current=disabled; host-share-cache: snapshot=nodax+keep-cache+writeback+restore-sync-v1 current=<absent>; home: snapshot=/Users/ramon current=<absent>"
+                "share_mismatch: host-shares: snapshot=enabled current=disabled; host-share-cache: snapshot=nodax+close-to-open+writeback+restore-sync-v2 current=<absent>; home: snapshot=/Users/ramon current=<absent>"
                     .to_string()
             )
         );
@@ -635,7 +693,7 @@ fn snapshot_shares_compatibility_requires_identical_stamp() {
     assert_eq!(
             snapshot_shares_incompatibility(temp.path(), &dax_current),
             Some(
-                "share_mismatch: host-share-cache: snapshot=nodax+keep-cache+writeback+restore-sync-v1 current=dax+keep-cache+writeback+restore-sync-v1"
+                "share_mismatch: host-share-cache: snapshot=nodax+close-to-open+writeback+restore-sync-v2 current=dax+close-to-open+writeback+restore-sync-v2"
                     .to_string()
             )
         );
@@ -1284,6 +1342,36 @@ fn existing_broker_client_propagates_protocol_mismatch() {
     let _ = fs::remove_file(&socket);
 
     assert!(err.downcast_ref::<BrokerProtocolMismatch>().is_some());
+}
+
+#[test]
+fn existing_broker_client_treats_missing_hello_as_not_ready() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let socket = PathBuf::from(format!("/tmp/lnx-bh-{}-{unique}.sock", std::process::id()));
+    let _ = fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket).expect("listen broker");
+    let server = thread::spawn(move || {
+        let (_stream, _) = listener.accept().expect("accept broker");
+    });
+
+    let status = run_existing_broker_client(
+        &socket,
+        &["true".to_string()],
+        Path::new("/"),
+        true,
+        true,
+        None,
+        "default",
+        None,
+    )
+    .expect("missing hello is transient");
+    server.join().expect("broker thread");
+    let _ = fs::remove_file(&socket);
+
+    assert_eq!(status, None);
 }
 
 #[test]

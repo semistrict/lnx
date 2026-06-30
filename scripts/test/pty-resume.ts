@@ -1,4 +1,11 @@
-import { assertContains, cleanupContext, defaultContext, prepareContext, run, testStep } from "./lib";
+import {
+  assertContains,
+  cleanupContext,
+  defaultContext,
+  prepareContext,
+  run,
+  testStep,
+} from "./lib";
 
 const ctx = defaultContext("pty-resume");
 

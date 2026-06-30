@@ -40,6 +40,9 @@ pub enum Error {
     DeviceNotFound,
     /// Failed to update the mmio device.
     UpdateFailed,
+    /// Failed to create vhost-user device.
+    #[cfg(feature = "vhost-user")]
+    VhostUserDevice(io::Error),
 }
 
 impl fmt::Display for Error {
@@ -58,6 +61,8 @@ impl fmt::Display for Error {
             Error::RegisterIrqFd => write!(f, "failed to register irqfd"),
             Error::DeviceNotFound => write!(f, "the device couldn't be found"),
             Error::UpdateFailed => write!(f, "failed to update the mmio device"),
+            #[cfg(feature = "vhost-user")]
+            Error::VhostUserDevice(ref e) => write!(f, "failed to create vhost-user device: {e}"),
         }
     }
 }

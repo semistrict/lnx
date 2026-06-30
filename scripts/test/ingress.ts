@@ -1,4 +1,10 @@
-import { assertContains, assertEq, defaultContext, run, testStep } from "./lib";
+import {
+  assertContains,
+  assertEq,
+  defaultContext,
+  run,
+  testStep,
+} from "./lib";
 
 const ctx = defaultContext("ingress");
 const env = {

@@ -1,5 +1,7 @@
-import { existsSync } from "node:fs";
-import { mkdir, rm } from "node:fs/promises";
+import {
+  existsSync } from "node:fs";
+import { mkdir,
+  rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertContains,
@@ -7,7 +9,6 @@ import {
   cloneSparseImage,
   cleanupContext,
   defaultContext,
-  lnx,
   prepareContext,
   quoteShell,
   run,
@@ -45,9 +46,7 @@ try {
     assertEq(new DataView(vmstate).getUint32(8, true), 4, "source snapshot is shared vmstate v4");
 
     try {
-      const restored = await lnx(
-        ctx,
-        [
+      const restored = await ctx.vm.cli([
           "--no-host-shares",
           "--memory-mib",
           "512",

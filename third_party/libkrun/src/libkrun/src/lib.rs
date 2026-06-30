@@ -2101,11 +2101,67 @@ pub unsafe extern "C" fn krun_add_vhost_user_device(
                 name: name_opt,
                 num_queues,
                 queue_sizes: queue_sizes_vec,
+                config_space: None,
             });
             KRUN_SUCCESS
         }
         Entry::Vacant(_) => -libc::ENOENT,
     }
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(feature = "vhost-user")]
+pub unsafe extern "C" fn krun_add_vhost_user_virtiofs(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    socket_path: *const c_char,
+) -> i32 {
+    use vmm::resources::VhostUserDeviceConfig;
+
+    if c_tag.is_null() || socket_path.is_null() {
+        return -libc::EINVAL;
+    }
+
+    let tag = match unsafe { CStr::from_ptr(c_tag) }.to_str() {
+        Ok(tag) if !tag.is_empty() && tag.as_bytes().len() <= 36 => tag,
+        _ => return -libc::EINVAL,
+    };
+    let socket_path_str = match unsafe { CStr::from_ptr(socket_path) }.to_str() {
+        Ok(s) if !s.is_empty() => s,
+        _ => return -libc::EINVAL,
+    };
+
+    let mut config_space = vec![0_u8; 40];
+    config_space[..tag.as_bytes().len()].copy_from_slice(tag.as_bytes());
+    config_space[36..40].copy_from_slice(&1_u32.to_le_bytes());
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            cfg.vmr.vhost_user_devices.push(VhostUserDeviceConfig {
+                device_type: 26,
+                socket_path: socket_path_str.to_string(),
+                name: Some(format!("vhost-user-fs-{tag}")),
+                num_queues: 2,
+                queue_sizes: vec![1024, 1024],
+                config_space: Some(config_space),
+            });
+            KRUN_SUCCESS
+        }
+        Entry::Vacant(_) => -libc::ENOENT,
+    }
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(not(feature = "vhost-user"))]
+pub unsafe extern "C" fn krun_add_vhost_user_virtiofs(
+    _ctx_id: u32,
+    _c_tag: *const c_char,
+    _socket_path: *const c_char,
+) -> i32 {
+    -libc::ENOTSUP
 }
 
 #[allow(clippy::missing_safety_doc)]

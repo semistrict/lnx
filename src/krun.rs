@@ -135,6 +135,17 @@ impl Context {
         self.set_host_virtiofs_write_allowlist_cstr(&tag, write_allowlist)
     }
 
+    pub fn add_vhost_user_virtiofs(&self, tag: &str, socket: &Path) -> Result<()> {
+        let tag = CString::new(tag)?;
+        let socket = cstring_path(socket)?;
+        call(
+            unsafe {
+                libkrun::krun_add_vhost_user_virtiofs(self.id, tag.as_ptr(), socket.as_ptr())
+            },
+            "krun_add_vhost_user_virtiofs",
+        )
+    }
+
     #[allow(dead_code)]
     pub fn set_host_virtiofs_write_allowlist(&self, tag: &str, paths: &[String]) -> Result<()> {
         let tag = CString::new(tag)?;

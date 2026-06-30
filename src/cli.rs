@@ -83,6 +83,14 @@ pub struct Cli {
     )]
     forwards: Vec<runner::PortForward>,
 
+    #[arg(
+        long = "vhost-user-fs",
+        value_name = "tag=NAME,mount=/GUEST/PATH,socket=/HOST/SOCK[,ro]",
+        value_parser = parse_vhost_user_fs_mount,
+        help = "Mount a read-only external vhost-user virtio-fs backend inside the guest"
+    )]
+    vhost_user_fs: Vec<runner::VhostUserFsMount>,
+
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -98,6 +106,7 @@ enum Command {
     Packages(PackagesArgs),
     Checkpoint(CheckpointArgs),
     Checkpoints,
+    Snapshots(SnapshotsArgs),
     Fork(ForkArgs),
     Fs(FsArgs),
     Server(ServerArgs),
@@ -205,6 +214,18 @@ struct PackagesInstallArgs {
 struct CheckpointArgs {
     #[arg(short = 'm')]
     message: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct SnapshotsArgs {
+    #[command(subcommand)]
+    command: SnapshotsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SnapshotsCommand {
+    #[command(about = "Remove the current instance's latest memory snapshot")]
+    Clear,
 }
 
 #[derive(Debug, Args)]
@@ -389,6 +410,7 @@ impl Cli {
             no_host_shares,
             root,
             forwards,
+            vhost_user_fs,
             command,
             guest_command,
         } = self;
@@ -401,7 +423,14 @@ impl Cli {
         let explicit_kernel = kernel.is_some();
         let explicit_rootfs = rootfs.is_some();
         let deterministic = deterministic.map(|seed| runner::DeterministicConfig { seed });
-        validate_deterministic_args(nested_kvm, &forwards, deterministic.as_ref(), trace_events)?;
+        validate_deterministic_args(
+            nested_kvm,
+            &forwards,
+            &vhost_user_fs,
+            deterministic.as_ref(),
+            trace_events,
+        )?;
+        validate_vhost_user_fs_mounts(&vhost_user_fs)?;
         let effective_no_host_shares = no_host_shares || deterministic.is_some();
         maybe_auto_init_git_worktree(
             &instance,
@@ -479,6 +508,7 @@ impl Cli {
                         trace_events,
                         root,
                         forwards,
+                        vhost_user_fs.clone(),
                         explicit_kernel,
                         explicit_rootfs,
                     )
@@ -522,6 +552,7 @@ impl Cli {
                         memory_mib,
                         snapshot_path,
                         forwards,
+                        vhost_user_fs.clone(),
                         explicit_kernel,
                         explicit_rootfs,
                         effective_no_host_shares,
@@ -531,6 +562,7 @@ impl Cli {
                 }
             }
             Some(Command::Checkpoints) => list_checkpoints(&layout),
+            Some(Command::Snapshots(args)) => run_snapshots_command(&layout, args),
             Some(Command::Fork(args)) => {
                 if cfg!(target_os = "macos") && deterministic.is_some() {
                     let mut subcommand = vec!["fork".to_string()];
@@ -561,6 +593,7 @@ impl Cli {
                         memory_mib,
                         snapshot_path,
                         forwards,
+                        vhost_user_fs.clone(),
                         explicit_kernel,
                         explicit_rootfs,
                         effective_no_host_shares,
@@ -621,6 +654,7 @@ impl Cli {
                 memory_mib,
                 nested_kvm,
                 effective_no_host_shares,
+                vhost_user_fs.clone(),
                 deterministic.clone(),
                 trace_events,
             ),
@@ -641,6 +675,7 @@ impl Cli {
                 run_as_root: false,
                 no_host_shares: effective_no_host_shares || args.no_host_shares,
                 package_store: args.package_store,
+                vhost_user_fs: vhost_user_fs.clone(),
                 reuse_owner: true,
                 deterministic: args
                     .deterministic
@@ -676,6 +711,7 @@ impl Cli {
                         trace_events,
                         root,
                         forwards,
+                        vhost_user_fs,
                         explicit_kernel,
                         explicit_rootfs,
                     )
@@ -811,6 +847,7 @@ fn init_local_default_instance(
                 memory_mib,
                 snapshot_path,
                 forwards,
+                Vec::new(),
                 explicit_kernel,
                 explicit_rootfs,
                 no_host_shares,
@@ -964,6 +1001,7 @@ fn run_packages_install(
         run_as_root: true,
         no_host_shares: true,
         package_store: GuestStoreMode::Writable,
+        vhost_user_fs: Vec::new(),
         reuse_owner: false,
         deterministic: None,
         trace_events: false,
@@ -1099,6 +1137,7 @@ fn init_local_fork_from_base(
                     memory_mib,
                     snapshot_path,
                     forwards,
+                    Vec::new(),
                     explicit_kernel,
                     explicit_rootfs,
                     no_host_shares,
@@ -1113,6 +1152,7 @@ fn init_local_fork_from_base(
                     memory_mib,
                     false,
                     no_host_shares,
+                    Vec::new(),
                     deterministic,
                     trace_events,
                 )?;
@@ -1125,6 +1165,7 @@ fn init_local_fork_from_base(
                     memory_mib,
                     false,
                     no_host_shares,
+                    Vec::new(),
                     deterministic,
                     trace_events,
                 )?;
@@ -1139,6 +1180,7 @@ fn init_local_fork_from_base(
                 memory_mib,
                 false,
                 no_host_shares,
+                Vec::new(),
                 deterministic,
                 trace_events,
             )?;
@@ -1518,6 +1560,7 @@ fn run_guest(
     trace_events: bool,
     run_as_root: bool,
     forwards: Vec<runner::PortForward>,
+    vhost_user_fs: Vec<runner::VhostUserFsMount>,
     explicit_kernel: bool,
     explicit_rootfs: bool,
 ) -> Result<()> {
@@ -1531,6 +1574,7 @@ fn run_guest(
         snapshot_path.is_some(),
         nested_kvm,
         no_host_shares,
+        &vhost_user_fs,
         deterministic.as_ref(),
         trace_events,
     )?;
@@ -1581,6 +1625,7 @@ fn run_guest(
         snapshot_output: None,
         no_host_shares,
         package_store: GuestStoreMode::Auto,
+        vhost_user_fs,
         reuse_owner: true,
         deterministic,
         trace_events,
@@ -1854,6 +1899,7 @@ fn ensure_vm_initialized(
     explicit_snapshot: bool,
     nested_kvm: bool,
     no_host_shares: bool,
+    vhost_user_fs: &[runner::VhostUserFsMount],
     deterministic: Option<&runner::DeterministicConfig>,
     trace_events: bool,
 ) -> Result<()> {
@@ -1865,31 +1911,37 @@ fn ensure_vm_initialized(
         return Ok(());
     }
     eprintln!("first run: initializing VM instance {}", layout.instance);
-    let cpus = cpus.to_string();
-    let memory_mib = memory_mib.to_string();
-    let no_host_shares_arg = no_host_shares.then_some("--no-host-shares");
-    let nested_kvm_arg = nested_kvm.then_some("--nested-kvm");
-    let mut command = vec!["--cpus", &cpus, "--memory-mib", &memory_mib];
-    if let Some(arg) = nested_kvm_arg {
-        command.push(arg);
+    let mut command = vec![
+        "--cpus".to_string(),
+        cpus.to_string(),
+        "--memory-mib".to_string(),
+        memory_mib.to_string(),
+    ];
+    if nested_kvm {
+        command.push("--nested-kvm".to_string());
     }
-    if let Some(arg) = no_host_shares_arg {
-        command.push(arg);
+    if no_host_shares {
+        command.push("--no-host-shares".to_string());
+    }
+    for mount in vhost_user_fs {
+        command.push("--vhost-user-fs".to_string());
+        command.push(runner::vhost_user_fs_arg(mount));
     }
     if let Some(config) = deterministic {
-        command.push("--deterministic");
-        command.push(&config.seed);
+        command.push("--deterministic".to_string());
+        command.push(config.seed.clone());
     }
     if trace_events {
-        command.push("--trace-events");
+        command.push("--trace-events".to_string());
     }
-    command.push("_vm-init");
+    command.push("_vm-init".to_string());
+    let command_refs = command.iter().map(String::as_str).collect::<Vec<_>>();
     run_lnx_child(
         layout,
         Some(&layout.kernel),
         Some(&layout.rootfs),
         None,
-        &command,
+        &command_refs,
         None,
         false,
     )
@@ -1900,6 +1952,7 @@ fn ensure_vm_initialized(
 fn validate_deterministic_args(
     nested_kvm: bool,
     forwards: &[runner::PortForward],
+    vhost_user_fs: &[runner::VhostUserFsMount],
     deterministic: Option<&runner::DeterministicConfig>,
     trace_events: bool,
 ) -> Result<()> {
@@ -1917,6 +1970,9 @@ fn validate_deterministic_args(
     }
     if !forwards.is_empty() {
         bail!("--deterministic cannot be combined with --forward yet");
+    }
+    if !vhost_user_fs.is_empty() {
+        bail!("--deterministic cannot be combined with --vhost-user-fs yet");
     }
     Ok(())
 }
@@ -1959,6 +2015,7 @@ fn run_nested_deterministic_on_macos(
         false,
         true,
         false,
+        &[],
         None,
         false,
     )?;
@@ -1997,6 +2054,7 @@ fn run_nested_deterministic_on_macos(
         run_as_root: false,
         no_host_shares: false,
         package_store: GuestStoreMode::Disabled,
+        vhost_user_fs: Vec::new(),
         reuse_owner: true,
         deterministic: None,
         trace_events: false,
@@ -2204,6 +2262,7 @@ fn initialize_vm_instance(
     memory_mib: u32,
     nested_kvm: bool,
     no_host_shares: bool,
+    vhost_user_fs: Vec<runner::VhostUserFsMount>,
     deterministic: Option<runner::DeterministicConfig>,
     trace_events: bool,
 ) -> Result<()> {
@@ -2211,6 +2270,7 @@ fn initialize_vm_instance(
         return Ok(());
     }
     let cwd = std::env::current_dir().context("current directory")?;
+    let snapshot_output = Some(layout.snapshot_dir.join("latest"));
     let status = runner::run(runner::RunConfig {
         layout: layout.clone(),
         command: vec!["true".to_string()],
@@ -2220,10 +2280,11 @@ fn initialize_vm_instance(
         nested_kvm,
         restore_snapshot: None,
         forwards: Vec::new(),
-        snapshot_output: Some(layout.snapshot_dir.join("latest")),
+        snapshot_output,
         run_as_root: false,
         no_host_shares,
         package_store: GuestStoreMode::Auto,
+        vhost_user_fs,
         reuse_owner: true,
         deterministic,
         trace_events,
@@ -2499,6 +2560,7 @@ fn create_checkpoint(
     memory_mib: u32,
     snapshot_path: Option<PathBuf>,
     forwards: Vec<runner::PortForward>,
+    vhost_user_fs: Vec<runner::VhostUserFsMount>,
     explicit_kernel: bool,
     explicit_rootfs: bool,
     no_host_shares: bool,
@@ -2537,6 +2599,7 @@ fn create_checkpoint(
             run_as_root: false,
             no_host_shares,
             package_store: GuestStoreMode::Auto,
+            vhost_user_fs,
             reuse_owner: true,
             deterministic,
             trace_events,
@@ -2570,6 +2633,22 @@ fn list_checkpoints(layout: &Layout) -> Result<()> {
     Ok(())
 }
 
+fn run_snapshots_command(layout: &Layout, args: SnapshotsArgs) -> Result<()> {
+    match args.command {
+        SnapshotsCommand::Clear => clear_latest_snapshot(layout),
+    }
+}
+
+fn clear_latest_snapshot(layout: &Layout) -> Result<()> {
+    let latest = layout.snapshot_dir.join("latest");
+    remove_path_if_exists(&latest)?;
+    remove_path_if_exists(&layout.snapshot_dir.join(".latest.next"))?;
+    remove_path_if_exists(&layout.snapshot_dir.join(".latest.previous"))?;
+    remove_path_if_exists(&layout.snapshot_dir.join(".restore-work"))?;
+    println!("cleared {}", latest.display());
+    Ok(())
+}
+
 fn fork_checkpoint(
     source: Layout,
     checkpoint: Option<&str>,
@@ -2578,6 +2657,7 @@ fn fork_checkpoint(
     memory_mib: u32,
     snapshot_path: Option<PathBuf>,
     forwards: Vec<runner::PortForward>,
+    vhost_user_fs: Vec<runner::VhostUserFsMount>,
     explicit_kernel: bool,
     explicit_rootfs: bool,
     no_host_shares: bool,
@@ -2592,6 +2672,7 @@ fn fork_checkpoint(
             memory_mib,
             snapshot_path,
             forwards,
+            vhost_user_fs,
             explicit_kernel,
             explicit_rootfs,
             no_host_shares,
@@ -2612,6 +2693,7 @@ fn create_internal_fork_checkpoint(
     memory_mib: u32,
     snapshot_path: Option<PathBuf>,
     forwards: Vec<runner::PortForward>,
+    vhost_user_fs: Vec<runner::VhostUserFsMount>,
     explicit_kernel: bool,
     explicit_rootfs: bool,
     no_host_shares: bool,
@@ -2650,6 +2732,7 @@ fn create_internal_fork_checkpoint(
             run_as_root: false,
             no_host_shares,
             package_store: GuestStoreMode::Auto,
+            vhost_user_fs,
             reuse_owner: true,
             deterministic,
             trace_events,
@@ -2685,6 +2768,97 @@ fn parse_port(value: &str) -> Result<u16, String> {
     value
         .parse::<u16>()
         .map_err(|_| format!("invalid port: {value}"))
+}
+
+fn parse_vhost_user_fs_mount(value: &str) -> Result<runner::VhostUserFsMount, String> {
+    let mut tag = None;
+    let mut mountpoint = None;
+    let mut socket = None;
+    let read_only = true;
+
+    for part in value.split(',').filter(|part| !part.is_empty()) {
+        match part {
+            "ro" | "readonly" => {}
+            "rw" => return Err("vhost-user fs mounts are read-only only".to_string()),
+            _ => {
+                let Some((key, raw_value)) = part.split_once('=') else {
+                    return Err(format!(
+                        "invalid vhost-user fs option {part:?}; expected key=value or ro"
+                    ));
+                };
+                match key {
+                    "tag" => tag = Some(raw_value.to_string()),
+                    "mount" => mountpoint = Some(raw_value.to_string()),
+                    "socket" => socket = Some(PathBuf::from(raw_value)),
+                    _ => {
+                        return Err(format!(
+                            "invalid vhost-user fs key {key:?}; expected tag, mount, or socket"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let mount = runner::VhostUserFsMount {
+        tag: tag.ok_or_else(|| "missing vhost-user fs tag=NAME".to_string())?,
+        mountpoint: mountpoint
+            .ok_or_else(|| "missing vhost-user fs mount=/GUEST/PATH".to_string())?,
+        socket: socket.ok_or_else(|| "missing vhost-user fs socket=/HOST/SOCK".to_string())?,
+        read_only,
+    };
+    validate_vhost_user_fs_mount(&mount)?;
+    Ok(mount)
+}
+
+fn validate_vhost_user_fs_mounts(mounts: &[runner::VhostUserFsMount]) -> Result<()> {
+    let mut tags = BTreeSet::new();
+    for mount in mounts {
+        validate_vhost_user_fs_mount(mount).map_err(anyhow::Error::msg)?;
+        if !tags.insert(mount.tag.as_str()) {
+            bail!("duplicate vhost-user fs tag: {}", mount.tag);
+        }
+    }
+    Ok(())
+}
+
+fn validate_vhost_user_fs_mount(mount: &runner::VhostUserFsMount) -> Result<(), String> {
+    if !mount.read_only {
+        return Err("vhost-user fs mounts are read-only only".to_string());
+    }
+    if mount.tag.is_empty() || mount.tag.len() > 36 {
+        return Err("vhost-user fs tag must be 1-36 bytes".to_string());
+    }
+    if !mount
+        .tag
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err("vhost-user fs tag may only contain letters, numbers, '.', '_', or '-'".into());
+    }
+    if matches!(
+        mount.tag.as_str(),
+        "home" | "cwd" | "lnx-nix-store" | "lnx-nix-root" | "lnx-packages"
+    ) {
+        return Err(format!("vhost-user fs tag is reserved: {}", mount.tag));
+    }
+    if !mount.mountpoint.starts_with('/')
+        || mount.mountpoint.contains(':')
+        || mount.mountpoint.contains(';')
+        || mount.mountpoint.contains(',')
+    {
+        return Err(
+            "vhost-user fs mount must be an absolute guest path without ':', ';', or ','"
+                .to_string(),
+        );
+    }
+    let socket = mount.socket.to_string_lossy();
+    if !mount.socket.is_absolute() || socket.contains(',') || socket.contains(';') {
+        return Err(
+            "vhost-user fs socket must be an absolute host path without ',' or ';'".to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn parse_package_store_mode(value: &str) -> Result<GuestStoreMode, String> {

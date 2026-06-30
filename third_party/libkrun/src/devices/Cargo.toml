@@ -19,7 +19,7 @@ input = ["zerocopy", "krun_input"]
 virgl_resource_map2 = []
 aws-nitro = []
 test_utils = []
-vhost-user = ["vhost", "vmm-sys-util"]
+vhost-user = []
 
 [dependencies]
 bitflags = "1.2.0"

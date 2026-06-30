@@ -1,5 +1,18 @@
-import { createServer } from "node:net";
-import { assertContains, assertEq, cleanupContext, cleanupInstance, defaultContext, lnx, prepareContext, run, skip, sleep, spawn, testStep, waitForOwnerExit } from "./lib";
+import {
+  createServer } from "node:net";
+import { assertContains,
+  assertEq,
+  cleanupContext,
+  cleanupInstance,
+  defaultContext,
+  prepareContext,
+  run,
+  skip,
+  sleep,
+  spawn,
+  testStep,
+  waitForOwnerExit,
+} from "./lib";
 
 const ctx = defaultContext("browser-snapshot");
 const forkName = `${ctx.instance}-browser-fork`;
@@ -147,18 +160,18 @@ try {
   await run(["rm", "-rf", `${ctx.base}/instances/${forkName}`, `${ctx.base}/instances/${forkName}`], { check: false });
 
   await testStep("install stock browser stack", async () => {
-    await lnx(ctx, [
+    await ctx.vm.cli([
       "bash",
       "-lc",
       "if [ -s /etc/apt/sources.list ] && [ -s /etc/apt/sources.list.d/ubuntu.sources ]; then sudo mv /etc/apt/sources.list /etc/apt/sources.list.lnx-disabled; fi",
     ], { timeoutMs: 120_000 });
-    await lnx(ctx, ["sudo", "apt-get", "update"], { timeoutMs: 300_000 });
-    await lnx(ctx, ["bash", "-lc", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y snapd squashfs-tools cage wayvnc novnc websockify"], { timeoutMs: 600_000 });
-    await lnx(ctx, ["sudo", "systemctl", "enable", "--now", "snapd.socket"], { timeoutMs: 120_000 });
-    await lnx(ctx, ["bash", "-lc", "sudo systemctl start snapd.service || true"], { timeoutMs: 120_000 });
-    await lnx(ctx, ["sudo", "timeout", "300s", "snap", "wait", "system", "seed.loaded"], { timeoutMs: 360_000 });
-    await lnx(ctx, ["sudo", "snap", "install", "chromium"], { timeoutMs: 900_000 });
-    const version = await lnx(ctx, ["/snap/bin/chromium", "--version"], { timeoutMs: 120_000 });
+    await ctx.vm.cli(["sudo", "apt-get", "update"], { timeoutMs: 300_000 });
+    await ctx.vm.cli(["bash", "-lc", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y snapd squashfs-tools cage wayvnc novnc websockify"], { timeoutMs: 600_000 });
+    await ctx.vm.cli(["sudo", "systemctl", "enable", "--now", "snapd.socket"], { timeoutMs: 120_000 });
+    await ctx.vm.cli(["bash", "-lc", "sudo systemctl start snapd.service || true"], { timeoutMs: 120_000 });
+    await ctx.vm.cli(["sudo", "timeout", "300s", "snap", "wait", "system", "seed.loaded"], { timeoutMs: 360_000 });
+    await ctx.vm.cli(["sudo", "snap", "install", "chromium"], { timeoutMs: 900_000 });
+    const version = await ctx.vm.cli(["/snap/bin/chromium", "--version"], { timeoutMs: 120_000 });
     assertContains(version.stdout, "Chromium", "snap chromium installed");
   });
 

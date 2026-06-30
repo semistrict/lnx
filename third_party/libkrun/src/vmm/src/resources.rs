@@ -55,6 +55,8 @@ pub struct VhostUserDeviceConfig {
     pub num_queues: u16,
     /// Size of each queue (empty = use device defaults)
     pub queue_sizes: Vec<u16>,
+    /// Optional frontend-owned virtio config space.
+    pub config_space: Option<Vec<u8>>,
 }
 
 /// Errors encountered when configuring microVM resources.

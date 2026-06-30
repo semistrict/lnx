@@ -1,0 +1,7 @@
+	// Hold the write lock for the entire dispatch so that control-plane
+	// mutations are never concurrent with vring dequeue (readLoop holds the
+	// read lock while draining).
+	s.device.dispatchMu.Lock()
+	var rep interface{}
+	var deviceErr error
+	switch inHeader.Request {

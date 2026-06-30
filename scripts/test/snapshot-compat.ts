@@ -1,6 +1,17 @@
-import { cp, readFile, writeFile } from "node:fs/promises";
+import {
+  cp,
+  readFile,
+  writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { assertContains, assertEq, cleanupContext, defaultContext, lnx, prepareContext, run, testStep, waitForVmSuspend } from "./lib";
+import { assertContains,
+  assertEq,
+  cleanupContext,
+  defaultContext,
+  prepareContext,
+  run,
+  testStep,
+  waitForVmSuspend,
+} from "./lib";
 
 Bun.env.LNX_BROKER_IDLE_TTL_MS ??= "500";
 
@@ -14,13 +25,13 @@ try {
   await prepareContext(ctx);
 
   await testStep("create restorable baseline", async () => {
-    await lnx(ctx, [
+    await ctx.vm.cli([
       "bash",
       "-lc",
       "printf disk-from-snapshot | sudo tee /root/compat-disk >/dev/null; printf memory-from-snapshot | sudo tee /run/compat-memory >/dev/null",
     ]);
     await waitForVmSuspend(ctx);
-    const restored = await lnx(ctx, [
+    const restored = await ctx.vm.cli([
       "bash",
       "-lc",
       'printf "%s/%s" "$(sudo cat /root/compat-disk)" "$(sudo cat /run/compat-memory)"',
@@ -36,7 +47,7 @@ try {
     header.writeUInt32LE(99, 32);
     await writeFile(vmstatePath, header);
 
-    const failure = await lnx(ctx, [
+    const failure = await ctx.vm.cli([
       "--snapshot",
       badSnapshot,
       "bash",
@@ -58,7 +69,7 @@ try {
     const currentStamp = await readFile(stampPath, "utf8");
     await writeFile(stampPath, currentStamp.replace(/^host-share-cache=.*\n/, ""));
 
-    const failure = await lnx(ctx, [
+    const failure = await ctx.vm.cli([
       "--snapshot",
       legacyCacheSnapshot,
       "bash",
@@ -89,7 +100,7 @@ try {
     vmstate[vmstate.length - 1] ^= 0xff;
     await writeFile(vmstatePath, vmstate);
 
-    const failure = await lnx(ctx, [
+    const failure = await ctx.vm.cli([
       "--snapshot",
       corruptSectionSnapshot,
       "bash",
@@ -122,7 +133,7 @@ try {
     const currentStamp = await readFile(stampPath, "utf8");
     await writeFile(stampPath, currentStamp.replace(/^home=.*\n/m, "home=/Users/lnx-share-drift\n"));
 
-    const drifted = await lnx(ctx, [
+    const drifted = await ctx.vm.cli([
       "--snapshot",
       shareMismatchSnapshot,
       "bash",

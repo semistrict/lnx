@@ -1,0 +1,13 @@
+	var rep interface{}
+	var deviceErr error
+	if inHeader.Request == REQ_GET_VRING_BASE {
+		req := (*VhostVringState)(inPayloadPtr)
+		r := (*VhostVringState)(outPayloadPtr)
+		*r = *s.device.GetVringBase(req.Index)
+		rep = r
+	} else {
+		// Hold the write lock for the entire dispatch so that control-plane
+		// mutations are never concurrent with vring dequeue (readLoop holds the
+		// read lock while draining).
+		s.device.dispatchMu.Lock()
+		switch inHeader.Request {

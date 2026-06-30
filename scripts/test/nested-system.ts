@@ -1,4 +1,13 @@
-import { assertContains, assertEq, cleanupContext, defaultContext, lnx, prepareContext, run, testStep } from "./lib";
+import {
+  assertContains,
+  assertEq,
+  cleanupContext,
+  defaultContext,
+  prepareContext,
+  run,
+  testStep,
+  type LnxCliOptions,
+} from "./lib";
 
 const ctx = defaultContext("nested-system");
 const vmArgs = [
@@ -6,8 +15,8 @@ const vmArgs = [
   ...(Bun.env.LNX_TEST_MEMORY_MIB ? ["--memory-mib", Bun.env.LNX_TEST_MEMORY_MIB] : []),
 ];
 
-function lnxVm(args: string[], options: Parameters<typeof lnx>[1] = {}) {
-  return lnx(ctx, [...vmArgs, ...args], options);
+function lnxVm(args: string[], options: LnxCliOptions = {}) {
+  return ctx.vm.cli([...vmArgs, ...args], options);
 }
 
 try {

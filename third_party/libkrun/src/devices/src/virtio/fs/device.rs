@@ -137,7 +137,7 @@ impl Fs {
             return false;
         };
         cfg.write_allowlist = Some(allowlist);
-        cfg.cache_policy = passthrough::CachePolicy::Always;
+        cfg.cache_policy = passthrough::CachePolicy::Auto;
         cfg.writeback = true;
         true
     }
@@ -183,7 +183,7 @@ mod tests {
     use std::sync::RwLock;
 
     #[test]
-    fn write_allowlisted_host_share_enables_fast_cache_settings() {
+    fn write_allowlisted_host_share_uses_close_to_open_cache_consistency() {
         let mut fs = Fs::new(
             "home".to_string(),
             Some("/Users/ramon".to_string()),
@@ -196,7 +196,7 @@ mod tests {
         assert!(fs.enable_write_allowlist(Arc::new(RwLock::new(Vec::new()))));
 
         let cfg = fs.passthrough_cfg.as_ref().expect("passthrough config");
-        assert_eq!(cfg.cache_policy, passthrough::CachePolicy::Always);
+        assert_eq!(cfg.cache_policy, passthrough::CachePolicy::Auto);
         assert_eq!(cfg.attr_timeout, std::time::Duration::from_secs(5));
         assert_eq!(cfg.entry_timeout, std::time::Duration::from_secs(5));
         assert!(cfg.writeback);

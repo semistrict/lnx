@@ -339,7 +339,7 @@ fn mount_fs(source: &[u8], target: &[u8], fstype: &[u8], flags: c_ulong, data: &
     }
 }
 
-fn mount_virtiofs(tag: &str, guest_path: &str, read_only: bool) {
+fn mount_virtiofs_with_dax(tag: &str, guest_path: &str, read_only: bool, dax: bool) {
     if tag.is_empty() || guest_path.is_empty() || !guest_path.starts_with('/') {
         return;
     }
@@ -351,7 +351,7 @@ fn mount_virtiofs(tag: &str, guest_path: &str, read_only: bool) {
     let target = CString::new(target).unwrap();
     let fstype = cstr(b"virtiofs\0");
     let flags = if read_only { MS_RDONLY } else { 0 };
-    let data = if virtiofs_dax_enabled() {
+    let data = if dax {
         cstr(b"dax\0") as *const c_void
     } else {
         ptr::null()
@@ -359,6 +359,10 @@ fn mount_virtiofs(tag: &str, guest_path: &str, read_only: bool) {
     if unsafe { mount(tag.as_ptr(), target.as_ptr(), fstype, flags, data) } < 0 {
         die("mount virtiofs");
     }
+}
+
+fn mount_virtiofs(tag: &str, guest_path: &str, read_only: bool) {
+    mount_virtiofs_with_dax(tag, guest_path, read_only, virtiofs_dax_enabled());
 }
 
 fn virtiofs_dax_enabled() -> bool {
@@ -374,6 +378,22 @@ fn mount_host_shares() {
     }
     if let Ok(cwd) = env::var("LNX_VIRTIOFS_CWD") {
         mount_virtiofs("cwd", &cwd, false);
+    }
+}
+
+fn mount_vhost_user_fs() {
+    let mounts = env::var("LNX_VHOST_USER_FS").unwrap_or_default();
+    for mount in mounts.split(';').filter(|mount| !mount.is_empty()) {
+        let parts = mount.split(':').collect::<Vec<_>>();
+        let [tag, guest_path, mode] = parts.as_slice() else {
+            log!("skipping malformed vhost-user fs mount: {mount}");
+            continue;
+        };
+        if *mode != "ro" {
+            log!("skipping non-read-only vhost-user fs mount: {mount}");
+            continue;
+        }
+        mount_virtiofs_with_dax(tag, guest_path, true, false);
     }
 }
 
@@ -986,6 +1006,7 @@ fn init_mode() -> ! {
         root_options,
     );
     mount_host_shares();
+    mount_vhost_user_fs();
     mount_package_store();
 
     ensure_dir("/newroot/usr/local/lib/lnx");

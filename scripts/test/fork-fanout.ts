@@ -1,4 +1,12 @@
-import { cleanupContext, cleanupInstance, defaultContext, lnx, prepareContext, run, assertEq, testStep } from "./lib";
+import {
+  cleanupContext,
+  cleanupInstance,
+  defaultContext,
+  prepareContext,
+  run,
+  assertEq,
+  testStep,
+} from "./lib";
 
 const ctx = defaultContext("fork-fanout");
 const forks = Array.from({ length: Number(Bun.env.LNX_FANOUT_COUNT ?? "5") }, (_, i) => `${ctx.instance}-fork-${i}`);
@@ -8,7 +16,7 @@ try {
   for (const fork of forks) await cleanupInstance(ctx, fork);
 
   await testStep("create named checkpoint", async () => {
-    await lnx(ctx, [
+    await ctx.vm.cli([
       "bash",
       "-lc",
       "printf base | sudo tee /root/fanout-marker >/dev/null; printf base-memory | sudo tee /run/fanout-marker >/dev/null",
@@ -55,7 +63,7 @@ PY`,
       forks.length,
       "fork restore entropy probes are unique",
     );
-    const source = await lnx(ctx, ["sudo", "cat", "/root/fanout-marker"]);
+    const source = await ctx.vm.cli(["sudo", "cat", "/root/fanout-marker"]);
     assertEq(source.stdout, "base", "source checkpoint clone not mutated by forks");
   });
 } finally {

@@ -1,5 +1,10 @@
-import { existsSync } from "node:fs";
-import { chmod, mkdir, readdir, readFile, rm } from "node:fs/promises";
+import {
+  existsSync } from "node:fs";
+import { chmod,
+  mkdir,
+  readdir,
+  readFile,
+  rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertContains,

@@ -1,4 +1,10 @@
-import { assertEq, cleanupContext, defaultContext, lnx, prepareContext, testStep } from "./lib";
+import {
+  assertEq,
+  cleanupContext,
+  defaultContext,
+  prepareContext,
+  testStep,
+} from "./lib";
 
 const ctx = defaultContext("stress");
 
@@ -6,7 +12,7 @@ try {
   await prepareContext(ctx);
 
   await testStep("warm VM", async () => {
-    assertEq((await lnx(ctx, ["echo", "warm"])).stdout, "warm", "warm exec");
+    assertEq((await ctx.vm.cli(["echo", "warm"])).stdout, "warm", "warm exec");
   });
 
   await testStep("parallel non-pty channels", async () => {
@@ -19,7 +25,7 @@ try {
         const id = pending.shift();
         if (id === undefined) return;
         const delay = id % 7;
-        const result = await lnx(ctx, ["bash", "-lc", `echo start-${id}; sleep 0.${delay}; echo end-${id}`]);
+        const result = await ctx.vm.cli(["bash", "-lc", `echo start-${id}; sleep 0.${delay}; echo end-${id}`]);
         results[id] = result.stdout;
       }
     }
@@ -31,9 +37,9 @@ try {
 
   await testStep("mixed stdin and exit status", async () => {
     const [cat, fail, slow] = await Promise.all([
-      lnx(ctx, ["cat"], { stdin: "pipe-ok" }),
-      lnx(ctx, ["bash", "-lc", "exit 33"], { check: false }),
-      lnx(ctx, ["bash", "-lc", "sleep 1; echo slow-ok"]),
+      ctx.vm.cli(["cat"], { stdin: "pipe-ok" }),
+      ctx.vm.cli(["bash", "-lc", "exit 33"], { check: false }),
+      ctx.vm.cli(["bash", "-lc", "sleep 1; echo slow-ok"]),
     ]);
     assertEq(cat.stdout, "pipe-ok", "parallel stdin");
     assertEq(fail.status, 33, "parallel failing status");
@@ -41,8 +47,8 @@ try {
   });
 
   await testStep("snapshot waits for active channels", async () => {
-    const delayed = lnx(ctx, ["bash", "-lc", "sleep 1; echo delayed"]);
-    const snapshot = lnx(ctx, ["lnxctl", "snapshot-exit"]);
+    const delayed = ctx.vm.cli(["bash", "-lc", "sleep 1; echo delayed"]);
+    const snapshot = ctx.vm.cli(["lnxctl", "snapshot-exit"]);
     assertEq((await delayed).stdout, "delayed", "delayed channel");
     assertEq((await snapshot).status, 0, "snapshot channel");
   });

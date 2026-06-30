@@ -2,6 +2,7 @@ import { mkdir, rm, writeFile, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { createLnxClient, type LnxClient, type LnxInstance } from "../../ts/index";
 
 export type ExecResult = {
   status: number;
@@ -9,9 +10,13 @@ export type ExecResult = {
   stderr: string;
 };
 
+export type LnxCliOptions = Parameters<LnxInstance["cli"]>[1];
+
 export type TestContext = {
   repoRoot: string;
   lnxBin: string;
+  client: LnxClient;
+  vm: LnxInstance;
   instance: string;
   base: string;
   tmpdir: string;
@@ -28,13 +33,17 @@ export function defaultContext(name: string): TestContext {
   const root = repoRoot();
   const instance = Bun.env.LNX_TEST_INSTANCE ?? `lnx-${name}-${process.pid}`;
   const base = Bun.env.LNX_BASE ?? join(Bun.env.HOME ?? ".", ".lnx");
+  const lnxBin = resolve(Bun.env.LNX_BIN ?? join(root, "target/debug/lnx"));
+  const client = createLnxClient({ binary: lnxBin, defaultInstance: instance });
   const imageDir = join(base, "instances", instance);
   const runBase = Bun.env.LNX_RUN_BASE ?? base;
   const runDir = join(runBase, "instances", instance);
   return {
     repoRoot: root,
     // Resolve now: tests spawn lnx from other working directories.
-    lnxBin: resolve(Bun.env.LNX_BIN ?? join(root, "target/debug/lnx")),
+    lnxBin,
+    client,
+    vm: client.instance(instance, { timeoutMs: 120_000 }),
     instance,
     base,
     tmpdir: join(tmpdir(), `lnx-${name}-${process.pid}`),
@@ -156,13 +165,6 @@ export async function run(
   return result;
 }
 
-export function lnx(ctx: TestContext, args: string[], options: Parameters<typeof run>[1] = {}) {
-  return run([ctx.lnxBin, "--instance", ctx.instance, ...args], {
-    timeoutMs: 120_000,
-    ...options,
-  });
-}
-
 export function spawn(
   args: string[],
   options: {
@@ -180,14 +182,6 @@ export function spawn(
     stdout: options.stdout ?? "pipe",
     stderr: options.stderr ?? "pipe",
   });
-}
-
-export function spawnLnx(
-  ctx: TestContext,
-  args: string[],
-  options: Parameters<typeof spawn>[1] = {},
-) {
-  return spawn([ctx.lnxBin, "--instance", ctx.instance, ...args], options);
 }
 
 export function assertEq(got: unknown, want: unknown, label: string): void {
