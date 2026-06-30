@@ -21,7 +21,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, anyhow, bail};
-use libkrun::{Context as KrunContext, KernelImageFormat};
+use libkrun::{Context as KrunContext, Error as KrunError, KernelImageFormat};
 use lnx_protocol::{MAX_MESSAGE_SIZE, Message, PROTOCOL_VERSION};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
@@ -1148,23 +1148,26 @@ fn start_vm(
     let vm_ctx = Arc::clone(&ctx);
     let vm_timings = Arc::clone(&timings);
     let vm_run_log = Arc::clone(&run_log);
-    let (vm_error_tx, vm_error_rx) = mpsc::channel::<i32>();
+    let (vm_error_tx, vm_error_rx) = mpsc::channel::<KrunError>();
     thread::spawn(move || {
         vm_timings.event("krun.start_enter.begin");
-        let rc = vm_ctx
-            .start_enter()
-            .map(|()| 0)
-            .unwrap_or_else(|error| error.return_code());
-        vm_timings.event(&format!("krun.start_enter.return rc={rc}"));
-        if rc < 0 {
-            vm_run_log.line(format!(
-                "krun.start_enter.error rc={rc} error={}",
-                krun_return_error(rc)
-            ));
-            log_console_tail(&vm_run_log, &console_log);
-            let _ = vm_error_tx.send(rc);
-        } else {
-            vm_run_log.line(format!("krun.start_enter.return rc={rc}"));
+        match vm_ctx.start_enter() {
+            Ok(()) => {
+                vm_timings.event("krun.start_enter.return ok");
+                vm_run_log.line("krun.start_enter.return ok");
+            }
+            Err(error) => {
+                vm_timings.event(&format!(
+                    "krun.start_enter.error errno={}",
+                    error.raw_os_error()
+                ));
+                vm_run_log.line(format!(
+                    "krun.start_enter.error errno={} error={error}",
+                    error.raw_os_error()
+                ));
+                log_console_tail(&vm_run_log, &console_log);
+                let _ = vm_error_tx.send(error);
+            }
         }
     });
     timings.event("krun.thread.spawned");
@@ -2097,14 +2100,6 @@ fn unix_nanos() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
-}
-
-fn krun_return_error(rc: i32) -> String {
-    if rc < 0 {
-        std::io::Error::from_raw_os_error(-rc).to_string()
-    } else {
-        format!("unexpected return code {rc}")
-    }
 }
 
 fn snapshot_vm_config(snapshot: &Path) -> Result<Option<SnapshotVmConfig>> {
@@ -3669,7 +3664,7 @@ fn run_broker_owner(
     timings: Arc<TimingLog>,
     run_log: Arc<RunLog>,
     trace_log: Option<Arc<TraceLog>>,
-    vm_error_rx: mpsc::Receiver<i32>,
+    vm_error_rx: mpsc::Receiver<KrunError>,
     owner_run_id: String,
 ) -> Result<thread::JoinHandle<()>> {
     listener
@@ -5180,7 +5175,7 @@ fn accept_agent_hello(
     timeout: Duration,
     timings: &TimingLog,
     run_log: &RunLog,
-    vm_error_rx: &mpsc::Receiver<i32>,
+    vm_error_rx: &mpsc::Receiver<KrunError>,
 ) -> Result<UnixStream> {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -5219,14 +5214,14 @@ fn accept_unix_with_progress(
     listener: &UnixListener,
     timeout: Duration,
     progress: Option<(&TimingLog, &str)>,
-    vm_error_rx: Option<&mpsc::Receiver<i32>>,
+    vm_error_rx: Option<&mpsc::Receiver<KrunError>>,
 ) -> Result<UnixStream> {
     let start = Instant::now();
     let mut last = None;
     while start.elapsed() < timeout {
         if let Some(rx) = vm_error_rx {
-            if let Ok(rc) = rx.try_recv() {
-                bail!("krun_start_enter failed: {}", krun_return_error(rc));
+            if let Ok(error) = rx.try_recv() {
+                bail!("libkrun start failed: {error}");
             }
         }
         let remaining = timeout.saturating_sub(start.elapsed());
@@ -5255,8 +5250,8 @@ fn accept_unix_with_progress(
             continue;
         }
         if let Some(rx) = vm_error_rx {
-            if let Ok(rc) = rx.try_recv() {
-                bail!("krun_start_enter failed: {}", krun_return_error(rc));
+            if let Ok(error) = rx.try_recv() {
+                bail!("libkrun start failed: {error}");
             }
         }
         match listener.accept() {
