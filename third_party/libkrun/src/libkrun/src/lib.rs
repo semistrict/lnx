@@ -159,27 +159,67 @@ impl From<KernelImageFormat> for u32 {
 /// paths, strings, and slices can cross the crate boundary as Rust values.
 pub struct Context {
     id: u32,
+    cfg: Mutex<Option<ContextConfig>>,
 }
 
+/// Error returned by the Rust API.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Error {
+    errno: i32,
+}
+
+impl Error {
+    fn from_errno(errno: i32) -> Self {
+        Self { errno: errno.abs() }
+    }
+
+    pub fn raw_os_error(self) -> i32 {
+        self.errno
+    }
+
+    pub fn return_code(self) -> i32 {
+        -self.errno
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            std::io::Error::from_raw_os_error(self.raw_os_error())
+        )
+    }
+}
+
+impl std::error::Error for Error {}
+
 impl Context {
-    pub fn create() -> Result<Self, i32> {
-        create_context().map(|id| Self { id })
+    pub fn new() -> Self {
+        Self {
+            id: next_context_id(),
+            cfg: Mutex::new(Some(new_context_config())),
+        }
+    }
+
+    pub fn create() -> std::result::Result<Self, Error> {
+        Ok(Self::new())
     }
 
     pub fn id(&self) -> u32 {
         self.id
     }
 
-    pub fn set_log_level(level: u32) -> Result<(), i32> {
+    pub fn set_log_level(level: u32) -> std::result::Result<(), Error> {
         errno_result(set_log_level(level))
     }
 
-    pub fn set_vm_config(&self, num_vcpus: u8, ram_mib: u32) -> Result<(), i32> {
-        errno_result(set_vm_config(self.id, num_vcpus, ram_mib))
+    pub fn set_vm_config(&self, num_vcpus: u8, ram_mib: u32) -> std::result::Result<(), Error> {
+        self.with_cfg(|cfg| set_vm_config(cfg, num_vcpus, ram_mib))
     }
 
-    pub fn set_console_output(&self, filepath: impl AsRef<Path>) -> Result<(), i32> {
-        with_cfg(self.id, |cfg| {
+    pub fn set_console_output(&self, filepath: impl AsRef<Path>) -> std::result::Result<(), Error> {
+        self.with_cfg(|cfg| {
             if cfg.console_output.is_some() {
                 -libc::EINVAL
             } else {
@@ -187,15 +227,13 @@ impl Context {
                 KRUN_SUCCESS
             }
         })
-        .into_result()
     }
 
-    pub fn set_nested_virt(&self, enabled: bool) -> Result<(), i32> {
-        with_cfg(self.id, |cfg| {
+    pub fn set_nested_virt(&self, enabled: bool) -> std::result::Result<(), Error> {
+        self.with_cfg(|cfg| {
             cfg.vmr.nested_enabled = enabled;
             KRUN_SUCCESS
         })
-        .into_result()
     }
 
     #[cfg(not(feature = "tee"))]
@@ -205,11 +243,13 @@ impl Context {
         format: KernelImageFormat,
         initramfs_path: Option<impl AsRef<Path>>,
         cmdline: Option<&str>,
-    ) -> Result<(), i32> {
+    ) -> std::result::Result<(), Error> {
         let path = path.as_ref().to_path_buf();
         let format = match format {
             #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
-            KernelImageFormat::Raw => return errno_result(map_kernel(self.id, &path)),
+            KernelImageFormat::Raw => {
+                return self.with_cfg(|cfg| map_kernel_cfg(cfg, &path));
+            }
             #[cfg(target_arch = "aarch64")]
             KernelImageFormat::Raw => KernelFormat::Raw,
             KernelImageFormat::Elf => KernelFormat::Elf,
@@ -218,13 +258,13 @@ impl Context {
             KernelImageFormat::ImageGz => KernelFormat::ImageGz,
             KernelImageFormat::ImageZstd => KernelFormat::ImageZstd,
             #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-            KernelImageFormat::Raw => return Err(-libc::EINVAL),
+            KernelImageFormat::Raw => return Err(Error::from_errno(libc::EINVAL)),
         };
 
         let (initramfs_path, initramfs_size) = if let Some(initramfs_path) = initramfs_path {
             let initramfs_path = initramfs_path.as_ref().to_path_buf();
             let initramfs_size = std::fs::metadata(&initramfs_path)
-                .map_err(|_| -libc::EINVAL)?
+                .map_err(|_| Error::from_errno(libc::EINVAL))?
                 .len();
             (Some(initramfs_path), initramfs_size)
         } else {
@@ -239,11 +279,10 @@ impl Context {
             cmdline: cmdline.map(ToOwned::to_owned),
         };
 
-        with_cfg(self.id, |cfg| {
+        self.with_cfg(|cfg| {
             cfg.vmr.set_external_kernel(external_kernel);
             KRUN_SUCCESS
         })
-        .into_result()
     }
 
     pub fn add_pmem(
@@ -251,17 +290,16 @@ impl Context {
         pmem_id: impl Into<String>,
         file_path: impl AsRef<Path>,
         read_only: bool,
-    ) -> Result<(), i32> {
+    ) -> std::result::Result<(), Error> {
         let pmem_cfg = PmemDeviceConfig {
             id: pmem_id.into(),
             path: file_path.as_ref().to_string_lossy().into_owned(),
             read_only,
         };
-        with_cfg(self.id, |cfg| {
+        self.with_cfg(|cfg| {
             cfg.add_pmem_cfg(pmem_cfg);
             KRUN_SUCCESS
         })
-        .into_result()
     }
 
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -272,15 +310,19 @@ impl Context {
         shm_size: u64,
         read_only: bool,
         write_allowlist: bool,
-    ) -> Result<(), i32> {
+    ) -> std::result::Result<(), Error> {
         let tag = tag.into();
         let shm_size = if shm_size > 0 {
-            Some(shm_size.try_into().map_err(|_| -libc::EINVAL)?)
+            Some(
+                shm_size
+                    .try_into()
+                    .map_err(|_| Error::from_errno(libc::EINVAL))?,
+            )
         } else {
             None
         };
         let shared_dir = path.map(|path| path.as_ref().to_string_lossy().into_owned());
-        with_cfg(self.id, |cfg| {
+        self.with_cfg(|cfg| {
             let mut virtual_entries = Vec::new();
             if tag == "/dev/root" && !cfg.disable_implicit_init {
                 virtual_entries.push(init_virtual_entry());
@@ -296,17 +338,32 @@ impl Context {
             });
             KRUN_SUCCESS
         })
-        .into_result()
     }
 
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-    pub fn set_virtiofs_unshare_dir(&self, tag: &str, path: impl AsRef<Path>) -> Result<(), i32> {
-        set_virtiofs_unshare_dir(self.id, tag, path.as_ref().to_path_buf()).into_result()
+    pub fn set_virtiofs_unshare_dir(
+        &self,
+        tag: &str,
+        path: impl AsRef<Path>,
+    ) -> std::result::Result<(), Error> {
+        if let Some(rc) =
+            set_running_virtiofs_unshare_dir(self.id, tag, path.as_ref().to_path_buf())
+        {
+            return errno_result(rc);
+        }
+        self.with_cfg(|cfg| set_cfg_virtiofs_unshare_dir(cfg, tag, path.as_ref().to_path_buf()))
     }
 
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-    pub fn set_virtiofs_write_allowlist(&self, tag: &str, paths: Vec<PathBuf>) -> Result<(), i32> {
-        set_virtiofs_write_allowlist(self.id, tag, paths).into_result()
+    pub fn set_virtiofs_write_allowlist(
+        &self,
+        tag: &str,
+        paths: Vec<PathBuf>,
+    ) -> std::result::Result<(), Error> {
+        if let Some(rc) = set_running_virtiofs_write_allowlist(self.id, tag, paths.clone()) {
+            return errno_result(rc);
+        }
+        self.with_cfg(|cfg| set_cfg_virtiofs_write_allowlist(cfg, tag, paths))
     }
 
     pub fn add_vsock_port(
@@ -314,29 +371,28 @@ impl Context {
         port: u32,
         filepath: impl AsRef<Path>,
         listen: bool,
-    ) -> Result<(), i32> {
+    ) -> std::result::Result<(), Error> {
         #[cfg(feature = "aws-nitro")]
         if listen {
-            return Err(-libc::EINVAL);
+            return Err(Error::from_errno(libc::EINVAL));
         }
 
         let filepath = filepath.as_ref().to_path_buf();
         if listen {
             match filepath.try_exists() {
-                Ok(true) => return Err(-libc::EEXIST),
-                Err(_) => return Err(-libc::EINVAL),
+                Ok(true) => return Err(Error::from_errno(libc::EEXIST)),
+                Err(_) => return Err(Error::from_errno(libc::EINVAL)),
                 _ => {}
             }
         }
 
-        with_cfg(self.id, |cfg| {
+        self.with_cfg(|cfg| {
             if cfg.vsock_config == VsockConfig::Disabled {
                 return -libc::ENODEV;
             }
             cfg.add_vsock_port(port, filepath, listen);
             KRUN_SUCCESS
         })
-        .into_result()
     }
 
     #[cfg(feature = "net")]
@@ -346,30 +402,28 @@ impl Context {
         mac: [u8; 6],
         features: u32,
         flags: u32,
-    ) -> Result<(), i32> {
+    ) -> std::result::Result<(), Error> {
         if (features & !NET_ALL_FEATURES) != 0 || (flags & !NET_FLAG_ALL) != 0 {
-            return Err(-libc::EINVAL);
+            return Err(Error::from_errno(libc::EINVAL));
         }
         let send_vfkit_magic = flags & NET_FLAG_VFKIT != 0;
         let enable_dhcp_client = flags & NET_FLAG_DHCP_CLIENT != 0;
         let backend = VirtioNetBackend::UnixgramPath(path.as_ref().to_path_buf(), send_vfkit_magic);
-        with_cfg(self.id, |cfg| {
+        self.with_cfg(|cfg| {
             create_virtio_net(cfg, backend, mac, features);
             if enable_dhcp_client {
                 cfg.vmr.dhcp_client = true;
             }
             KRUN_SUCCESS
         })
-        .into_result()
     }
 
-    pub fn set_workdir(&self, workdir: impl Into<String>) -> Result<(), i32> {
+    pub fn set_workdir(&self, workdir: impl Into<String>) -> std::result::Result<(), Error> {
         let workdir = workdir.into();
-        with_cfg(self.id, |cfg| {
+        self.with_cfg(|cfg| {
             cfg.set_workdir(workdir);
             KRUN_SUCCESS
         })
-        .into_result()
     }
 
     pub fn set_exec(
@@ -377,31 +431,36 @@ impl Context {
         exec_path: impl Into<String>,
         argv: &[String],
         envp: &[String],
-    ) -> Result<(), i32> {
+    ) -> std::result::Result<(), Error> {
         let exec_path = exec_path.into();
         let args = argv.join(" ");
         let env = envp.join(" ");
-        with_cfg(self.id, |cfg| {
+        self.with_cfg(|cfg| {
             cfg.set_exec_path(exec_path);
             cfg.set_env(env);
             cfg.set_args(args);
             KRUN_SUCCESS
         })
-        .into_result()
     }
 
-    pub fn start_enter(&self) -> i32 {
-        start_enter_context(self.id)
+    pub fn start_enter(&self) -> std::result::Result<(), Error> {
+        let cfg = self
+            .cfg
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| Error::from_errno(libc::ENOENT))?;
+        errno_result(start_enter_context(self.id, cfg))
     }
 
     #[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
-    pub fn snapshot(&self, path: impl AsRef<Path>) -> Result<(), i32> {
+    pub fn snapshot(&self, path: impl AsRef<Path>) -> std::result::Result<(), Error> {
         snapshot(self.id, path.as_ref()).into_result()
     }
 
     #[cfg(not(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64")))]
-    pub fn snapshot(&self, _path: impl AsRef<Path>) -> Result<(), i32> {
-        Err(-libc::ENOSYS)
+    pub fn snapshot(&self, _path: impl AsRef<Path>) -> std::result::Result<(), Error> {
+        Err(Error::from_errno(libc::ENOSYS))
     }
 
     #[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
@@ -410,7 +469,7 @@ impl Context {
         path: impl AsRef<Path>,
         copy_src: impl AsRef<Path>,
         copy_dst_name: impl AsRef<Path>,
-    ) -> Result<(), i32> {
+    ) -> std::result::Result<(), Error> {
         snapshot_with_file_copy(
             self.id,
             path.as_ref(),
@@ -426,44 +485,52 @@ impl Context {
         _path: impl AsRef<Path>,
         _copy_src: impl AsRef<Path>,
         _copy_dst_name: impl AsRef<Path>,
-    ) -> Result<(), i32> {
-        Err(-libc::ENOSYS)
+    ) -> std::result::Result<(), Error> {
+        Err(Error::from_errno(libc::ENOSYS))
     }
 
     #[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
-    pub fn set_snapshot_path(&self, path: impl AsRef<Path>) -> Result<(), i32> {
+    pub fn set_snapshot_path(&self, path: impl AsRef<Path>) -> std::result::Result<(), Error> {
         let path = path.as_ref().to_path_buf();
-        with_cfg(self.id, |cfg| {
+        self.with_cfg(|cfg| {
             cfg.snapshot_restore_path = Some(path);
             KRUN_SUCCESS
         })
-        .into_result()
     }
 
     #[cfg(not(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64")))]
-    pub fn set_snapshot_path(&self, _path: impl AsRef<Path>) -> Result<(), i32> {
-        Err(-libc::ENOSYS)
+    pub fn set_snapshot_path(&self, _path: impl AsRef<Path>) -> std::result::Result<(), Error> {
+        Err(Error::from_errno(libc::ENOSYS))
     }
-}
 
-impl Drop for Context {
-    fn drop(&mut self) {
-        let _ = free_context(self.id);
+    fn with_cfg(
+        &self,
+        f: impl FnOnce(&mut ContextConfig) -> i32,
+    ) -> std::result::Result<(), Error> {
+        let mut guard = self.cfg.lock().unwrap();
+        let cfg = guard
+            .as_mut()
+            .ok_or_else(|| Error::from_errno(libc::ENOENT))?;
+        errno_result(f(cfg))
     }
 }
 
 trait ErrnoResult {
-    fn into_result(self) -> Result<(), i32>;
+    fn into_result(self) -> std::result::Result<(), Error>;
 }
 
 impl ErrnoResult for i32 {
-    fn into_result(self) -> Result<(), i32> {
+    fn into_result(self) -> std::result::Result<(), Error> {
         errno_result(self)
     }
 }
 
-fn errno_result(rc: i32) -> Result<(), i32> {
-    if rc < 0 { Err(rc) } else { Ok(()) }
+fn errno_result(rc: i32) -> std::result::Result<(), Error> {
+    if rc < 0 {
+        Err(Error::from_errno(-rc))
+    } else {
+        Ok(())
+    }
 }
 
 static KRUNFW: LazyLock<Option<libloading::Library>> = LazyLock::new(|| unsafe {
@@ -926,28 +993,34 @@ pub extern "C" fn krun_create_ctx() -> i32 {
 }
 
 fn create_context() -> Result<u32, i32> {
+    let ctx_cfg = new_context_config();
+    let ctx_id = next_context_id();
+    CTX_MAP.lock().unwrap().insert(ctx_id, ctx_cfg);
+
+    Ok(ctx_id)
+}
+
+fn new_context_config() -> ContextConfig {
     let shutdown_efd = if cfg!(target_arch = "aarch64") && cfg!(target_os = "macos") {
         Some(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap())
     } else {
         None
     };
 
-    let ctx_cfg = {
-        ContextConfig {
-            krunfw: KrunfwBindings::new(),
-            shutdown_efd,
-            ..Default::default()
-        }
-    };
+    ContextConfig {
+        krunfw: KrunfwBindings::new(),
+        shutdown_efd,
+        ..Default::default()
+    }
+}
 
+fn next_context_id() -> u32 {
     let ctx_id = CTX_IDS.fetch_add(1, Ordering::SeqCst);
     if ctx_id == i32::MAX || CTX_MAP.lock().unwrap().contains_key(&(ctx_id as u32)) {
         // libkrun is not intended to be used as a daemon for managing VMs.
         panic!("Context ID namespace exhausted");
     }
-    CTX_MAP.lock().unwrap().insert(ctx_id as u32, ctx_cfg);
-
-    Ok(ctx_id as u32)
+    ctx_id as u32
 }
 
 #[cfg(not(feature = "disable-c-api"))]
@@ -966,10 +1039,10 @@ fn free_context(ctx_id: u32) -> i32 {
 #[cfg(not(feature = "disable-c-api"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -> i32 {
-    set_vm_config(ctx_id, num_vcpus, ram_mib)
+    with_cfg(ctx_id, |cfg| set_vm_config(cfg, num_vcpus, ram_mib))
 }
 
-fn set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -> i32 {
+fn set_vm_config(ctx_cfg: &mut ContextConfig, num_vcpus: u8, ram_mib: u32) -> i32 {
     let mem_size_mib: usize = match ram_mib.try_into() {
         Ok(size) => size,
         Err(e) => {
@@ -985,13 +1058,8 @@ fn set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -> i32 {
         cpu_template: None,
     };
 
-    match CTX_MAP.lock().unwrap().entry(ctx_id) {
-        Entry::Occupied(mut ctx_cfg) => {
-            if ctx_cfg.get_mut().vmr.set_vm_config(&vm_config).is_err() {
-                return -libc::EINVAL;
-            }
-        }
-        Entry::Vacant(_) => return -libc::ENOENT,
+    if ctx_cfg.vmr.set_vm_config(&vm_config).is_err() {
+        return -libc::EINVAL;
     }
 
     KRUN_SUCCESS
@@ -1174,31 +1242,50 @@ pub unsafe extern "C" fn krun_set_virtiofs_write_allowlist(
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 fn set_virtiofs_write_allowlist(ctx_id: u32, tag: &str, paths: Vec<PathBuf>) -> i32 {
+    if let Some(rc) = set_running_virtiofs_write_allowlist(ctx_id, tag, paths.clone()) {
+        return rc;
+    }
+
+    with_cfg(ctx_id, |cfg| {
+        set_cfg_virtiofs_write_allowlist(cfg, tag, paths)
+    })
+}
+
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+fn set_running_virtiofs_write_allowlist(
+    ctx_id: u32,
+    tag: &str,
+    paths: Vec<PathBuf>,
+) -> Option<i32> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         if let Some(vmm) = RUNNING_VMMS.lock().unwrap().get(&ctx_id).cloned() {
-            return if vmm.lock().unwrap().set_virtiofs_write_allowlist(tag, paths) {
-                KRUN_SUCCESS
-            } else {
-                -libc::ENOENT
-            };
+            return Some(
+                if vmm.lock().unwrap().set_virtiofs_write_allowlist(tag, paths) {
+                    KRUN_SUCCESS
+                } else {
+                    -libc::ENOENT
+                },
+            );
         }
     }
 
-    match CTX_MAP.lock().unwrap().entry(ctx_id) {
-        Entry::Occupied(mut ctx_cfg) => {
-            let cfg = ctx_cfg.get_mut();
-            let Some(fs) = cfg.vmr.fs.iter_mut().find(|fs| fs.fs_id == tag) else {
-                return -libc::ENOENT;
-            };
-            let Some(allowlist) = &fs.write_allowlist else {
-                return -libc::EINVAL;
-            };
-            *allowlist.write().unwrap() = paths;
-        }
-        Entry::Vacant(_) => return -libc::ENOENT,
-    }
+    None
+}
 
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+fn set_cfg_virtiofs_write_allowlist(
+    cfg: &mut ContextConfig,
+    tag: &str,
+    paths: Vec<PathBuf>,
+) -> i32 {
+    let Some(fs) = cfg.vmr.fs.iter_mut().find(|fs| fs.fs_id == tag) else {
+        return -libc::ENOENT;
+    };
+    let Some(allowlist) = &fs.write_allowlist else {
+        return -libc::EINVAL;
+    };
+    *allowlist.write().unwrap() = paths;
     KRUN_SUCCESS
 }
 
@@ -1230,28 +1317,35 @@ pub unsafe extern "C" fn krun_set_virtiofs_unshare_dir(
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 fn set_virtiofs_unshare_dir(ctx_id: u32, tag: &str, path: PathBuf) -> i32 {
+    if let Some(rc) = set_running_virtiofs_unshare_dir(ctx_id, tag, path.clone()) {
+        return rc;
+    }
+
+    with_cfg(ctx_id, |cfg| set_cfg_virtiofs_unshare_dir(cfg, tag, path))
+}
+
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+fn set_running_virtiofs_unshare_dir(ctx_id: u32, tag: &str, path: PathBuf) -> Option<i32> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         if let Some(vmm) = RUNNING_VMMS.lock().unwrap().get(&ctx_id).cloned() {
-            return if vmm.lock().unwrap().set_virtiofs_unshare_dir(tag, path) {
+            return Some(if vmm.lock().unwrap().set_virtiofs_unshare_dir(tag, path) {
                 KRUN_SUCCESS
             } else {
                 -libc::ENOENT
-            };
+            });
         }
     }
 
-    match CTX_MAP.lock().unwrap().entry(ctx_id) {
-        Entry::Occupied(mut ctx_cfg) => {
-            let cfg = ctx_cfg.get_mut();
-            let Some(fs) = cfg.vmr.fs.iter_mut().find(|fs| fs.fs_id == tag) else {
-                return -libc::ENOENT;
-            };
-            fs.unshare_dir = Some(path);
-        }
-        Entry::Vacant(_) => return -libc::ENOENT,
-    }
+    None
+}
 
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+fn set_cfg_virtiofs_unshare_dir(cfg: &mut ContextConfig, tag: &str, path: PathBuf) -> i32 {
+    let Some(fs) = cfg.vmr.fs.iter_mut().find(|fs| fs.fs_id == tag) else {
+        return -libc::ENOENT;
+    };
+    fs.unshare_dir = Some(path);
     KRUN_SUCCESS
 }
 
@@ -2790,6 +2884,11 @@ fn create_virtio_net(
 
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
 fn map_kernel(ctx_id: u32, kernel_path: &PathBuf) -> i32 {
+    with_cfg(ctx_id, |cfg| map_kernel_cfg(cfg, kernel_path))
+}
+
+#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+fn map_kernel_cfg(ctx_cfg: &mut ContextConfig, kernel_path: &PathBuf) -> i32 {
     let file = match File::options().read(true).write(false).open(kernel_path) {
         Ok(file) => file,
         Err(err) => {
@@ -2822,14 +2921,7 @@ fn map_kernel(ctx_id: u32, kernel_path: &PathBuf) -> i32 {
         size: kernel_size as usize,
     };
 
-    match CTX_MAP.lock().unwrap().entry(ctx_id) {
-        Entry::Occupied(mut ctx_cfg) => ctx_cfg
-            .get_mut()
-            .vmr
-            .set_kernel_bundle(kernel_bundle)
-            .unwrap(),
-        Entry::Vacant(_) => return -libc::ENOENT,
-    }
+    ctx_cfg.vmr.set_kernel_bundle(kernel_bundle).unwrap();
 
     KRUN_SUCCESS
 }
@@ -3546,11 +3638,15 @@ pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const
 #[unsafe(no_mangle)]
 #[allow(unreachable_code)]
 pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
-    start_enter_context(ctx_id)
+    let ctx_cfg = match CTX_MAP.lock().unwrap().remove(&ctx_id) {
+        Some(ctx_cfg) => ctx_cfg,
+        None => return -libc::ENOENT,
+    };
+    start_enter_context(ctx_id, ctx_cfg)
 }
 
 #[allow(unreachable_code)]
-fn start_enter_context(ctx_id: u32) -> i32 {
+fn start_enter_context(ctx_id: u32, mut ctx_cfg: ContextConfig) -> i32 {
     vmm::timing_event("start_enter.entry");
     #[cfg(target_os = "linux")]
     {
@@ -3562,7 +3658,7 @@ fn start_enter_context(ctx_id: u32) -> i32 {
     }
 
     #[cfg(feature = "aws-nitro")]
-    return krun_start_enter_nitro(ctx_id);
+    return krun_start_enter_nitro(ctx_cfg);
 
     let mut event_manager = match EventManager::new() {
         Ok(em) => em,
@@ -3573,10 +3669,6 @@ fn start_enter_context(ctx_id: u32) -> i32 {
     };
     vmm::timing_event("start_enter.event_manager.created");
 
-    let mut ctx_cfg = match CTX_MAP.lock().unwrap().remove(&ctx_id) {
-        Some(ctx_cfg) => ctx_cfg,
-        None => return -libc::ENOENT,
-    };
     vmm::timing_event("start_enter.ctx.loaded");
 
     if ctx_cfg.vmr.external_kernel.is_none()
@@ -3828,12 +3920,7 @@ fn start_enter_context(ctx_id: u32) -> i32 {
 }
 
 #[cfg(feature = "aws-nitro")]
-fn krun_start_enter_nitro(ctx_id: u32) -> i32 {
-    let ctx_cfg = match CTX_MAP.lock().unwrap().remove(&ctx_id) {
-        Some(ctx_cfg) => ctx_cfg,
-        None => return -libc::ENOENT,
-    };
-
+fn krun_start_enter_nitro(ctx_cfg: ContextConfig) -> i32 {
     let Ok(enclave) = NitroEnclave::try_from(ctx_cfg) else {
         return -libc::EINVAL;
     };

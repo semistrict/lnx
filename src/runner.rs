@@ -21,13 +21,13 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, anyhow, bail};
+use libkrun::{Context as KrunContext, KernelImageFormat};
 use lnx_protocol::{MAX_MESSAGE_SIZE, Message, PROTOCOL_VERSION};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    host_share, initramfs,
-    krun::Context as KrunContext,
+    host_share, initramfs, krun,
     packages::{GuestStoreMode, StoreLayout},
     paths::Layout,
 };
@@ -934,8 +934,8 @@ fn start_vm(
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(2);
-    KrunContext::set_log_level(krun_log_level)?;
-    let ctx = Arc::new(KrunContext::create()?);
+    krun::set_log_level_once(krun_log_level)?;
+    let ctx = Arc::new(KrunContext::new());
     ctx.set_console_output(&config.layout.console_log)?;
     ctx.set_vm_config(config.cpus, config.memory_mib)?;
     if config.nested_kvm {
@@ -974,7 +974,7 @@ fn start_vm(
     let rootfs_backend = RootfsBackend::from_env(std::env::var(ROOTFS_BACKEND_ENV).ok())?;
     let root_device = match rootfs_backend {
         RootfsBackend::Pmem => {
-            ctx.add_root_pmem(&rootfs)?;
+            krun::add_root_pmem(ctx.as_ref(), &rootfs)?;
             "/dev/pmem0"
         }
     };
@@ -993,14 +993,16 @@ fn start_vm(
     if share_layout.no_host_shares {
         run_log.line("host_shares.disabled");
     } else {
-        ctx.add_host_virtiofs(
+        krun::add_host_virtiofs(
+            ctx.as_ref(),
             "home",
             &share_layout.host_home,
             &home_write_allowlist(&config.cwd, &share_layout.host_home),
             &host_share_unshare_dir(&config.layout, "home"),
         )?;
         if let Some(cwd) = &share_layout.outside_home_cwd {
-            ctx.add_host_virtiofs(
+            krun::add_host_virtiofs(
+                ctx.as_ref(),
                 "cwd",
                 cwd,
                 &cwd_write_allowlist(),
@@ -1023,12 +1025,19 @@ fn start_vm(
     if config.nested_kvm {
         kernel_cmdline.push_str(" kvm.allow_unsafe_mappings=1");
     }
-    ctx.set_kernel(&config.layout.kernel, Some(&initrd), &kernel_cmdline)?;
-    ctx.add_vsock_connector(AGENT_PORT, &socket)?;
-    ctx.add_vsock_connector(SNAPSHOT_PORT, &snapshot_socket)?;
-    ctx.add_vsock_connector(CONTROL_PORT, &control_socket)?;
+    ctx.set_kernel(
+        &config.layout.kernel,
+        KernelImageFormat::Raw,
+        Some(&initrd),
+        Some(&kernel_cmdline),
+    )?;
+    krun::add_vsock_connector(ctx.as_ref(), AGENT_PORT, &socket)?;
+    krun::add_vsock_connector(ctx.as_ref(), SNAPSHOT_PORT, &snapshot_socket)?;
+    krun::add_vsock_connector(ctx.as_ref(), CONTROL_PORT, &control_socket)?;
     match &mut network {
-        NetworkBacking::Gvproxy(gvproxy) => ctx.add_gvproxy_network(&gvproxy.socket)?,
+        NetworkBacking::Gvproxy(gvproxy) => {
+            krun::add_gvproxy_network(ctx.as_ref(), &gvproxy.socket)?
+        }
     }
     timings.event("krun.devices.configured");
 
@@ -1088,7 +1097,10 @@ fn start_vm(
     let (vm_error_tx, vm_error_rx) = mpsc::channel::<i32>();
     thread::spawn(move || {
         vm_timings.event("krun.start_enter.begin");
-        let rc = vm_ctx.start_enter();
+        let rc = vm_ctx
+            .start_enter()
+            .map(|()| 0)
+            .unwrap_or_else(|error| error.return_code());
         vm_timings.event(&format!("krun.start_enter.return rc={rc}"));
         if rc < 0 {
             vm_run_log.line(format!(
@@ -5340,7 +5352,7 @@ fn configure_package_store(
     let writable = matches!(mode, GuestStoreMode::Writable);
     if writable {
         layout.ensure()?;
-        ctx.add_virtiofs("lnx-nix-root", &layout.mount, false)?;
+        krun::add_virtiofs(ctx, "lnx-nix-root", &layout.mount, false)?;
         run_log.line(format!(
             "packages.store.mounted mode=writable root={}",
             layout.root.display()
@@ -5354,9 +5366,9 @@ fn configure_package_store(
     if !layout.prepare_readonly()? {
         return Ok(Vec::new());
     }
-    ctx.add_virtiofs("lnx-nix-root", &layout.mount, true)?;
-    ctx.add_virtiofs("lnx-nix-store", &layout.store, !writable)?;
-    ctx.add_virtiofs("lnx-packages", &layout.profiles, !writable)?;
+    krun::add_virtiofs(ctx, "lnx-nix-root", &layout.mount, true)?;
+    krun::add_virtiofs(ctx, "lnx-nix-store", &layout.store, !writable)?;
+    krun::add_virtiofs(ctx, "lnx-packages", &layout.profiles, !writable)?;
     let env = vec![
         "LNX_VIRTIOFS_NIX_ROOT=1".to_string(),
         "LNX_VIRTIOFS_NIX_STORE=1".to_string(),
@@ -5626,7 +5638,7 @@ fn preflight_host_share_cwd_with_home(
 
 #[cfg(target_os = "macos")]
 fn set_home_write_allowlist(ctx: &KrunContext, cwd: &Path, host_home: &Path) -> Result<()> {
-    ctx.set_host_virtiofs_write_allowlist("home", &home_write_allowlist(cwd, host_home))
+    krun::set_host_virtiofs_write_allowlist(ctx, "home", &home_write_allowlist(cwd, host_home))
 }
 
 #[cfg(not(target_os = "macos"))]
