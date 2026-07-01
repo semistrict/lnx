@@ -18,6 +18,11 @@ jobs:
         with:
           targets: aarch64-unknown-linux-musl
 
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: third_party/gvproxy-bridge/go.mod
+
       - name: Install Linux musl cross compiler
         run: brew install FiloSottile/musl-cross/musl-cross
 
