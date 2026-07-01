@@ -31,6 +31,31 @@ dispatched and runs:
 depot build --project rc3tz55hnc --token "$DEPOT_TOKEN" --build-platform linux/arm64 --platform linux/arm64 -f Dockerfile.kernel -t lnx-kernel --load .
 ```
 
+Use Depot CI for downloadable kernel artifacts. Do not use
+`gh workflow run kernel.yml` for this: that dispatches the `.github` workflow
+copy on a GitHub runner and is much slower. Dispatch the Depot workflow with:
+
+```sh
+depot ci dispatch --repo semistrict/lnx --workflow kernel.yml --ref main --output json
+```
+
+Then inspect the run with:
+
+```sh
+depot ci status <run-id> --output json
+depot ci logs <attempt-id>
+depot ci artifacts list <run-id>
+```
+
+Download the resulting artifact with:
+
+```sh
+depot ci artifacts download <artifact-id> --output-file vmlinuz.gz.zip
+```
+
+The downloaded artifact is a zip wrapper containing `vmlinuz.gz`; unzip it
+before running `gzip -t` or installing the kernel.
+
 That job extracts `/build/arch/arm64/boot/Image` from the built image, writes it
 as `vmlinuz`, compresses it to `vmlinuz.gz`, and uploads `vmlinuz.gz` as the
 artifact.
@@ -43,6 +68,12 @@ When changing VM kernel behavior, update `kernel.config`, `kernel-patches/`, or
 `Dockerfile.kernel` as appropriate, then use the Depot artifact. The managed VM
 kernel at `~/.lnx/vmlinuz` will not change until a new artifact is installed or
 an explicit `--kernel` path is used.
+
+In new checkouts and default test flows, use the downloaded managed kernel at
+`~/.lnx/vmlinuz`. Do not build the kernel from source unless the user explicitly
+asks for a source kernel build. `bun run test:nested-deterministic-time` should
+therefore ensure downloaded images with `bun run kernel:ensure-downloaded`;
+`bun run kernel:build-lnx` is the explicit source-build path.
 
 ## Instance Forks And Clones
 

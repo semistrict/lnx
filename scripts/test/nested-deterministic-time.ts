@@ -37,7 +37,7 @@ const linuxLinker =
   "/opt/homebrew/bin/aarch64-linux-musl-gcc";
 const hostHome = Bun.env.HOME ?? "";
 const managedKernel = join(hostHome, ".lnx", "vmlinuz");
-const outerKernel = Bun.env.LNX_NESTED_OUTER_KERNEL ?? defaultOuterKernel();
+const outerKernel = Bun.env.LNX_NESTED_OUTER_KERNEL ?? managedKernel;
 const innerKernel = Bun.env.LNX_NESTED_INNER_KERNEL ?? managedKernel;
 const rootfs =
   Bun.env.LNX_NESTED_ROOTFS ??
@@ -65,22 +65,6 @@ const outerVmArgs = [
   "--memory-mib",
   "4096",
 ];
-
-function defaultOuterKernel(): string {
-  const result = Bun.spawnSync(["scripts/kernel-build.sh", "image-path"], {
-    cwd: ctx.repoRoot,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  if (result.exitCode === 0) {
-    return new TextDecoder().decode(result.stdout).trim();
-  }
-  return join(
-    ctx.repoRoot,
-    "target",
-    `vmlinuz-${Bun.env.LNX_KERNEL_VERSION ?? "7.1.2"}`,
-  );
-}
 
 function e2fsTool(name: string): string {
   for (const dir of [
@@ -207,7 +191,7 @@ async function ensureLinuxTools() {
 async function prepareInnerBase() {
   if (!existsSync(outerKernel)) {
     throw new Error(
-      `missing outer kernel image: ${outerKernel}; run bun run kernel:ensure-lnx`,
+      `missing outer kernel image: ${outerKernel}; run bun run kernel:ensure-downloaded`,
     );
   }
   if (!existsSync(innerKernel)) {
