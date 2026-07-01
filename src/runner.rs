@@ -21,7 +21,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, anyhow, bail};
-use libkrun::{Context as KrunContext, KernelImageFormat};
+use libkrun::{Error as KrunError, Kernel, Network, VmBuilder, VmHandle};
 use lnx_protocol::{MAX_MESSAGE_SIZE, Message, PROTOCOL_VERSION};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
@@ -974,12 +974,12 @@ fn start_vm(
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(2);
-    krun::set_log_level_once(krun_log_level)?;
-    let ctx = Arc::new(KrunContext::new());
-    ctx.set_console_output(&config.layout.console_log)?;
-    ctx.set_vm_config(config.cpus, config.memory_mib)?;
+    krun::init_logging_once(krun::log_level_from_verbosity(krun_log_level))?;
+    let mut vm_builder = VmBuilder::new();
+    vm_builder.console_output(&config.layout.console_log);
+    vm_builder.resources(config.cpus, config.memory_mib)?;
     if config.nested_kvm {
-        ctx.set_nested_virt(true)?;
+        vm_builder.nested_virt(true);
     }
     let rootfs = prepared_restore
         .as_ref()
@@ -1014,7 +1014,7 @@ fn start_vm(
     let rootfs_backend = RootfsBackend::from_env(std::env::var(ROOTFS_BACKEND_ENV).ok())?;
     let root_device = match rootfs_backend {
         RootfsBackend::Pmem => {
-            krun::add_root_pmem(ctx.as_ref(), &rootfs)?;
+            vm_builder.root_pmem(&rootfs);
             "/dev/pmem0"
         }
     };
@@ -1033,25 +1033,23 @@ fn start_vm(
     if share_layout.no_host_shares {
         run_log.line("host_shares.disabled");
     } else {
-        krun::add_host_virtiofs(
-            ctx.as_ref(),
+        vm_builder.virtiofs(krun::host_share_virtiofs(
             "home",
             &share_layout.host_home,
             &home_write_allowlist(&config.cwd, &share_layout.host_home),
             &host_share_unshare_dir(&config.layout, "home"),
-        )?;
+        ))?;
         if let Some(cwd) = &share_layout.outside_home_cwd {
-            krun::add_host_virtiofs(
-                ctx.as_ref(),
+            vm_builder.virtiofs(krun::host_share_virtiofs(
                 "cwd",
                 cwd,
                 &cwd_write_allowlist(),
                 &host_share_unshare_dir(&config.layout, "cwd"),
-            )?;
+            ))?;
         }
     }
     for mount in &config.vhost_user_fs {
-        krun::add_vhost_user_virtiofs(ctx.as_ref(), &mount.tag, &mount.socket)?;
+        vm_builder.vhost_user_virtiofs(&mount.tag, &mount.socket)?;
         run_log.line(format!(
             "vhost_user_fs.added tag={} mount={} socket={} read_only={}",
             mount.tag,
@@ -1061,7 +1059,7 @@ fn start_vm(
         ));
     }
     let package_env = configure_package_store(
-        ctx.as_ref(),
+        &mut vm_builder,
         &config.layout.base,
         config.package_store,
         share_layout.no_host_shares,
@@ -1075,24 +1073,23 @@ fn start_vm(
     if config.nested_kvm {
         kernel_cmdline.push_str(" kvm.allow_unsafe_mappings=1");
     }
-    ctx.set_kernel(
-        &config.layout.kernel,
-        KernelImageFormat::Raw,
-        Some(&initrd),
-        Some(&kernel_cmdline),
+    vm_builder.kernel(
+        Kernel::raw(&config.layout.kernel)
+            .initramfs(&initrd)
+            .cmdline(kernel_cmdline),
     )?;
-    krun::add_vsock_connector(ctx.as_ref(), AGENT_PORT, &socket)?;
-    krun::add_vsock_connector(ctx.as_ref(), SNAPSHOT_PORT, &snapshot_socket)?;
-    krun::add_vsock_connector(ctx.as_ref(), CONTROL_PORT, &control_socket)?;
+    vm_builder.vsock_connector(AGENT_PORT, &socket)?;
+    vm_builder.vsock_connector(SNAPSHOT_PORT, &snapshot_socket)?;
+    vm_builder.vsock_connector(CONTROL_PORT, &control_socket)?;
     match &mut network {
         NetworkBacking::Gvproxy(gvproxy) => {
-            krun::add_gvproxy_network(ctx.as_ref(), &gvproxy.socket)?
+            vm_builder.network(Network::gvproxy_vfkit(&gvproxy.socket))?;
         }
     }
     timings.event("krun.devices.configured");
 
     if let Some(snapshot) = &vm_restore_snapshot {
-        ctx.set_snapshot_path(snapshot)?;
+        vm_builder.restore_from_snapshot(snapshot)?;
         timings.event("snapshot.restore.configured");
         run_log.line(format!(
             "snapshot.restore.configured owner_run_id={owner_run_id} generation_id={} path={}",
@@ -1104,7 +1101,7 @@ fn start_vm(
         ));
     }
 
-    ctx.set_workdir("/")?;
+    vm_builder.workdir("/");
     let init_unix_secs = match &config.deterministic {
         Some(_) => 0,
         None => SystemTime::now()
@@ -1141,30 +1138,28 @@ fn start_vm(
         ),
     ];
     init_env.extend(package_env);
-    ctx.set_exec("/init", &["--init".to_string()], &init_env)?;
+    vm_builder.exec("/init", &["--init".to_string()], &init_env);
     timings.event("krun.exec.configured");
 
+    let vm = vm_builder.build();
+    let ctx = Arc::new(vm.handle());
     let console_log = config.layout.console_log.clone();
-    let vm_ctx = Arc::clone(&ctx);
     let vm_timings = Arc::clone(&timings);
     let vm_run_log = Arc::clone(&run_log);
-    let (vm_error_tx, vm_error_rx) = mpsc::channel::<i32>();
+    let (vm_error_tx, vm_error_rx) = mpsc::channel::<KrunError>();
     thread::spawn(move || {
         vm_timings.event("krun.start_enter.begin");
-        let rc = vm_ctx
-            .start_enter()
-            .map(|()| 0)
-            .unwrap_or_else(|error| error.return_code());
-        vm_timings.event(&format!("krun.start_enter.return rc={rc}"));
-        if rc < 0 {
-            vm_run_log.line(format!(
-                "krun.start_enter.error rc={rc} error={}",
-                krun_return_error(rc)
-            ));
-            log_console_tail(&vm_run_log, &console_log);
-            let _ = vm_error_tx.send(rc);
-        } else {
-            vm_run_log.line(format!("krun.start_enter.return rc={rc}"));
+        match vm.start() {
+            Ok(()) => {
+                vm_timings.event("krun.start_enter.return ok");
+                vm_run_log.line("krun.start_enter.return ok");
+            }
+            Err(error) => {
+                vm_timings.event("krun.start_enter.error");
+                vm_run_log.line(format!("krun.start_enter.error error={error}"));
+                log_console_tail(&vm_run_log, &console_log);
+                let _ = vm_error_tx.send(error);
+            }
         }
     });
     timings.event("krun.thread.spawned");
@@ -2097,14 +2092,6 @@ fn unix_nanos() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
-}
-
-fn krun_return_error(rc: i32) -> String {
-    if rc < 0 {
-        std::io::Error::from_raw_os_error(-rc).to_string()
-    } else {
-        format!("unexpected return code {rc}")
-    }
 }
 
 fn snapshot_vm_config(snapshot: &Path) -> Result<Option<SnapshotVmConfig>> {
@@ -3650,7 +3637,7 @@ fn run_broker_owner(
     listener: UnixListener,
     layout: Layout,
     console_log: PathBuf,
-    ctx: Arc<KrunContext>,
+    ctx: Arc<VmHandle>,
     snapshot_path: PathBuf,
     rootfs: PathBuf,
     canonical_rootfs: PathBuf,
@@ -3669,7 +3656,7 @@ fn run_broker_owner(
     timings: Arc<TimingLog>,
     run_log: Arc<RunLog>,
     trace_log: Option<Arc<TraceLog>>,
-    vm_error_rx: mpsc::Receiver<i32>,
+    vm_error_rx: mpsc::Receiver<KrunError>,
     owner_run_id: String,
 ) -> Result<thread::JoinHandle<()>> {
     listener
@@ -4246,7 +4233,7 @@ fn run_broker_owner(
     }))
 }
 
-fn maybe_spawn_restore_proof_snapshotter(ctx: Arc<KrunContext>, run_log: Arc<RunLog>) {
+fn maybe_spawn_restore_proof_snapshotter(ctx: Arc<VmHandle>, run_log: Arc<RunLog>) {
     let Some(path) = std::env::var_os("LNX_RESTORE_PROOF_SNAPSHOT_DIR").map(PathBuf::from) else {
         return;
     };
@@ -4555,7 +4542,7 @@ fn handle_broker_client(
     clients: Arc<Mutex<HashMap<u64, BrokerChannel>>>,
     mut active_reservation: ActiveReservation,
     seen_active: Arc<AtomicBool>,
-    ctx: Arc<KrunContext>,
+    ctx: Arc<VmHandle>,
     host_home: PathBuf,
     no_host_shares: bool,
     run_log: Arc<RunLog>,
@@ -4621,7 +4608,7 @@ fn handle_broker_client(
     }
     if !no_host_shares {
         if let Message::OpenExec { cwd, .. } = &first {
-            set_home_write_allowlist(ctx.as_ref(), Path::new(cwd), &host_home)?;
+            replace_home_write_allowlist(ctx.as_ref(), Path::new(cwd), &host_home)?;
         }
     }
     seen_active.store(true, Ordering::SeqCst);
@@ -5180,7 +5167,7 @@ fn accept_agent_hello(
     timeout: Duration,
     timings: &TimingLog,
     run_log: &RunLog,
-    vm_error_rx: &mpsc::Receiver<i32>,
+    vm_error_rx: &mpsc::Receiver<KrunError>,
 ) -> Result<UnixStream> {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -5219,14 +5206,14 @@ fn accept_unix_with_progress(
     listener: &UnixListener,
     timeout: Duration,
     progress: Option<(&TimingLog, &str)>,
-    vm_error_rx: Option<&mpsc::Receiver<i32>>,
+    vm_error_rx: Option<&mpsc::Receiver<KrunError>>,
 ) -> Result<UnixStream> {
     let start = Instant::now();
     let mut last = None;
     while start.elapsed() < timeout {
         if let Some(rx) = vm_error_rx {
-            if let Ok(rc) = rx.try_recv() {
-                bail!("krun_start_enter failed: {}", krun_return_error(rc));
+            if let Ok(error) = rx.try_recv() {
+                bail!("libkrun start failed: {error}");
             }
         }
         let remaining = timeout.saturating_sub(start.elapsed());
@@ -5255,8 +5242,8 @@ fn accept_unix_with_progress(
             continue;
         }
         if let Some(rx) = vm_error_rx {
-            if let Ok(rc) = rx.try_recv() {
-                bail!("krun_start_enter failed: {}", krun_return_error(rc));
+            if let Ok(error) = rx.try_recv() {
+                bail!("libkrun start failed: {error}");
             }
         }
         match listener.accept() {
@@ -5452,7 +5439,7 @@ fn cwd_write_allowlist() -> Vec<String> {
 }
 
 fn configure_package_store(
-    ctx: &KrunContext,
+    builder: &mut VmBuilder,
     base: &Path,
     mode: GuestStoreMode,
     no_host_shares: bool,
@@ -5466,7 +5453,7 @@ fn configure_package_store(
     let writable = matches!(mode, GuestStoreMode::Writable);
     if writable {
         layout.ensure()?;
-        krun::add_virtiofs(ctx, "lnx-nix-root", &layout.mount, false)?;
+        builder.virtiofs(krun::shared_virtiofs("lnx-nix-root", &layout.mount, false))?;
         run_log.line(format!(
             "packages.store.mounted mode=writable root={}",
             layout.root.display()
@@ -5480,9 +5467,17 @@ fn configure_package_store(
     if !layout.prepare_readonly()? {
         return Ok(Vec::new());
     }
-    krun::add_virtiofs(ctx, "lnx-nix-root", &layout.mount, true)?;
-    krun::add_virtiofs(ctx, "lnx-nix-store", &layout.store, !writable)?;
-    krun::add_virtiofs(ctx, "lnx-packages", &layout.profiles, !writable)?;
+    builder.virtiofs(krun::shared_virtiofs("lnx-nix-root", &layout.mount, true))?;
+    builder.virtiofs(krun::shared_virtiofs(
+        "lnx-nix-store",
+        &layout.store,
+        !writable,
+    ))?;
+    builder.virtiofs(krun::shared_virtiofs(
+        "lnx-packages",
+        &layout.profiles,
+        !writable,
+    ))?;
     let env = vec![
         "LNX_VIRTIOFS_NIX_ROOT=1".to_string(),
         "LNX_VIRTIOFS_NIX_STORE=1".to_string(),
@@ -5751,18 +5746,18 @@ fn preflight_host_share_cwd_with_home(
 }
 
 #[cfg(target_os = "macos")]
-fn set_home_write_allowlist(ctx: &KrunContext, cwd: &Path, host_home: &Path) -> Result<()> {
-    krun::set_host_virtiofs_write_allowlist(ctx, "home", &home_write_allowlist(cwd, host_home))
+fn replace_home_write_allowlist(ctx: &VmHandle, cwd: &Path, host_home: &Path) -> Result<()> {
+    krun::replace_host_virtiofs_write_allowlist(ctx, "home", &home_write_allowlist(cwd, host_home))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn set_home_write_allowlist(_ctx: &KrunContext, _cwd: &Path, _host_home: &Path) -> Result<()> {
+fn replace_home_write_allowlist(_ctx: &VmHandle, _cwd: &Path, _host_home: &Path) -> Result<()> {
     Ok(())
 }
 
 fn serve_snapshot(
     listener: UnixListener,
-    ctx: &KrunContext,
+    ctx: &VmHandle,
     snapshot_path: &Path,
     rootfs: &Path,
     initramfs_stamp: &Path,
@@ -5904,7 +5899,7 @@ fn promote_snapshot_rootfs(
 }
 
 fn capture_snapshot_for_publish(
-    ctx: &KrunContext,
+    ctx: &VmHandle,
     snapshot_path: &Path,
     rootfs: &Path,
     initramfs_stamp: &Path,
