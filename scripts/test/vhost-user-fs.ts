@@ -156,9 +156,8 @@ try {
     });
   });
 
-  const server = spawn([fixtureBin, "-socket", socketPath, "-root", backendRoot], {
-    stderr: "inherit",
-  });
+  const server = spawn([fixtureBin, "-socket", socketPath, "-root", backendRoot]);
+  const serverStderr = new Response(server.stderr).text();
   try {
     await waitForSocket(socketPath);
 
@@ -201,6 +200,7 @@ try {
   } finally {
     server.kill();
     await server.exited.catch(() => {});
+    await serverStderr.catch(() => {});
   }
 } finally {
   await cleanupContext(ctx);

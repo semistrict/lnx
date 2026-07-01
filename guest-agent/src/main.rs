@@ -2337,6 +2337,7 @@ fn run_channel_pty(
     unsafe {
         close(pty_slave);
     }
+    let _ = write_message_locked(&agent_fd, &Message::ExecStarted { channel_id });
     set_nonblocking(pty_master);
     let control_fd = listen_unix(&control_socket);
     let mut pending_control_fd = -1;
@@ -2514,6 +2515,7 @@ fn run_channel_pipe(
         exec_failed(child_exec.argv_ptrs[0]);
     }
     log!("channel.pipe.spawned channel={channel_id:016x} pid={pid}");
+    let _ = write_message_locked(&agent_fd, &Message::ExecStarted { channel_id });
     unsafe {
         close(stdin_pipe[0]);
         close(stdout_pipe[1]);
@@ -2885,6 +2887,7 @@ fn agent_loop() {
                     let _ = state.tx.send(ChannelInput::SnapshotFailed);
                 }
             }
+            Message::ExecStarted { .. } => {}
             Message::OpenUrlResult { channel_id, ok } => {
                 if let Some((_, state)) = channels.iter().find(|(id, _)| *id == channel_id) {
                     let input = if ok {

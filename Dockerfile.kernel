@@ -8,12 +8,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     dwarves \
     libelf-dev \
     libssl-dev \
-    linux-source-7.0.0 \
+    ca-certificates \
+    curl \
     cpio \
+    xz-utils \
+    patch \
     && rm -rf /var/lib/apt/lists/*
 
+ARG LINUX_VERSION=7.1.2
 RUN mkdir /build && \
-    tar xf /usr/src/linux-source-7.0.0.tar.bz2 -C /build --strip-components=1
+    curl -fL "https://cdn.kernel.org/pub/linux/kernel/v${LINUX_VERSION%%.*}.x/linux-${LINUX_VERSION}.tar.xz" | \
+    tar -xJ -C /build --strip-components=1
 
 WORKDIR /build
 

@@ -17,7 +17,7 @@ use std::env;
 use std::ffi::CString;
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
 use std::fs::File;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
 use std::os::fd::AsRawFd;
 #[cfg(feature = "aws-nitro")]
 use std::os::fd::RawFd;
@@ -463,6 +463,16 @@ impl VmBuilder {
         self.cfg.argv = argv.to_vec();
         self.cfg.env = envp.to_vec();
         self
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub fn deterministic_host_activity_begin() {
+        vmm::deterministic_host_activity_begin();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    pub fn deterministic_host_activity_end() {
+        vmm::deterministic_host_activity_end();
     }
 
     #[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]

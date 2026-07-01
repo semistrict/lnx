@@ -33,6 +33,7 @@ function instanceRunDir(instance: string) {
 
 function deterministicEnv() {
   return {
+    KRUN_DETERMINISTIC_DEBUG: "1",
     LNX_BROKER_IDLE_TTL_MS: "600000",
     LNX_INGRESS_STATE_DIR: join(ctx.tmpdir, "ingress"),
   };
@@ -104,25 +105,61 @@ function parseDeltaSeconds(stdout: string): number {
   return Number(match[1]);
 }
 
+async function instanceDiagnostics(instance: string): Promise<string> {
+  const logs = [];
+  for (const name of ["owner.log", "lnx.log", "console.log"]) {
+    const path = join(instanceRunDir(instance), name);
+    if (existsSync(path)) {
+      const lines = (await readFile(path, "utf8")).split("\n");
+      logs.push(`\n--- ${name} tail ---\n${lines.slice(-120).join("\n")}`);
+    }
+  }
+  const timingsPath = join(instanceRunDir(instance), "timings.log");
+  if (existsSync(timingsPath)) {
+    const deterministicLines = (await readFile(timingsPath, "utf8"))
+      .split("\n")
+      .filter((line) => line.includes("deterministic_time"));
+    logs.push(`\n--- timings.log deterministic_time ---\n${deterministicLines.join("\n")}`);
+  }
+  for (const name of ["deterministic-clock.state", "deterministic-timer-jumps.log"]) {
+    const path = join(instanceRunDir(instance), name);
+    if (existsSync(path)) {
+      try {
+        logs.push(`\n--- ${name} ---\n${await readFile(path, "utf8")}`);
+      } catch {
+        // The owner may finish cleanup between the exists check and the read.
+      }
+    }
+  }
+  return logs.join("");
+}
+
 async function deterministicProbe(instance: string, checkpoint: string) {
   const started = performance.now();
-  const result = await lnxCommand(instance, [
-    "--rootfs",
-    join(checkpoint, "rootfs.ext4"),
-    "--snapshot",
-    checkpoint,
-    "--deterministic=seed42",
-    "--trace-events",
-    "bash",
-    "-lc",
-    [
-      "set -euo pipefail",
-      "a=$(date +%s%N)",
-      "sleep 20",
-      "b=$(date +%s%N)",
-      'printf "delta_s=%s\\n" "$(((b - a) / 1000000000))"',
-    ].join("; "),
-  ]);
+  let result;
+  try {
+    result = await lnxCommand(instance, [
+      "--rootfs",
+      join(checkpoint, "rootfs.ext4"),
+      "--snapshot",
+      checkpoint,
+      "--deterministic=seed42",
+      "--trace-events",
+      "bash",
+      "-lc",
+      [
+        "set -euo pipefail",
+        "a=$(date +%s%N)",
+        "sleep 20",
+        "b=$(date +%s%N)",
+        'printf "delta_s=%s\\n" "$(((b - a) / 1000000000))"',
+      ].join("; "),
+    ]);
+  } catch (error) {
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}${await instanceDiagnostics(instance)}`,
+    );
+  }
   await stopOwner(instance);
   return { stdout: result.stdout, elapsedMs: performance.now() - started };
 }
@@ -166,7 +203,7 @@ try {
     }
     if (first.elapsedMs > 15_000) {
       throw new Error(
-        `deterministic sleep used host wall time: ${Math.round(first.elapsedMs)}ms\n${first.stdout}`,
+        `deterministic sleep used host wall time: ${Math.round(first.elapsedMs)}ms\n${first.stdout}${await instanceDiagnostics(sourceInstance)}`,
       );
     }
 

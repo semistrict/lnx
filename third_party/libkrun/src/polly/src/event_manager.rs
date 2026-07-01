@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -15,6 +16,27 @@ use utils::epoll::{self, Epoll, EpollEvent};
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Pollable = RawFd;
+
+static ACTIVE_EVENT_DISPATCHES: AtomicUsize = AtomicUsize::new(0);
+
+pub fn active_event_dispatches() -> usize {
+    ACTIVE_EVENT_DISPATCHES.load(Ordering::Acquire)
+}
+
+struct EventDispatchGuard;
+
+impl EventDispatchGuard {
+    fn new() -> Self {
+        ACTIVE_EVENT_DISPATCHES.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for EventDispatchGuard {
+    fn drop(&mut self) {
+        ACTIVE_EVENT_DISPATCHES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Errors associated with epoll events handling.
 pub enum Error {
@@ -224,6 +246,7 @@ impl EventManager {
             let pollable = event.fd();
 
             if self.subscribers.contains_key(&pollable) {
+                let _dispatch = EventDispatchGuard::new();
                 self.subscribers
                     .get_mut(&pollable)
                     .unwrap()
