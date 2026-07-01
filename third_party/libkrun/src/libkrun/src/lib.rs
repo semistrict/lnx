@@ -719,6 +719,7 @@ struct ContextConfig {
     exec_path: Option<String>,
     env: Vec<String>,
     argv: Vec<String>,
+    #[cfg(feature = "net")]
     net_index: u8,
     vsock_config: VsockConfig,
     pmem_cfgs: Vec<PmemDeviceConfig>,
