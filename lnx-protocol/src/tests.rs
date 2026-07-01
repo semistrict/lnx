@@ -56,6 +56,15 @@ fn restore_sync_carries_entropy() {
 }
 
 #[test]
+fn exec_started_round_trips() {
+    let message = Message::ExecStarted { channel_id: 11 };
+    let encoded = postcard::to_allocvec(&message).expect("encode");
+    let decoded: Message = postcard::from_bytes(&encoded).expect("decode");
+
+    assert_eq!(decoded, message);
+}
+
+#[test]
 fn open_url_round_trips_with_result() {
     let request = Message::OpenUrl {
         channel_id: 9,

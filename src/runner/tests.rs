@@ -820,7 +820,7 @@ fn snapshot_deterministic_compatibility_requires_matching_mode_and_seed() {
     assert_eq!(
             snapshot_deterministic_incompatibility(temp.path(), &disabled),
             Some(
-                "deterministic: snapshot=enabled-v1 current=disabled-v1; seed: snapshot=seed-a current=<absent>; initial_realtime_unix_secs: snapshot=0 current=<absent>; clock_state: snapshot=deterministic-clock-state-v1 current=<absent>; restore_timer_rebase: snapshot=disabled-v1 current=<absent>; virtual_counter: snapshot=kvm-controlled-counter-v1 current=<absent>; kvm_halt_poll: snapshot=disabled-v1 current=<absent>; rtc: snapshot=deterministic-zero-v1 current=<absent>; trng: snapshot=deterministic-smccc-v1 current=<absent>; virtio_rng: snapshot=deterministic-stateless-v1 current=<absent>; vsock_timesync: snapshot=disabled-v1 current=<absent>; restore_entropy: snapshot=sha256-seed-v1 current=<absent>; exec_user: snapshot=uid1000-gid1000-lnxuser current=<absent>; exec_env: snapshot=c-utf8-utc-v1 current=<absent>; exec_tty: snapshot=none-24x80-xterm-256color-v1 current=<absent>; network: snapshot=gvproxy-fixed-v1 current=<absent>"
+                "deterministic: snapshot=enabled-v1 current=disabled-v1; seed: snapshot=seed-a current=<absent>; initial_realtime_unix_secs: snapshot=0 current=<absent>; clock_state: snapshot=deterministic-clock-state-v1 current=<absent>; restore_timer_rebase: snapshot=disabled-v1 current=<absent>; virtual_counter: snapshot=kvm-controlled-counter-v1 current=<absent>; kvm_halt_poll: snapshot=disabled-v1 current=<absent>; kvm_wfi_exit: snapshot=enabled-v1 current=<absent>; host_activity_gate: snapshot=broker-and-device-idle-v1 current=<absent>; rtc: snapshot=deterministic-zero-v1 current=<absent>; trng: snapshot=deterministic-smccc-v1 current=<absent>; virtio_rng: snapshot=deterministic-stateless-v1 current=<absent>; vsock_timesync: snapshot=disabled-v1 current=<absent>; restore_entropy: snapshot=sha256-seed-v1 current=<absent>; exec_user: snapshot=uid1000-gid1000-lnxuser current=<absent>; exec_env: snapshot=c-utf8-utc-v1 current=<absent>; exec_tty: snapshot=none-24x80-xterm-256color-v1 current=<absent>; network: snapshot=gvproxy-fixed-v1 current=<absent>"
                     .to_string()
             )
         );
@@ -1007,6 +1007,8 @@ fn deterministic_stamp_records_network_policy() {
     assert!(stamp.contains("restore_timer_rebase=disabled-v1\n"));
     assert!(stamp.contains("virtual_counter=kvm-controlled-counter-v1\n"));
     assert!(stamp.contains("kvm_halt_poll=disabled-v1\n"));
+    assert!(stamp.contains("kvm_wfi_exit=enabled-v1\n"));
+    assert!(stamp.contains("host_activity_gate=broker-and-device-idle-v1\n"));
     assert!(stamp.contains("rtc=deterministic-zero-v1\n"));
     assert!(stamp.contains("trng=deterministic-smccc-v1\n"));
     assert!(stamp.contains("virtio_rng=deterministic-stateless-v1\n"));

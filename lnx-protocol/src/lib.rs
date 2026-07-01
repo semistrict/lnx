@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +41,9 @@ pub enum Message {
     Stderr {
         channel_id: u64,
         bytes: Vec<u8>,
+    },
+    ExecStarted {
+        channel_id: u64,
     },
     Eof {
         channel_id: u64,

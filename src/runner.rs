@@ -4,6 +4,7 @@ use std::{
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     net::{Shutdown, TcpListener, TcpStream},
     os::fd::AsRawFd,
+    os::unix::ffi::OsStrExt,
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -1191,6 +1192,7 @@ fn start_vm(
         share_layout.host_home.clone(),
         share_layout.no_host_shares,
         config.deterministic.clone(),
+        deterministic_clock_state.clone(),
         idle,
         Arc::clone(&timings),
         Arc::clone(&run_log),
@@ -2477,7 +2479,7 @@ fn parse_shares_stamp(stamp: &str) -> BTreeMap<String, String> {
 fn deterministic_stamp_content(config: Option<&DeterministicConfig>) -> String {
     match config {
         Some(config) => format!(
-            "deterministic=enabled-v1\nseed={}\ninitial_realtime_unix_secs=0\nclock_state=deterministic-clock-state-v1\nrestore_timer_rebase=disabled-v1\nvirtual_counter=kvm-controlled-counter-v1\nkvm_halt_poll=disabled-v1\nrtc=deterministic-zero-v1\ntrng=deterministic-smccc-v1\nvirtio_rng=deterministic-stateless-v1\nvsock_timesync=disabled-v1\nrestore_entropy=sha256-seed-v1\nexec_user=uid1000-gid1000-lnxuser\nexec_env=c-utf8-utc-v1\nexec_tty=none-24x80-xterm-256color-v1\nnetwork=gvproxy-fixed-v1\n",
+            "deterministic=enabled-v1\nseed={}\ninitial_realtime_unix_secs=0\nclock_state=deterministic-clock-state-v1\nrestore_timer_rebase=disabled-v1\nvirtual_counter=kvm-controlled-counter-v1\nkvm_halt_poll=disabled-v1\nkvm_wfi_exit=enabled-v1\nhost_activity_gate=broker-and-device-idle-v1\nrtc=deterministic-zero-v1\ntrng=deterministic-smccc-v1\nvirtio_rng=deterministic-stateless-v1\nvsock_timesync=disabled-v1\nrestore_entropy=sha256-seed-v1\nexec_user=uid1000-gid1000-lnxuser\nexec_env=c-utf8-utc-v1\nexec_tty=none-24x80-xterm-256color-v1\nnetwork=gvproxy-fixed-v1\n",
             config.seed
         ),
         None => "deterministic=disabled-v1\n".to_string(),
@@ -2594,6 +2596,20 @@ fn write_deterministic_clock_state(path: &Path, state: &DeterministicClockState)
         .with_context(|| format!("write {}", path.display()))
 }
 
+fn ensure_deterministic_clock_state_file(
+    initramfs_stamp: &Path,
+    state: Option<&DeterministicClockState>,
+) -> Result<()> {
+    let Some(state) = state else {
+        return Ok(());
+    };
+    let path = initramfs_stamp.with_file_name(DETERMINISTIC_CLOCK_STATE);
+    if path.exists() {
+        return Ok(());
+    }
+    write_deterministic_clock_state(&path, state)
+}
+
 fn flush_deterministic_trace_events(layout: &Layout, trace_log: Option<&TraceLog>) -> Result<()> {
     let initramfs_stamp = layout.run_dir.join("initramfs.stamp");
     import_deterministic_timer_jumps(&initramfs_stamp, trace_log)?;
@@ -2611,9 +2627,12 @@ fn sync_deterministic_clock_event_sequence(
     if !path.exists() {
         return Ok(());
     }
-    let mut state = parse_deterministic_clock_state(
-        &fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?,
-    )?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let mut state = parse_deterministic_clock_state(&raw)?;
     state.event_sequence = trace_log.next_sequence();
     write_deterministic_clock_state(&path, &state)
 }
@@ -2701,6 +2720,8 @@ fn describe_deterministic_stamp_mismatch(snapshot: &str, current: &str) -> Strin
         "restore_timer_rebase",
         "virtual_counter",
         "kvm_halt_poll",
+        "kvm_wfi_exit",
+        "host_activity_gate",
         "rtc",
         "trng",
         "virtio_rng",
@@ -3652,6 +3673,7 @@ fn run_broker_owner(
     host_home: PathBuf,
     no_host_shares: bool,
     deterministic: Option<DeterministicConfig>,
+    deterministic_clock_state: Option<DeterministicClockState>,
     idle: IdlePolicy,
     timings: Arc<TimingLog>,
     run_log: Arc<RunLog>,
@@ -3790,6 +3812,7 @@ fn run_broker_owner(
         .context("clone lnx-agent stream for writer")?;
     thread::spawn(move || {
         while let Ok(message) = agent_rx.recv() {
+            let _activity = krun::deterministic_host_activity();
             if write_message(&mut agent_writer, &message).is_err() {
                 break;
             }
@@ -3813,17 +3836,25 @@ fn run_broker_owner(
                 Ok(message) => message,
                 Err(e) => break e,
             };
+            let _activity = krun::deterministic_host_activity();
             let channel_id = match &message {
                 Message::Data { channel_id, .. }
                 | Message::Stderr { channel_id, .. }
                 | Message::Eof { channel_id }
                 | Message::ExitStatus { channel_id, .. }
                 | Message::Close { channel_id }
+                | Message::ExecStarted { channel_id }
                 | Message::Error { channel_id, .. }
                 | Message::SnapshotExit { channel_id }
                 | Message::OpenUrl { channel_id, .. } => Some(*channel_id),
                 _ => None,
             };
+            if let Message::ExecStarted { channel_id } = message {
+                if let Some(trace) = &reader_trace {
+                    trace_agent_message(trace, &Message::ExecStarted { channel_id });
+                }
+                continue;
+            }
             if let Message::SnapshotExit { channel_id } = message {
                 if let Some(trace) = &reader_trace {
                     trace.event(
@@ -4016,6 +4047,10 @@ fn run_broker_owner(
                                 &snapshot_path,
                                 &owner_log,
                             )?;
+                            ensure_deterministic_clock_state_file(
+                                &initramfs_stamp,
+                                deterministic_clock_state.as_ref(),
+                            )?;
                             owner_log.line(format!(
                                 "checkpoint.capture.begin owner_run_id={} generation_id={} path={} source_rootfs={} source_generation={}",
                                 owner_run_id,
@@ -4026,6 +4061,7 @@ fn run_broker_owner(
                             ));
                             ctx.snapshot_with_file_copy(&request.path, &rootfs, "rootfs.ext4")?;
                             validate_snapshot_rootfs(&request.path)?;
+                            align_snapshot_rootfs_mtime_with_memory(&request.path)?;
                             owner_log.line(format!(
                                 "checkpoint.capture.done owner_run_id={} generation_id={} path={}",
                                 owner_run_id,
@@ -4036,6 +4072,7 @@ fn run_broker_owner(
                                 &request.path,
                                 &initramfs_stamp,
                                 trace_log.as_deref(),
+                                deterministic_clock_state.as_ref(),
                             )?;
                             copy_host_share_state_to_snapshot(&layout, &request.path)?;
                             write_snapshot_lifecycle_manifest(
@@ -4086,6 +4123,7 @@ fn run_broker_owner(
                             &initramfs_stamp,
                             &layout,
                             trace_log.as_deref(),
+                            deterministic_clock_state.as_ref(),
                             restore_snapshot.as_deref(),
                             false,
                             &owner_log,
@@ -4202,6 +4240,7 @@ fn run_broker_owner(
             &initramfs_stamp,
             &layout,
             trace_log.as_deref(),
+            deterministic_clock_state.as_ref(),
             restore_snapshot.as_deref(),
             force_full_snapshot,
             promote_rootfs_after_snapshot.then_some(canonical_rootfs.as_path()),
@@ -4392,7 +4431,7 @@ fn run_broker_client_awaiting_owner(
     config: &RunConfig,
     layout: &Layout,
     run_log: &RunLog,
-    run_id: &str,
+    _run_id: &str,
 ) -> Result<i32> {
     let deadline = Instant::now() + OWNER_BOOT_TIMEOUT;
     let mut last = None;
@@ -4420,12 +4459,7 @@ fn run_broker_client_awaiting_owner(
             }
         }
         if let Some(status) = owner.try_wait().context("check lnx _vm-owner")? {
-            // An owner that exits zero lost the bootstrap race to another
-            // owner, so keep retrying until that one's broker comes up.
-            if status.success() {
-                run_log.line("owner.exited.early status=0 retry=spawn");
-                *owner = spawn_owner_process(config, run_log, run_id)?;
-            } else if status.code() == Some(EXIT_RESTORE_FAILED) {
+            if status.code() == Some(EXIT_RESTORE_FAILED) {
                 run_log.line(format!(
                     "owner.exited.early status={status} restore_failed=true"
                 ));
@@ -4569,6 +4603,7 @@ fn handle_broker_client(
         },
     )?;
     let first = read_message(&mut client)?;
+    let first_activity = krun::deterministic_host_activity();
     if let Message::Checkpoint { channel_id, path } = first {
         if let Some(trace) = &trace_log {
             trace.event(
@@ -4645,10 +4680,12 @@ fn handle_broker_client(
         }
         return Err(e).context("send open exec to agent");
     }
+    drop(first_activity);
     active_reservation.disarm();
     let mut writer = client.try_clone().context("clone broker client")?;
     thread::spawn(move || {
         while let Ok(message) = to_client_rx.recv() {
+            let _activity = krun::deterministic_host_activity();
             if write_message(&mut writer, &message).is_err() {
                 break;
             }
@@ -4657,6 +4694,7 @@ fn handle_broker_client(
     loop {
         match read_message(&mut client) {
             Ok(message) => {
+                let _activity = krun::deterministic_host_activity();
                 match &message {
                     Message::Data { channel_id, bytes } => run_log.line(format!(
                         "broker.client.data channel={channel_id:016x} bytes={}",
@@ -4689,6 +4727,7 @@ fn handle_broker_client(
                 }
             }
             Err(_) => {
+                let _activity = krun::deterministic_host_activity();
                 run_log.line(format!("broker.client.read_eof channel={channel_id:016x}"));
                 let _ = agent_tx.send(Message::Eof { channel_id });
                 return Ok(());
@@ -4833,6 +4872,10 @@ fn trace_agent_message(trace: &TraceLog, message: &Message) {
                 trace_integer("len", bytes.len() as i64),
                 trace_blob("bytes", bytes),
             ],
+        ),
+        Message::ExecStarted { channel_id } => trace.event(
+            "guest_exec_started",
+            vec![trace_text("channel_id", format!("{channel_id:016x}"))],
         ),
         Message::ExitStatus { channel_id, status } => trace.event(
             "guest_exit_status",
@@ -5770,6 +5813,7 @@ fn serve_snapshot(
     initramfs_stamp: &Path,
     layout: &Layout,
     trace_log: Option<&TraceLog>,
+    deterministic_clock_state: Option<&DeterministicClockState>,
     base_snapshot: Option<&Path>,
     force_full: bool,
     promote_rootfs_to: Option<&Path>,
@@ -5831,6 +5875,7 @@ fn serve_snapshot(
         initramfs_stamp,
         layout,
         trace_log,
+        deterministic_clock_state,
         base_snapshot,
         force_full,
         run_log,
@@ -5912,6 +5957,7 @@ fn capture_snapshot_for_publish(
     initramfs_stamp: &Path,
     layout: &Layout,
     trace_log: Option<&TraceLog>,
+    deterministic_clock_state: Option<&DeterministicClockState>,
     base_snapshot: Option<&Path>,
     force_full: bool,
     run_log: &RunLog,
@@ -5924,12 +5970,14 @@ fn capture_snapshot_for_publish(
     if !force_full {
         seed_incremental_snapshot(&temp, base_snapshot, snapshot_path, run_log)?;
     }
+    ensure_deterministic_clock_state_file(initramfs_stamp, deterministic_clock_state)?;
     ctx.snapshot_with_file_copy(&temp, rootfs, "rootfs.ext4")?;
     if let Err(e) = validate_snapshot_rootfs(&temp) {
         let _ = remove_path_if_exists(&temp);
         return Err(e);
     }
-    copy_snapshot_stamp(&temp, initramfs_stamp, trace_log)?;
+    align_snapshot_rootfs_mtime_with_memory(&temp)?;
+    copy_snapshot_stamp(&temp, initramfs_stamp, trace_log, deterministic_clock_state)?;
     copy_host_share_state_to_snapshot(layout, &temp)?;
     write_snapshot_lifecycle_manifest(&temp, generation_id, owner_run_id, rootfs)?;
     publish_snapshot_dir(snapshot_path, &temp, run_log, owner_run_id, generation_id)?;
@@ -5988,6 +6036,37 @@ fn publish_snapshot_dir(
 
 fn validate_snapshot_rootfs(snapshot_path: &Path) -> Result<()> {
     crate::init::ensure_ext4_has_no_errors(&snapshot_path.join("rootfs.ext4"), "snapshot rootfs")
+}
+
+fn align_snapshot_rootfs_mtime_with_memory(snapshot_path: &Path) -> Result<()> {
+    let rootfs = snapshot_path.join("rootfs.ext4");
+    let vmstate = snapshot_path.join("vmstate.bin");
+    let pages = snapshot_path.join("pages.img");
+    let state_modified = file_modified_time(&vmstate)?.max(file_modified_time(&pages)?);
+    set_file_modified_time(&rootfs, state_modified)
+}
+
+fn set_file_modified_time(path: &Path, time: SystemTime) -> Result<()> {
+    let duration = time
+        .duration_since(UNIX_EPOCH)
+        .with_context(|| format!("mtime before unix epoch for {}", path.display()))?;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("encode path {}", path.display()))?;
+    let times = [
+        libc::timespec {
+            tv_sec: duration.as_secs() as _,
+            tv_nsec: duration.subsec_nanos() as _,
+        },
+        libc::timespec {
+            tv_sec: duration.as_secs() as _,
+            tv_nsec: duration.subsec_nanos() as _,
+        },
+    ];
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+    if rc == 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::last_os_error()).with_context(|| format!("set mtime {}", path.display()))
 }
 
 fn seed_incremental_snapshot(
@@ -6053,33 +6132,78 @@ fn copy_snapshot_stamp(
     snapshot_path: &Path,
     initramfs_stamp: &Path,
     trace_log: Option<&TraceLog>,
+    deterministic_clock_state: Option<&DeterministicClockState>,
 ) -> Result<()> {
     // Compatibility stamps live in the run dir; they travel with the snapshot
     // so a later restore can check agent, share-root, and deterministic mode.
     import_deterministic_timer_jumps(initramfs_stamp, trace_log)?;
     sync_deterministic_clock_event_sequence(initramfs_stamp, trace_log)?;
+    ensure_deterministic_clock_state_file(initramfs_stamp, deterministic_clock_state)?;
     let shares_stamp = initramfs_stamp.with_file_name("shares.stamp");
     let deterministic_stamp = initramfs_stamp.with_file_name("deterministic.stamp");
-    let deterministic_clock_state = initramfs_stamp.with_file_name(DETERMINISTIC_CLOCK_STATE);
+    let deterministic_clock_state_path = initramfs_stamp.with_file_name(DETERMINISTIC_CLOCK_STATE);
     for stamp in [
         initramfs_stamp,
         shares_stamp.as_path(),
         deterministic_stamp.as_path(),
-        deterministic_clock_state.as_path(),
+        deterministic_clock_state_path.as_path(),
     ] {
-        if !stamp.exists()
-            && stamp
-                .file_name()
-                .is_some_and(|name| name == DETERMINISTIC_CLOCK_STATE)
-        {
-            continue;
-        }
         let name = stamp.file_name().context("stamp file name")?;
         let target = snapshot_path.join(name);
-        fs::copy(stamp, &target)
-            .with_context(|| format!("copy {} to {}", stamp.display(), target.display()))?;
+        if name == DETERMINISTIC_CLOCK_STATE {
+            if let Some(state) = deterministic_clock_state {
+                match fs::read(stamp) {
+                    Ok(bytes) => write_snapshot_metadata_file(&target, &bytes)?,
+                    Err(e) if e.kind() == ErrorKind::NotFound => {
+                        write_deterministic_clock_state(&target, state)?;
+                    }
+                    Err(e) => return Err(e).with_context(|| format!("read {}", stamp.display())),
+                }
+                continue;
+            }
+            if !stamp.exists() {
+                continue;
+            }
+        }
+        copy_snapshot_metadata_file(stamp, &target)?;
     }
     Ok(())
+}
+
+fn write_snapshot_metadata_file(dst: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let mut dst_file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(dst)
+        .with_context(|| format!("create {}", dst.display()))?;
+    dst_file
+        .write_all(bytes)
+        .with_context(|| format!("write {}", dst.display()))?;
+    dst_file
+        .sync_all()
+        .with_context(|| format!("sync {}", dst.display()))
+}
+
+fn copy_snapshot_metadata_file(src: &Path, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let mut src_file = fs::File::open(src).with_context(|| format!("open {}", src.display()))?;
+    let mut dst_file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(dst)
+        .with_context(|| format!("create {}", dst.display()))?;
+    std::io::copy(&mut src_file, &mut dst_file)
+        .with_context(|| format!("copy {} to {}", src.display(), dst.display()))?;
+    dst_file
+        .sync_all()
+        .with_context(|| format!("sync {}", dst.display()))
 }
 
 fn copy_host_share_state_to_snapshot(layout: &Layout, snapshot_path: &Path) -> Result<()> {

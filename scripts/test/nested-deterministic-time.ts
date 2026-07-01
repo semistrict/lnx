@@ -36,19 +36,28 @@ const linuxLinker =
   Bun.env.CC_LINUX ??
   "/opt/homebrew/bin/aarch64-linux-musl-gcc";
 const hostHome = Bun.env.HOME ?? "";
-const kernel = join(hostHome, ".lnx", "vmlinuz");
+const managedKernel = join(hostHome, ".lnx", "vmlinuz");
+const outerKernel = Bun.env.LNX_NESTED_OUTER_KERNEL ?? managedKernel;
+const innerKernel = Bun.env.LNX_NESTED_INNER_KERNEL ?? managedKernel;
 const rootfs =
   Bun.env.LNX_NESTED_ROOTFS ??
-  join(hostHome, ".lnx", "instances", "default", "rootfs.ext4");
+  join(hostHome, ".lnx", "cache", "rootfs.ext4");
 const outerInstance = `${ctx.instance}-outer`;
 const suiteBase = join(cwd, "inner-base");
 const outerRootfs = join(cwd, "outer-rootfs.ext4");
+const outerRootfsBytes = Number(
+  Bun.env.LNX_NESTED_OUTER_ROOTFS_BYTES ?? 16 * 1024 * 1024 * 1024,
+);
+const suiteRootfsBytes = Number(
+  Bun.env.LNX_NESTED_SUITE_ROOTFS_BYTES ?? 2 * 1024 * 1024 * 1024,
+);
 const suiteCache = join(suiteBase, "cache", "rootfs.ext4");
 const suiteDefault = join(suiteBase, "instances", "default", "rootfs.ext4");
+const outerLocalSuiteBase = `/root/lnx-nested-deterministic-inner-${process.pid}`;
 const outerVmArgs = [
   "--nested-kvm",
   "--kernel",
-  kernel,
+  outerKernel,
   "--rootfs",
   outerRootfs,
   "--cpus",
@@ -84,6 +93,15 @@ async function shrinkRootfsToMinimum(path: string) {
   }
   await run([e2fsTool("resize2fs"), "-M", path], { timeoutMs: 180_000 });
   await alignRootfsForPmem(path);
+  const postResizeFsck = await run([e2fsTool("e2fsck"), "-fy", path], {
+    check: false,
+    timeoutMs: 180_000,
+  });
+  if ((postResizeFsck.status & ~3) !== 0) {
+    throw new Error(
+      `post-resize e2fsck failed (${postResizeFsck.status}): ${postResizeFsck.stderr || postResizeFsck.stdout}`,
+    );
+  }
 }
 
 async function alignRootfsForPmem(path: string) {
@@ -95,9 +113,30 @@ async function alignRootfsForPmem(path: string) {
   ]);
 }
 
+async function fsckRootfs(path: string, label: string) {
+  const fsck = await run([e2fsTool("e2fsck"), "-fy", path], {
+    check: false,
+    timeoutMs: 180_000,
+  });
+  if ((fsck.status & ~3) !== 0) {
+    throw new Error(
+      `${label} e2fsck failed (${fsck.status}): ${fsck.stderr || fsck.stdout}`,
+    );
+  }
+}
+
 async function cloneShrunkRootfs(src: string, dest: string) {
   await cloneSparseImage(src, dest);
   await shrinkRootfsToMinimum(dest);
+}
+
+async function growRootfs(path: string, sizeBytes: number) {
+  await run(["truncate", "-s", String(sizeBytes), path], {
+    timeoutMs: 180_000,
+  });
+  await run([e2fsTool("resize2fs"), path], { timeoutMs: 180_000 });
+  await alignRootfsForPmem(path);
+  await fsckRootfs(path, "post-grow");
 }
 
 async function assertSparseVmImage(path: string, label: string) {
@@ -114,7 +153,7 @@ async function ensureLinuxTools() {
   if (!existsSync(linuxLinker)) {
     throw new Error(`missing Linux target linker: ${linuxLinker}`);
   }
-  await run(["cargo", "build", "--target", linuxTarget], {
+  await run(["scripts/prepare-nested-helpers.sh", "debug"], {
     cwd: ctx.repoRoot,
     timeoutMs: 180_000,
     env: {
@@ -150,8 +189,13 @@ async function ensureLinuxTools() {
 }
 
 async function prepareInnerBase() {
-  if (!existsSync(kernel)) {
-    throw new Error(`missing kernel image: ${kernel}`);
+  if (!existsSync(outerKernel)) {
+    throw new Error(
+      `missing outer kernel image: ${outerKernel}; run bun run kernel:ensure-downloaded`,
+    );
+  }
+  if (!existsSync(innerKernel)) {
+    throw new Error(`missing inner kernel image: ${innerKernel}`);
   }
   if (!existsSync(rootfs)) {
     throw new Error(`missing rootfs image: ${rootfs}`);
@@ -159,9 +203,11 @@ async function prepareInnerBase() {
   await rm(suiteBase, { recursive: true, force: true });
   await mkdir(join(suiteBase, "cache"), { recursive: true });
   await mkdir(join(suiteBase, "instances", "default"), { recursive: true });
-  await run(["cp", kernel, join(suiteBase, "vmlinuz")], { timeoutMs: 180_000 });
+  await run(["cp", innerKernel, join(suiteBase, "vmlinuz")], { timeoutMs: 180_000 });
   await cloneShrunkRootfs(rootfs, outerRootfs);
+  await growRootfs(outerRootfs, outerRootfsBytes);
   await cloneShrunkRootfs(rootfs, suiteCache);
+  await growRootfs(suiteCache, suiteRootfsBytes);
   await cloneSparseImage(suiteCache, suiteDefault);
   await writeFile(join(suiteBase, "instances", "default", "vm-initialized"), "1\n");
   await assertSparseVmImage(suiteCache, "nested deterministic cache rootfs");
@@ -180,6 +226,17 @@ function stageNestedToolsScript(): string[] {
     'export PATH="$nested_tools:$PATH"',
     'export LNX_BIN="$nested_tools/lnx"',
     'export GVPROXY_PATH="$nested_tools/gvproxy-linux-arm64"',
+  ];
+}
+
+function stageInnerBaseScript(): string[] {
+  const localDefault = `${outerLocalSuiteBase}/instances/default/rootfs.ext4`;
+  return [
+    `rm -rf ${quoteShell(outerLocalSuiteBase)}`,
+    `mkdir -p ${quoteShell(`${outerLocalSuiteBase}/instances/default`)}`,
+    `cp ${quoteShell(join(suiteBase, "vmlinuz"))} ${quoteShell(`${outerLocalSuiteBase}/vmlinuz`)}`,
+    `"$LNX_BIN" _sparse-copy ${quoteShell(suiteDefault)} ${quoteShell(localDefault)}`,
+    `cp ${quoteShell(join(suiteBase, "instances/default/vm-initialized"))} ${quoteShell(`${outerLocalSuiteBase}/instances/default/vm-initialized`)}`,
   ];
 }
 
@@ -218,8 +275,9 @@ try {
       "test -c /dev/kvm",
       "test -r /dev/kvm",
       ...stageNestedToolsScript(),
+      ...stageInnerBaseScript(),
       "command -v bun >/dev/null",
-      `export LNX_BASE=${quoteShell(suiteBase)}`,
+      `export LNX_BASE=${quoteShell(outerLocalSuiteBase)}`,
       "export LNX_TEST_INSTANCE=default",
       "export LNX_TEST_CPUS=1",
       "export LNX_TEST_MEMORY_MIB=512",

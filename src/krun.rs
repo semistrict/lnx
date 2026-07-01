@@ -32,6 +32,26 @@ pub(crate) fn init_logging_once(level: LogLevel) -> Result<()> {
     Ok(())
 }
 
+pub(crate) struct DeterministicHostActivity;
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub(crate) fn deterministic_host_activity() -> DeterministicHostActivity {
+    libkrun::VmBuilder::deterministic_host_activity_begin();
+    DeterministicHostActivity
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+pub(crate) fn deterministic_host_activity() -> DeterministicHostActivity {
+    DeterministicHostActivity
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+impl Drop for DeterministicHostActivity {
+    fn drop(&mut self) {
+        libkrun::VmBuilder::deterministic_host_activity_end();
+    }
+}
+
 pub(crate) fn shared_virtiofs(tag: &str, path: &Path, read_only: bool) -> VirtioFs {
     VirtioFs::shared(tag, path)
         .dax_window_bytes(host_share_dax_window_bytes())

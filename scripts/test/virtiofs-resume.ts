@@ -163,6 +163,17 @@ import time
 mount = subprocess.check_output(["findmnt", "-T", os.getcwd(), "-no", "FSTYPE,OPTIONS"], text=True).strip()
 assert mount.startswith("virtiofs ") and "dax=always" in mount, mount
 
+for marker in [
+    "/tmp/virtiofs-fork-ready",
+    "/tmp/virtiofs-fork-go",
+    "/tmp/virtiofs-fork-result",
+    "/tmp/virtiofs-fork-result.tmp",
+]:
+    try:
+        pathlib.Path(marker).unlink()
+    except FileNotFoundError:
+        pass
+
 fd = os.open("fork-open.bin", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
 os.ftruncate(fd, 4096)
 view = mmap.mmap(fd, 4096, access=mmap.ACCESS_WRITE)
@@ -192,7 +203,10 @@ try:
         b"fork-fd-after" in data,
         data[256:256 + len(fork_mmap_after)] == fork_mmap_after,
     ]
-    pathlib.Path("/tmp/virtiofs-fork-result").write_text("ok" if all(checks) else repr(data))
+    result = pathlib.Path("/tmp/virtiofs-fork-result")
+    tmp_result = pathlib.Path("/tmp/virtiofs-fork-result.tmp")
+    tmp_result.write_text("ok" if all(checks) else repr(data))
+    os.replace(tmp_result, result)
     print("fork-worker-done", flush=True)
 finally:
     view.close()
@@ -218,7 +232,7 @@ finally:
           forkInstance,
           "bash",
           "-lc",
-          "touch /tmp/virtiofs-fork-go; for i in $(seq 1 600); do test -e /tmp/virtiofs-fork-result && break; sleep 0.1; done; cat /tmp/virtiofs-fork-result",
+          "touch /tmp/virtiofs-fork-go; for i in $(seq 1 600); do test -s /tmp/virtiofs-fork-result && break; sleep 0.1; done; test -s /tmp/virtiofs-fork-result; cat /tmp/virtiofs-fork-result",
         ],
         { cwd, timeoutMs: 180_000, env: { LNX_HOST_SHARE_DAX: "1" } },
       );

@@ -1,0 +1,38 @@
+Subject: [PATCH] virtio-pmem: Complete bio flushes when persistence is virtual
+
+virtio-pmem can be backed by a VMM shared-memory window where the guest has a
+usable pmem block device but the host cannot provide hardware-style write
+pending queue persistence. The pmem driver already reports this as
+"unable to guarantee persistence of writes"; in that mode, failing ordinary
+REQ_PREFLUSH/REQ_FUA metadata writes turns the device from "best effort
+persistence" into an unusable block device.
+
+For bio-tied flushes, complete the request locally and let the block write
+continue. Explicit region flushes still go through the virtio-pmem request
+queue so freeze/shutdown paths can ask the host to make a best-effort sync.
+
+--- a/drivers/nvdimm/nd_virtio.c
++++ b/drivers/nvdimm/nd_virtio.c
+@@ -113,21 +113,11 @@ int async_pmem_flush(struct nd_region *nd_region, struct bio *bio)
+ 	/*
+ 	 * Create child bio for asynchronous flush and chain with
+ 	 * parent bio. Otherwise directly call nd_region flush.
+ 	 */
+ 	if (bio && bio->bi_iter.bi_sector != -1) {
+-		struct bio *child = bio_alloc(bio->bi_bdev, 0,
+-					      REQ_OP_WRITE | REQ_PREFLUSH,
+-					      GFP_ATOMIC);
+-
+-		if (!child)
+-			return -ENOMEM;
+-		bio_clone_blkg_association(child, bio);
+-		child->bi_iter.bi_sector = -1;
+-		bio_chain(child, bio);
+-		submit_bio(child);
+-		return 0;
++		return 0;
+ 	}
+ 	if (virtio_pmem_flush(nd_region))
+ 		return -EIO;
+ 
+ 	return 0;

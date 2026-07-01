@@ -23,12 +23,10 @@ use std::os::unix::thread::JoinHandleExt;
 #[cfg(target_arch = "x86_64")]
 use std::env;
 use std::result;
-use std::sync::Arc;
 #[cfg(not(test))]
 use std::sync::Barrier;
-use std::sync::atomic::{AtomicBool, Ordering, fence};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 use std::thread;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -73,14 +71,14 @@ use kvm_bindings::{
 };
 #[cfg(target_arch = "aarch64")]
 use kvm_bindings::{
-    KVM_MP_STATE_HALTED, KVM_MP_STATE_RUNNABLE, KVM_REG_ARM_CORE, KVM_REG_ARM64,
-    KVM_REG_ARM64_SYSREG, KVM_REG_ARM64_SYSREG_CRM_MASK, KVM_REG_ARM64_SYSREG_CRM_SHIFT,
-    KVM_REG_ARM64_SYSREG_CRN_MASK, KVM_REG_ARM64_SYSREG_CRN_SHIFT, KVM_REG_ARM64_SYSREG_OP0_MASK,
-    KVM_REG_ARM64_SYSREG_OP0_SHIFT, KVM_REG_ARM64_SYSREG_OP1_MASK, KVM_REG_ARM64_SYSREG_OP1_SHIFT,
-    KVM_REG_ARM64_SYSREG_OP2_MASK, KVM_REG_ARM64_SYSREG_OP2_SHIFT, KVM_REG_SIZE_MASK,
-    KVM_REG_SIZE_U8, KVM_REG_SIZE_U16, KVM_REG_SIZE_U32, KVM_REG_SIZE_U64, KVM_REG_SIZE_U128,
-    KVM_REG_SIZE_U256, KVM_REG_SIZE_U512, KVM_REG_SIZE_U1024, KVM_REG_SIZE_U2048, RegList,
-    kvm_mp_state, kvm_regs, kvm_vcpu_events, user_fpsimd_state, user_pt_regs,
+    KVM_MP_STATE_RUNNABLE, KVM_REG_ARM_CORE, KVM_REG_ARM64, KVM_REG_ARM64_SYSREG,
+    KVM_REG_ARM64_SYSREG_CRM_MASK, KVM_REG_ARM64_SYSREG_CRM_SHIFT, KVM_REG_ARM64_SYSREG_CRN_MASK,
+    KVM_REG_ARM64_SYSREG_CRN_SHIFT, KVM_REG_ARM64_SYSREG_OP0_MASK, KVM_REG_ARM64_SYSREG_OP0_SHIFT,
+    KVM_REG_ARM64_SYSREG_OP1_MASK, KVM_REG_ARM64_SYSREG_OP1_SHIFT, KVM_REG_ARM64_SYSREG_OP2_MASK,
+    KVM_REG_ARM64_SYSREG_OP2_SHIFT, KVM_REG_SIZE_MASK, KVM_REG_SIZE_U8, KVM_REG_SIZE_U16,
+    KVM_REG_SIZE_U32, KVM_REG_SIZE_U64, KVM_REG_SIZE_U128, KVM_REG_SIZE_U256, KVM_REG_SIZE_U512,
+    KVM_REG_SIZE_U1024, KVM_REG_SIZE_U2048, RegList, kvm_mp_state, kvm_regs, kvm_vcpu_events,
+    user_fpsimd_state, user_pt_regs,
 };
 use kvm_ioctls::{Cap::*, *};
 use utils::eventfd::EventFd;
@@ -464,12 +462,32 @@ fn deterministic_time_enabled() -> bool {
     std::env::var_os("KRUN_DETERMINISTIC_TIME").is_some_and(|value| value == "1")
 }
 
+static DETERMINISTIC_HOST_ACTIVITY: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "aarch64")]
+const KVM_CAP_ARM_WFI_EXIT: u32 = 249;
+
+pub fn deterministic_host_activity_begin() {
+    DETERMINISTIC_HOST_ACTIVITY.fetch_add(1, Ordering::AcqRel);
+}
+
+pub fn deterministic_host_activity_end() {
+    DETERMINISTIC_HOST_ACTIVITY.fetch_sub(1, Ordering::AcqRel);
+}
+
+fn deterministic_host_idle() -> bool {
+    DETERMINISTIC_HOST_ACTIVITY.load(Ordering::Acquire) == 0
+        && polly::event_manager::active_event_dispatches() == 0
+}
+
 fn configure_deterministic_vm_clock(kvm: &Kvm, vm_fd: &VmFd) -> Result<()> {
     if !deterministic_time_enabled() {
         return Ok(());
     }
 
     disable_halt_poll(kvm, vm_fd)?;
+
+    #[cfg(target_arch = "aarch64")]
+    enable_arm_wfi_exit(kvm, vm_fd)?;
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -489,6 +507,22 @@ fn configure_deterministic_vm_clock(kvm: &Kvm, vm_fd: &VmFd) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn enable_arm_wfi_exit(kvm: &Kvm, vm_fd: &VmFd) -> Result<()> {
+    if kvm.check_extension_raw(KVM_CAP_ARM_WFI_EXIT as libc::c_ulong) <= 0 {
+        return Err(Error::KvmRawCap(KVM_CAP_ARM_WFI_EXIT));
+    }
+    vm_enable_cap(
+        vm_fd,
+        &kvm_enable_cap {
+            cap: KVM_CAP_ARM_WFI_EXIT,
+            flags: 0,
+            args: [0, 0, 0, 0],
+            ..Default::default()
+        },
+    )
 }
 
 fn disable_halt_poll(kvm: &Kvm, vm_fd: &VmFd) -> Result<()> {
@@ -1571,8 +1605,6 @@ impl Vcpu {
                 self.init_thread_local_data()
                     .expect("Cannot cleanly initialize vcpu TLS.");
 
-                let _deterministic_kicker = DeterministicVcpuKicker::start();
-
                 init_tls_sender
                     .send(true)
                     .expect("Cannot notify vcpu TLS initialization.");
@@ -1910,9 +1942,12 @@ impl Vcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn advance_deterministic_time_if_blocked(&self, require_halted: bool) -> Result<bool> {
+    fn advance_deterministic_time_if_blocked(&self) -> Result<bool> {
         let mp_state = self.fd.get_mp_state().map_err(Error::VcpuGetMpState)?;
-        if require_halted && mp_state.mp_state != KVM_MP_STATE_HALTED {
+        if mp_state.mp_state != KVM_MP_STATE_HALTED {
+            return Ok(false);
+        }
+        if !deterministic_host_idle() {
             return Ok(false);
         }
 
@@ -1937,52 +1972,101 @@ impl Vcpu {
     }
 
     #[cfg(target_arch = "aarch64")]
-    fn advance_deterministic_time_if_blocked(&self, require_halted: bool) -> Result<bool> {
-        let mp_state = self.fd.get_mp_state().map_err(Error::VcpuGetMpState)?;
-        if require_halted && mp_state.mp_state != KVM_MP_STATE_HALTED {
+    fn advance_deterministic_time_if_blocked(&self) -> Result<bool> {
+        deterministic_time_debug_event(format!("deterministic_time.arm.wfi_exit vcpu={}", self.id));
+        if !deterministic_host_idle() {
+            deterministic_time_debug_event(format!(
+                "deterministic_time.arm.skip_host_activity vcpu={}",
+                self.id
+            ));
             return Ok(false);
         }
 
-        let Some(ctl) = self.get_one_reg_u64(kvm_timer_ctl_id()) else {
+        let Some(timer) = self.next_deterministic_timer_deadline()? else {
             return Ok(false);
         };
-        if (ctl & TMR_CTL_ENABLE) == 0 || (ctl & TMR_CTL_IMASK) != 0 {
-            return Ok(false);
-        }
 
-        let Some(cval) = self.get_one_reg_u64(kvm_timer_cval_id()) else {
-            return Ok(false);
-        };
-        let Some(cnt) = self.get_one_reg_u64(kvm_timer_counter_id()) else {
-            return Ok(false);
-        };
-        if cval <= cnt {
-            return Ok(false);
-        }
-
-        self.set_one_reg_u64(kvm_timer_counter_id(), cval)?;
-        self.set_one_reg_u64(kvm_timer_cval_id(), cval)?;
-        self.set_one_reg_u64(kvm_timer_ctl_id(), ctl & !TMR_CTL_ISTATUS)?;
+        let jump_to = timer.cval;
+        let delta = jump_to - timer.cnt;
+        self.set_one_reg_u64(timer.cnt_reg, jump_to)?;
+        deterministic_time_debug_event(format!(
+            "deterministic_time.arm.jump_counter vcpu={} timer={} delta={}",
+            self.id, timer.name, delta
+        ));
+        self.set_one_reg_u64(timer.cval_reg, timer.cval)?;
+        self.set_one_reg_u64(timer.ctl_reg, timer.ctl & !TMR_CTL_ISTATUS)?;
         let counter_frequency_hz = self
             .get_one_reg_u64(arm64_sys_reg_id(3, 3, 14, 0, 0))
             .unwrap_or(DETERMINISTIC_ARM_COUNTER_HZ);
-        record_deterministic_timer_jump(cval, counter_frequency_hz)?;
-        if mp_state.mp_state == KVM_MP_STATE_HALTED {
-            self.fd
-                .set_mp_state(kvm_mp_state {
-                    mp_state: KVM_MP_STATE_RUNNABLE,
-                })
-                .map_err(Error::VcpuSetMpState)?;
-        }
+        record_deterministic_timer_jump(jump_to, counter_frequency_hz)?;
         debug!(
-            "deterministic_time.jump_halted_vcpu vcpu={} previous_cnt={} deadline_cnt={}",
-            self.id, cnt, cval
+            "deterministic_time.jump_halted_vcpu vcpu={} timer={} previous_cnt={} deadline_cnt={} jump_cnt={}",
+            self.id, timer.name, timer.cnt, timer.cval, jump_to
         );
         Ok(true)
     }
 
+    #[cfg(target_arch = "aarch64")]
+    fn next_deterministic_timer_deadline(&self) -> Result<Option<DeterministicTimerDeadline>> {
+        let mut selected: Option<DeterministicTimerDeadline> = None;
+        for timer in deterministic_timer_registers() {
+            let Some(ctl) = self.get_one_reg_u64(timer.ctl_reg) else {
+                deterministic_time_debug_event(format!(
+                    "deterministic_time.arm.skip_no_ctl vcpu={} timer={}",
+                    self.id, timer.name
+                ));
+                continue;
+            };
+            if (ctl & TMR_CTL_ENABLE) == 0 || (ctl & TMR_CTL_IMASK) != 0 {
+                deterministic_time_debug_event(format!(
+                    "deterministic_time.arm.skip_ctl vcpu={} timer={} ctl=0x{:x}",
+                    self.id, timer.name, ctl
+                ));
+                continue;
+            }
+            let Some(cval) = self.get_one_reg_u64(timer.cval_reg) else {
+                deterministic_time_debug_event(format!(
+                    "deterministic_time.arm.skip_no_cval vcpu={} timer={}",
+                    self.id, timer.name
+                ));
+                continue;
+            };
+            let Some(cnt) = self.get_one_reg_u64(timer.cnt_reg) else {
+                deterministic_time_debug_event(format!(
+                    "deterministic_time.arm.skip_no_cnt vcpu={} timer={}",
+                    self.id, timer.name
+                ));
+                continue;
+            };
+            if cval <= cnt {
+                deterministic_time_debug_event(format!(
+                    "deterministic_time.arm.skip_past_deadline vcpu={} timer={} cval={} cnt={}",
+                    self.id, timer.name, cval, cnt
+                ));
+                continue;
+            }
+            let deadline = DeterministicTimerDeadline {
+                name: timer.name,
+                ctl_reg: timer.ctl_reg,
+                cval_reg: timer.cval_reg,
+                cnt_reg: timer.cnt_reg,
+                ctl,
+                cval,
+                cnt,
+            };
+            let should_select = match selected.as_ref() {
+                Some(current) => cval - cnt < current.cval - current.cnt,
+                None => true,
+            };
+            if should_select {
+                selected = Some(deadline);
+            }
+        }
+        Ok(selected)
+    }
+
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    fn advance_deterministic_time_if_blocked(&self, _require_halted: bool) -> Result<bool> {
+    fn advance_deterministic_time_if_blocked(&self) -> Result<bool> {
         Ok(false)
     }
 
@@ -2115,7 +2199,7 @@ impl Vcpu {
         #[cfg(target_arch = "x86_64")]
         {
             if self.kernel_enomem_workaround {
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(std::time::Duration::from_millis(5));
             }
         }
 
@@ -2218,8 +2302,12 @@ impl Vcpu {
                     #[cfg(target_arch = "aarch64")]
                     self.log_restore_debug_exit(format_args!("Hlt"));
                     if deterministic_time_enabled()
-                        && self.advance_deterministic_time_if_blocked(true)?
+                        && self.advance_deterministic_time_if_blocked()?
                     {
+                        return Ok(VcpuEmulation::Handled);
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    if deterministic_time_enabled() {
                         return Ok(VcpuEmulation::Handled);
                     }
                     info!("Received KVM_EXIT_HLT signal");
@@ -2277,9 +2365,6 @@ impl Vcpu {
                         if self.restore_debug_exits_remaining > 0 {
                             self.log_hvf_restore_readback();
                         }
-                    }
-                    if deterministic_time_enabled() {
-                        let _ = self.advance_deterministic_time_if_blocked(false)?;
                     }
                     self.fd.set_kvm_immediate_exit(0);
                     // Notify that this KVM_RUN was interrupted.
@@ -2700,6 +2785,75 @@ fn kvm_timer_counter_id() -> u64 {
 }
 
 #[cfg(target_arch = "aarch64")]
+fn kvm_physical_timer_cval_id() -> u64 {
+    arm64_sys_reg_id(3, 3, 14, 2, 2)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn kvm_physical_timer_ctl_id() -> u64 {
+    arm64_sys_reg_id(3, 3, 14, 2, 1)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn kvm_physical_timer_counter_id() -> u64 {
+    arm64_sys_reg_id(3, 3, 14, 0, 1)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn kvm_hyp_physical_timer_cval_id() -> u64 {
+    arm64_sys_reg_id(3, 4, 14, 2, 2)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn kvm_hyp_physical_timer_ctl_id() -> u64 {
+    arm64_sys_reg_id(3, 4, 14, 2, 1)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+struct DeterministicTimerRegisters {
+    name: &'static str,
+    ctl_reg: u64,
+    cval_reg: u64,
+    cnt_reg: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+struct DeterministicTimerDeadline {
+    name: &'static str,
+    ctl_reg: u64,
+    cval_reg: u64,
+    cnt_reg: u64,
+    ctl: u64,
+    cval: u64,
+    cnt: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+fn deterministic_timer_registers() -> [DeterministicTimerRegisters; 3] {
+    [
+        DeterministicTimerRegisters {
+            name: "virtual",
+            ctl_reg: kvm_timer_ctl_id(),
+            cval_reg: kvm_timer_cval_id(),
+            cnt_reg: kvm_timer_counter_id(),
+        },
+        DeterministicTimerRegisters {
+            name: "physical",
+            ctl_reg: kvm_physical_timer_ctl_id(),
+            cval_reg: kvm_physical_timer_cval_id(),
+            cnt_reg: kvm_physical_timer_counter_id(),
+        },
+        DeterministicTimerRegisters {
+            name: "hyp_physical",
+            ctl_reg: kvm_hyp_physical_timer_ctl_id(),
+            cval_reg: kvm_hyp_physical_timer_cval_id(),
+            cnt_reg: kvm_physical_timer_counter_id(),
+        },
+    ]
+}
+
+#[cfg(target_arch = "aarch64")]
 fn hvf_timer_restore_state(state: &VcpuState) -> HvfTimerRestoreState {
     HvfTimerRestoreState {
         ctl: reg_u64(state, kvm_timer_ctl_id()),
@@ -2941,6 +3095,19 @@ const DETERMINISTIC_X86_TSC_HZ: u64 = 1_000_000_000;
 const DETERMINISTIC_ARM_COUNTER_HZ: u64 = 1_000_000_000;
 
 #[cfg(target_arch = "aarch64")]
+static DETERMINISTIC_TIME_DEBUG_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_arch = "aarch64")]
+fn deterministic_time_debug_event(message: String) {
+    if std::env::var_os("KRUN_DETERMINISTIC_DEBUG").is_none() {
+        return;
+    }
+    if DETERMINISTIC_TIME_DEBUG_EVENTS.fetch_add(1, Ordering::Relaxed) < 200 {
+        crate::timing_event(&message);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
 fn arm64_sys_reg_id(op0: u64, op1: u64, crn: u64, crm: u64, op2: u64) -> u64 {
     KVM_REG_ARM64 as u64
         | KVM_REG_SIZE_U64 as u64
@@ -3000,51 +3167,6 @@ pub struct VcpuHandle {
 
 pub struct VcpuKicker {
     pthread: usize,
-}
-
-struct DeterministicVcpuKicker {
-    stop: Arc<AtomicBool>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-impl DeterministicVcpuKicker {
-    fn start() -> Option<Self> {
-        if !deterministic_time_enabled() {
-            return None;
-        }
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        let pthread = unsafe { libc::pthread_self() } as usize;
-        let thread = thread::Builder::new()
-            .name("fc_vcpu deterministic kicker".into())
-            .spawn(move || {
-                while !thread_stop.load(Ordering::Acquire) {
-                    thread::sleep(Duration::from_millis(1));
-                    let _ = unsafe {
-                        libc::pthread_kill(
-                            pthread as libc::pthread_t,
-                            sigrtmin() + VCPU_RTSIG_OFFSET,
-                        )
-                    };
-                }
-            })
-            .ok()?;
-
-        Some(Self {
-            stop,
-            thread: Some(thread),
-        })
-    }
-}
-
-impl Drop for DeterministicVcpuKicker {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
 }
 
 impl VcpuKicker {

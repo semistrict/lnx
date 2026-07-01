@@ -1,0 +1,103 @@
+Subject: [PATCH] KVM: arm64: Add a VM capability to exit WFI to userspace
+
+Some VMMs need to observe that a vCPU has architecturally entered WFI
+instead of letting KVM block inside the kernel. One example is a
+deterministic replay engine that can advance a virtual counter only after it
+has proven that the vCPU is waiting for an interrupt and that the next guest
+timer deadline is in the future.
+
+Add KVM_CAP_ARM_WFI_EXIT as an opt-in VM capability. When enabled, arm64 KVM
+exits to userspace with KVM_EXIT_HLT when the guest executes WFI. WFE remains
+handled in-kernel.
+
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -8904,6 +8904,22 @@ helpful if user space wants to emulate instructions which are not
+ This capability can be enabled dynamically even if VCPUs were already
+ created and are running.
+ 
++7.47 KVM_CAP_ARM_WFI_EXIT
++-------------------------
++
++:Architectures: arm64
++:Type: vm
++:Parameters: none
++
++When enabled, KVM will exit to userspace with KVM_EXIT_HLT when the
++guest executes a WFI instruction. WFE instructions continue to be handled
++in-kernel.
++
++Userspace may resume the vCPU by calling KVM_RUN again. If userspace
++advances guest time or injects an interrupt before resuming, it is
++responsible for preserving the architectural effects expected by the
++guest.
++
+ 8. Other capabilities.
+ ======================
+ 
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -367,6 +367,8 @@ struct kvm_arch {
+ #define KVM_ARCH_FLAG_WRITABLE_IMP_ID_REGS		10
+ 	/* Unhandled SEAs are taken to userspace */
+ #define KVM_ARCH_FLAG_EXIT_SEA				11
++	/* Exit to userspace when the guest executes WFI */
++#define KVM_ARCH_FLAG_WFI_EXIT				12
+ 	unsigned long flags;
+ 
+ 	/* VM-wide vCPU feature set */
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -188,6 +188,10 @@ int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
+ 		r = 0;
+ 		set_bit(KVM_ARCH_FLAG_EXIT_SEA, &kvm->arch.flags);
+ 		break;
++	case KVM_CAP_ARM_WFI_EXIT:
++		r = 0;
++		set_bit(KVM_ARCH_FLAG_WFI_EXIT, &kvm->arch.flags);
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -392,6 +396,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_COUNTER_OFFSET:
+ 	case KVM_CAP_ARM_WRITABLE_IMP_ID_REGS:
+ 	case KVM_CAP_ARM_SEA_TO_USER:
++	case KVM_CAP_ARM_WFI_EXIT:
+ 		r = 1;
+ 		break;
+ 	case KVM_CAP_SET_GUEST_DEBUG2:
+--- a/arch/arm64/kvm/handle_exit.c
++++ b/arch/arm64/kvm/handle_exit.c
+@@ -166,6 +166,11 @@ static int kvm_handle_wfx(struct kvm_vcpu *vcpu)
+ 	if (esr & ESR_ELx_WFx_ISS_WFE) {
+ 		kvm_vcpu_on_spin(vcpu, vcpu_mode_priv(vcpu));
+ 	} else {
++		if (test_bit(KVM_ARCH_FLAG_WFI_EXIT, &vcpu->kvm->arch.flags)) {
++			vcpu->run->exit_reason = KVM_EXIT_HLT;
++			goto out_user;
++		}
++
+ 		if (esr & ESR_ELx_WFx_ISS_WFxT)
+ 			vcpu_set_flag(vcpu, IN_WFIT);
+ 
+@@ -175,6 +180,9 @@ out:
+ 	kvm_incr_pc(vcpu);
+ 
+ 	return 1;
++out_user:
++	kvm_incr_pc(vcpu);
++	return 0;
+ }
+ 
+ /**
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -996,6 +996,7 @@ struct kvm_enable_cap {
+ #define KVM_CAP_S390_USER_OPEREXEC 246
+ #define KVM_CAP_S390_KEYOP 247
+ #define KVM_CAP_S390_VSIE_ESAMODE 248
++#define KVM_CAP_ARM_WFI_EXIT 249
+ 
+ struct kvm_irq_routing_irqchip {
+ 	__u32 irqchip;

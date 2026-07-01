@@ -75,6 +75,16 @@ use vm_memory::GuestMemoryMmap;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use vm_memory::{Address, GuestMemory, GuestMemoryRegion};
 
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub fn deterministic_host_activity_begin() {
+    vstate::deterministic_host_activity_begin();
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub fn deterministic_host_activity_end() {
+    vstate::deterministic_host_activity_end();
+}
+
 /// Success exit code.
 pub const FC_EXIT_CODE_OK: u8 = 0;
 /// Generic error exit code.
