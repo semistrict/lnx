@@ -27,7 +27,7 @@ use utils::eventfd::EventFd;
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 use vmm::resources::{TsiFlags, VmResources, VsockConfig};
-#[cfg(not(feature = "tee"))]
+#[cfg(all(not(feature = "tee"), target_arch = "aarch64"))]
 use vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(not(feature = "tee"))]
 use vmm::vmm_config::fs::FsDeviceConfig;
@@ -77,147 +77,213 @@ fn init_virtual_entry() -> VirtualDirEntry {
     }
 }
 
-/// Format used when configuring an external kernel.
-#[cfg(not(feature = "tee"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KernelImageFormat {
-    Raw,
-    Elf,
-    PeGz,
-    ImageBz2,
-    ImageGz,
-    ImageZstd,
-}
-
-#[cfg(not(feature = "tee"))]
-impl TryFrom<u32> for KernelImageFormat {
-    type Error = ();
-
-    fn try_from(value: u32) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Raw),
-            1 => Ok(Self::Elf),
-            2 => Ok(Self::PeGz),
-            3 => Ok(Self::ImageBz2),
-            4 => Ok(Self::ImageGz),
-            5 => Ok(Self::ImageZstd),
-            _ => Err(()),
-        }
-    }
-}
-
-#[cfg(not(feature = "tee"))]
-impl From<KernelImageFormat> for u32 {
-    fn from(value: KernelImageFormat) -> Self {
-        match value {
-            KernelImageFormat::Raw => 0,
-            KernelImageFormat::Elf => 1,
-            KernelImageFormat::PeGz => 2,
-            KernelImageFormat::ImageBz2 => 3,
-            KernelImageFormat::ImageGz => 4,
-            KernelImageFormat::ImageZstd => 5,
-        }
-    }
-}
-
 type RunningVmm = Arc<Mutex<vmm::Vmm>>;
 pub type KrunResult<T = ()> = std::result::Result<T, Error>;
 
-/// A libkrun configuration and runtime context for Rust callers.
-pub struct Context {
-    cfg: Mutex<Option<ContextConfig>>,
-    vmm: Mutex<Option<RunningVmm>>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LogLevel {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    fn as_filter_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
 }
 
 /// Error returned by the Rust API.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Error {
-    errno: i32,
+pub enum Error {
+    InvalidConfig,
+    NotFound,
+    AlreadyExists,
+    NotStarted,
+    Unsupported,
+    PermissionDenied,
+    Io,
+    Other(std::io::ErrorKind),
 }
 
 impl Error {
     fn from_errno(errno: i32) -> Self {
-        Self { errno: errno.abs() }
-    }
-
-    pub fn raw_os_error(self) -> i32 {
-        self.errno
+        match errno.abs() {
+            libc::EINVAL => Self::InvalidConfig,
+            libc::ENOENT => Self::NotFound,
+            libc::EEXIST => Self::AlreadyExists,
+            libc::ENODEV => Self::NotStarted,
+            libc::ENOTSUP | libc::ENOSYS => Self::Unsupported,
+            libc::EPERM => Self::PermissionDenied,
+            libc::EIO => Self::Io,
+            errno => Self::Other(std::io::Error::from_raw_os_error(errno).kind()),
+        }
     }
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            std::io::Error::from_raw_os_error(self.raw_os_error())
-        )
+        match self {
+            Self::InvalidConfig => write!(f, "invalid VM configuration"),
+            Self::NotFound => write!(f, "requested VM resource was not found"),
+            Self::AlreadyExists => write!(f, "VM resource already exists"),
+            Self::NotStarted => write!(f, "VM is not running yet"),
+            Self::Unsupported => write!(f, "operation is not supported on this platform"),
+            Self::PermissionDenied => write!(f, "VM device refused the operation"),
+            Self::Io => write!(f, "VM I/O operation failed"),
+            Self::Other(kind) => write!(f, "VM operation failed ({kind:?})"),
+        }
     }
 }
 
 impl std::error::Error for Error {}
 
-impl Context {
-    pub fn new() -> Self {
+#[cfg(not(feature = "tee"))]
+pub struct Kernel {
+    path: PathBuf,
+    initramfs_path: Option<PathBuf>,
+    cmdline: Option<String>,
+}
+
+#[cfg(not(feature = "tee"))]
+impl Kernel {
+    pub fn raw(path: impl AsRef<Path>) -> Self {
         Self {
-            cfg: Mutex::new(Some(new_context_config())),
-            vmm: Mutex::new(None),
+            path: path.as_ref().to_path_buf(),
+            initramfs_path: None,
+            cmdline: None,
         }
     }
 
-    pub fn set_log_level(level: u32) -> KrunResult {
-        set_log_level(level)
+    pub fn initramfs(mut self, path: impl AsRef<Path>) -> Self {
+        self.initramfs_path = Some(path.as_ref().to_path_buf());
+        self
     }
 
-    pub fn set_vm_config(&self, num_vcpus: u8, ram_mib: u32) -> KrunResult {
-        self.with_cfg(|cfg| set_vm_config(cfg, num_vcpus, ram_mib))
+    pub fn cmdline(mut self, cmdline: impl Into<String>) -> Self {
+        self.cmdline = Some(cmdline.into());
+        self
+    }
+}
+
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub struct VirtioFs {
+    tag: String,
+    shared_dir: Option<PathBuf>,
+    dax_window_bytes: u64,
+    read_only: bool,
+    write_allowlist: Option<Vec<PathBuf>>,
+    unshare_dir: Option<PathBuf>,
+}
+
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+impl VirtioFs {
+    pub fn shared(tag: impl Into<String>, path: impl AsRef<Path>) -> Self {
+        Self {
+            tag: tag.into(),
+            shared_dir: Some(path.as_ref().to_path_buf()),
+            dax_window_bytes: 0,
+            read_only: false,
+            write_allowlist: None,
+            unshare_dir: None,
+        }
     }
 
-    pub fn set_console_output(&self, filepath: impl AsRef<Path>) -> KrunResult {
-        self.with_cfg(|cfg| {
-            if cfg.console_output.is_some() {
-                Err(Error::from_errno(libc::EINVAL))
-            } else {
-                cfg.console_output = Some(filepath.as_ref().to_path_buf());
-                Ok(())
-            }
-        })
+    pub fn dax_window_bytes(mut self, bytes: u64) -> Self {
+        self.dax_window_bytes = bytes;
+        self
     }
 
-    pub fn set_nested_virt(&self, enabled: bool) -> KrunResult {
-        self.with_cfg(|cfg| {
-            cfg.vmr.nested_enabled = enabled;
-            Ok(())
-        })
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    pub fn write_allowlist<I, P>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.write_allowlist = Some(paths.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn unshare_dir(mut self, path: impl AsRef<Path>) -> Self {
+        self.unshare_dir = Some(path.as_ref().to_path_buf());
+        self
+    }
+}
+
+#[cfg(feature = "net")]
+pub struct Network {
+    socket: PathBuf,
+    mac: [u8; 6],
+    dhcp_client: bool,
+}
+
+#[cfg(feature = "net")]
+impl Network {
+    pub fn gvproxy_vfkit(socket: impl AsRef<Path>) -> Self {
+        Self {
+            socket: socket.as_ref().to_path_buf(),
+            mac: [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee],
+            dhcp_client: true,
+        }
+    }
+}
+
+pub struct VmBuilder {
+    cfg: ContextConfig,
+}
+
+impl VmBuilder {
+    pub fn new() -> Self {
+        Self {
+            cfg: new_context_config(),
+        }
+    }
+
+    pub fn resources(&mut self, num_vcpus: u8, ram_mib: u32) -> KrunResult<&mut Self> {
+        set_vm_config(&mut self.cfg, num_vcpus, ram_mib)?;
+        Ok(self)
+    }
+
+    pub fn console_output(&mut self, filepath: impl AsRef<Path>) -> &mut Self {
+        self.cfg.console_output = Some(filepath.as_ref().to_path_buf());
+        self
+    }
+
+    pub fn nested_virt(&mut self, enabled: bool) -> &mut Self {
+        self.cfg.vmr.nested_enabled = enabled;
+        self
     }
 
     #[cfg(not(feature = "tee"))]
-    pub fn set_kernel(
-        &self,
-        path: impl AsRef<Path>,
-        format: KernelImageFormat,
-        initramfs_path: Option<impl AsRef<Path>>,
-        cmdline: Option<&str>,
-    ) -> KrunResult {
-        let path = path.as_ref().to_path_buf();
-        let format = match format {
-            #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
-            KernelImageFormat::Raw => {
-                return self.with_cfg(|cfg| map_kernel_cfg(cfg, &path));
-            }
-            #[cfg(target_arch = "aarch64")]
-            KernelImageFormat::Raw => KernelFormat::Raw,
-            KernelImageFormat::Elf => KernelFormat::Elf,
-            KernelImageFormat::PeGz => KernelFormat::PeGz,
-            KernelImageFormat::ImageBz2 => KernelFormat::ImageBz2,
-            KernelImageFormat::ImageGz => KernelFormat::ImageGz,
-            KernelImageFormat::ImageZstd => KernelFormat::ImageZstd,
-            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-            KernelImageFormat::Raw => return Err(Error::from_errno(libc::EINVAL)),
-        };
+    pub fn kernel(&mut self, kernel: Kernel) -> KrunResult<&mut Self> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            map_kernel_cfg(&mut self.cfg, &kernel.path)?;
+            return Ok(self);
+        }
 
-        let (initramfs_path, initramfs_size) = if let Some(initramfs_path) = initramfs_path {
-            let initramfs_path = initramfs_path.as_ref().to_path_buf();
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let _ = kernel;
+            return Err(Error::from_errno(libc::EINVAL));
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        let (initramfs_path, initramfs_size) = if let Some(initramfs_path) = kernel.initramfs_path {
             let initramfs_size = std::fs::metadata(&initramfs_path)
                 .map_err(|_| Error::from_errno(libc::EINVAL))?
                 .len();
@@ -226,199 +292,206 @@ impl Context {
             (None, 0)
         };
 
+        #[cfg(target_arch = "aarch64")]
         let external_kernel = ExternalKernel {
-            path,
-            format,
+            path: kernel.path,
+            format: KernelFormat::Raw,
             initramfs_path,
             initramfs_size,
-            cmdline: cmdline.map(ToOwned::to_owned),
+            cmdline: kernel.cmdline,
         };
 
-        self.with_cfg(|cfg| {
-            cfg.vmr.set_external_kernel(external_kernel);
-            Ok(())
-        })
+        #[cfg(target_arch = "aarch64")]
+        self.cfg.vmr.set_external_kernel(external_kernel);
+        Ok(self)
     }
 
-    pub fn add_pmem(
-        &self,
+    fn pmem(
+        &mut self,
         pmem_id: impl Into<String>,
         file_path: impl AsRef<Path>,
         read_only: bool,
-    ) -> KrunResult {
+    ) -> &mut Self {
         let pmem_cfg = PmemDeviceConfig {
             id: pmem_id.into(),
             path: file_path.as_ref().to_string_lossy().into_owned(),
             read_only,
         };
-        self.with_cfg(|cfg| {
-            cfg.add_pmem_cfg(pmem_cfg);
-            Ok(())
-        })
+        self.cfg.add_pmem_cfg(pmem_cfg);
+        self
+    }
+
+    pub fn root_pmem(&mut self, file_path: impl AsRef<Path>) -> &mut Self {
+        self.pmem("rootfs", file_path, false)
     }
 
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-    pub fn add_virtiofs(
-        &self,
-        tag: impl Into<String>,
-        path: Option<impl AsRef<Path>>,
-        shm_size: u64,
-        read_only: bool,
-        write_allowlist: bool,
-    ) -> KrunResult {
-        let tag = tag.into();
-        let shm_size = if shm_size > 0 {
+    pub fn virtiofs(&mut self, fs: VirtioFs) -> KrunResult<&mut Self> {
+        let shm_size = if fs.dax_window_bytes > 0 {
             Some(
-                shm_size
+                fs.dax_window_bytes
                     .try_into()
                     .map_err(|_| Error::from_errno(libc::EINVAL))?,
             )
         } else {
             None
         };
-        let shared_dir = path.map(|path| path.as_ref().to_string_lossy().into_owned());
-        self.with_cfg(|cfg| {
-            let mut virtual_entries = Vec::new();
-            if tag == "/dev/root" {
-                virtual_entries.push(init_virtual_entry());
-            }
-            cfg.vmr.add_fs_device(FsDeviceConfig {
-                fs_id: tag,
-                shared_dir,
-                shm_size,
-                read_only,
-                write_allowlist: write_allowlist.then(|| Arc::new(RwLock::new(Vec::new()))),
-                unshare_dir: None,
-                virtual_entries,
-            });
-            Ok(())
-        })
-    }
 
-    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-    pub fn set_virtiofs_unshare_dir(&self, tag: &str, path: impl AsRef<Path>) -> KrunResult {
-        let path = path.as_ref().to_path_buf();
-        if let Some(vmm) = self.running_vmm() {
-            return set_running_virtiofs_unshare_dir(&vmm, tag, path);
+        let mut virtual_entries = Vec::new();
+        if fs.tag == "/dev/root" {
+            virtual_entries.push(init_virtual_entry());
         }
-        self.with_cfg(|cfg| set_cfg_virtiofs_unshare_dir(cfg, tag, path))
-    }
 
-    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-    pub fn set_virtiofs_write_allowlist(&self, tag: &str, paths: Vec<PathBuf>) -> KrunResult {
-        if let Some(vmm) = self.running_vmm() {
-            return set_running_virtiofs_write_allowlist(&vmm, tag, paths);
-        }
-        self.with_cfg(|cfg| set_cfg_virtiofs_write_allowlist(cfg, tag, paths))
+        self.cfg.vmr.add_fs_device(FsDeviceConfig {
+            fs_id: fs.tag,
+            shared_dir: fs
+                .shared_dir
+                .map(|path| path.to_string_lossy().into_owned()),
+            shm_size,
+            read_only: fs.read_only,
+            write_allowlist: fs.write_allowlist.map(|paths| Arc::new(RwLock::new(paths))),
+            unshare_dir: fs.unshare_dir,
+            virtual_entries,
+        });
+        Ok(self)
     }
 
     #[cfg(feature = "vhost-user")]
-    pub fn add_vhost_user_virtiofs(
-        &self,
+    pub fn vhost_user_virtiofs(
+        &mut self,
         tag: impl Into<String>,
         socket_path: impl AsRef<Path>,
-    ) -> KrunResult {
+    ) -> KrunResult<&mut Self> {
         let tag = tag.into();
         let socket_path = socket_path.as_ref().to_string_lossy().into_owned();
-        self.with_cfg(|cfg| add_vhost_user_virtiofs_config(cfg, &tag, socket_path))
+        add_vhost_user_virtiofs_config(&mut self.cfg, &tag, socket_path)?;
+        Ok(self)
     }
 
     #[cfg(not(feature = "vhost-user"))]
-    pub fn add_vhost_user_virtiofs(
-        &self,
+    pub fn vhost_user_virtiofs(
+        &mut self,
         _tag: impl Into<String>,
         _socket_path: impl AsRef<Path>,
-    ) -> KrunResult {
+    ) -> KrunResult<&mut Self> {
         Err(Error::from_errno(libc::ENOTSUP))
     }
 
-    pub fn add_vsock_port(
-        &self,
-        port: u32,
+    pub fn vsock_connector(
+        &mut self,
+        guest_port: u32,
         filepath: impl AsRef<Path>,
-        listen: bool,
-    ) -> KrunResult {
-        #[cfg(feature = "aws-nitro")]
-        if listen {
-            return Err(Error::from_errno(libc::EINVAL));
-        }
-
+    ) -> KrunResult<&mut Self> {
         let filepath = filepath.as_ref().to_path_buf();
-        if listen {
-            match filepath.try_exists() {
-                Ok(true) => return Err(Error::from_errno(libc::EEXIST)),
-                Err(_) => return Err(Error::from_errno(libc::EINVAL)),
-                _ => {}
-            }
+        if self.cfg.vsock_config == VsockConfig::Disabled {
+            return Err(Error::from_errno(libc::ENODEV));
         }
-
-        self.with_cfg(|cfg| {
-            if cfg.vsock_config == VsockConfig::Disabled {
-                return Err(Error::from_errno(libc::ENODEV));
-            }
-            cfg.add_vsock_port(port, filepath, listen);
-            Ok(())
-        })
+        self.cfg.add_vsock_port(guest_port, filepath, false);
+        Ok(self)
     }
 
     #[cfg(feature = "net")]
-    pub fn add_net_unixgram(
-        &self,
-        path: impl AsRef<Path>,
-        mac: [u8; 6],
-        features: u32,
-        flags: u32,
-    ) -> KrunResult {
-        if (features & !NET_ALL_FEATURES) != 0 || (flags & !NET_FLAG_ALL) != 0 {
-            return Err(Error::from_errno(libc::EINVAL));
+    pub fn network(&mut self, network: Network) -> KrunResult<&mut Self> {
+        let backend = VirtioNetBackend::UnixgramPath(network.socket, true);
+        create_virtio_net(
+            &mut self.cfg,
+            backend,
+            network.mac,
+            NET_GVPROXY_VFKIT_FEATURES,
+        );
+        if network.dhcp_client {
+            self.cfg.vmr.dhcp_client = true;
         }
-        let send_vfkit_magic = flags & NET_FLAG_VFKIT != 0;
-        let enable_dhcp_client = flags & NET_FLAG_DHCP_CLIENT != 0;
-        let backend = VirtioNetBackend::UnixgramPath(path.as_ref().to_path_buf(), send_vfkit_magic);
-        self.with_cfg(|cfg| {
-            create_virtio_net(cfg, backend, mac, features);
-            if enable_dhcp_client {
-                cfg.vmr.dhcp_client = true;
-            }
-            Ok(())
-        })
+        Ok(self)
     }
 
-    pub fn set_workdir(&self, workdir: impl Into<String>) -> KrunResult {
-        let workdir = workdir.into();
-        self.with_cfg(|cfg| {
-            cfg.set_workdir(workdir);
-            Ok(())
-        })
+    pub fn workdir(&mut self, workdir: impl Into<String>) -> &mut Self {
+        self.cfg.set_workdir(workdir.into());
+        self
     }
 
-    pub fn set_exec(
-        &self,
+    pub fn exec(
+        &mut self,
         exec_path: impl Into<String>,
         argv: &[String],
         envp: &[String],
-    ) -> KrunResult {
-        let exec_path = exec_path.into();
+    ) -> &mut Self {
         let args = argv.join(" ");
         let env = envp.join(" ");
-        self.with_cfg(|cfg| {
-            cfg.set_exec_path(exec_path);
-            cfg.set_env(env);
-            cfg.set_args(args);
-            Ok(())
-        })
+        self.cfg.set_exec_path(exec_path.into());
+        self.cfg.set_env(env);
+        self.cfg.set_args(args);
+        self
     }
 
-    pub fn start_enter(&self) -> KrunResult {
-        let cfg = self
-            .cfg
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| Error::from_errno(libc::ENOENT))?;
-        start_enter_context(cfg, |vmm| {
-            *self.vmm.lock().unwrap() = Some(vmm);
-        })
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
+    pub fn restore_from_snapshot(&mut self, path: impl AsRef<Path>) -> KrunResult<&mut Self> {
+        self.cfg.snapshot_restore_path = Some(path.as_ref().to_path_buf());
+        Ok(self)
+    }
+
+    #[cfg(not(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64")))]
+    pub fn restore_from_snapshot(&mut self, _path: impl AsRef<Path>) -> KrunResult<&mut Self> {
+        Err(Error::from_errno(libc::ENOSYS))
+    }
+
+    pub fn build(self) -> ConfiguredVm {
+        ConfiguredVm {
+            cfg: self.cfg,
+            handle: VmHandle::new(),
+        }
+    }
+}
+
+impl Default for VmBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct ConfiguredVm {
+    cfg: ContextConfig,
+    handle: VmHandle,
+}
+
+impl ConfiguredVm {
+    pub fn handle(&self) -> VmHandle {
+        self.handle.clone()
+    }
+
+    pub fn start(self) -> KrunResult {
+        let handle = self.handle;
+        start_enter_context(self.cfg, |vmm| handle.store(vmm))
+    }
+}
+
+#[derive(Clone)]
+pub struct VmHandle {
+    vmm: Arc<Mutex<Option<RunningVmm>>>,
+}
+
+impl VmHandle {
+    fn new() -> Self {
+        Self {
+            vmm: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn store(&self, vmm: RunningVmm) {
+        *self.vmm.lock().unwrap() = Some(vmm);
+    }
+
+    fn running_vmm(&self) -> Option<RunningVmm> {
+        self.vmm.lock().unwrap().clone()
+    }
+
+    fn require_running_vmm(&self) -> KrunResult<RunningVmm> {
+        self.running_vmm().ok_or(Error::NotStarted)
+    }
+
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    pub fn replace_virtiofs_write_allowlist(&self, tag: &str, paths: Vec<PathBuf>) -> KrunResult {
+        set_running_virtiofs_write_allowlist(&self.require_running_vmm()?, tag, paths)
     }
 
     #[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
@@ -455,43 +528,10 @@ impl Context {
     ) -> KrunResult {
         Err(Error::from_errno(libc::ENOSYS))
     }
-
-    #[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
-    pub fn set_snapshot_path(&self, path: impl AsRef<Path>) -> KrunResult {
-        let path = path.as_ref().to_path_buf();
-        self.with_cfg(|cfg| {
-            cfg.snapshot_restore_path = Some(path);
-            Ok(())
-        })
-    }
-
-    #[cfg(not(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64")))]
-    pub fn set_snapshot_path(&self, _path: impl AsRef<Path>) -> KrunResult {
-        Err(Error::from_errno(libc::ENOSYS))
-    }
-
-    fn with_cfg(&self, f: impl FnOnce(&mut ContextConfig) -> KrunResult) -> KrunResult {
-        let mut guard = self.cfg.lock().unwrap();
-        let cfg = guard
-            .as_mut()
-            .ok_or_else(|| Error::from_errno(libc::ENOENT))?;
-        f(cfg)
-    }
-
-    fn running_vmm(&self) -> Option<RunningVmm> {
-        self.vmm.lock().unwrap().clone()
-    }
-
-    fn require_running_vmm(&self) -> KrunResult<RunningVmm> {
-        self.running_vmm()
-            .ok_or_else(|| Error::from_errno(libc::ENOENT))
-    }
 }
 
-impl Default for Context {
-    fn default() -> Self {
-        Self::new()
-    }
+pub fn init_logging(level: LogLevel) -> KrunResult {
+    configure_log_level(level)
 }
 
 static KRUNFW: LazyLock<Option<libloading::Library>> = LazyLock::new(|| unsafe {
@@ -500,7 +540,7 @@ static KRUNFW: LazyLock<Option<libloading::Library>> = LazyLock::new(|| unsafe {
         .or_else(|| libloading::Library::new(KRUNFW_NAME).ok())
 });
 
-pub struct KrunfwBindings {
+struct KrunfwBindings {
     get_kernel: libloading::Symbol<
         'static,
         unsafe extern "C" fn(*mut u64, *mut u64, *mut size_t) -> *mut c_char,
@@ -528,7 +568,7 @@ impl KrunfwBindings {
         })
     }
 
-    pub fn new() -> Option<Self> {
+    fn new() -> Option<Self> {
         Self::load_bindings().ok()
     }
 }
@@ -705,19 +745,8 @@ impl TryFrom<ContextConfig> for NitroEnclave {
     }
 }
 
-fn log_level_to_filter_str(level: u32) -> &'static str {
-    match level {
-        0 => "off",
-        1 => "error",
-        2 => "warn",
-        3 => "info",
-        4 => "debug",
-        _ => "trace",
-    }
-}
-
-fn set_log_level(level: u32) -> KrunResult {
-    let filter = log_level_to_filter_str(level);
+fn configure_log_level(level: LogLevel) -> KrunResult {
+    let filter = level.as_filter_str();
     let _ = env_logger::Builder::from_env(Env::default().default_filter_or(filter))
         .format_timestamp_micros()
         .try_init();
@@ -725,7 +754,7 @@ fn set_log_level(level: u32) -> KrunResult {
     #[cfg(feature = "aws-nitro")]
     {
         // Notify krun-awsnitro to enable debug for log level.
-        if level == 4 {
+        if level == LogLevel::Debug {
             let mut debug = KRUN_NITRO_DEBUG.lock().unwrap();
 
             *debug = true;
@@ -794,61 +823,6 @@ fn set_running_virtiofs_write_allowlist(
     }
 }
 
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-fn set_cfg_virtiofs_write_allowlist(
-    cfg: &mut ContextConfig,
-    tag: &str,
-    paths: Vec<PathBuf>,
-) -> KrunResult {
-    let Some(fs) = cfg.vmr.fs.iter_mut().find(|fs| fs.fs_id == tag) else {
-        return Err(Error::from_errno(libc::ENOENT));
-    };
-    let Some(allowlist) = &fs.write_allowlist else {
-        return Err(Error::from_errno(libc::EINVAL));
-    };
-    *allowlist.write().unwrap() = paths;
-    Ok(())
-}
-
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-fn set_running_virtiofs_unshare_dir(vmm: &RunningVmm, tag: &str, path: PathBuf) -> KrunResult {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        return if vmm.lock().unwrap().set_virtiofs_unshare_dir(tag, path) {
-            Ok(())
-        } else {
-            Err(Error::from_errno(libc::ENOENT))
-        };
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    {
-        let _ = (vmm, tag, path);
-        Err(Error::from_errno(libc::ENOENT))
-    }
-}
-
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-fn set_cfg_virtiofs_unshare_dir(cfg: &mut ContextConfig, tag: &str, path: PathBuf) -> KrunResult {
-    let Some(fs) = cfg.vmr.fs.iter_mut().find(|fs| fs.fs_id == tag) else {
-        return Err(Error::from_errno(libc::ENOENT));
-    };
-    fs.unshare_dir = Some(path);
-    Ok(())
-}
-
-/*
- * Send the VFKIT magic after establishing the connection,
- * as required by gvproxy in vfkit mode.
- */
-#[cfg(feature = "net")]
-const NET_FLAG_VFKIT: u32 = 1 << 0;
-#[cfg(feature = "net")]
-const NET_FLAG_DHCP_CLIENT: u32 = 1 << 1;
-#[cfg(feature = "net")]
-const NET_FLAG_ALL: u32 = NET_FLAG_VFKIT | NET_FLAG_DHCP_CLIENT;
-
-/* Taken from uapi/linux/virtio_net.h */
 #[cfg(feature = "net")]
 const NET_FEATURE_CSUM: u32 = 1 << 0;
 #[cfg(feature = "net")]
@@ -856,23 +830,17 @@ const NET_FEATURE_GUEST_CSUM: u32 = 1 << 1;
 #[cfg(feature = "net")]
 const NET_FEATURE_GUEST_TSO4: u32 = 1 << 7;
 #[cfg(feature = "net")]
-const NET_FEATURE_GUEST_TSO6: u32 = 1 << 8;
-#[cfg(feature = "net")]
 const NET_FEATURE_GUEST_UFO: u32 = 1 << 10;
 #[cfg(feature = "net")]
 const NET_FEATURE_HOST_TSO4: u32 = 1 << 11;
 #[cfg(feature = "net")]
-const NET_FEATURE_HOST_TSO6: u32 = 1 << 12;
-#[cfg(feature = "net")]
 const NET_FEATURE_HOST_UFO: u32 = 1 << 14;
 #[cfg(feature = "net")]
-const NET_ALL_FEATURES: u32 = NET_FEATURE_CSUM
+const NET_GVPROXY_VFKIT_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_GUEST_CSUM
     | NET_FEATURE_GUEST_TSO4
-    | NET_FEATURE_GUEST_TSO6
     | NET_FEATURE_GUEST_UFO
     | NET_FEATURE_HOST_TSO4
-    | NET_FEATURE_HOST_TSO6
     | NET_FEATURE_HOST_UFO;
 
 #[cfg(feature = "vhost-user")]
