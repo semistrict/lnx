@@ -113,18 +113,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    if (getenv("KRUN_DISABLE_VSOCK")) {
-        rc = krun_disable_implicit_vsock((uint32_t)ctx_id);
-        if (rc != 0) {
-            fprintf(stderr, "krun_disable_implicit_vsock failed: %d\n", rc);
-            return 1;
-        }
-    } else if (getenv("KRUN_EXPLICIT_VSOCK_NO_TSI") || !getenv("KRUN_USE_IMPLICIT_VSOCK")) {
-        rc = krun_disable_implicit_vsock((uint32_t)ctx_id);
-        if (rc != 0) {
-            fprintf(stderr, "krun_disable_implicit_vsock failed: %d\n", rc);
-            return 1;
-        }
+    if (!getenv("KRUN_DISABLE_VSOCK")) {
         rc = krun_add_vsock((uint32_t)ctx_id, 0);
         if (rc != 0) {
             fprintf(stderr, "krun_add_vsock failed: %d\n", rc);
@@ -164,9 +153,9 @@ int main(int argc, char **argv) {
         unlink(done_path);
     }
 
-    rc = krun_set_root((uint32_t)ctx_id, root);
+    rc = krun_add_virtiofs3((uint32_t)ctx_id, KRUN_FS_ROOT_TAG, root, 0, false);
     if (rc != 0) {
-        fprintf(stderr, "krun_set_root failed: %d\n", rc);
+        fprintf(stderr, "krun_add_virtiofs3 failed: %d\n", rc);
         return 1;
     }
 

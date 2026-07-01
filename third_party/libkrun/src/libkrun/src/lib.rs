@@ -26,7 +26,7 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use utils::eventfd::EventFd;
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
-use vmm::resources::{TsiFlags, VmResources, VsockConfig};
+use vmm::resources::{TsiFlags, VirtioConsoleConfigMode, VmResources, VsockConfig};
 #[cfg(all(not(feature = "tee"), target_arch = "aarch64"))]
 use vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(not(feature = "tee"))]
@@ -60,10 +60,16 @@ static KRUN_NITRO_DEBUG: Mutex<bool> = Mutex::new(false);
 // Path to the init binary to be executed inside the VM.
 const INIT_PATH: &str = "/init.krun";
 
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(all(
+    feature = "init-blob",
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
 const DEFAULT_INIT_PAYLOAD: &[u8] = init_blob::INIT_BINARY;
 
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(all(
+    feature = "init-blob",
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
 fn init_virtual_entry() -> VirtualDirEntry {
     VirtualDirEntry {
         name: CString::new("init.krun").unwrap(),
@@ -287,7 +293,21 @@ impl VmBuilder {
     }
 
     pub fn console_output(&mut self, filepath: impl AsRef<Path>) -> &mut Self {
-        self.cfg.console_output = Some(filepath.as_ref().to_path_buf());
+        let filepath = filepath.as_ref().to_path_buf();
+
+        #[cfg(feature = "aws-nitro")]
+        {
+            self.cfg.nitro_console_output = Some(filepath);
+        }
+
+        #[cfg(all(not(feature = "aws-nitro"), unix))]
+        {
+            self.cfg
+                .vmr
+                .virtio_consoles
+                .push(VirtioConsoleConfigMode::OutputFile(filepath));
+        }
+
         self
     }
 
@@ -355,10 +375,16 @@ impl VmBuilder {
             None
         };
 
-        let mut virtual_entries = Vec::new();
-        if fs.tag == "/dev/root" {
-            virtual_entries.push(init_virtual_entry());
-        }
+        #[cfg(feature = "init-blob")]
+        let virtual_entries = if fs.tag == "/dev/root" {
+            let mut entries = Vec::new();
+            entries.push(init_virtual_entry());
+            entries
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(feature = "init-blob"))]
+        let virtual_entries = Vec::new();
 
         self.cfg.vmr.add_fs_device(FsDeviceConfig {
             fs_id: fs.tag,
@@ -419,7 +445,9 @@ impl VmBuilder {
     ) -> KrunResult<&mut Self> {
         let filepath = filepath.as_ref().to_path_buf();
         if self.cfg.vsock_config == VsockConfig::Disabled {
-            return Err(Error::from_errno(libc::ENODEV));
+            self.cfg.vsock_config = VsockConfig::Explicit {
+                tsi_flags: TsiFlags::empty(),
+            };
         }
         self.cfg
             .unix_ipc_port_map
@@ -634,7 +662,7 @@ pub fn init_logging(level: LogLevel) -> KrunResult {
     #[cfg(feature = "aws-nitro")]
     {
         // Notify krun-awsnitro to enable debug for log level.
-        if level == LogLevel::Debug {
+        if matches!(level, LogLevel::Debug | LogLevel::Trace) {
             let mut debug = KRUN_NITRO_DEBUG.lock().unwrap();
 
             *debug = true;
@@ -691,6 +719,7 @@ struct ContextConfig {
     exec_path: Option<String>,
     env: Vec<String>,
     argv: Vec<String>,
+    #[cfg(feature = "net")]
     net_index: u8,
     vsock_config: VsockConfig,
     pmem_cfgs: Vec<PmemDeviceConfig>,
@@ -698,7 +727,8 @@ struct ContextConfig {
     tee_config_file: Option<PathBuf>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     shutdown_efd: Option<EventFd>,
-    console_output: Option<PathBuf>,
+    #[cfg(feature = "aws-nitro")]
+    nitro_console_output: Option<PathBuf>,
     /// If set, `krun_start_enter` will restore from this snapshot directory
     /// instead of doing a fresh boot.
     #[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
@@ -771,7 +801,7 @@ impl TryFrom<ContextConfig> for NitroEnclave {
             }
         };
 
-        let Some(output_path) = ctx.console_output else {
+        let Some(output_path) = ctx.nitro_console_output else {
             error!("console output path not specified");
             return Err(-libc::EINVAL);
         };
@@ -996,39 +1026,9 @@ fn start_enter_context(
             };
             ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
         }
-        VsockConfig::Implicit => {
-            // Implicit vsock configuration - use heuristics
-            // Check if TSI should be enabled based on network configuration
-            #[cfg(feature = "net")]
-            let enable_tsi = ctx_cfg.vmr.net.list.is_empty();
-            #[cfg(not(feature = "net"))]
-            let enable_tsi = true;
-
-            let has_ipc_map = ctx_cfg.unix_ipc_port_map.is_some();
-
-            if enable_tsi || has_ipc_map {
-                let (tsi_flags, host_port_map) = if enable_tsi {
-                    (TsiFlags::HIJACK_INET, None)
-                } else {
-                    (TsiFlags::empty(), None)
-                };
-
-                let vsock_device_config = VsockDeviceConfig {
-                    vsock_id: "vsock0".to_string(),
-                    guest_cid: 3,
-                    host_port_map,
-                    unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
-                    tsi_flags,
-                };
-                ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
-            }
-        }
     }
     vmm::timing_event("start_enter.vsock.configured");
 
-    if let Some(console_output) = ctx_cfg.console_output {
-        ctx_cfg.vmr.set_console_output(console_output);
-    }
     vmm::timing_event("start_enter.resources.finalized");
 
     let (sender, _receiver) = unbounded();

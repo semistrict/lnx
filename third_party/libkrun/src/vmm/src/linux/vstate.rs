@@ -57,14 +57,18 @@ use kvm_bindings::{
     kvm_vcpu_events, kvm_xcrs, kvm_xsave,
 };
 use kvm_bindings::{
-    KVM_API_VERSION, KVM_CAP_HALT_POLL, KVM_MEM_GUEST_MEMFD, KVM_SYSTEM_EVENT_RESET,
-    KVM_SYSTEM_EVENT_SHUTDOWN, kvm_create_guest_memfd, kvm_enable_cap, kvm_userspace_memory_region,
-    kvm_userspace_memory_region2,
+    KVM_API_VERSION, KVM_CAP_HALT_POLL, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN,
+    kvm_enable_cap,
 };
 #[cfg(feature = "tee")]
 use kvm_bindings::{KVM_CAP_EXIT_HYPERCALL, KVM_MEMORY_EXIT_FLAG_PRIVATE};
-#[cfg(not(target_arch = "riscv64"))]
-use kvm_bindings::{KVM_MEMORY_ATTRIBUTE_PRIVATE, kvm_memory_attributes};
+#[cfg(not(feature = "tee"))]
+use kvm_bindings::kvm_userspace_memory_region;
+#[cfg(all(feature = "tee", target_arch = "x86_64"))]
+use kvm_bindings::{
+    KVM_MEM_GUEST_MEMFD, KVM_MEMORY_ATTRIBUTE_PRIVATE, kvm_create_guest_memfd,
+    kvm_memory_attributes, kvm_userspace_memory_region2,
+};
 #[cfg(target_arch = "aarch64")]
 use kvm_bindings::{
     KVM_MP_STATE_RUNNABLE, KVM_REG_ARM_CORE, KVM_REG_ARM64, KVM_REG_ARM64_SYSREG,
@@ -935,90 +939,121 @@ impl Vm {
         None
     }
 
-    #[allow(unused_mut)]
+    // GuestMemfd is generally intended for either of two purposes:
+    // * sharing the memory with out-of-process components, and conversely,
+    // * hiding the memory completely from the VMM process (Confidential Computing).
+    //
+    // We only use it for the second use case currently, so don't even try to use it
+    // outside of TEE builds. Software-protected VMs are only available on x86_64 and
+    // are marked with strongly-worded warnings about them being for development only,
+    // as of late 2025. Also, on other architectures like aarch64, guest_memfd in
+    // general is unstable for now, so don't try to use it without a reason.
+
+    #[cfg(not(feature = "tee"))]
+    fn create_guest_physical_memory_slot(
+        &mut self,
+        host_addr: u64,
+        start: u64,
+        region: &GuestRegionMmap,
+    ) -> Result<()> {
+        let memory_region = kvm_userspace_memory_region {
+            slot: self.next_mem_slot,
+            guest_phys_addr: start,
+            memory_size: region.len(),
+            userspace_addr: host_addr,
+            flags: 0,
+        };
+
+        // Safe because we mapped the memory region and ensured regions do not overlap.
+        unsafe {
+            self.fd
+                .set_user_memory_region(memory_region)
+                .map_err(Error::SetUserMemoryRegion)?;
+        };
+
+        Ok(())
+    }
+
+    #[cfg(all(feature = "tee", target_arch = "x86_64"))]
+    fn create_guest_physical_memory_slot(
+        &mut self,
+        host_addr: u64,
+        start: u64,
+        region: &GuestRegionMmap,
+    ) -> Result<()> {
+        let end = start + region.len();
+
+        if !self.fd.check_extension(GuestMemfd) {
+            return Err(Error::KvmCap(GuestMemfd));
+        }
+
+        // GuestMemfd is only used for confidential-memory setups in TEE builds.
+        let guest_memfd = self
+            .fd
+            .create_guest_memfd(kvm_create_guest_memfd {
+                size: region.size() as u64,
+                flags: 0,
+                reserved: [0; 6],
+            })
+            .map_err(Error::CreateGuestMemfd)?;
+
+        let memory_region = kvm_userspace_memory_region2 {
+            slot: self.next_mem_slot,
+            flags: KVM_MEM_GUEST_MEMFD,
+            guest_phys_addr: start,
+            memory_size: region.len(),
+            userspace_addr: host_addr,
+            guest_memfd_offset: 0,
+            guest_memfd: guest_memfd as u32,
+            pad1: 0,
+            pad2: [0; 14],
+        };
+
+        // Safe because we mapped the memory region and ensured regions do not overlap.
+        unsafe {
+            self.fd
+                .set_user_memory_region2(memory_region)
+                .map_err(Error::SetUserMemoryRegion)?;
+        };
+
+        let attr = kvm_memory_attributes {
+            address: start,
+            size: region.len(),
+            attributes: KVM_MEMORY_ATTRIBUTE_PRIVATE as u64,
+            flags: 0,
+        };
+
+        self.fd
+            .set_memory_attributes(attr)
+            .map_err(Error::SetMemoryAttributes)?;
+
+        self.guest_memfds.push((Range { start, end }, guest_memfd));
+
+        Ok(())
+    }
+
+    #[cfg(all(feature = "tee", not(target_arch = "x86_64")))]
+    fn create_guest_physical_memory_slot(
+        &mut self,
+        _host_addr: u64,
+        _start: u64,
+        _region: &GuestRegionMmap,
+    ) -> Result<()> {
+        // TEE support should be rejected during VM setup on non-x86_64 targets.
+        // Do not silently fall back to the non-TEE path here, because that would
+        // ignore an invalid TEE configuration and create a normal VM instead.
+        Err(Error::InvalidTee)
+    }
+
     fn memory_region_set(
         &mut self,
         guest_mem: &GuestMemoryMmap,
         region: &GuestRegionMmap,
     ) -> Result<()> {
-        let host_addr = guest_mem.get_host_address(region.start_addr()).unwrap();
+        let host_addr = guest_mem.get_host_address(region.start_addr()).unwrap() as u64;
         let start = region.start_addr().raw_value();
-        let end = start + region.len();
 
-        // GuestMemfd is generally intended for either of two purposes:
-        // * sharing the memory with out-of-process components, and conversely,
-        // * hiding the memory completely from the VMM process (Confidential Computing).
-        //
-        // We only use it for the second use case currently, so don't even try to use it
-        // outside of TEE builds. Software-protected VMs are only available on x86_64 and
-        // are marked with strongly-worded warnings about them being for development only,
-        // as of late 2025. Also, on other architectures like aarch64, guest_memfd in
-        // general is unstable for now, so don't try to use it without a reason.
-
-        if cfg!(not(feature = "tee")) {
-            let memory_region = kvm_userspace_memory_region {
-                slot: self.next_mem_slot,
-                guest_phys_addr: start,
-                memory_size: region.len(),
-                userspace_addr: host_addr as u64,
-                flags: 0,
-            };
-
-            // Safe because we mapped the memory region, we made sure that the regions
-            // are not overlapping.
-            unsafe {
-                self.fd
-                    .set_user_memory_region(memory_region)
-                    .map_err(Error::SetUserMemoryRegion)?;
-            };
-        } else {
-            if !self.fd.check_extension(GuestMemfd) {
-                return Err(Error::KvmCap(GuestMemfd));
-            }
-
-            // Create a guest_memfd and set the region.
-            let guest_memfd = self
-                .fd
-                .create_guest_memfd(kvm_create_guest_memfd {
-                    size: region.size() as u64,
-                    flags: 0,
-                    reserved: [0; 6],
-                })
-                .map_err(Error::CreateGuestMemfd)?;
-
-            let memory_region = kvm_userspace_memory_region2 {
-                slot: self.next_mem_slot,
-                flags: KVM_MEM_GUEST_MEMFD,
-                guest_phys_addr: start,
-                memory_size: region.len(),
-                userspace_addr: host_addr as u64,
-                guest_memfd_offset: 0,
-                guest_memfd: guest_memfd as u32,
-                pad1: 0,
-                pad2: [0; 14],
-            };
-
-            // Safe because we mapped the memory region, we made sure that the regions
-            // are not overlapping.
-            unsafe {
-                self.fd
-                    .set_user_memory_region2(memory_region)
-                    .map_err(Error::SetUserMemoryRegion)?;
-            };
-
-            let attr = kvm_memory_attributes {
-                address: start,
-                size: region.len(),
-                attributes: KVM_MEMORY_ATTRIBUTE_PRIVATE as u64,
-                flags: 0,
-            };
-
-            self.fd
-                .set_memory_attributes(attr)
-                .map_err(Error::SetMemoryAttributes)?;
-
-            self.guest_memfds.push((Range { start, end }, guest_memfd));
-        }
+        self.create_guest_physical_memory_slot(host_addr, start, region)?;
 
         self.next_mem_slot += 1;
 

@@ -9,6 +9,9 @@ runs:
         rustup update stable
         rustup default stable
         rustup component add rustfmt clippy
+        rustup target add x86_64-unknown-freebsd
+        rustup toolchain install nightly
+        rustup component add rust-src --toolchain nightly
 
     - name: Cache Cargo dependencies
       uses: actions/cache@v4
@@ -26,7 +29,7 @@ runs:
     - name: Install packages (macOS)
       if: runner.os == 'macOS'
       shell: bash
-      run: brew tap slp/krun && brew install virglrenderer clang-format llvm
+      run: brew tap libkrun/krun && brew trust libkrun/krun && brew install virglrenderer clang-format llvm
 
     - name: Install packages (Linux)
       if: runner.os == 'Linux'

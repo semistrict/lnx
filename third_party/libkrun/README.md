@@ -10,6 +10,14 @@
 
 It integrates a VMM (Virtual Machine Monitor, the userspace side of an Hypervisor) with the minimum amount of emulated devices required to its purpose, abstracting most of the complexity that comes from Virtual Machine management, offering users a simple C API.
 
+> [!NOTE]
+> The `main` branch is now **libkrun 2.0**, which will not be backwards
+> compatible with the 1.x API/ABI. The 2.0 API is also still under active
+> development and may change further before the first stable release. If
+> you are building from source for production use, please use the newest
+> [`stable-*` release branch](https://github.com/libkrun/libkrun/branches)
+> instead.
+
 ## Use cases
 
 * [crun](https://github.com/containers/crun/blob/main/krun.1.md): Adding Virtualization-based isolation to container and confidential workloads.
@@ -65,7 +73,7 @@ This is a novel technique called **Transparent Socket Impersonation** which allo
 
 #### Enabling TSI
 
-TSI for AF_INET and AF_INET6 is automatically enabled when no network interface is added to the VM. TSI for AF_UNIX is enabled when, in addition to the previous condition, `krun_set_root` has been used to set `/` as root filesystem.
+TSI for AF_INET and AF_INET6 is automatically enabled when no network interface is added to the VM. TSI for AF_UNIX is enabled when, in addition to the previous condition, the root filesystem has been configured with `/` as the shared directory.
 
 #### Known limitations
 
@@ -92,7 +100,7 @@ While most virtio devices allow the guest to access resources from the host, two
 
 ### virtio-fs
 
-When exposing a directory in a filesystem from the host to the guest through virtio-fs devices configured with `krun_set_root` and/or `krun_add_virtiofs`, libkrun **does not** provide any protection against the guest attempting to access other directories in the same filesystem, or even other filesystems in the host.
+When exposing a directory in a filesystem from the host to the guest through virtio-fs devices configured with `krun_add_virtiofs*`, libkrun **does not** provide any protection against the guest attempting to access other directories in the same filesystem, or even other filesystems in the host.
 
 A mount point isolation mechanism from the host should be used in combination with virtio-fs.
 

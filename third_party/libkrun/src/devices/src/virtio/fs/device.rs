@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 #[cfg(target_os = "macos")]
@@ -20,6 +21,7 @@ use super::super::{
 };
 use super::ExportTable;
 use super::passthrough;
+use super::passthrough::PermissionSemantics;
 use super::virtual_entry::VirtualDirEntry;
 use super::worker::FsServerSnapshot;
 use super::worker::{FsWorker, FsWorkerStopResult};
@@ -50,6 +52,7 @@ pub struct Fs {
     acked_features: u64,
     device_state: DeviceState,
     config: VirtioFsConfig,
+    allow_idmap: bool,
     shm_region: Option<VirtioShmRegion>,
     passthrough_cfg: Option<passthrough::Config>,
     read_only: bool,
@@ -65,6 +68,7 @@ pub struct Fs {
 impl Fs {
     pub fn new(
         fs_id: String,
+        semantics: PermissionSemantics,
         shared_dir: Option<String>,
         exit_code: Arc<AtomicI32>,
         read_only: bool,
@@ -77,18 +81,31 @@ impl Fs {
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
         config.num_request_queues = 1;
 
+        let attr_timeout = if matches!(semantics, PermissionSemantics::LinuxSimplified) {
+            // As uid/gid are context-dependent, attributes can't be cached.
+            Duration::from_secs(0)
+        } else {
+            // The value defined as default in virtio-fs.
+            Duration::from_secs(5)
+        };
+
         let fs_cfg = shared_dir.map(|root_dir| passthrough::Config {
             root_dir,
+            semantics,
+            attr_timeout,
             #[cfg(target_os = "macos")]
             write_allowlist: None,
             ..Default::default()
         });
+
+        let allow_idmap = matches!(semantics, PermissionSemantics::LinuxComplete);
 
         Ok(Fs {
             avail_features,
             acked_features: 0,
             device_state: DeviceState::Inactive,
             config,
+            allow_idmap,
             shm_region: None,
             passthrough_cfg: fs_cfg,
             read_only,
@@ -186,6 +203,7 @@ mod tests {
     fn write_allowlisted_host_share_uses_close_to_open_cache_consistency() {
         let mut fs = Fs::new(
             "home".to_string(),
+            PermissionSemantics::LinuxComplete,
             Some("/Users/ramon".to_string()),
             Arc::new(AtomicI32::new(0)),
             false,
@@ -274,6 +292,7 @@ impl VirtioDevice for Fs {
             queue_evts,
             interrupt.clone(),
             mem.clone(),
+            self.allow_idmap,
             self.shm_region.clone(),
             self.passthrough_cfg.clone(),
             self.read_only,
@@ -347,6 +366,7 @@ impl VirtioDevice for Fs {
             stop.queue_evts,
             interrupt,
             mem,
+            self.allow_idmap,
             self.shm_region.clone(),
             stop.server,
             self.worker_stopfd
