@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::Result;
-use libkrun::{LogLevel, VirtioFs, VmHandle};
+use libkrun::{LogLevel, VirtioFs};
 
 const VIRTIOFS_DAX_WINDOW_BYTES: u64 = 8 << 30;
 /// Opt back into the old host-share DAX path. Writable host-share DAX can
@@ -46,18 +46,8 @@ pub(crate) fn host_share_virtiofs(
 ) -> VirtioFs {
     VirtioFs::shared(tag, path)
         .dax_window_bytes(host_share_dax_window_bytes())
-        .write_allowlist(pathbufs(write_allowlist))
+        .write_allowlist(write_allowlist.iter().map(PathBuf::from))
         .unshare_dir(unshare_dir)
-}
-
-#[allow(dead_code)]
-pub(crate) fn replace_host_virtiofs_write_allowlist(
-    vm: &VmHandle,
-    tag: &str,
-    paths: &[String],
-) -> Result<()> {
-    vm.replace_virtiofs_write_allowlist(tag, pathbufs(paths))?;
-    Ok(())
 }
 
 pub(crate) fn host_share_dax_enabled() -> bool {
@@ -73,8 +63,4 @@ fn host_share_dax_window_bytes() -> u64 {
     } else {
         0
     }
-}
-
-fn pathbufs(paths: &[String]) -> Vec<PathBuf> {
-    paths.iter().map(PathBuf::from).collect()
 }

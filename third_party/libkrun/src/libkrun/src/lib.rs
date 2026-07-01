@@ -248,13 +248,41 @@ pub struct VmBuilder {
 
 impl VmBuilder {
     pub fn new() -> Self {
+        let shutdown_efd = if cfg!(target_arch = "aarch64") && cfg!(target_os = "macos") {
+            Some(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap())
+        } else {
+            None
+        };
+
         Self {
-            cfg: new_context_config(),
+            cfg: ContextConfig {
+                krunfw: KrunfwBindings::new(),
+                shutdown_efd,
+                ..Default::default()
+            },
         }
     }
 
     pub fn resources(&mut self, num_vcpus: u8, ram_mib: u32) -> KrunResult<&mut Self> {
-        set_vm_config(&mut self.cfg, num_vcpus, ram_mib)?;
+        let mem_size_mib = match ram_mib.try_into() {
+            Ok(size) => size,
+            Err(e) => {
+                warn!("Error parsing the amount of RAM: {e:?}");
+                return Err(Error::from_errno(libc::EINVAL));
+            }
+        };
+
+        let vm_config = VmConfig {
+            vcpu_count: Some(num_vcpus),
+            mem_size_mib: Some(mem_size_mib),
+            ht_enabled: Some(false),
+            cpu_template: None,
+        };
+
+        if self.cfg.vmr.set_vm_config(&vm_config).is_err() {
+            return Err(Error::from_errno(libc::EINVAL));
+        }
+
         Ok(self)
     }
 
@@ -306,23 +334,13 @@ impl VmBuilder {
         Ok(self)
     }
 
-    fn pmem(
-        &mut self,
-        pmem_id: impl Into<String>,
-        file_path: impl AsRef<Path>,
-        read_only: bool,
-    ) -> &mut Self {
-        let pmem_cfg = PmemDeviceConfig {
-            id: pmem_id.into(),
-            path: file_path.as_ref().to_string_lossy().into_owned(),
-            read_only,
-        };
-        self.cfg.add_pmem_cfg(pmem_cfg);
-        self
-    }
-
     pub fn root_pmem(&mut self, file_path: impl AsRef<Path>) -> &mut Self {
-        self.pmem("rootfs", file_path, false)
+        self.cfg.pmem_cfgs.push(PmemDeviceConfig {
+            id: "rootfs".to_string(),
+            path: file_path.as_ref().to_string_lossy().into_owned(),
+            read_only: false,
+        });
+        self
     }
 
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -362,9 +380,26 @@ impl VmBuilder {
         tag: impl Into<String>,
         socket_path: impl AsRef<Path>,
     ) -> KrunResult<&mut Self> {
+        use vmm::resources::VhostUserDeviceConfig;
+
         let tag = tag.into();
         let socket_path = socket_path.as_ref().to_string_lossy().into_owned();
-        add_vhost_user_virtiofs_config(&mut self.cfg, &tag, socket_path)?;
+        if tag.is_empty() || tag.as_bytes().len() > 36 || socket_path.is_empty() {
+            return Err(Error::from_errno(libc::EINVAL));
+        }
+
+        let mut config_space = vec![0_u8; 40];
+        config_space[..tag.as_bytes().len()].copy_from_slice(tag.as_bytes());
+        config_space[36..40].copy_from_slice(&1_u32.to_le_bytes());
+
+        self.cfg.vmr.vhost_user_devices.push(VhostUserDeviceConfig {
+            device_type: 26,
+            socket_path,
+            name: Some(format!("vhost-user-fs-{tag}")),
+            num_queues: 2,
+            queue_sizes: vec![1024, 1024],
+            config_space: Some(config_space),
+        });
         Ok(self)
     }
 
@@ -386,19 +421,27 @@ impl VmBuilder {
         if self.cfg.vsock_config == VsockConfig::Disabled {
             return Err(Error::from_errno(libc::ENODEV));
         }
-        self.cfg.add_vsock_port(guest_port, filepath, false);
+        self.cfg
+            .unix_ipc_port_map
+            .get_or_insert_with(HashMap::new)
+            .insert(guest_port, (filepath, false));
         Ok(self)
     }
 
     #[cfg(feature = "net")]
     pub fn network(&mut self, network: Network) -> KrunResult<&mut Self> {
-        let backend = VirtioNetBackend::UnixgramPath(network.socket, true);
-        create_virtio_net(
-            &mut self.cfg,
-            backend,
-            network.mac,
-            NET_GVPROXY_VFKIT_FEATURES,
-        );
+        let network_interface_config = NetworkInterfaceConfig {
+            iface_id: format!("eth{}", self.cfg.net_index),
+            backend: VirtioNetBackend::UnixgramPath(network.socket, true),
+            mac: network.mac,
+            features: NET_GVPROXY_VFKIT_FEATURES,
+        };
+        self.cfg.net_index += 1;
+        self.cfg
+            .vmr
+            .add_network_interface(network_interface_config)
+            .expect("Failed to create network interface");
+
         if network.dhcp_client {
             self.cfg.vmr.dhcp_client = true;
         }
@@ -406,7 +449,7 @@ impl VmBuilder {
     }
 
     pub fn workdir(&mut self, workdir: impl Into<String>) -> &mut Self {
-        self.cfg.set_workdir(workdir.into());
+        self.cfg.workdir = Some(workdir.into());
         self
     }
 
@@ -416,11 +459,9 @@ impl VmBuilder {
         argv: &[String],
         envp: &[String],
     ) -> &mut Self {
-        let args = argv.join(" ");
-        let env = envp.join(" ");
-        self.cfg.set_exec_path(exec_path.into());
-        self.cfg.set_env(env);
-        self.cfg.set_args(args);
+        self.cfg.exec_path = Some(exec_path.into());
+        self.cfg.argv = argv.to_vec();
+        self.cfg.env = envp.to_vec();
         self
     }
 
@@ -481,22 +522,51 @@ impl VmHandle {
         *self.vmm.lock().unwrap() = Some(vmm);
     }
 
-    fn running_vmm(&self) -> Option<RunningVmm> {
-        self.vmm.lock().unwrap().clone()
-    }
-
     fn require_running_vmm(&self) -> KrunResult<RunningVmm> {
-        self.running_vmm().ok_or(Error::NotStarted)
+        self.vmm.lock().unwrap().clone().ok_or(Error::NotStarted)
     }
 
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     pub fn replace_virtiofs_write_allowlist(&self, tag: &str, paths: Vec<PathBuf>) -> KrunResult {
-        set_running_virtiofs_write_allowlist(&self.require_running_vmm()?, tag, paths)
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            return if self
+                .require_running_vmm()?
+                .lock()
+                .unwrap()
+                .set_virtiofs_write_allowlist(tag, paths)
+            {
+                Ok(())
+            } else {
+                Err(Error::from_errno(libc::ENOENT))
+            };
+        }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (tag, paths);
+            Err(Error::from_errno(libc::ENOENT))
+        }
     }
 
     #[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
     pub fn snapshot(&self, path: impl AsRef<Path>) -> KrunResult {
-        snapshot_running_vmm(&self.require_running_vmm()?, path.as_ref())
+        match self
+            .require_running_vmm()?
+            .lock()
+            .unwrap()
+            .snapshot(path.as_ref())
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                error!("krun_snapshot failed: {e}");
+                if e.contains("device refused") || e.contains("connections") {
+                    Err(Error::from_errno(libc::EPERM))
+                } else {
+                    Err(Error::from_errno(libc::EIO))
+                }
+            }
+        }
     }
 
     #[cfg(not(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64")))]
@@ -511,12 +581,27 @@ impl VmHandle {
         copy_src: impl AsRef<Path>,
         copy_dst_name: impl AsRef<Path>,
     ) -> KrunResult {
-        snapshot_running_vmm_with_file_copy(
-            &self.require_running_vmm()?,
-            path.as_ref(),
-            copy_src.as_ref(),
-            copy_dst_name.as_ref(),
-        )
+        let copy_dst_name = copy_dst_name.as_ref();
+        if copy_dst_name.is_absolute() || copy_dst_name.components().count() != 1 {
+            return Err(Error::from_errno(libc::EINVAL));
+        }
+
+        match self
+            .require_running_vmm()?
+            .lock()
+            .unwrap()
+            .snapshot_with_file_copy(path.as_ref(), copy_src.as_ref(), copy_dst_name)
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                error!("krun_snapshot_with_file_copy failed: {e}");
+                if e.contains("device refused") || e.contains("connections") {
+                    Err(Error::from_errno(libc::EPERM))
+                } else {
+                    Err(Error::from_errno(libc::EIO))
+                }
+            }
+        }
     }
 
     #[cfg(not(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64")))]
@@ -531,7 +616,22 @@ impl VmHandle {
 }
 
 pub fn init_logging(level: LogLevel) -> KrunResult {
-    configure_log_level(level)
+    let filter = level.as_filter_str();
+    let _ = env_logger::Builder::from_env(Env::default().default_filter_or(filter))
+        .format_timestamp_micros()
+        .try_init();
+
+    #[cfg(feature = "aws-nitro")]
+    {
+        // Notify krun-awsnitro to enable debug for log level.
+        if level == LogLevel::Debug {
+            let mut debug = KRUN_NITRO_DEBUG.lock().unwrap();
+
+            *debug = true;
+        }
+    }
+
+    Ok(())
 }
 
 static KRUNFW: LazyLock<Option<libloading::Library>> = LazyLock::new(|| unsafe {
@@ -579,8 +679,8 @@ struct ContextConfig {
     vmr: VmResources,
     workdir: Option<String>,
     exec_path: Option<String>,
-    env: Option<String>,
-    args: Option<String>,
+    env: Vec<String>,
+    argv: Vec<String>,
     net_index: u8,
     vsock_config: VsockConfig,
     pmem_cfgs: Vec<PmemDeviceConfig>,
@@ -593,71 +693,6 @@ struct ContextConfig {
     /// instead of doing a fresh boot.
     #[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
     snapshot_restore_path: Option<PathBuf>,
-}
-
-impl ContextConfig {
-    fn set_workdir(&mut self, workdir: String) {
-        self.workdir = Some(workdir);
-    }
-
-    fn get_workdir(&self) -> String {
-        match &self.workdir {
-            Some(workdir) => format!("KRUN_WORKDIR={workdir}"),
-            None => "".to_string(),
-        }
-    }
-
-    fn set_exec_path(&mut self, exec_path: String) {
-        self.exec_path = Some(exec_path);
-    }
-
-    fn get_exec_path(&self) -> String {
-        match &self.exec_path {
-            Some(exec_path) => format!("KRUN_INIT={exec_path}"),
-            None => "".to_string(),
-        }
-    }
-
-    fn set_env(&mut self, env: String) {
-        self.env = Some(env);
-    }
-
-    fn get_env(&self) -> String {
-        match &self.env {
-            Some(env) => env.clone(),
-            None => "".to_string(),
-        }
-    }
-
-    fn set_args(&mut self, args: String) {
-        self.args = Some(args);
-    }
-
-    fn get_args(&self) -> String {
-        match &self.args {
-            Some(args) => args.clone(),
-            None => "".to_string(),
-        }
-    }
-
-    fn add_pmem_cfg(&mut self, pmem_cfg: PmemDeviceConfig) {
-        self.pmem_cfgs.push(pmem_cfg);
-    }
-
-    #[cfg(feature = "tee")]
-    fn get_tee_config_file(&self) -> Option<PathBuf> {
-        self.tee_config_file.clone()
-    }
-
-    fn add_vsock_port(&mut self, port: u32, filepath: PathBuf, listen: bool) {
-        if let Some(map) = &mut self.unix_ipc_port_map {
-            map.insert(port, (filepath, listen));
-        } else {
-            let mut map: HashMap<u32, (PathBuf, bool)> = HashMap::new();
-            map.insert(port, (filepath, listen));
-            self.unix_ipc_port_map = Some(map);
-        }
-    }
 }
 
 #[cfg(feature = "aws-nitro")]
@@ -689,15 +724,17 @@ impl TryFrom<ContextConfig> for NitroEnclave {
             return Err(-libc::EINVAL);
         };
 
-        let Some(exec_env) = ctx.env else {
+        if ctx.env.is_empty() {
             error!("execution env not specified");
             return Err(-libc::EINVAL);
-        };
+        }
+        let exec_env = ctx.env.join(" ");
 
-        let Some(exec_args) = ctx.args else {
+        if ctx.argv.is_empty() {
             error!("execution args not specified");
             return Err(-libc::EINVAL);
-        };
+        }
+        let exec_args = ctx.argv.join(" ");
 
         let net_unixfd = {
             let mut list = ctx.vmr.net.list;
@@ -745,84 +782,6 @@ impl TryFrom<ContextConfig> for NitroEnclave {
     }
 }
 
-fn configure_log_level(level: LogLevel) -> KrunResult {
-    let filter = level.as_filter_str();
-    let _ = env_logger::Builder::from_env(Env::default().default_filter_or(filter))
-        .format_timestamp_micros()
-        .try_init();
-
-    #[cfg(feature = "aws-nitro")]
-    {
-        // Notify krun-awsnitro to enable debug for log level.
-        if level == LogLevel::Debug {
-            let mut debug = KRUN_NITRO_DEBUG.lock().unwrap();
-
-            *debug = true;
-        }
-    }
-
-    Ok(())
-}
-
-fn new_context_config() -> ContextConfig {
-    let shutdown_efd = if cfg!(target_arch = "aarch64") && cfg!(target_os = "macos") {
-        Some(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap())
-    } else {
-        None
-    };
-
-    ContextConfig {
-        krunfw: KrunfwBindings::new(),
-        shutdown_efd,
-        ..Default::default()
-    }
-}
-
-fn set_vm_config(ctx_cfg: &mut ContextConfig, num_vcpus: u8, ram_mib: u32) -> KrunResult {
-    let mem_size_mib: usize = match ram_mib.try_into() {
-        Ok(size) => size,
-        Err(e) => {
-            warn!("Error parsing the amount of RAM: {e:?}");
-            return Err(Error::from_errno(libc::EINVAL));
-        }
-    };
-
-    let vm_config = VmConfig {
-        vcpu_count: Some(num_vcpus),
-        mem_size_mib: Some(mem_size_mib),
-        ht_enabled: Some(false),
-        cpu_template: None,
-    };
-
-    if ctx_cfg.vmr.set_vm_config(&vm_config).is_err() {
-        return Err(Error::from_errno(libc::EINVAL));
-    }
-
-    Ok(())
-}
-
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-fn set_running_virtiofs_write_allowlist(
-    vmm: &RunningVmm,
-    tag: &str,
-    paths: Vec<PathBuf>,
-) -> KrunResult {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        return if vmm.lock().unwrap().set_virtiofs_write_allowlist(tag, paths) {
-            Ok(())
-        } else {
-            Err(Error::from_errno(libc::ENOENT))
-        };
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    {
-        let _ = (vmm, tag, paths);
-        Err(Error::from_errno(libc::ENOENT))
-    }
-}
-
 #[cfg(feature = "net")]
 const NET_FEATURE_CSUM: u32 = 1 << 0;
 #[cfg(feature = "net")]
@@ -842,53 +801,6 @@ const NET_GVPROXY_VFKIT_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_GUEST_UFO
     | NET_FEATURE_HOST_TSO4
     | NET_FEATURE_HOST_UFO;
-
-#[cfg(feature = "vhost-user")]
-fn add_vhost_user_virtiofs_config(
-    cfg: &mut ContextConfig,
-    tag: &str,
-    socket_path: String,
-) -> KrunResult {
-    use vmm::resources::VhostUserDeviceConfig;
-
-    if tag.is_empty() || tag.as_bytes().len() > 36 || socket_path.is_empty() {
-        return Err(Error::from_errno(libc::EINVAL));
-    }
-
-    let mut config_space = vec![0_u8; 40];
-    config_space[..tag.as_bytes().len()].copy_from_slice(tag.as_bytes());
-    config_space[36..40].copy_from_slice(&1_u32.to_le_bytes());
-
-    cfg.vmr.vhost_user_devices.push(VhostUserDeviceConfig {
-        device_type: 26,
-        socket_path,
-        name: Some(format!("vhost-user-fs-{tag}")),
-        num_queues: 2,
-        queue_sizes: vec![1024, 1024],
-        config_space: Some(config_space),
-    });
-    Ok(())
-}
-
-#[cfg(feature = "net")]
-fn create_virtio_net(
-    ctx_cfg: &mut ContextConfig,
-    backend: VirtioNetBackend,
-    mac: [u8; 6],
-    features: u32,
-) {
-    let network_interface_config = NetworkInterfaceConfig {
-        iface_id: format!("eth{}", ctx_cfg.net_index),
-        backend,
-        mac,
-        features,
-    };
-    ctx_cfg.net_index += 1;
-    ctx_cfg
-        .vmr
-        .add_network_interface(network_interface_config)
-        .expect("Failed to create network interface");
-}
 
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
 fn map_kernel_cfg(ctx_cfg: &mut ContextConfig, kernel_path: &PathBuf) -> KrunResult {
@@ -1028,7 +940,7 @@ fn start_enter_context(
      * message and fail.
      */
     #[cfg(feature = "tee")]
-    if let Some(tee_config) = ctx_cfg.get_tee_config_file() {
+    if let Some(tee_config) = ctx_cfg.tee_config_file.clone() {
         if let Err(e) = ctx_cfg.vmr.set_tee_config(tee_config) {
             error!("Error setting up TEE config: {e:?}");
             return Err(Error::from_errno(libc::EINVAL));
@@ -1038,15 +950,23 @@ fn start_enter_context(
         return Err(Error::from_errno(libc::EINVAL));
     }
 
+    let exec_path_env = ctx_cfg
+        .exec_path
+        .as_deref()
+        .map(|exec_path| format!("KRUN_INIT={exec_path}"))
+        .unwrap_or_default();
+    let workdir_env = ctx_cfg
+        .workdir
+        .as_deref()
+        .map(|workdir| format!("KRUN_WORKDIR={workdir}"))
+        .unwrap_or_default();
+    let guest_env = ctx_cfg.env.join(" ");
+    let argv = ctx_cfg.argv.join(" ");
+
     let kernel_cmdline = KernelCmdlineConfig {
         prolog: Some(format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}")),
-        krun_env: Some(format!(
-            " {} {} {}",
-            ctx_cfg.get_exec_path(),
-            ctx_cfg.get_workdir(),
-            ctx_cfg.get_env(),
-        )),
-        epilog: Some(format!(" -- {}", ctx_cfg.get_args())),
+        krun_env: Some(format!(" {exec_path_env} {workdir_env} {guest_env}")),
+        epilog: Some(format!(" -- {argv}")),
     };
 
     if ctx_cfg.vmr.set_kernel_cmdline(kernel_cmdline).is_err() {
@@ -1212,49 +1132,6 @@ fn krun_start_enter_nitro(ctx_cfg: ContextConfig) -> KrunResult {
             error!("Error running nitro enclave: {e}");
 
             Err(Error::from_errno(libc::EINVAL))
-        }
-    }
-}
-
-#[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
-fn snapshot_running_vmm(vmm: &RunningVmm, path: &Path) -> KrunResult {
-    let result = vmm.lock().unwrap().snapshot(path);
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            error!("krun_snapshot failed: {e}");
-            if e.contains("device refused") || e.contains("connections") {
-                Err(Error::from_errno(libc::EPERM))
-            } else {
-                Err(Error::from_errno(libc::EIO))
-            }
-        }
-    }
-}
-
-#[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
-fn snapshot_running_vmm_with_file_copy(
-    vmm: &RunningVmm,
-    path: &Path,
-    copy_src: &Path,
-    copy_dst_name: &Path,
-) -> KrunResult {
-    if copy_dst_name.is_absolute() || copy_dst_name.components().count() != 1 {
-        return Err(Error::from_errno(libc::EINVAL));
-    }
-    let result = vmm
-        .lock()
-        .unwrap()
-        .snapshot_with_file_copy(path, copy_src, copy_dst_name);
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            error!("krun_snapshot_with_file_copy failed: {e}");
-            if e.contains("device refused") || e.contains("connections") {
-                Err(Error::from_errno(libc::EPERM))
-            } else {
-                Err(Error::from_errno(libc::EIO))
-            }
         }
     }
 }

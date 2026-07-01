@@ -5747,7 +5747,14 @@ fn preflight_host_share_cwd_with_home(
 
 #[cfg(target_os = "macos")]
 fn replace_home_write_allowlist(ctx: &VmHandle, cwd: &Path, host_home: &Path) -> Result<()> {
-    krun::replace_host_virtiofs_write_allowlist(ctx, "home", &home_write_allowlist(cwd, host_home))
+    ctx.replace_virtiofs_write_allowlist(
+        "home",
+        home_write_allowlist(cwd, host_home)
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
+    )?;
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
