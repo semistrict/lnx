@@ -460,7 +460,6 @@ fn test_layout(base: &Path) -> Layout {
 fn nested_deterministic_script_quotes_paths_and_exports_inner_base() {
     let script = nested_deterministic_script(
         Path::new("/Users/test/src/target/aarch64-unknown-linux-musl/debug/lnx"),
-        Path::new("/Users/test/src/target/gvproxy-linux-arm64"),
         Path::new("/Users/test/.lnx"),
         Some(Path::new("/tmp/lnx run")),
         &["--instance".to_string(), "dev one".to_string()],
@@ -469,6 +468,7 @@ fn nested_deterministic_script_quotes_paths_and_exports_inner_base() {
     assert!(!script.contains("LNX_ROOTFS_BACKEND"));
     assert!(script.contains("export LNX_BASE='/Users/test/.lnx'"));
     assert!(script.contains("export LNX_RUN_BASE='/tmp/lnx run'"));
+    assert!(!script.contains("GVPROXY_PATH"));
     assert!(script.contains("exec \"$LNX_BIN\" '--instance' 'dev one'"));
 }
 

@@ -2003,7 +2003,6 @@ fn run_nested_deterministic_on_macos(
     }
 
     let linux_lnx = find_linux_lnx_binary(&layout.base)?;
-    let linux_gvproxy = find_linux_gvproxy_binary(&layout.base)?;
     let outer_instance = nested_deterministic_outer_instance(&layout.instance);
     let outer_layout = Layout::resolve(&outer_instance, Some(layout.kernel.clone()), None)?;
     ensure_image_and_instance(&outer_layout, explicit_kernel, false)?;
@@ -2033,7 +2032,6 @@ fn run_nested_deterministic_on_macos(
     );
     let script = nested_deterministic_script(
         &linux_lnx,
-        &linux_gvproxy,
         &layout.base,
         std::env::var_os("LNX_RUN_BASE")
             .map(PathBuf::from)
@@ -2110,7 +2108,6 @@ fn nested_deterministic_inner_args(
 
 fn nested_deterministic_script(
     linux_lnx: &Path,
-    linux_gvproxy: &Path,
     base: &Path,
     run_base: Option<&Path>,
     inner_args: &[String],
@@ -2126,13 +2123,8 @@ fn nested_deterministic_script(
             "cp {} \"$nested_tools/lnx\"",
             shell_quote(&linux_lnx.display().to_string())
         ),
-        format!(
-            "cp {} \"$nested_tools/gvproxy-linux-arm64\"",
-            shell_quote(&linux_gvproxy.display().to_string())
-        ),
         "chmod +x \"$nested_tools\"/*".to_string(),
         "export LNX_BIN=\"$nested_tools/lnx\"".to_string(),
-        "export GVPROXY_PATH=\"$nested_tools/gvproxy-linux-arm64\"".to_string(),
         format!(
             "export LNX_BASE={}",
             shell_quote(&base.display().to_string())
@@ -2220,32 +2212,6 @@ fn linux_lnx_candidates(current_exe: &Path) -> Vec<PathBuf> {
         cursor = dir.parent();
     }
     candidates
-}
-
-fn find_linux_gvproxy_binary(base: &Path) -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("LNX_LINUX_GVPROXY").map(PathBuf::from) {
-        return require_executable_file(path, "Linux gvproxy binary");
-    }
-    let exe = std::env::current_exe().context("current executable")?;
-    if let Some(dir) = exe.parent() {
-        let candidate = dir.join("gvproxy-linux-arm64");
-        if candidate.exists() {
-            return require_executable_file(candidate, "Linux gvproxy binary");
-        }
-    }
-    let mut cursor = exe.parent();
-    while let Some(dir) = cursor {
-        if dir.file_name().and_then(|name| name.to_str()) == Some("target") {
-            let candidate = dir.join("gvproxy-linux-arm64");
-            if candidate.exists() {
-                return require_executable_file(candidate, "Linux gvproxy binary");
-            }
-        }
-        cursor = dir.parent();
-    }
-    let cache_path = base.join("cache").join("gvproxy-linux-arm64");
-    crate::init::ensure_nested_linux_gvproxy(&cache_path)?;
-    require_executable_file(cache_path, "Linux gvproxy binary")
 }
 
 fn require_executable_file(path: PathBuf, label: &str) -> Result<PathBuf> {

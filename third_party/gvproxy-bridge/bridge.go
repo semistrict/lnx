@@ -7,13 +7,16 @@ import "C"
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/url"
 	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/containers/gvisor-tap-vsock/pkg/transport"
 	"github.com/containers/gvisor-tap-vsock/pkg/types"
@@ -37,7 +40,29 @@ var (
 	lastErr   string
 )
 
-func main() {}
+func main() {
+	vfkitEndpoint := flag.String("listen-vfkit", "", "vfkit unixgram endpoint")
+	logPath := flag.String("log", "", "log file path")
+	sshPort := flag.Int("ssh-port", 0, "host SSH forwarding port")
+	flag.Parse()
+
+	if *vfkitEndpoint == "" {
+		fmt.Fprintln(os.Stderr, "--listen-vfkit is required")
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	id, err := start(*vfkitEndpoint, *logPath, *sshPort)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "start gvproxy: %s\n", err)
+		os.Exit(1)
+	}
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	<-signals
+	stop(id)
+}
 
 //export lnx_gvproxy_start
 func lnx_gvproxy_start(vfkitEndpoint *C.char, logPath *C.char, sshPort C.int) C.longlong {
@@ -53,7 +78,10 @@ func lnx_gvproxy_start(vfkitEndpoint *C.char, logPath *C.char, sshPort C.int) C.
 
 //export lnx_gvproxy_stop
 func lnx_gvproxy_stop(rawID C.longlong) {
-	id := int64(rawID)
+	stop(int64(rawID))
+}
+
+func stop(id int64) {
 	serversMu.Lock()
 	handle := servers[id]
 	delete(servers, id)

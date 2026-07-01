@@ -84,19 +84,12 @@ jobs:
             depot cargo build --release --target aarch64-unknown-linux-musl
           cp target/aarch64-unknown-linux-musl/release/lnx lnx-linux-aarch64
 
-      - name: Download Linux gvproxy helper
-        run: |
-          curl -fL -o gvproxy-linux-arm64 \
-            https://github.com/containers/gvisor-tap-vsock/releases/download/v0.8.9/gvproxy-linux-arm64
-          chmod +x gvproxy-linux-arm64
-
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: linux-helpers
           path: |
             lnx-linux-aarch64
-            gvproxy-linux-arm64
 
   release:
     needs: [kernel, rootfs, linux-helpers]
@@ -124,9 +117,8 @@ jobs:
           set -euo pipefail
           gzip -t vmlinuz.gz
           zstd -t rootfs.ext4.zst
-          chmod +x lnx-linux-aarch64 gvproxy-linux-arm64
+          chmod +x lnx-linux-aarch64
           test -x lnx-linux-aarch64
-          test -x gvproxy-linux-arm64
           zstd -d --force --sparse -o rootfs.ext4 rootfs.ext4.zst
           debugfs -R 'stat /sbin/init' rootfs.ext4
           debugfs -R 'stat /usr/lib/systemd/systemd' rootfs.ext4
@@ -142,7 +134,6 @@ jobs:
             - `vmlinuz.gz` — Linux kernel (arm64, gzip compressed)
             - `rootfs.ext4.zst` — Ubuntu rootfs (64G sparse ext4, 16K block size, zstd compressed)
             - `lnx-linux-aarch64` — Linux helper used by nested deterministic runs on macOS
-            - `gvproxy-linux-arm64` — Linux gvproxy helper used by nested deterministic runs on macOS
 
             Place the decompressed images at `~/.lnx/vmlinuz` and
             `~/.lnx/images/default/rootfs.ext4`.
@@ -150,4 +141,3 @@ jobs:
             vmlinuz.gz
             rootfs.ext4.zst
             lnx-linux-aarch64
-            gvproxy-linux-arm64

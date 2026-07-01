@@ -24,9 +24,6 @@ const ctx = defaultContext("nested-deterministic-time");
 const cwd = join(ctx.repoRoot, `.lnx-ndt-${process.pid}`);
 const linuxTarget = "aarch64-unknown-linux-musl";
 const linuxLnx = join(ctx.repoRoot, "target", linuxTarget, "debug", "lnx");
-const linuxGvproxy = join(ctx.repoRoot, "target", "gvproxy-linux-arm64");
-const gvproxyUrl =
-  "https://github.com/containers/gvisor-tap-vsock/releases/download/v0.8.9/gvproxy-linux-arm64";
 const bunVersion = "1.3.14";
 const linuxBunDir = join(ctx.repoRoot, "target", "bun-linux-aarch64");
 const linuxBun = join(linuxBunDir, "bun");
@@ -162,14 +159,6 @@ async function ensureLinuxTools() {
     },
   });
 
-  if (!existsSync(linuxGvproxy)) {
-    await run(["curl", "-fL", "-o", linuxGvproxy, gvproxyUrl], {
-      cwd: ctx.repoRoot,
-      timeoutMs: 180_000,
-    });
-  }
-  await chmod(linuxGvproxy, 0o755);
-
   if (!existsSync(linuxBun)) {
     const archive = join(
       ctx.repoRoot,
@@ -220,12 +209,10 @@ function stageNestedToolsScript(): string[] {
     'rm -rf "$nested_tools"',
     'mkdir -p "$nested_tools"',
     `cp ${quoteShell(linuxLnx)} "$nested_tools/lnx"`,
-    `cp ${quoteShell(linuxGvproxy)} "$nested_tools/gvproxy-linux-arm64"`,
     `cp ${quoteShell(linuxBun)} "$nested_tools/bun"`,
     'chmod +x "$nested_tools"/*',
     'export PATH="$nested_tools:$PATH"',
     'export LNX_BIN="$nested_tools/lnx"',
-    'export GVPROXY_PATH="$nested_tools/gvproxy-linux-arm64"',
   ];
 }
 

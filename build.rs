@@ -19,14 +19,17 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LNX_AGENT_LINKER");
     println!("cargo:rerun-if-env-changed=LNX_SKIP_SERVER_UI_BUILD");
     println!("cargo:rerun-if-env-changed=LNX_SKIP_SERVER_UI_INSTALL");
+    println!("cargo:rerun-if-env-changed=CC_LINUX");
 
     let source_stamp = source_stamp(&tracked_paths);
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     if server_ui_enabled() {
         build_server_ui(&out_dir);
     }
-    if target_os() == "macos" {
-        build_gvproxy_bridge(&out_dir);
+    match target_os().as_str() {
+        "linux" => build_linux_gvproxy_bridge(&out_dir),
+        "macos" => build_macos_gvproxy_bridge(&out_dir),
+        _ => {}
     }
     let agent = out_dir.join("lnx-agent");
     let agent_target_dir = env::var_os("LNX_AGENT_TARGET_DIR")
@@ -88,7 +91,38 @@ fn target_arch() -> String {
     env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default()
 }
 
-fn build_gvproxy_bridge(out_dir: &Path) {
+fn cargo_target_env_key(target: &str, suffix: &str) -> String {
+    format!(
+        "CARGO_TARGET_{}_{}",
+        target.replace('-', "_").to_ascii_uppercase(),
+        suffix
+    )
+}
+
+fn build_macos_gvproxy_bridge(out_dir: &Path) {
+    let archive = out_dir.join("liblnx_gvproxy_bridge.a");
+    build_gvproxy_bridge("darwin", &archive, |command| {
+        command.arg("-buildmode=c-archive");
+    });
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=lnx_gvproxy_bridge");
+    println!("cargo:rustc-link-lib=dylib=resolv");
+}
+
+fn build_linux_gvproxy_bridge(out_dir: &Path) {
+    let executable = out_dir.join("lnx-gvproxy-bridge");
+    build_gvproxy_bridge("linux", &executable, |command| {
+        command
+            .arg("-ldflags")
+            .arg("-linkmode external -extldflags -static");
+    });
+    println!(
+        "cargo:rustc-env=LNX_GVPROXY_BRIDGE={}",
+        executable.display()
+    );
+}
+
+fn build_gvproxy_bridge(goos: &str, output: &Path, configure: impl FnOnce(&mut Command)) {
     println!("cargo:rerun-if-changed=third_party/gvproxy-bridge/bridge.go");
     println!("cargo:rerun-if-changed=third_party/gvproxy-bridge/go.mod");
     println!("cargo:rerun-if-changed=third_party/gvproxy-bridge/go.sum");
@@ -97,25 +131,35 @@ fn build_gvproxy_bridge(out_dir: &Path) {
         "x86_64" => "amd64",
         other => panic!("unsupported gvproxy bridge target arch {other}"),
     };
-    let archive = out_dir.join("liblnx_gvproxy_bridge.a");
-    let status = Command::new("go")
-        .arg("build")
-        .arg("-buildmode=c-archive")
+    let mut command = Command::new("go");
+    command.arg("build");
+    configure(&mut command);
+    command
         .arg("-o")
-        .arg(&archive)
+        .arg(output)
         .arg(".")
-        .env("GOOS", "darwin")
+        .env("GOOS", goos)
         .env("GOARCH", goarch)
         .env("CGO_ENABLED", "1")
-        .current_dir("third_party/gvproxy-bridge")
+        .current_dir("third_party/gvproxy-bridge");
+    if goos == "linux" && env::var_os("CC").is_none() {
+        let target = env::var("TARGET").unwrap_or_default();
+        println!(
+            "cargo:rerun-if-env-changed={}",
+            cargo_target_env_key(&target, "LINKER")
+        );
+        if let Some(cc) =
+            env::var_os(cargo_target_env_key(&target, "LINKER")).or_else(|| env::var_os("CC_LINUX"))
+        {
+            command.env("CC", cc);
+        }
+    }
+    let status = command
         .status()
         .expect("run go build for embedded gvproxy bridge");
     if !status.success() {
         panic!("embedded gvproxy bridge build failed with {status}");
     }
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=lnx_gvproxy_bridge");
-    println!("cargo:rustc-link-lib=dylib=resolv");
 }
 
 fn server_ui_enabled() -> bool {

@@ -33,9 +33,6 @@ const cwd =
   join(hostHome, ".lnx", "test-work", `nested-kvm-${process.pid}`);
 const linuxTarget = "aarch64-unknown-linux-musl";
 const linuxLnx = join(ctx.repoRoot, "target", linuxTarget, "debug", "lnx");
-const linuxGvproxy = join(ctx.repoRoot, "target", "gvproxy-linux-arm64");
-const gvproxyUrl =
-  "https://github.com/containers/gvisor-tap-vsock/releases/download/v0.8.9/gvproxy-linux-arm64";
 const bunVersion = "1.3.14";
 const linuxBunDir = join(ctx.repoRoot, "target", "bun-linux-aarch64");
 const linuxBun = join(linuxBunDir, "bun");
@@ -444,11 +441,9 @@ function stageNestedToolsScript(extraTools: string[] = []): string[] {
     'rm -rf "$nested_tools"',
     'mkdir -p "$nested_tools"',
     `cp ${quoteShell(linuxLnx)} "$nested_tools/lnx"`,
-    `cp ${quoteShell(linuxGvproxy)} "$nested_tools/gvproxy-linux-arm64"`,
     ...extraTools,
     'chmod +x "$nested_tools"/*',
     'export LNX_BIN="$nested_tools/lnx"',
-    'export GVPROXY_PATH="$nested_tools/gvproxy-linux-arm64"',
   ];
 }
 
@@ -933,19 +928,6 @@ try {
     });
   });
 
-  await skippableTestStep(
-    "prepare Linux gvproxy for nested guest",
-    async () => {
-      if (!existsSync(linuxGvproxy)) {
-        await run(["curl", "-fL", "-o", linuxGvproxy, gvproxyUrl], {
-          cwd: ctx.repoRoot,
-          timeoutMs: 180_000,
-        });
-      }
-      await chmod(linuxGvproxy, 0o755);
-    },
-  );
-
   await skippableTestStep("prepare Linux bun for nested suite", async () => {
     if (!existsSync(linuxBun)) {
       const archive = join(
@@ -986,9 +968,6 @@ try {
     }
     if (!existsSync(rootfs)) {
       throw new Error(`missing rootfs image: ${rootfs}`);
-    }
-    if (!existsSync(linuxGvproxy)) {
-      throw new Error(`missing Linux gvproxy binary: ${linuxGvproxy}`);
     }
     if (!existsSync(linuxBun)) {
       throw new Error(`missing Linux bun binary: ${linuxBun}`);

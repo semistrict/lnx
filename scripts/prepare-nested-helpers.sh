@@ -26,10 +26,3 @@ if [ -n "$release_arg" ]; then
 fi
 cargo_args+=(--target "$linux_target")
 cargo "${cargo_args[@]}"
-
-gvproxy="target/gvproxy-linux-arm64"
-if [ ! -f "$gvproxy" ]; then
-  curl -fL -o "$gvproxy" \
-    https://github.com/containers/gvisor-tap-vsock/releases/download/v0.8.9/gvproxy-linux-arm64
-fi
-chmod +x "$gvproxy"
