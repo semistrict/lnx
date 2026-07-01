@@ -35,12 +35,6 @@ jobs:
             CC_LINUX=/opt/homebrew/bin/aarch64-linux-musl-gcc \
             cargo build --release --target aarch64-unknown-linux-musl
 
-      - name: Download Linux gvproxy helper
-        run: |
-          curl -fL -o target/gvproxy-linux-arm64 \
-            https://github.com/containers/gvisor-tap-vsock/releases/download/v0.8.9/gvproxy-linux-arm64
-          chmod +x target/gvproxy-linux-arm64
-
       - name: Codesign release binary
         run: codesign --entitlements entitlements.plist --force -s - target/release/lnx
 
@@ -49,8 +43,7 @@ jobs:
           mkdir -p dist
           cp target/release/lnx dist/lnx
           cp target/aarch64-unknown-linux-musl/release/lnx dist/lnx-linux-aarch64
-          cp target/gvproxy-linux-arm64 dist/gvproxy-linux-arm64
-          tar -C dist -czf lnx-macos-arm64.tar.gz lnx lnx-linux-aarch64 gvproxy-linux-arm64
+          tar -C dist -czf lnx-macos-arm64.tar.gz lnx lnx-linux-aarch64
           shasum -a 256 lnx-macos-arm64.tar.gz > lnx-macos-arm64.tar.gz.sha256
 
       - name: Upload binary artifact

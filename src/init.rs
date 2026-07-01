@@ -106,10 +106,6 @@ pub fn ensure_nested_linux_lnx(dest: &Path) -> Result<()> {
     download_executable_release(dest, "lnx-linux-aarch64", NESTED_HELPER_IMAGE_VERSION)
 }
 
-pub fn ensure_nested_linux_gvproxy(dest: &Path) -> Result<()> {
-    download_executable_release(dest, "gvproxy-linux-arm64", NESTED_HELPER_IMAGE_VERSION)
-}
-
 /// Installs a caller-supplied kernel image instead of downloading one.
 pub fn install_kernel(layout: &Layout, kernel: &Path) -> Result<()> {
     copy_if_needed(kernel, &layout.kernel, "kernel")

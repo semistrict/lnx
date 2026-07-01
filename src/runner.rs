@@ -2797,19 +2797,19 @@ fn unlock_file(file: &fs::File) -> std::io::Result<()> {
 
 struct Gvproxy {
     socket: PathBuf,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     embedded: Option<crate::gvproxy_embedded::EmbeddedGvproxy>,
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     child: Child,
 }
 
 impl Drop for Gvproxy {
     fn drop(&mut self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             drop(self.embedded.take());
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = self.child.kill();
             let _ = self.child.wait();
@@ -2830,7 +2830,7 @@ fn start_gvproxy(run_dir: &Path) -> Result<Gvproxy> {
     let _ = fs::remove_file(&api_socket);
     let ssh_port = unused_local_port().context("find unused localhost port for gvproxy ssh")?;
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let embedded = crate::gvproxy_embedded::EmbeddedGvproxy::start(&socket, &log, ssh_port)?;
         wait_for_path(&socket, Duration::from_secs(30))
@@ -2841,7 +2841,7 @@ fn start_gvproxy(run_dir: &Path) -> Result<Gvproxy> {
         });
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let gvproxy = resolve_gvproxy_path();
         if !gvproxy.exists() {
@@ -2874,7 +2874,7 @@ fn start_gvproxy(run_dir: &Path) -> Result<Gvproxy> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn resolve_gvproxy_path() -> PathBuf {
     if let Some(path) = std::env::var_os("GVPROXY_PATH") {
         return PathBuf::from(path);
@@ -2885,7 +2885,7 @@ fn resolve_gvproxy_path() -> PathBuf {
     PathBuf::from("/opt/homebrew/opt/podman/libexec/podman/gvproxy")
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&paths) {

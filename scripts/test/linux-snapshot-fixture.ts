@@ -1,7 +1,6 @@
 import {
   existsSync } from "node:fs";
-import { chmod,
-  mkdir,
+import { mkdir,
   readdir,
   readFile,
   rm,
@@ -36,9 +35,6 @@ const linuxLinker =
   Bun.env.CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER ??
   Bun.env.CC_LINUX ??
   "/opt/homebrew/bin/aarch64-linux-musl-gcc";
-const linuxGvproxy = join(ctx.repoRoot, "target", "gvproxy-linux-arm64");
-const gvproxyUrl =
-  "https://github.com/containers/gvisor-tap-vsock/releases/download/v0.8.9/gvproxy-linux-arm64";
 const kernel = Bun.env.LNX_NESTED_INNER_KERNEL ?? join(hostHome, ".lnx", "vmlinuz");
 const outerKernel = Bun.env.LNX_NESTED_OUTER_KERNEL ?? join(hostHome, ".lnx", "vmlinuz");
 const rootfs =
@@ -122,13 +118,6 @@ async function ensureLinuxTools() {
     },
   });
 
-  if (!existsSync(linuxGvproxy)) {
-    await run(["curl", "-fL", "-o", linuxGvproxy, gvproxyUrl], {
-      cwd: ctx.repoRoot,
-      timeoutMs: 180_000,
-    });
-  }
-  await chmod(linuxGvproxy, 0o755);
 }
 
 function outerScript(): string {
@@ -165,10 +154,8 @@ print("linux-source-after", flush=True)
     "rm -rf \"$nested_tools\"",
     "mkdir -p \"$nested_tools\"",
     `cp ${quoteShell(linuxLnx)} "$nested_tools/lnx"`,
-    `cp ${quoteShell(linuxGvproxy)} "$nested_tools/gvproxy-linux-arm64"`,
     "chmod +x \"$nested_tools\"/*",
     "export LNX_BIN=\"$nested_tools/lnx\"",
-    "export GVPROXY_PATH=\"$nested_tools/gvproxy-linux-arm64\"",
     "export LNX_BROKER_IDLE_TTL_MS=250",
     `inner_instance=${quoteShell(innerInstance)}`,
     `checkpointName=${quoteShell(checkpointName)}`,

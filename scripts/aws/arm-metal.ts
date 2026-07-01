@@ -1323,11 +1323,6 @@ systemctl enable --now docker || true
 usermod -aG docker ${sshUser} || true
 usermod -aG kvm ${sshUser} || true
 
-if ! command -v gvproxy >/dev/null 2>&1; then
-  curl -fsSL https://github.com/containers/gvisor-tap-vsock/releases/download/v0.8.9/gvproxy-linux-arm64 -o /usr/local/bin/gvproxy
-  chmod 0755 /usr/local/bin/gvproxy
-fi
-
 if ! command -v bun >/dev/null 2>&1; then
   su - ${sshUser} -c 'curl -fsSL https://bun.sh/install | bash'
 fi
