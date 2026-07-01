@@ -11,6 +11,14 @@ fn musl_target_for_host() -> &'static str {
     }
 }
 
+fn cargo_target_env_key(target: &str, suffix: &str) -> String {
+    format!(
+        "CARGO_TARGET_{}_{}",
+        target.replace('-', "_").to_ascii_uppercase(),
+        suffix
+    )
+}
+
 fn musl_supported(rustc: &str) -> bool {
     let musl_target = musl_target_for_host();
     let output = Command::new(rustc)
@@ -124,6 +132,13 @@ fn build_rust_init() -> PathBuf {
         // flags from the Makefile would be silently ignored. Remove it so
         // the per-target env vars take effect.
         cmd.env_remove("CARGO_ENCODED_RUSTFLAGS");
+
+        let linker_key = cargo_target_env_key(musl_target, "LINKER");
+        if env::var_os(&linker_key).is_none() {
+            if let Some(linker) = env::var_os("CC_LINUX") {
+                cmd.env(linker_key, linker);
+            }
+        }
     }
 
     let mut features: Vec<&str> = Vec::new();
