@@ -88,7 +88,7 @@ try {
       if (exportMacosSnapshot) {
         await waitForVmSuspend(ctx, 120_000);
         const latest = join(ctx.snapshotDir, "latest");
-        for (const file of ["vmstate.bin", "pages.img", "rootfs.ext4", "shares.stamp", "initramfs.stamp"]) {
+        for (const file of ["vmstate.bin", "pages.img", "rootfs.ext4", "launch.json", "initramfs.stamp"]) {
           const path = join(latest, file);
           if (!existsSync(path)) {
             throw new Error(`missing exported macOS snapshot file: ${path}`);
@@ -98,7 +98,7 @@ try {
         await mkdir(exportMacosSnapshot, { recursive: true });
         await cloneSparseImage(join(latest, "rootfs.ext4"), join(exportMacosSnapshot, "rootfs.ext4"));
         await cloneSparseImage(join(latest, "pages.img"), join(exportMacosSnapshot, "pages.img"));
-        for (const file of ["vmstate.bin", "shares.stamp", "initramfs.stamp"]) {
+        for (const file of ["vmstate.bin", "launch.json", "initramfs.stamp"]) {
           await run(["cp", join(latest, file), join(exportMacosSnapshot, file)], { timeoutMs: 180_000 });
         }
         console.log(`LNX_MACOS_SNAPSHOT_FIXTURE=${exportMacosSnapshot}`);

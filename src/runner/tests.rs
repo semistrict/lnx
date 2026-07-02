@@ -499,106 +499,65 @@ fn snapshot_rootfs_promotion_rejects_ext4_errors() {
     );
 }
 
-#[test]
-fn shares_stamp_content_lists_home_cwd_and_network() {
-    assert_eq!(
-        shares_stamp_content_with_cache_stamp(
-            Path::new("/Users/ramon"),
-            None,
-            "net=gvproxy",
-            false,
-            HOST_SHARE_CACHE_NODAX_STAMP,
-        ),
-        "host-share-cache=nodax+close-to-open+writeback+restore-sync-v2\nhome=/Users/ramon\nnet=gvproxy\n"
-    );
-    assert_eq!(
-        shares_stamp_content_with_cache_stamp(
-            Path::new("/Users/ramon"),
-            Some(Path::new("/tmp/build")),
-            "net=other",
-            false,
-            HOST_SHARE_CACHE_NODAX_STAMP,
-        ),
-        "host-share-cache=nodax+close-to-open+writeback+restore-sync-v2\nhome=/Users/ramon\ncwd=/tmp/build\nnet=other\n"
-    );
-    assert_eq!(
-        shares_stamp_content_with_cache_stamp(
-            Path::new("/Users/ramon"),
-            None,
-            "net=gvproxy",
-            true,
-            HOST_SHARE_CACHE_NODAX_STAMP,
-        ),
-        "host-shares=disabled-v1\nnet=gvproxy\n"
-    );
-    assert_eq!(
-        shares_stamp_content_with_cache_stamp(
-            Path::new("/Users/ramon"),
-            None,
-            "net=gvproxy",
-            false,
-            HOST_SHARE_CACHE_DAX_STAMP,
-        ),
-        "host-share-cache=dax+close-to-open+writeback+restore-sync-v2\nhome=/Users/ramon\nnet=gvproxy\n"
-    );
+fn test_launch_metadata(
+    host_home: &str,
+    outside_home_cwd: Option<&str>,
+    no_host_shares: bool,
+    host_share_cache: &str,
+    packages: &str,
+    net: &str,
+    vhost_user_fs: Vec<LaunchVhostUserFsMount>,
+) -> LaunchMetadata {
+    LaunchMetadata {
+        version: 1,
+        owner_args: vec!["lnx".to_string(), "_vm-owner".to_string()],
+        compatibility: LaunchCompatibility {
+            host_share_cache: host_share_cache.to_string(),
+            packages: packages.to_string(),
+            net: net.to_string(),
+        },
+        shares: LaunchShares {
+            no_host_shares,
+            host_home: (!no_host_shares).then(|| PathBuf::from(host_home)),
+            outside_home_cwd: if no_host_shares {
+                None
+            } else {
+                outside_home_cwd.map(PathBuf::from)
+            },
+        },
+        vhost_user_fs,
+    }
 }
 
 #[test]
-fn shares_stamp_content_records_package_store() {
-    assert_eq!(
-        shares_stamp_content_with_cache_and_package_store(
-            Path::new("/Users/ramon"),
-            None,
-            "net=gvproxy",
-            false,
-            HOST_SHARE_CACHE_NODAX_STAMP,
-            "packages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64",
-        ),
-        "host-share-cache=nodax+close-to-open+writeback+restore-sync-v2\nhome=/Users/ramon\npackages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64\nnet=gvproxy\n"
-    );
-}
-
-#[test]
-fn shares_stamp_content_records_vhost_user_fs() {
-    let temp = TempDir::new("snapshot-vhost-user-fs");
+fn launch_metadata_records_vhost_user_fs_and_restart_args() {
+    let temp = TempDir::new("snapshot-vhost-user-fs-json");
     fs::create_dir_all(temp.path()).expect("create snapshot dir");
-    let mounts = vec![VhostUserFsMount {
-        tag: "testfs".to_string(),
-        mountpoint: "/mnt/testfs".to_string(),
-        socket: PathBuf::from("/tmp/testfs.sock"),
-        read_only: true,
-    }];
-    let mut current = shares_stamp_content_with_cache_and_package_store(
-        Path::new("/Users/ramon"),
+    let current = test_launch_metadata(
+        "/Users/ramon",
         None,
-        "net=gvproxy",
         false,
         HOST_SHARE_CACHE_NODAX_STAMP,
         PACKAGE_STORE_DISABLED_STAMP,
-    );
-    append_vhost_user_fs_stamp(&mut current, &mounts);
-
-    assert!(current.contains("vhost-user-fs=testfs:/mnt/testfs:/tmp/testfs.sock:ro\n"));
-    fs::write(temp.path().join("shares.stamp"), &current).expect("write stamp");
-    assert_eq!(snapshot_shares_incompatibility(temp.path(), &current), None);
-
-    let mut changed_socket = shares_stamp_content_with_cache_and_package_store(
-        Path::new("/Users/ramon"),
-        None,
         "net=gvproxy",
-        false,
-        HOST_SHARE_CACHE_NODAX_STAMP,
-        PACKAGE_STORE_DISABLED_STAMP,
-    );
-    append_vhost_user_fs_stamp(
-        &mut changed_socket,
-        &[VhostUserFsMount {
-            socket: PathBuf::from("/tmp/other.sock"),
-            ..mounts[0].clone()
+        vec![LaunchVhostUserFsMount {
+            tag: "testfs".to_string(),
+            mount: "/mnt/testfs".to_string(),
+            socket: PathBuf::from("/tmp/testfs.sock"),
+            read_only: true,
         }],
     );
+    write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &current)
+        .expect("write launch metadata");
+    let raw = fs::read_to_string(temp.path().join(LAUNCH_METADATA)).expect("read launch metadata");
+    assert!(raw.contains("owner_args"));
+    assert!(raw.contains("vhost_user_fs"));
+    assert_eq!(snapshot_launch_incompatibility(temp.path(), &current), None);
+
+    let mut changed_socket = current.clone();
+    changed_socket.vhost_user_fs[0].socket = PathBuf::from("/tmp/other.sock");
     assert_eq!(
-        snapshot_shares_incompatibility(temp.path(), &changed_socket),
+        snapshot_launch_incompatibility(temp.path(), &changed_socket),
         Some(
             "share_mismatch: vhost-user-fs: snapshot=testfs:/mnt/testfs:/tmp/testfs.sock:ro current=testfs:/mnt/testfs:/tmp/other.sock:ro"
                 .to_string()
@@ -607,173 +566,161 @@ fn shares_stamp_content_records_vhost_user_fs() {
 }
 
 #[test]
-fn snapshot_shares_compatibility_requires_identical_stamp() {
-    let temp = TempDir::new("snapshot-shares");
+fn snapshot_launch_compatibility_requires_matching_json() {
+    let temp = TempDir::new("snapshot-launch-json");
     fs::create_dir_all(temp.path()).expect("create snapshot dir");
-    let current = shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", false);
-
-    // A snapshot from before share/cache-policy stamping may preserve
-    // unsafe host-file cache state, so it must not memory-restore.
-    assert_eq!(
-        snapshot_shares_incompatibility(temp.path(), &current),
-        Some(
-            "host_share_cache_policy: snapshot has no host-share/network compatibility stamp"
-                .to_string()
-        )
-    );
-
-    fs::write(temp.path().join("shares.stamp"), &current).expect("write stamp");
-    assert_eq!(snapshot_shares_incompatibility(temp.path(), &current), None);
-
-    let legacy_keep_cache = "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\nnet=gvproxy\n";
-    fs::write(temp.path().join("shares.stamp"), legacy_keep_cache).expect("write stamp");
-    assert_eq!(
-        snapshot_shares_incompatibility(temp.path(), &current),
-        Some(
-            "share_mismatch: host-share-cache: snapshot=nodax+keep-cache+writeback+restore-sync-v1 current=nodax+close-to-open+writeback+restore-sync-v2"
-                .to_string()
-        )
-    );
-
-    let legacy_cache_policy = "home=/Users/ramon\nnet=gvproxy\n";
-    fs::write(temp.path().join("shares.stamp"), legacy_cache_policy).expect("write stamp");
-    assert_eq!(
-            snapshot_shares_incompatibility(temp.path(), &current),
-            Some(
-                "host_share_cache_policy: snapshot was created before host-share cache policy was recorded"
-                    .to_string()
-            )
-        );
-
-    let drifted = shares_stamp_content(Path::new("/home/ramon"), None, "net=gvproxy", false);
-    fs::write(temp.path().join("shares.stamp"), &current).expect("write stamp");
-    assert_eq!(
-        snapshot_shares_incompatibility(temp.path(), &drifted),
-        Some("share_mismatch: home: snapshot=/Users/ramon current=/home/ramon".to_string())
-    );
-
-    // The same shares on a different network backing must not restore.
-    let renetworked = shares_stamp_content(Path::new("/Users/ramon"), None, "net=other", false);
-    assert_eq!(
-        snapshot_shares_incompatibility(temp.path(), &renetworked),
-        Some("share_mismatch: net: snapshot=gvproxy current=other".to_string())
-    );
-
-    let disabled = shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", true);
-    fs::write(temp.path().join("shares.stamp"), &disabled).expect("write stamp");
-    assert_eq!(
-        snapshot_shares_incompatibility(temp.path(), &disabled),
-        None
-    );
-
-    assert_eq!(
-            snapshot_shares_incompatibility(temp.path(), &current),
-            Some(
-                "share_mismatch: host-shares: snapshot=disabled current=enabled; host-share-cache: snapshot=<absent> current=nodax+close-to-open+writeback+restore-sync-v2; home: snapshot=<absent> current=/Users/ramon"
-                    .to_string()
-            )
-        );
-
-    fs::write(temp.path().join("shares.stamp"), &current).expect("write stamp");
-    assert_eq!(
-            snapshot_shares_incompatibility(temp.path(), &disabled),
-            Some(
-                "share_mismatch: host-shares: snapshot=enabled current=disabled; host-share-cache: snapshot=nodax+close-to-open+writeback+restore-sync-v2 current=<absent>; home: snapshot=/Users/ramon current=<absent>"
-                    .to_string()
-            )
-        );
-
-    let dax_current = shares_stamp_content_with_cache_stamp(
-        Path::new("/Users/ramon"),
+    let current = test_launch_metadata(
+        "/Users/ramon",
         None,
-        "net=gvproxy",
-        false,
-        HOST_SHARE_CACHE_DAX_STAMP,
-    );
-    assert_eq!(
-            snapshot_shares_incompatibility(temp.path(), &dax_current),
-            Some(
-                "share_mismatch: host-share-cache: snapshot=nodax+close-to-open+writeback+restore-sync-v2 current=dax+close-to-open+writeback+restore-sync-v2"
-                    .to_string()
-            )
-        );
-}
-
-#[test]
-fn snapshot_shares_compatibility_requires_matching_package_store() {
-    let temp = TempDir::new("snapshot-package-shares");
-    fs::create_dir_all(temp.path()).expect("create snapshot dir");
-    let disabled = shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", false);
-    let enabled = shares_stamp_content_with_cache_and_package_store(
-        Path::new("/Users/ramon"),
-        None,
-        "net=gvproxy",
-        false,
-        HOST_SHARE_CACHE_NODAX_STAMP,
-        "packages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64",
-    );
-
-    fs::write(temp.path().join("shares.stamp"), &disabled).expect("write stamp");
-    assert_eq!(
-        snapshot_shares_incompatibility(temp.path(), &enabled),
-        Some(
-            "share_mismatch: packages: snapshot=disabled-v1 current=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64"
-                .to_string()
-        )
-    );
-
-    let disabled_with_explicit_package = shares_stamp_content_with_cache_and_package_store(
-        Path::new("/Users/ramon"),
-        None,
-        "net=gvproxy",
         false,
         HOST_SHARE_CACHE_NODAX_STAMP,
         PACKAGE_STORE_DISABLED_STAMP,
+        "net=gvproxy",
+        Vec::new(),
     );
-    fs::write(
-        temp.path().join("shares.stamp"),
-        &disabled_with_explicit_package,
-    )
-    .expect("write stamp");
+
     assert_eq!(
-        snapshot_shares_incompatibility(temp.path(), &disabled),
+        snapshot_launch_incompatibility(temp.path(), &current),
+        Some("launch_metadata: snapshot has no launch.json".to_string())
+    );
+
+    write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &current)
+        .expect("write launch metadata");
+    assert_eq!(snapshot_launch_incompatibility(temp.path(), &current), None);
+
+    let mut drifted_home = current.clone();
+    drifted_home.shares.host_home = Some(PathBuf::from("/home/ramon"));
+    assert_eq!(
+        snapshot_launch_incompatibility(temp.path(), &drifted_home),
+        Some("share_mismatch: home: snapshot=/Users/ramon current=/home/ramon".to_string())
+    );
+
+    let mut renetworked = current.clone();
+    renetworked.compatibility.net = "net=other".to_string();
+    assert_eq!(
+        snapshot_launch_incompatibility(temp.path(), &renetworked),
+        Some("share_mismatch: net: snapshot=net=gvproxy current=net=other".to_string())
+    );
+
+    let disabled = test_launch_metadata(
+        "/Users/ramon",
+        None,
+        true,
+        HOST_SHARE_CACHE_NODAX_STAMP,
+        PACKAGE_STORE_DISABLED_STAMP,
+        "net=gvproxy",
+        Vec::new(),
+    );
+    write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &disabled)
+        .expect("write disabled launch metadata");
+    assert_eq!(
+        snapshot_launch_incompatibility(temp.path(), &disabled),
         None
     );
+    assert_eq!(
+        snapshot_launch_incompatibility(temp.path(), &current),
+        Some(
+            "share_mismatch: host-shares: snapshot=disabled current=enabled; home: snapshot=<absent> current=/Users/ramon"
+                .to_string()
+        )
+    );
+
+    write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &current)
+        .expect("write launch metadata");
+    let mut dax_current = current.clone();
+    dax_current.compatibility.host_share_cache = HOST_SHARE_CACHE_DAX_STAMP.to_string();
+    assert_eq!(
+        snapshot_launch_incompatibility(temp.path(), &dax_current),
+        Some(
+            "share_mismatch: host-share-cache: snapshot=host-share-cache=nodax+close-to-open+writeback+restore-sync-v2 current=host-share-cache=dax+close-to-open+writeback+restore-sync-v2"
+                .to_string()
+        )
+    );
 }
 
 #[test]
-fn snapshot_shares_compatibility_tolerates_cwd_share_changes() {
-    let temp = TempDir::new("snapshot-shares-cwd");
+fn snapshot_launch_compatibility_requires_matching_package_store() {
+    let temp = TempDir::new("snapshot-package-launch");
     fs::create_dir_all(temp.path()).expect("create snapshot dir");
-    let snapshot = shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", false);
-    let current = shares_stamp_content(
-        Path::new("/Users/ramon"),
-        Some(Path::new("/private/tmp")),
-        "net=gvproxy",
+    let disabled = test_launch_metadata(
+        "/Users/ramon",
+        None,
         false,
+        HOST_SHARE_CACHE_NODAX_STAMP,
+        PACKAGE_STORE_DISABLED_STAMP,
+        "net=gvproxy",
+        Vec::new(),
+    );
+    let enabled = test_launch_metadata(
+        "/Users/ramon",
+        None,
+        false,
+        HOST_SHARE_CACHE_NODAX_STAMP,
+        "packages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64",
+        "net=gvproxy",
+        Vec::new(),
     );
 
-    fs::write(temp.path().join("shares.stamp"), snapshot).expect("write stamp");
-    assert_eq!(snapshot_shares_incompatibility(temp.path(), &current), None);
+    write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &disabled)
+        .expect("write launch metadata");
+    assert_eq!(
+        snapshot_launch_incompatibility(temp.path(), &enabled),
+        Some(
+            "share_mismatch: packages: snapshot=packages=disabled-v1 current=packages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64"
+                .to_string()
+        )
+    );
 }
 
 #[test]
-fn snapshot_share_layout_reads_recorded_share_dirs() {
-    let temp = TempDir::new("snapshot-share-layout");
+fn snapshot_launch_compatibility_tolerates_cwd_share_changes() {
+    let temp = TempDir::new("snapshot-launch-cwd");
     fs::create_dir_all(temp.path()).expect("create snapshot dir");
-    let stamp = shares_stamp_content(
-        Path::new("/Users/ramon"),
-        Some(Path::new("/tmp/build")),
-        "net=gvproxy",
+    let snapshot = test_launch_metadata(
+        "/Users/ramon",
+        None,
         false,
+        HOST_SHARE_CACHE_NODAX_STAMP,
+        PACKAGE_STORE_DISABLED_STAMP,
+        "net=gvproxy",
+        Vec::new(),
     );
-    fs::write(temp.path().join("shares.stamp"), &stamp).expect("write stamp");
+    let current = test_launch_metadata(
+        "/Users/ramon",
+        Some("/private/tmp"),
+        false,
+        HOST_SHARE_CACHE_NODAX_STAMP,
+        PACKAGE_STORE_DISABLED_STAMP,
+        "net=gvproxy",
+        Vec::new(),
+    );
+
+    write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &snapshot)
+        .expect("write launch metadata");
+    assert_eq!(snapshot_launch_incompatibility(temp.path(), &current), None);
+}
+
+#[test]
+fn snapshot_share_layout_reads_recorded_launch_metadata() {
+    let temp = TempDir::new("snapshot-share-layout-json");
+    fs::create_dir_all(temp.path()).expect("create snapshot dir");
+    let metadata = test_launch_metadata(
+        "/Users/ramon",
+        Some("/tmp/build"),
+        false,
+        HOST_SHARE_CACHE_NODAX_STAMP,
+        PACKAGE_STORE_DISABLED_STAMP,
+        "net=gvproxy",
+        Vec::new(),
+    );
+    write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &metadata)
+        .expect("write launch metadata");
 
     let layout = snapshot_share_layout(temp.path())
         .expect("read layout")
         .expect("layout");
 
-    assert_eq!(layout.stamp, stamp);
+    assert_eq!(layout.metadata, metadata);
     assert_eq!(
         layout.layout,
         ShareLayout {

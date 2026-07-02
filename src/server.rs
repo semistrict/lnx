@@ -1403,19 +1403,19 @@ fn validate_imported_snapshot_manifest(
         return Ok(());
     }
     let shares_path = format!(
-        "instances/{}/memory-snapshots/latest/shares.stamp",
+        "instances/{}/memory-snapshots/latest/launch.json",
         manifest.source_instance
     );
     let Some(shares_file) = manifest.files.iter().find(|file| file.path == shares_path) else {
         bail!(
-            "snapshot cannot be restored on this server because its host-share/network settings differ (host_share_cache_policy); push a fresh checkpoint created for this server or remove the snapshot before pushing ({shares_path})"
+            "snapshot cannot be restored on this server because its launch metadata is missing; push a fresh checkpoint created for this server or remove the snapshot before pushing ({shares_path})"
         );
     };
     let temp = tempfile::Builder::new()
-        .prefix("lnx-cas-shares-")
+        .prefix("lnx-cas-launch-")
         .tempdir()
-        .context("create shares stamp tempdir")?;
-    let stamp = temp.path().join("shares.stamp");
+        .context("create launch metadata tempdir")?;
+    let stamp = temp.path().join("launch.json");
     reconstruct_cas_file(shares_file, &stamp)?;
     let cwd = std::env::current_dir().context("current directory")?;
     if let Some(reason) =
@@ -1553,7 +1553,7 @@ fn validate_imported_snapshot(imported: &Path, state: &AppState) -> Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("unknown");
-    let logical_stamp = format!("instances/{source_instance}/memory-snapshots/latest/shares.stamp");
+    let logical_stamp = format!("instances/{source_instance}/memory-snapshots/latest/launch.json");
     let cwd = std::env::current_dir().context("current directory")?;
     if let Some(reason) = runner::snapshot_shares_incompatibility_for_import(
         &latest_snapshot,

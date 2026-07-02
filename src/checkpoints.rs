@@ -193,7 +193,7 @@ fn clone_snapshot_dir(src: &Path, dest: &Path) -> Result<()> {
         "snapshot.meta",
         "checkpoint.meta",
         "initramfs.stamp",
-        "shares.stamp",
+        "launch.json",
     ] {
         let src_file = src.join(name);
         if src_file.exists() {

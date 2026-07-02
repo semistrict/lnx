@@ -25,6 +25,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use libkrun::{Error as KrunError, Kernel, Network, VmBuilder, VmHandle};
 use lnx_protocol::{MAX_MESSAGE_SIZE, Message, PROTOCOL_VERSION};
 use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -72,6 +73,7 @@ const DETERMINISTIC_TIMER_JUMPS_CURSOR: &str = "deterministic-timer-jumps.cursor
 const RESTORE_WORK_SNAPSHOT: &str = ".restore-work";
 const RUN_ID_ENV: &str = "LNX_RUN_ID";
 const SNAPSHOT_LIFECYCLE_META: &str = "snapshot.meta";
+const LAUNCH_METADATA: &str = "launch.json";
 static SIGNAL_INIT: Once = Once::new();
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static LIFECYCLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -321,40 +323,20 @@ pub fn validate_runtime_deterministic_compatibility(
 }
 
 fn validate_runtime_share_compatibility(config: &RunConfig) -> Result<()> {
-    let current = current_shares_stamp_for_config(config, "net=gvproxy")?;
-    let stamp_path = config.layout.run_dir.join("shares.stamp");
-    match fs::read_to_string(&stamp_path) {
-        Ok(stamp) if shares_stamps_match_ignoring_cwd(&stamp, &current) => Ok(()),
-        Ok(stamp) => bail!(
-            "running VM host-share/network stamp is incompatible ({}): {}",
-            describe_shares_stamp_mismatch(&stamp, &current),
-            stamp_path.display()
+    let current = launch_metadata_for_config(config, "net=gvproxy")?;
+    let path = config.layout.run_dir.join(LAUNCH_METADATA);
+    match read_launch_metadata(&config.layout.run_dir) {
+        Ok(metadata) if launch_metadata_matches_ignoring_cwd(&metadata, &current) => Ok(()),
+        Ok(metadata) => bail!(
+            "running VM launch metadata is incompatible ({}): {}",
+            describe_launch_mismatch(&metadata, &current),
+            path.display()
         ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
-            "running VM has no host-share/network compatibility stamp: {}",
-            stamp_path.display()
-        ),
-        Err(e) => Err(e).with_context(|| format!("read {}", stamp_path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("running VM has no launch metadata: {}", path.display())
+        }
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
     }
-}
-
-fn current_shares_stamp_for_config(config: &RunConfig, net_stamp_line: &str) -> Result<String> {
-    let host_home = host_home_for_cwd(&config.cwd)?;
-    let outside_home_cwd = (!config.cwd.starts_with(&host_home)).then(|| config.cwd.clone());
-    let package_store_stamp = package_store_stamp_line(
-        &config.layout.base,
-        config.package_store,
-        config.no_host_shares,
-    )?;
-    let mut stamp = shares_stamp_content_with_package_store(
-        &host_home,
-        outside_home_cwd.as_deref(),
-        net_stamp_line,
-        config.no_host_shares,
-        &package_store_stamp,
-    );
-    append_vhost_user_fs_stamp(&mut stamp, &config.vhost_user_fs);
-    Ok(stamp)
 }
 
 fn prepare_fresh_owner_slot(
@@ -786,29 +768,30 @@ fn start_vm(
     let current_host_home = host_home_for_cwd(&config.cwd)?;
     let current_outside_home_cwd =
         (!config.cwd.starts_with(&current_host_home)).then(|| config.cwd.clone());
-    let current_shares_stamp = current_shares_stamp_for_config(config, &network.stamp_line())?;
+    let current_launch_metadata = launch_metadata_for_config(config, &network.stamp_line())?;
     let mut share_layout = ShareLayout {
         host_home: current_host_home,
         outside_home_cwd: current_outside_home_cwd,
         no_host_shares: config.no_host_shares,
     };
-    let mut shares_stamp = current_shares_stamp.clone();
+    let mut launch_metadata = current_launch_metadata.clone();
     if let Some(snapshot) = &config.restore_snapshot {
         if let Some(snapshot_share_layout) = snapshot_share_layout(snapshot)? {
-            if shares_stamps_match_ignoring_cwd(&snapshot_share_layout.stamp, &current_shares_stamp)
-            {
+            if launch_metadata_matches_ignoring_cwd(
+                &snapshot_share_layout.metadata,
+                &current_launch_metadata,
+            ) {
                 run_log.line(format!(
                     "snapshot.shares.restore_layout path={}",
-                    snapshot.join("shares.stamp").display()
+                    snapshot.join(LAUNCH_METADATA).display()
                 ));
-                shares_stamp = snapshot_share_layout.stamp;
+                launch_metadata = snapshot_share_layout.metadata;
                 share_layout = snapshot_share_layout.layout;
             }
         }
     }
-    let shares_stamp_path = config.layout.run_dir.join("shares.stamp");
-    fs::write(&shares_stamp_path, &shares_stamp)
-        .with_context(|| format!("write {}", shares_stamp_path.display()))?;
+    let launch_metadata_path = config.layout.run_dir.join(LAUNCH_METADATA);
+    write_launch_metadata(&launch_metadata_path, &launch_metadata)?;
     let deterministic_stamp = deterministic_stamp_content(config.deterministic.as_ref());
     let deterministic_stamp_path = config.layout.run_dir.join("deterministic.stamp");
     fs::write(&deterministic_stamp_path, &deterministic_stamp)
@@ -881,10 +864,10 @@ fn start_vm(
                 initramfs_stamp.display()
             ));
         }
-        if let Some(reason) = snapshot_shares_incompatibility(snapshot, &shares_stamp) {
+        if let Some(reason) = snapshot_launch_incompatibility(snapshot, &launch_metadata) {
             bail!(
-                "snapshot host-share/network stamp is incompatible ({reason}): {}\nrecovery: lnx --instance {} snapshots clear",
-                snapshot.join("shares.stamp").display(),
+                "snapshot launch metadata is incompatible ({reason}): {}\nrecovery: lnx --instance {} snapshots clear",
+                snapshot.join(LAUNCH_METADATA).display(),
                 config.layout.instance
             );
         }
@@ -2142,11 +2125,6 @@ const HOST_SHARE_CACHE_DAX_STAMP: &str =
     "host-share-cache=dax+close-to-open+writeback+restore-sync-v2";
 const HOST_SHARE_CACHE_NODAX_STAMP: &str =
     "host-share-cache=nodax+close-to-open+writeback+restore-sync-v2";
-const LEGACY_HOST_SHARE_CACHE_DAX_KEEP_CACHE_STAMP: &str =
-    "host-share-cache=dax+keep-cache+writeback+restore-sync-v1";
-const LEGACY_HOST_SHARE_CACHE_NODAX_KEEP_CACHE_STAMP: &str =
-    "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1";
-const HOST_SHARES_DISABLED_STAMP: &str = "host-shares=disabled-v1";
 const PACKAGE_STORE_DISABLED_STAMP: &str = "packages=disabled-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2157,8 +2135,40 @@ struct ShareLayout {
 }
 
 struct SnapshotShareLayout {
-    stamp: String,
+    metadata: LaunchMetadata,
     layout: ShareLayout,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct LaunchMetadata {
+    version: u32,
+    owner_args: Vec<String>,
+    compatibility: LaunchCompatibility,
+    shares: LaunchShares,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    vhost_user_fs: Vec<LaunchVhostUserFsMount>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct LaunchCompatibility {
+    host_share_cache: String,
+    packages: String,
+    net: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct LaunchShares {
+    no_host_shares: bool,
+    host_home: Option<PathBuf>,
+    outside_home_cwd: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct LaunchVhostUserFsMount {
+    tag: String,
+    mount: String,
+    socket: PathBuf,
+    read_only: bool,
 }
 
 // A restored guest keeps its snapshot-time share mounts, network
@@ -2168,133 +2178,116 @@ struct SnapshotShareLayout {
 // host directory, a drifted network would strand the guest's addresses, and an
 // old cache policy can preserve stale host-file contents or size after the
 // host changed while the VM was stopped.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-fn shares_stamp_content(
-    host_home: &Path,
-    outside_home_cwd: Option<&Path>,
-    net_stamp_line: &str,
+fn launch_metadata_for_config(config: &RunConfig, net_stamp_line: &str) -> Result<LaunchMetadata> {
+    let host_home = host_home_for_cwd(&config.cwd)?;
+    let outside_home_cwd = (!config.cwd.starts_with(&host_home)).then(|| config.cwd.clone());
+    let package_store = package_store_stamp_line(
+        &config.layout.base,
+        config.package_store,
+        config.no_host_shares,
+    )?;
+    Ok(launch_metadata_for_parts(
+        config,
+        host_home,
+        outside_home_cwd,
+        config.no_host_shares,
+        host_share_cache_stamp().to_string(),
+        package_store,
+        net_stamp_line.to_string(),
+    ))
+}
+
+fn launch_metadata_for_parts(
+    config: &RunConfig,
+    host_home: PathBuf,
+    outside_home_cwd: Option<PathBuf>,
     no_host_shares: bool,
-) -> String {
-    let host_share_cache_stamp = if crate::krun::host_share_dax_enabled() {
+    host_share_cache: String,
+    packages: String,
+    net: String,
+) -> LaunchMetadata {
+    LaunchMetadata {
+        version: 1,
+        owner_args: owner_restart_args(config),
+        compatibility: LaunchCompatibility {
+            host_share_cache,
+            packages,
+            net,
+        },
+        shares: LaunchShares {
+            no_host_shares,
+            host_home: (!no_host_shares).then_some(host_home),
+            outside_home_cwd: if no_host_shares {
+                None
+            } else {
+                outside_home_cwd
+            },
+        },
+        vhost_user_fs: config
+            .vhost_user_fs
+            .iter()
+            .map(|mount| LaunchVhostUserFsMount {
+                tag: mount.tag.clone(),
+                mount: mount.mountpoint.clone(),
+                socket: mount.socket.clone(),
+                read_only: mount.read_only,
+            })
+            .collect(),
+    }
+}
+
+fn owner_restart_args(config: &RunConfig) -> Vec<String> {
+    let mut args = vec![
+        "--instance".to_string(),
+        config.layout.instance.clone(),
+        "--kernel".to_string(),
+        config.layout.kernel.display().to_string(),
+        "--rootfs".to_string(),
+        config.layout.rootfs.display().to_string(),
+        "--cpus".to_string(),
+        config.cpus.to_string(),
+        "--memory-mib".to_string(),
+        config.memory_mib.to_string(),
+    ];
+    if config.nested_kvm {
+        args.push("--nested-kvm".to_string());
+    }
+    if config.no_host_shares {
+        args.push("--no-host-shares".to_string());
+    }
+    if let Some(deterministic) = &config.deterministic {
+        args.push("--deterministic".to_string());
+        args.push(deterministic.seed.clone());
+    }
+    if config.trace_events {
+        args.push("--trace-events".to_string());
+    }
+    for forward in &config.forwards {
+        args.push("--forward".to_string());
+        args.push(forward_spec(forward));
+    }
+    for mount in &config.vhost_user_fs {
+        args.push("--vhost-user-fs".to_string());
+        args.push(vhost_user_fs_arg(mount));
+    }
+    args.push("_vm-owner".to_string());
+    args.push("--cwd".to_string());
+    args.push(config.cwd.display().to_string());
+    args.push("--package-store".to_string());
+    args.push(config.package_store.as_arg().to_string());
+    if let Some(snapshot) = &config.restore_snapshot {
+        args.push("--restore".to_string());
+        args.push(snapshot.display().to_string());
+    }
+    args
+}
+
+fn host_share_cache_stamp() -> &'static str {
+    if crate::krun::host_share_dax_enabled() {
         HOST_SHARE_CACHE_DAX_STAMP
     } else {
         HOST_SHARE_CACHE_NODAX_STAMP
-    };
-    shares_stamp_content_with_cache_stamp(
-        host_home,
-        outside_home_cwd,
-        net_stamp_line,
-        no_host_shares,
-        host_share_cache_stamp,
-    )
-}
-
-fn shares_stamp_content_with_package_store(
-    host_home: &Path,
-    outside_home_cwd: Option<&Path>,
-    net_stamp_line: &str,
-    no_host_shares: bool,
-    package_store_stamp_line: &str,
-) -> String {
-    let host_share_cache_stamp = if crate::krun::host_share_dax_enabled() {
-        HOST_SHARE_CACHE_DAX_STAMP
-    } else {
-        HOST_SHARE_CACHE_NODAX_STAMP
-    };
-    shares_stamp_content_with_cache_and_package_store(
-        host_home,
-        outside_home_cwd,
-        net_stamp_line,
-        no_host_shares,
-        host_share_cache_stamp,
-        package_store_stamp_line,
-    )
-}
-
-fn append_vhost_user_fs_stamp(stamp: &mut String, mounts: &[VhostUserFsMount]) {
-    if mounts.is_empty() {
-        return;
     }
-    stamp.push_str("vhost-user-fs=");
-    stamp.push_str(&vhost_user_fs_stamp_value(mounts));
-    stamp.push('\n');
-}
-
-fn vhost_user_fs_stamp_value(mounts: &[VhostUserFsMount]) -> String {
-    let mut entries = mounts
-        .iter()
-        .map(|mount| {
-            format!(
-                "{}:{}:{}:{}",
-                mount.tag,
-                mount.mountpoint,
-                mount.socket.display(),
-                if mount.read_only { "ro" } else { "rw" }
-            )
-        })
-        .collect::<Vec<_>>();
-    entries.sort();
-    entries.join(";")
-}
-
-fn vhost_user_fs_guest_env(mounts: &[VhostUserFsMount]) -> String {
-    mounts
-        .iter()
-        .map(|mount| {
-            format!(
-                "{}:{}:{}",
-                mount.tag,
-                mount.mountpoint,
-                if mount.read_only { "ro" } else { "rw" }
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(";")
-}
-
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-fn shares_stamp_content_with_cache_stamp(
-    host_home: &Path,
-    outside_home_cwd: Option<&Path>,
-    net_stamp_line: &str,
-    no_host_shares: bool,
-    host_share_cache_stamp: &str,
-) -> String {
-    if no_host_shares {
-        return format!("{HOST_SHARES_DISABLED_STAMP}\n{net_stamp_line}\n");
-    }
-    let mut content = format!("{host_share_cache_stamp}\nhome={}\n", host_home.display());
-    if let Some(cwd) = outside_home_cwd {
-        content.push_str(&format!("cwd={}\n", cwd.display()));
-    }
-    content.push_str(net_stamp_line);
-    content.push('\n');
-    content
-}
-
-fn shares_stamp_content_with_cache_and_package_store(
-    host_home: &Path,
-    outside_home_cwd: Option<&Path>,
-    net_stamp_line: &str,
-    no_host_shares: bool,
-    host_share_cache_stamp: &str,
-    package_store_stamp_line: &str,
-) -> String {
-    if no_host_shares {
-        return format!(
-            "{HOST_SHARES_DISABLED_STAMP}\n{package_store_stamp_line}\n{net_stamp_line}\n"
-        );
-    }
-    let mut content = format!(
-        "{host_share_cache_stamp}\nhome={}\n{package_store_stamp_line}\n",
-        host_home.display()
-    );
-    if let Some(cwd) = outside_home_cwd {
-        content.push_str(&format!("cwd={}\n", cwd.display()));
-    }
-    content.push_str(net_stamp_line);
-    content.push('\n');
-    content
 }
 
 fn package_store_stamp_line(
@@ -2338,134 +2331,152 @@ pub fn snapshot_shares_incompatibility_for_import(
 ) -> Result<Option<String>> {
     let host_home = host_home_for_cwd(cwd)?;
     let outside_home_cwd = (!cwd.starts_with(&host_home)).then(|| cwd.to_path_buf());
-    let shares_stamp = shares_stamp_content(
-        &host_home,
-        outside_home_cwd.as_deref(),
-        "net=gvproxy",
-        no_host_shares,
-    );
-    Ok(snapshot_shares_incompatibility(
-        snapshot_path,
-        &shares_stamp,
-    ))
+    let current = LaunchMetadata {
+        version: 1,
+        owner_args: Vec::new(),
+        compatibility: LaunchCompatibility {
+            host_share_cache: host_share_cache_stamp().to_string(),
+            packages: PACKAGE_STORE_DISABLED_STAMP.to_string(),
+            net: "net=gvproxy".to_string(),
+        },
+        shares: LaunchShares {
+            no_host_shares,
+            host_home: (!no_host_shares).then_some(host_home),
+            outside_home_cwd: if no_host_shares {
+                None
+            } else {
+                outside_home_cwd
+            },
+        },
+        vhost_user_fs: Vec::new(),
+    };
+    Ok(snapshot_launch_incompatibility(snapshot_path, &current))
 }
 
-fn snapshot_shares_incompatibility(snapshot_path: &Path, current: &str) -> Option<String> {
-    match fs::read_to_string(snapshot_path.join("shares.stamp")) {
-        Ok(stamp) if stamp == current => None,
-        Ok(stamp)
-            if !stamp.lines().any(|line| {
-                line == HOST_SHARE_CACHE_DAX_STAMP
-                    || line == HOST_SHARE_CACHE_NODAX_STAMP
-                    || line == LEGACY_HOST_SHARE_CACHE_DAX_KEEP_CACHE_STAMP
-                    || line == LEGACY_HOST_SHARE_CACHE_NODAX_KEEP_CACHE_STAMP
-                    || line == HOST_SHARES_DISABLED_STAMP
-            }) =>
-        {
-            Some("host_share_cache_policy: snapshot was created before host-share cache policy was recorded".to_string())
+fn snapshot_launch_incompatibility(
+    snapshot_path: &Path,
+    current: &LaunchMetadata,
+) -> Option<String> {
+    match read_launch_metadata(snapshot_path) {
+        Ok(snapshot) if launch_metadata_matches_ignoring_cwd(&snapshot, current) => None,
+        Ok(snapshot) => Some(describe_launch_mismatch(&snapshot, current)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Some("launch_metadata: snapshot has no launch.json".to_string())
         }
-        Ok(stamp) if shares_stamps_match_ignoring_cwd(&stamp, current) => None,
-        Ok(stamp) => Some(describe_shares_stamp_mismatch(&stamp, current)),
-        // Missing stamps predate the host-share cache-policy stamp. Do not
-        // memory-restore them: the guest may hold stale page-cache, inode-size,
-        // or dentry state for host-owned files.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(
-            "host_share_cache_policy: snapshot has no host-share/network compatibility stamp"
-                .to_string(),
-        ),
-        Err(e) => Some(format!("shares_stamp_unreadable: {e}")),
+        Err(e) => Some(format!("launch_metadata_unreadable: {e}")),
     }
 }
 
-fn describe_shares_stamp_mismatch(snapshot: &str, current: &str) -> String {
-    let snapshot_fields = parse_shares_stamp(snapshot);
-    let current_fields = parse_shares_stamp(current);
+fn describe_launch_mismatch(snapshot: &LaunchMetadata, current: &LaunchMetadata) -> String {
     let mut mismatches = Vec::new();
-
-    let snapshot_disabled = snapshot_fields.contains_key("host-shares");
-    let current_disabled = current_fields.contains_key("host-shares");
-    if snapshot_disabled != current_disabled {
+    if snapshot.shares.no_host_shares != current.shares.no_host_shares {
         mismatches.push(format!(
             "host-shares: snapshot={} current={}",
-            if snapshot_disabled {
+            if snapshot.shares.no_host_shares {
                 "disabled"
             } else {
                 "enabled"
             },
-            if current_disabled {
+            if current.shares.no_host_shares {
                 "disabled"
             } else {
                 "enabled"
             }
         ));
     }
-
-    for key in [
-        "host-share-cache",
-        "home",
-        "packages",
-        "net",
-        "vhost-user-fs",
-    ] {
-        let snapshot_value = share_stamp_field_value(&snapshot_fields, key);
-        let current_value = share_stamp_field_value(&current_fields, key);
-        if snapshot_value != current_value {
-            mismatches.push(format!(
-                "{key}: snapshot={snapshot_value} current={current_value}"
-            ));
-        }
+    if snapshot.compatibility.host_share_cache != current.compatibility.host_share_cache {
+        mismatches.push(format!(
+            "host-share-cache: snapshot={} current={}",
+            snapshot.compatibility.host_share_cache, current.compatibility.host_share_cache
+        ));
     }
-
+    if snapshot.shares.host_home != current.shares.host_home {
+        mismatches.push(format!(
+            "home: snapshot={} current={}",
+            optional_path_display(snapshot.shares.host_home.as_deref()),
+            optional_path_display(current.shares.host_home.as_deref())
+        ));
+    }
+    if snapshot.compatibility.packages != current.compatibility.packages {
+        mismatches.push(format!(
+            "packages: snapshot={} current={}",
+            snapshot.compatibility.packages, current.compatibility.packages
+        ));
+    }
+    if snapshot.compatibility.net != current.compatibility.net {
+        mismatches.push(format!(
+            "net: snapshot={} current={}",
+            snapshot.compatibility.net, current.compatibility.net
+        ));
+    }
+    if normalized_vhost_user_fs(&snapshot.vhost_user_fs)
+        != normalized_vhost_user_fs(&current.vhost_user_fs)
+    {
+        mismatches.push(format!(
+            "vhost-user-fs: snapshot={} current={}",
+            vhost_user_fs_launch_value(&snapshot.vhost_user_fs),
+            vhost_user_fs_launch_value(&current.vhost_user_fs)
+        ));
+    }
     if mismatches.is_empty() {
-        "share_mismatch: snapshot and current stamps differ only in unrecognized fields".to_string()
+        "share_mismatch: launch metadata differs only in ignored fields".to_string()
     } else {
         format!("share_mismatch: {}", mismatches.join("; "))
     }
 }
 
-fn shares_stamps_match_ignoring_cwd(snapshot: &str, current: &str) -> bool {
-    comparable_share_stamp_fields(snapshot) == comparable_share_stamp_fields(current)
+fn optional_path_display(path: Option<&Path>) -> String {
+    path.map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<absent>".to_string())
 }
 
-fn comparable_share_stamp_fields(stamp: &str) -> BTreeMap<String, String> {
-    let mut fields = parse_shares_stamp(stamp);
-    fields.remove("cwd");
-    fields
-        .entry("packages".to_string())
-        .or_insert_with(|| "disabled-v1".to_string());
-    fields
+fn launch_metadata_matches_ignoring_cwd(
+    snapshot: &LaunchMetadata,
+    current: &LaunchMetadata,
+) -> bool {
+    let mut snapshot = snapshot.clone();
+    let mut current = current.clone();
+    snapshot.owner_args.clear();
+    current.owner_args.clear();
+    snapshot.shares.outside_home_cwd = None;
+    current.shares.outside_home_cwd = None;
+    snapshot == current
 }
 
-fn share_stamp_field_value<'a>(fields: &'a BTreeMap<String, String>, key: &str) -> &'a str {
-    fields
-        .get(key)
-        .map(String::as_str)
-        .unwrap_or(if key == "packages" {
-            "disabled-v1"
-        } else {
-            "<absent>"
+fn normalized_vhost_user_fs(mounts: &[LaunchVhostUserFsMount]) -> Vec<LaunchVhostUserFsMount> {
+    let mut mounts = mounts.to_vec();
+    mounts.sort_by(|a, b| {
+        (&a.tag, &a.mount, &a.socket, a.read_only).cmp(&(&b.tag, &b.mount, &b.socket, b.read_only))
+    });
+    mounts
+}
+
+fn vhost_user_fs_launch_value(mounts: &[LaunchVhostUserFsMount]) -> String {
+    normalized_vhost_user_fs(mounts)
+        .iter()
+        .map(|mount| {
+            format!(
+                "{}:{}:{}:{}",
+                mount.tag,
+                mount.mount,
+                mount.socket.display(),
+                if mount.read_only { "ro" } else { "rw" }
+            )
         })
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
-fn snapshot_share_layout(snapshot_path: &Path) -> Result<Option<SnapshotShareLayout>> {
-    let path = snapshot_path.join("shares.stamp");
-    let stamp = match fs::read_to_string(&path) {
-        Ok(stamp) => stamp,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-    };
-    let fields = parse_shares_stamp(&stamp);
-    let no_host_shares = fields.contains_key("host-shares");
-    let host_home = fields.get("home").map(PathBuf::from).unwrap_or_default();
-    let outside_home_cwd = fields.get("cwd").map(PathBuf::from);
-    Ok(Some(SnapshotShareLayout {
-        stamp,
-        layout: ShareLayout {
-            host_home,
-            outside_home_cwd,
-            no_host_shares,
-        },
-    }))
+fn write_launch_metadata(path: &Path, metadata: &LaunchMetadata) -> Result<()> {
+    let data = serde_json::to_vec_pretty(metadata).context("encode launch metadata")?;
+    fs::write(path, data).with_context(|| format!("write {}", path.display()))
+}
+
+fn read_launch_metadata(snapshot_path: &Path) -> std::io::Result<LaunchMetadata> {
+    let path = snapshot_path.join(LAUNCH_METADATA);
+    let data = fs::read(&path)?;
+    serde_json::from_slice(&data)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
 }
 
 fn parse_shares_stamp(stamp: &str) -> BTreeMap<String, String> {
@@ -2474,6 +2485,40 @@ fn parse_shares_stamp(stamp: &str) -> BTreeMap<String, String> {
         .filter_map(|line| line.split_once('='))
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect()
+}
+
+fn snapshot_share_layout(snapshot_path: &Path) -> Result<Option<SnapshotShareLayout>> {
+    let metadata = match read_launch_metadata(snapshot_path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("read {}", snapshot_path.join(LAUNCH_METADATA).display()));
+        }
+    };
+    Ok(Some(SnapshotShareLayout {
+        layout: ShareLayout {
+            host_home: metadata.shares.host_home.clone().unwrap_or_default(),
+            outside_home_cwd: metadata.shares.outside_home_cwd.clone(),
+            no_host_shares: metadata.shares.no_host_shares,
+        },
+        metadata,
+    }))
+}
+
+fn vhost_user_fs_guest_env(mounts: &[VhostUserFsMount]) -> String {
+    mounts
+        .iter()
+        .map(|mount| {
+            format!(
+                "{}:{}:{}",
+                mount.tag,
+                mount.mountpoint,
+                if mount.read_only { "ro" } else { "rw" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 fn deterministic_stamp_content(config: Option<&DeterministicConfig>) -> String {
@@ -5595,7 +5640,7 @@ fn clone_restore_snapshot(src: &Path, dst: &Path) -> Result<()> {
         "pages.img",
         "rootfs.ext4",
         "initramfs.stamp",
-        "shares.stamp",
+        LAUNCH_METADATA,
         "deterministic.stamp",
         DETERMINISTIC_CLOCK_STATE,
         SNAPSHOT_LIFECYCLE_META,
@@ -6101,7 +6146,7 @@ fn seed_incremental_snapshot(
         "vmstate.bin",
         "rootfs.ext4",
         "initramfs.stamp",
-        "shares.stamp",
+        LAUNCH_METADATA,
         "deterministic.stamp",
         DETERMINISTIC_CLOCK_STATE,
     ] {
@@ -6139,7 +6184,7 @@ fn copy_snapshot_stamp(
     import_deterministic_timer_jumps(initramfs_stamp, trace_log)?;
     sync_deterministic_clock_event_sequence(initramfs_stamp, trace_log)?;
     ensure_deterministic_clock_state_file(initramfs_stamp, deterministic_clock_state)?;
-    let shares_stamp = initramfs_stamp.with_file_name("shares.stamp");
+    let shares_stamp = initramfs_stamp.with_file_name(LAUNCH_METADATA);
     let deterministic_stamp = initramfs_stamp.with_file_name("deterministic.stamp");
     let deterministic_clock_state_path = initramfs_stamp.with_file_name(DETERMINISTIC_CLOCK_STATE);
     for stamp in [

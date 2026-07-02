@@ -1859,8 +1859,8 @@ fn default_restore_package_store_matches(
     snapshot: &Path,
     no_host_shares: bool,
 ) -> Result<bool> {
-    let snapshot_stamp = match fs::read_to_string(snapshot.join("shares.stamp")) {
-        Ok(stamp) => package_store_stamp_from_shares(&stamp),
+    let snapshot_stamp = match fs::read_to_string(snapshot.join("launch.json")) {
+        Ok(stamp) => package_store_stamp_from_launch(&stamp),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
         Err(e) => return Err(e).with_context(|| format!("read {}", snapshot.display())),
     };
@@ -1883,12 +1883,22 @@ fn current_package_store_stamp(layout: &Layout, no_host_shares: bool) -> Result<
 
 const PACKAGE_STORE_DISABLED: &str = "disabled-v1";
 
-fn package_store_stamp_from_shares(stamp: &str) -> String {
-    stamp
-        .lines()
-        .find_map(|line| line.strip_prefix("packages="))
-        .unwrap_or(PACKAGE_STORE_DISABLED)
-        .to_string()
+fn package_store_stamp_from_launch(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("compatibility")
+                .and_then(|compat| compat.get("packages"))
+                .and_then(|packages| packages.as_str())
+                .map(|packages| {
+                    packages
+                        .strip_prefix("packages=")
+                        .unwrap_or(packages)
+                        .to_string()
+                })
+        })
+        .unwrap_or_else(|| PACKAGE_STORE_DISABLED.to_string())
 }
 
 fn ensure_vm_initialized(
