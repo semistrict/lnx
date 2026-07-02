@@ -503,18 +503,16 @@ fn test_launch_metadata(
     host_home: &str,
     outside_home_cwd: Option<&str>,
     no_host_shares: bool,
-    host_share_cache: &str,
-    packages: &str,
-    net: &str,
+    host_share_cache: LaunchHostShareCache,
+    packages: LaunchPackages,
     vhost_user_fs: Vec<LaunchVhostUserFsMount>,
 ) -> LaunchMetadata {
     LaunchMetadata {
         version: 1,
         owner_args: vec!["lnx".to_string(), "_vm-owner".to_string()],
         compatibility: LaunchCompatibility {
-            host_share_cache: host_share_cache.to_string(),
-            packages: packages.to_string(),
-            net: net.to_string(),
+            host_share_cache,
+            packages,
         },
         shares: LaunchShares {
             no_host_shares,
@@ -529,6 +527,10 @@ fn test_launch_metadata(
     }
 }
 
+fn test_host_share_cache(dax: bool) -> LaunchHostShareCache {
+    LaunchHostShareCache { dax }
+}
+
 #[test]
 fn launch_metadata_records_vhost_user_fs_and_restart_args() {
     let temp = TempDir::new("snapshot-vhost-user-fs-json");
@@ -537,9 +539,8 @@ fn launch_metadata_records_vhost_user_fs_and_restart_args() {
         "/Users/ramon",
         None,
         false,
-        HOST_SHARE_CACHE_NODAX_STAMP,
-        PACKAGE_STORE_DISABLED_STAMP,
-        "net=gvproxy",
+        test_host_share_cache(false),
+        LaunchPackages::Disabled,
         vec![LaunchVhostUserFsMount {
             tag: "testfs".to_string(),
             mount: "/mnt/testfs".to_string(),
@@ -573,9 +574,8 @@ fn snapshot_launch_compatibility_requires_matching_json() {
         "/Users/ramon",
         None,
         false,
-        HOST_SHARE_CACHE_NODAX_STAMP,
-        PACKAGE_STORE_DISABLED_STAMP,
-        "net=gvproxy",
+        test_host_share_cache(false),
+        LaunchPackages::Disabled,
         Vec::new(),
     );
 
@@ -595,20 +595,12 @@ fn snapshot_launch_compatibility_requires_matching_json() {
         Some("share_mismatch: home: snapshot=/Users/ramon current=/home/ramon".to_string())
     );
 
-    let mut renetworked = current.clone();
-    renetworked.compatibility.net = "net=other".to_string();
-    assert_eq!(
-        snapshot_launch_incompatibility(temp.path(), &renetworked),
-        Some("share_mismatch: net: snapshot=net=gvproxy current=net=other".to_string())
-    );
-
     let disabled = test_launch_metadata(
         "/Users/ramon",
         None,
         true,
-        HOST_SHARE_CACHE_NODAX_STAMP,
-        PACKAGE_STORE_DISABLED_STAMP,
-        "net=gvproxy",
+        test_host_share_cache(false),
+        LaunchPackages::Disabled,
         Vec::new(),
     );
     write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &disabled)
@@ -628,13 +620,10 @@ fn snapshot_launch_compatibility_requires_matching_json() {
     write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &current)
         .expect("write launch metadata");
     let mut dax_current = current.clone();
-    dax_current.compatibility.host_share_cache = HOST_SHARE_CACHE_DAX_STAMP.to_string();
+    dax_current.compatibility.host_share_cache = test_host_share_cache(true);
     assert_eq!(
         snapshot_launch_incompatibility(temp.path(), &dax_current),
-        Some(
-            "share_mismatch: host-share-cache: snapshot=host-share-cache=nodax+close-to-open+writeback+restore-sync-v2 current=host-share-cache=dax+close-to-open+writeback+restore-sync-v2"
-                .to_string()
-        )
+        Some("share_mismatch: host-share-cache: snapshot=nodax current=dax".to_string())
     );
 }
 
@@ -646,18 +635,18 @@ fn snapshot_launch_compatibility_requires_matching_package_store() {
         "/Users/ramon",
         None,
         false,
-        HOST_SHARE_CACHE_NODAX_STAMP,
-        PACKAGE_STORE_DISABLED_STAMP,
-        "net=gvproxy",
+        test_host_share_cache(false),
+        LaunchPackages::Disabled,
         Vec::new(),
     );
     let enabled = test_launch_metadata(
         "/Users/ramon",
         None,
         false,
-        HOST_SHARE_CACHE_NODAX_STAMP,
-        "packages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64",
-        "net=gvproxy",
+        test_host_share_cache(false),
+        LaunchPackages::Readonly {
+            root: PathBuf::from("/Users/ramon/.lnx/stores/nix-linux-aarch64"),
+        },
         Vec::new(),
     );
 
@@ -666,7 +655,7 @@ fn snapshot_launch_compatibility_requires_matching_package_store() {
     assert_eq!(
         snapshot_launch_incompatibility(temp.path(), &enabled),
         Some(
-            "share_mismatch: packages: snapshot=packages=disabled-v1 current=packages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64"
+            "share_mismatch: packages: snapshot=disabled current=readonly root=/Users/ramon/.lnx/stores/nix-linux-aarch64"
                 .to_string()
         )
     );
@@ -680,18 +669,16 @@ fn snapshot_launch_compatibility_tolerates_cwd_share_changes() {
         "/Users/ramon",
         None,
         false,
-        HOST_SHARE_CACHE_NODAX_STAMP,
-        PACKAGE_STORE_DISABLED_STAMP,
-        "net=gvproxy",
+        test_host_share_cache(false),
+        LaunchPackages::Disabled,
         Vec::new(),
     );
     let current = test_launch_metadata(
         "/Users/ramon",
         Some("/private/tmp"),
         false,
-        HOST_SHARE_CACHE_NODAX_STAMP,
-        PACKAGE_STORE_DISABLED_STAMP,
-        "net=gvproxy",
+        test_host_share_cache(false),
+        LaunchPackages::Disabled,
         Vec::new(),
     );
 
@@ -708,9 +695,8 @@ fn snapshot_share_layout_reads_recorded_launch_metadata() {
         "/Users/ramon",
         Some("/tmp/build"),
         false,
-        HOST_SHARE_CACHE_NODAX_STAMP,
-        PACKAGE_STORE_DISABLED_STAMP,
-        "net=gvproxy",
+        test_host_share_cache(false),
+        LaunchPackages::Disabled,
         Vec::new(),
     );
     write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &metadata)

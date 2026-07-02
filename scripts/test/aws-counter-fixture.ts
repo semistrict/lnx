@@ -153,7 +153,7 @@ print("snapshot-exit-ready", flush=True)
 
   const launch = JSON.parse(await Bun.file(join(snapshot, "launch.json")).text());
   assertEq(launch.shares.no_host_shares, true, "source snapshot has host shares disabled");
-  assertEq(launch.compatibility.net, "net=gvproxy", "source snapshot uses portable gvproxy backing");
+  assertEq("net" in launch.compatibility, false, "network is not a launch option");
 
   await mkdir(output, { recursive: true });
   await cloneSparseImage(join(snapshot, "rootfs.ext4"), join(output, "rootfs.ext4"));

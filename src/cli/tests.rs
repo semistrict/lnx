@@ -332,14 +332,12 @@ fn clear_latest_snapshot_removes_snapshot_runtime_state() {
 #[test]
 fn package_store_stamp_from_launch_defaults_to_disabled() {
     assert_eq!(
-        package_store_stamp_from_launch(
-            r#"{"compatibility":{"host_share_cache":"host-share-cache=nodax+close-to-open+writeback+restore-sync-v2","net":"net=gvproxy"}}"#
-        ),
+        package_store_stamp_from_launch(r#"{"compatibility":{"host_share_cache":{"dax":false}}}"#),
         "disabled-v1"
     );
     assert_eq!(
         package_store_stamp_from_launch(
-            r#"{"compatibility":{"host_share_cache":"host-share-cache=nodax+close-to-open+writeback+restore-sync-v2","packages":"packages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64","net":"net=gvproxy"}}"#
+            r#"{"compatibility":{"host_share_cache":{"dax":false},"packages":{"mode":"readonly","root":"/Users/ramon/.lnx/stores/nix-linux-aarch64"}}}"#
         ),
         "readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64"
     );

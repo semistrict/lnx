@@ -29,9 +29,8 @@ const launchMetadata = JSON.stringify({
   version: 1,
   owner_args: [],
   compatibility: {
-    host_share_cache: "host-share-cache=nodax+close-to-open+writeback+restore-sync-v2",
-    packages: "packages=disabled-v1",
-    net: "net=gvproxy",
+    host_share_cache: { dax: false },
+    packages: { mode: "disabled" },
   },
   shares: {
     no_host_shares: false,

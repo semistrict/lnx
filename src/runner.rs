@@ -323,7 +323,7 @@ pub fn validate_runtime_deterministic_compatibility(
 }
 
 fn validate_runtime_share_compatibility(config: &RunConfig) -> Result<()> {
-    let current = launch_metadata_for_config(config, "net=gvproxy")?;
+    let current = launch_metadata_for_config(config)?;
     let path = config.layout.run_dir.join(LAUNCH_METADATA);
     match read_launch_metadata(&config.layout.run_dir) {
         Ok(metadata) if launch_metadata_matches_ignoring_cwd(&metadata, &current) => Ok(()),
@@ -670,14 +670,6 @@ enum NetworkBacking {
 }
 
 impl NetworkBacking {
-    /// One line of network backing identity. Part of the snapshot stamp: a
-    /// snapshot taken on one backing must not restore on another.
-    fn stamp_line(&self) -> String {
-        match self {
-            NetworkBacking::Gvproxy(_) => "net=gvproxy".to_string(),
-        }
-    }
-
     /// LNX_NET_IP / LNX_NET_GATEWAY values for the guest agent; empty means
     /// the agent uses the gvproxy static configuration.
     fn guest_env(&self) -> (String, String) {
@@ -768,7 +760,7 @@ fn start_vm(
     let current_host_home = host_home_for_cwd(&config.cwd)?;
     let current_outside_home_cwd =
         (!config.cwd.starts_with(&current_host_home)).then(|| config.cwd.clone());
-    let current_launch_metadata = launch_metadata_for_config(config, &network.stamp_line())?;
+    let current_launch_metadata = launch_metadata_for_config(config)?;
     let mut share_layout = ShareLayout {
         host_home: current_host_home,
         outside_home_cwd: current_outside_home_cwd,
@@ -825,7 +817,7 @@ fn start_vm(
             trace_bool("nested_kvm", config.nested_kvm),
             trace_bool("no_host_shares", config.no_host_shares),
             trace_bool("restore_snapshot", config.restore_snapshot.is_some()),
-            trace_text("network", network.stamp_line()),
+            trace_text("network", "embedded-gvproxy"),
         ];
         if let Some(deterministic) = &config.deterministic {
             fields.push(trace_text("seed", deterministic.seed.clone()));
@@ -2121,12 +2113,6 @@ fn snapshot_initramfs_is_compatible(snapshot_path: &Path, current_stamp: &Path) 
     snapshot_key == current_key
 }
 
-const HOST_SHARE_CACHE_DAX_STAMP: &str =
-    "host-share-cache=dax+close-to-open+writeback+restore-sync-v2";
-const HOST_SHARE_CACHE_NODAX_STAMP: &str =
-    "host-share-cache=nodax+close-to-open+writeback+restore-sync-v2";
-const PACKAGE_STORE_DISABLED_STAMP: &str = "packages=disabled-v1";
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ShareLayout {
     host_home: PathBuf,
@@ -2151,9 +2137,21 @@ struct LaunchMetadata {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct LaunchCompatibility {
-    host_share_cache: String,
-    packages: String,
-    net: String,
+    host_share_cache: LaunchHostShareCache,
+    packages: LaunchPackages,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct LaunchHostShareCache {
+    dax: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", rename_all = "kebab-case")]
+enum LaunchPackages {
+    Disabled,
+    Readonly { root: PathBuf },
+    Writable { root: PathBuf },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2171,17 +2169,16 @@ struct LaunchVhostUserFsMount {
     read_only: bool,
 }
 
-// A restored guest keeps its snapshot-time share mounts, network
-// configuration, and kernel-side virtiofs caches. A snapshot is only valid for
-// the same host share roots, network backing, and host-share cache policy: a
-// drifted root would silently back the old guest mount points with a different
-// host directory, a drifted network would strand the guest's addresses, and an
-// old cache policy can preserve stale host-file contents or size after the
-// host changed while the VM was stopped.
-fn launch_metadata_for_config(config: &RunConfig, net_stamp_line: &str) -> Result<LaunchMetadata> {
+// A restored guest keeps its snapshot-time share mounts and kernel-side
+// virtiofs caches. A snapshot is only valid for the same host share roots and
+// host-share cache policy: a drifted root would silently back the old guest
+// mount points with a different host directory, and an old cache policy can
+// preserve stale host-file contents or size after the host changed while the VM
+// was stopped.
+fn launch_metadata_for_config(config: &RunConfig) -> Result<LaunchMetadata> {
     let host_home = host_home_for_cwd(&config.cwd)?;
     let outside_home_cwd = (!config.cwd.starts_with(&host_home)).then(|| config.cwd.clone());
-    let package_store = package_store_stamp_line(
+    let package_store = package_store_metadata(
         &config.layout.base,
         config.package_store,
         config.no_host_shares,
@@ -2191,9 +2188,8 @@ fn launch_metadata_for_config(config: &RunConfig, net_stamp_line: &str) -> Resul
         host_home,
         outside_home_cwd,
         config.no_host_shares,
-        host_share_cache_stamp().to_string(),
+        host_share_cache_metadata(),
         package_store,
-        net_stamp_line.to_string(),
     ))
 }
 
@@ -2202,9 +2198,8 @@ fn launch_metadata_for_parts(
     host_home: PathBuf,
     outside_home_cwd: Option<PathBuf>,
     no_host_shares: bool,
-    host_share_cache: String,
-    packages: String,
-    net: String,
+    host_share_cache: LaunchHostShareCache,
+    packages: LaunchPackages,
 ) -> LaunchMetadata {
     LaunchMetadata {
         version: 1,
@@ -2212,7 +2207,6 @@ fn launch_metadata_for_parts(
         compatibility: LaunchCompatibility {
             host_share_cache,
             packages,
-            net,
         },
         shares: LaunchShares {
             no_host_shares,
@@ -2282,21 +2276,19 @@ fn owner_restart_args(config: &RunConfig) -> Vec<String> {
     args
 }
 
-fn host_share_cache_stamp() -> &'static str {
-    if crate::krun::host_share_dax_enabled() {
-        HOST_SHARE_CACHE_DAX_STAMP
-    } else {
-        HOST_SHARE_CACHE_NODAX_STAMP
+fn host_share_cache_metadata() -> LaunchHostShareCache {
+    LaunchHostShareCache {
+        dax: crate::krun::host_share_dax_enabled(),
     }
 }
 
-fn package_store_stamp_line(
+fn package_store_metadata(
     base: &Path,
     mode: GuestStoreMode,
     no_host_shares: bool,
-) -> Result<String> {
+) -> Result<LaunchPackages> {
     if package_store_disabled(mode, no_host_shares) {
-        return Ok(PACKAGE_STORE_DISABLED_STAMP.to_string());
+        return Ok(LaunchPackages::Disabled);
     }
 
     let layout = StoreLayout::resolve(base);
@@ -2308,15 +2300,14 @@ fn package_store_stamp_line(
         layout.prepare_readonly()?
     };
     if !enabled {
-        return Ok(PACKAGE_STORE_DISABLED_STAMP.to_string());
+        return Ok(LaunchPackages::Disabled);
     }
 
-    let mode = if writable {
-        "writable-v1"
+    Ok(if writable {
+        LaunchPackages::Writable { root: layout.root }
     } else {
-        "readonly-v1"
-    };
-    Ok(format!("packages={mode} root={}", layout.root.display()))
+        LaunchPackages::Readonly { root: layout.root }
+    })
 }
 
 fn package_store_disabled(mode: GuestStoreMode, no_host_shares: bool) -> bool {
@@ -2335,9 +2326,8 @@ pub fn snapshot_shares_incompatibility_for_import(
         version: 1,
         owner_args: Vec::new(),
         compatibility: LaunchCompatibility {
-            host_share_cache: host_share_cache_stamp().to_string(),
-            packages: PACKAGE_STORE_DISABLED_STAMP.to_string(),
-            net: "net=gvproxy".to_string(),
+            host_share_cache: host_share_cache_metadata(),
+            packages: LaunchPackages::Disabled,
         },
         shares: LaunchShares {
             no_host_shares,
@@ -2387,7 +2377,8 @@ fn describe_launch_mismatch(snapshot: &LaunchMetadata, current: &LaunchMetadata)
     if snapshot.compatibility.host_share_cache != current.compatibility.host_share_cache {
         mismatches.push(format!(
             "host-share-cache: snapshot={} current={}",
-            snapshot.compatibility.host_share_cache, current.compatibility.host_share_cache
+            describe_host_share_cache(&snapshot.compatibility.host_share_cache),
+            describe_host_share_cache(&current.compatibility.host_share_cache)
         ));
     }
     if snapshot.shares.host_home != current.shares.host_home {
@@ -2400,13 +2391,8 @@ fn describe_launch_mismatch(snapshot: &LaunchMetadata, current: &LaunchMetadata)
     if snapshot.compatibility.packages != current.compatibility.packages {
         mismatches.push(format!(
             "packages: snapshot={} current={}",
-            snapshot.compatibility.packages, current.compatibility.packages
-        ));
-    }
-    if snapshot.compatibility.net != current.compatibility.net {
-        mismatches.push(format!(
-            "net: snapshot={} current={}",
-            snapshot.compatibility.net, current.compatibility.net
+            describe_packages(&snapshot.compatibility.packages),
+            describe_packages(&current.compatibility.packages)
         ));
     }
     if normalized_vhost_user_fs(&snapshot.vhost_user_fs)
@@ -2428,6 +2414,22 @@ fn describe_launch_mismatch(snapshot: &LaunchMetadata, current: &LaunchMetadata)
 fn optional_path_display(path: Option<&Path>) -> String {
     path.map(|path| path.display().to_string())
         .unwrap_or_else(|| "<absent>".to_string())
+}
+
+fn describe_host_share_cache(cache: &LaunchHostShareCache) -> String {
+    if cache.dax {
+        "dax".to_string()
+    } else {
+        "nodax".to_string()
+    }
+}
+
+fn describe_packages(packages: &LaunchPackages) -> String {
+    match packages {
+        LaunchPackages::Disabled => "disabled".to_string(),
+        LaunchPackages::Readonly { root } => format!("readonly root={}", root.display()),
+        LaunchPackages::Writable { root } => format!("writable root={}", root.display()),
+    }
 }
 
 fn launch_metadata_matches_ignoring_cwd(
@@ -2492,8 +2494,9 @@ fn snapshot_share_layout(snapshot_path: &Path) -> Result<Option<SnapshotShareLay
         Ok(metadata) => metadata,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
-            return Err(e)
-                .with_context(|| format!("read {}", snapshot_path.join(LAUNCH_METADATA).display()));
+            return Err(e).with_context(|| {
+                format!("read {}", snapshot_path.join(LAUNCH_METADATA).display())
+            });
         }
     };
     Ok(Some(SnapshotShareLayout {
@@ -2842,23 +2845,12 @@ fn unlock_file(file: &fs::File) -> std::io::Result<()> {
 
 struct Gvproxy {
     socket: PathBuf,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     embedded: Option<crate::gvproxy_embedded::EmbeddedGvproxy>,
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    child: Child,
 }
 
 impl Drop for Gvproxy {
     fn drop(&mut self) {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            drop(self.embedded.take());
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
+        drop(self.embedded.take());
         let _ = fs::remove_file(&self.socket);
         if let (Some(parent), Some(name)) = (self.socket.parent(), self.socket.file_name()) {
             let krun_socket = parent.join(format!("{}-krun.sock", name.to_string_lossy()));
@@ -2869,77 +2861,17 @@ impl Drop for Gvproxy {
 
 fn start_gvproxy(run_dir: &Path) -> Result<Gvproxy> {
     let socket = run_dir.join("gvproxy.sock");
-    let api_socket = run_dir.join("gvproxy-api.sock");
     let log = run_dir.join("gvproxy.log");
     let _ = fs::remove_file(&socket);
-    let _ = fs::remove_file(&api_socket);
     let ssh_port = unused_local_port().context("find unused localhost port for gvproxy ssh")?;
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        let embedded = crate::gvproxy_embedded::EmbeddedGvproxy::start(&socket, &log, ssh_port)?;
-        wait_for_path(&socket, Duration::from_secs(30))
-            .with_context(|| format!("embedded gvproxy did not create {}", socket.display()))?;
-        return Ok(Gvproxy {
-            socket,
-            embedded: Some(embedded),
-        });
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let gvproxy = resolve_gvproxy_path();
-        if !gvproxy.exists() {
-            bail!(
-                "gvproxy not found at {}. Install gvproxy or set GVPROXY_PATH.",
-                gvproxy.display()
-            );
-        }
-
-        let log_file =
-            fs::File::create(&log).with_context(|| format!("create {}", log.display()))?;
-        let child = Command::new(&gvproxy)
-            .arg("--listen")
-            .arg(format!("unix://{}", api_socket.display()))
-            .arg("--listen-vfkit")
-            .arg(format!("unixgram:{}", socket.display()))
-            .arg("--ssh-port")
-            .arg(ssh_port.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log_file)
-            .spawn()
-            .with_context(|| format!("start {}", gvproxy.display()))?;
-
-        // Generous: in a freshly restored nested guest, process startup and
-        // socket creation on virtiofs can take well over the usual instant.
-        wait_for_path(&socket, Duration::from_secs(30))
-            .with_context(|| format!("gvproxy did not create {}", socket.display()))?;
-        Ok(Gvproxy { socket, child })
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn resolve_gvproxy_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("GVPROXY_PATH") {
-        return PathBuf::from(path);
-    }
-    if let Some(path) = find_on_path("gvproxy") {
-        return path;
-    }
-    PathBuf::from("/opt/homebrew/opt/podman/libexec/podman/gvproxy")
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&paths) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    let embedded = crate::gvproxy_embedded::EmbeddedGvproxy::start(&socket, &log, ssh_port)?;
+    wait_for_path(&socket, Duration::from_secs(30))
+        .with_context(|| format!("embedded gvproxy did not create {}", socket.display()))?;
+    Ok(Gvproxy {
+        socket,
+        embedded: Some(embedded),
+    })
 }
 
 fn unused_local_port() -> Result<u16> {

@@ -1140,11 +1140,7 @@ print("mac-source-after", flush=True)
         "true",
         "source snapshot has host shares disabled",
       );
-      assertContains(
-        launch.compatibility.net,
-        "net=gvproxy",
-        "source snapshot uses portable gvproxy backing",
-      );
+      assertEq("net" in launch.compatibility, false, "network is not a launch option");
 
       const stagedSnapshot = join(cwd, "macos-linux-snapshot");
       await rm(stagedSnapshot, { recursive: true, force: true });

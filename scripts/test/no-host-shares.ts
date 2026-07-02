@@ -40,7 +40,7 @@ try {
 
     const launch = JSON.parse(await Bun.file(join(ctx.runDir, "launch.json")).text());
     assertEq(launch.shares.no_host_shares, true, "host shares disabled in launch metadata");
-    assertEq(launch.compatibility.net, "net=gvproxy", "portable network stamp");
+    assertEq("net" in launch.compatibility, false, "network is not a launch option");
   });
 } finally {
   await cleanupContext(ctx);

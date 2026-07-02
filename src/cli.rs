@@ -1887,16 +1887,16 @@ fn package_store_stamp_from_launch(raw: &str) -> String {
     serde_json::from_str::<serde_json::Value>(raw)
         .ok()
         .and_then(|value| {
-            value
-                .get("compatibility")
-                .and_then(|compat| compat.get("packages"))
-                .and_then(|packages| packages.as_str())
-                .map(|packages| {
-                    packages
-                        .strip_prefix("packages=")
-                        .unwrap_or(packages)
-                        .to_string()
-                })
+            let packages = value.get("compatibility")?.get("packages")?;
+            let mode = packages.get("mode")?.as_str()?;
+            match mode {
+                "disabled" => Some(PACKAGE_STORE_DISABLED.to_string()),
+                "readonly" | "writable" => {
+                    let root = packages.get("root")?.as_str()?;
+                    Some(format!("{mode}-v1 root={root}"))
+                }
+                _ => None,
+            }
         })
         .unwrap_or_else(|| PACKAGE_STORE_DISABLED.to_string())
 }
