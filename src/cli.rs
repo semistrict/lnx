@@ -11,7 +11,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::{
     checkpoints, descriptor, host_share, ingress, init,
-    packages::{self, GuestStoreMode, PackageManifest, StoreLayout},
+    packages::{self, GuestStoreMode, StoreLayout},
     paths::Layout,
     runner,
 };
@@ -72,6 +72,14 @@ pub struct Cli {
 
     #[arg(
         long,
+        value_enum,
+        default_value_t = GuestStoreMode::Auto,
+        help = "Shared package store mode; disabled also skips the first-run default install"
+    )]
+    package_store: GuestStoreMode,
+
+    #[arg(
+        long,
         help = "Run the guest command as root instead of the host-matching user"
     )]
     root: bool,
@@ -100,17 +108,29 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(about = "Initialize an instance from an image, rootfs, or existing VM")]
     Init(InitArgs),
+    #[command(about = "Run a command in the guest")]
     Run(RunArgs),
+    #[command(about = "Print instance paths")]
     Paths,
+    #[command(about = "Manage the shared Nix package store")]
     Packages(PackagesArgs),
+    #[command(about = "Create a checkpoint of the current instance")]
     Checkpoint(CheckpointArgs),
+    #[command(about = "List checkpoints")]
     Checkpoints,
+    #[command(about = "Manage memory snapshots")]
     Snapshots(SnapshotsArgs),
+    #[command(about = "Fork a checkpoint into a new instance")]
     Fork(ForkArgs),
+    #[command(about = "Filesystem state commands")]
     Fs(FsArgs),
+    #[command(about = "Run an lnx server or push this instance to one")]
     Server(ServerArgs),
+    #[command(about = "Manage the ingress service")]
     Ingress(IngressArgs),
+    #[command(about = "List instances")]
     Instances(InstancesArgs),
     #[command(about = "Persist per-instance settings, like: set cpus=4 memory-mib=8192")]
     Set(SetArgs),
@@ -191,6 +211,10 @@ struct PackagesArgs {
 enum PackagesCommand {
     #[command(about = "Install packages into the shared Linux Nix store")]
     Install(PackagesInstallArgs),
+    #[command(about = "List installed packages and linked binaries")]
+    List,
+    #[command(about = "Remove store paths no longer referenced by the package profile")]
+    Gc,
     #[command(about = "Print shared package store paths")]
     Paths,
 }
@@ -367,12 +391,7 @@ struct HiddenVmOwnerArgs {
     #[arg(long)]
     trace_events: bool,
 
-    #[arg(
-        long,
-        value_parser = parse_package_store_mode,
-        default_value = "auto",
-        hide = true
-    )]
+    #[arg(long, value_enum, default_value_t = GuestStoreMode::Auto, hide = true)]
     package_store: GuestStoreMode,
 }
 
@@ -408,6 +427,7 @@ impl Cli {
             deterministic,
             trace_events,
             no_host_shares,
+            package_store,
             root,
             forwards,
             vhost_user_fs,
@@ -504,6 +524,7 @@ impl Cli {
                         snapshot_path,
                         nested_kvm,
                         effective_no_host_shares,
+                        package_store,
                         deterministic.clone(),
                         trace_events,
                         root,
@@ -523,7 +544,7 @@ impl Cli {
                 println!("snapshots: {}", layout.snapshot_dir.display());
                 Ok(())
             }
-            Some(Command::Packages(args)) => run_packages_command(&layout, args, cpus, memory_mib),
+            Some(Command::Packages(args)) => run_packages_command(args, cpus, memory_mib),
             Some(Command::Checkpoint(args)) => {
                 if cfg!(target_os = "macos") && deterministic.is_some() {
                     let mut subcommand = vec!["checkpoint".to_string()];
@@ -707,6 +728,7 @@ impl Cli {
                         snapshot_path,
                         nested_kvm,
                         effective_no_host_shares,
+                        package_store,
                         deterministic,
                         trace_events,
                         root,
@@ -903,187 +925,75 @@ fn set_instance_settings(layout: &Layout, settings: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn run_packages_command(
-    layout: &Layout,
-    args: PackagesArgs,
-    cpus: u8,
-    memory_mib: u32,
-) -> Result<()> {
+fn run_packages_command(args: PackagesArgs, cpus: u8, memory_mib: u32) -> Result<()> {
     match args.command {
-        PackagesCommand::Install(args) => run_packages_install(layout, args, cpus, memory_mib),
+        PackagesCommand::Install(args) => {
+            let manifest = packages::install(
+                packages::InstallRequest {
+                    builder: args.builder,
+                    builder_image: args.builder_image,
+                    binaries: args.binaries,
+                    packages: args.packages,
+                },
+                cpus,
+                memory_mib,
+            )?;
+            let store = StoreLayout::resolve_global()?;
+            println!("packages installed");
+            println!("profile: {}", store.profile_link().display());
+            println!("packages: {}", manifest.packages.join(", "));
+            if !manifest.binaries.is_empty() {
+                println!("checked binaries: {}", manifest.binaries.join(", "));
+            }
+            Ok(())
+        }
+        PackagesCommand::List => run_packages_list(),
+        PackagesCommand::Gc => {
+            let outcome = packages::gc()?;
+            println!(
+                "removed {} store paths ({:.1} MiB), kept {}",
+                outcome.removed,
+                outcome.removed_bytes as f64 / (1024.0 * 1024.0),
+                outcome.kept
+            );
+            Ok(())
+        }
         PackagesCommand::Paths => {
-            let package_layout = StoreLayout::resolve(&layout.base);
-            println!("root: {}", package_layout.root.display());
-            println!("image: {}", package_layout.image.display());
-            println!("mount: {}", package_layout.mount.display());
-            println!("store: {}", package_layout.store.display());
-            println!("var: {}", package_layout.var.display());
-            println!("profiles: {}", package_layout.profiles.display());
-            println!("profile: {}", package_layout.profile_link().display());
-            println!("manifest: {}", package_layout.manifest.display());
+            let store = StoreLayout::resolve_global()?;
+            println!("root: {}", store.root.display());
+            println!("image: {}", store.image.display());
+            println!("mount: {}", store.mount.display());
+            println!("store: {}", store.store.display());
+            println!("var: {}", store.var.display());
+            println!("profiles: {}", store.profiles.display());
+            println!("profile: {}", store.profile_link().display());
+            println!("manifest: {}", store.manifest.display());
             Ok(())
         }
     }
 }
 
-fn run_packages_install(
-    layout: &Layout,
-    args: PackagesInstallArgs,
-    cpus: u8,
-    memory_mib: u32,
-) -> Result<()> {
-    let installing_defaults = args.packages.is_empty();
-    let requested_packages = if installing_defaults {
-        packages::default_packages()
-    } else {
-        args.packages
-    };
-    let requested_binaries = if args.binaries.is_empty() {
-        if installing_defaults {
-            packages::default_binaries()
-        } else {
-            infer_package_binaries(&requested_packages)
-        }
-    } else {
-        args.binaries
-    };
-    validate_package_binaries(&requested_binaries)?;
-
-    let package_layout = StoreLayout::resolve(&layout.base);
-    let store_ready = package_layout.prepare_readonly()?;
-    let existing = package_layout.read_manifest()?;
-    let use_existing = existing
-        .as_ref()
-        .is_some_and(|manifest| store_ready && package_layout.manifest_is_coherent(manifest));
-    let mut package_refs = if use_existing {
-        existing
-            .as_ref()
-            .map(|manifest| manifest.packages.clone())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let mut binaries = if use_existing {
-        existing
-            .as_ref()
-            .map(|manifest| manifest.binaries.clone())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    append_unique(&mut package_refs, requested_packages);
-    append_unique(&mut binaries, requested_binaries);
-    if package_refs.is_empty() {
-        package_refs = packages::default_packages();
-    }
-    if binaries.is_empty() && installing_defaults {
-        binaries = packages::default_binaries();
-    }
-    validate_package_binaries(&binaries)?;
-
-    let builder_layout = Layout::resolve_in_base(&args.builder, layout.base.clone(), None, None);
-    ensure_package_builder_instance(&builder_layout, &args.builder, &args.builder_image)?;
-    let cwd = std::env::current_dir().context("current directory")?;
-    let status = runner::run(runner::RunConfig {
-        layout: builder_layout,
-        command: vec![
-            "sh".to_string(),
-            "-lc".to_string(),
-            packages::install_script(&package_refs, &binaries),
-        ],
-        cwd,
-        cpus,
-        memory_mib,
-        nested_kvm: false,
-        restore_snapshot: None,
-        forwards: Vec::new(),
-        snapshot_output: None,
-        run_as_root: true,
-        no_host_shares: true,
-        package_store: GuestStoreMode::Writable,
-        vhost_user_fs: Vec::new(),
-        reuse_owner: false,
-        deterministic: None,
-        trace_events: false,
-    })?;
-    if status != 0 {
-        bail!("package install exited with status {status}");
-    }
-    let manifest = PackageManifest {
-        packages: package_refs,
-        binaries,
-    };
-    package_layout.write_manifest(&manifest)?;
-    println!("packages installed");
-    println!("profile: {}", package_layout.profile_link().display());
-    println!("binaries: {}", manifest.binaries.join(", "));
-    Ok(())
-}
-
-fn append_unique(values: &mut Vec<String>, new_values: Vec<String>) {
-    for value in new_values {
-        if !values.iter().any(|existing| existing == &value) {
-            values.push(value);
-        }
-    }
-}
-
-fn infer_package_binaries(packages: &[String]) -> Vec<String> {
-    packages
-        .iter()
-        .filter_map(|package| {
-            let attr = package
-                .rsplit_once('#')
-                .map(|(_, attr)| attr)
-                .unwrap_or(package);
-            let name = attr.rsplit(['.', '/']).next().unwrap_or(attr);
-            (!name.is_empty()
-                && name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
-            .then(|| name.to_string())
-        })
-        .collect()
-}
-
-fn ensure_package_builder_instance(
-    layout: &Layout,
-    builder: &str,
-    builder_image: &str,
-) -> Result<()> {
-    let expected_image = format!("oci:{builder_image}");
-    let descriptor = descriptor::load(layout)?;
-    if layout.rootfs.exists() && descriptor.image.as_deref() == Some(expected_image.as_str()) {
-        init::ensure_kernel(layout)?;
-        init::ensure_instance(layout)?;
+fn run_packages_list() -> Result<()> {
+    let store = StoreLayout::resolve_global()?;
+    let ready = store.prepare_readonly()?;
+    let Some(manifest) = store.read_manifest()? else {
+        println!("no packages installed (run: lnx packages install [PACKAGE...])");
         return Ok(());
+    };
+    println!(
+        "store: {} ({})",
+        store.root.display(),
+        if ready { "ready" } else { "not ready" }
+    );
+    if let Some(target) = &manifest.profile_target {
+        println!("profile: {target}");
     }
-
-    if layout.rootfs.exists() || layout.instance_dir.exists() {
-        if builder != packages::DEFAULT_BUILDER_INSTANCE {
-            bail!(
-                "builder instance {builder} already exists and is not image {builder_image}; choose another --builder or remove it"
-            );
-        }
-        let _ = fs::remove_dir_all(&layout.run_dir);
-        if layout.run_dir != layout.instance_dir {
-            let _ = fs::remove_dir_all(&layout.instance_dir);
-        }
+    println!("closure: {} store paths", manifest.closure.len());
+    for package in &manifest.packages {
+        println!("package: {package}");
     }
-
-    crate::oci::import_image(layout, builder_image, None)
-        .with_context(|| format!("initialize package builder from {builder_image}"))
-}
-
-fn validate_package_binaries(binaries: &[String]) -> Result<()> {
-    for binary in binaries {
-        if binary.is_empty()
-            || !binary
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        {
-            bail!("invalid package binary name {binary:?}");
-        }
+    for binary in &manifest.binaries {
+        println!("binary: {binary}");
     }
     Ok(())
 }
@@ -1556,6 +1466,7 @@ fn run_guest(
     snapshot_path: Option<PathBuf>,
     nested_kvm: bool,
     no_host_shares: bool,
+    package_store: GuestStoreMode,
     deterministic: Option<runner::DeterministicConfig>,
     trace_events: bool,
     run_as_root: bool,
@@ -1565,7 +1476,13 @@ fn run_guest(
     explicit_rootfs: bool,
 ) -> Result<()> {
     ensure_image_and_instance(&layout, explicit_kernel, explicit_rootfs)?;
-    ensure_default_package_store(&layout, cpus, memory_mib, no_host_shares)?;
+    packages::ensure_default_store(
+        &layout.instance,
+        cpus,
+        memory_mib,
+        no_host_shares,
+        package_store,
+    )?;
     ensure_vm_initialized(
         &layout,
         cpus,
@@ -1606,10 +1523,10 @@ fn run_guest(
     let restore_snapshot =
         restore_snapshot_for_run(&layout, snapshot_path, explicit_kernel, explicit_rootfs);
     let restore_snapshot = filter_default_restore_for_package_store(
-        &layout,
         restore_snapshot,
         explicit_restore_snapshot,
         no_host_shares,
+        package_store,
     )?;
 
     let config = runner::RunConfig {
@@ -1624,7 +1541,7 @@ fn run_guest(
         run_as_root,
         snapshot_output: None,
         no_host_shares,
-        package_store: GuestStoreMode::Auto,
+        package_store,
         vhost_user_fs,
         reuse_owner: true,
         deterministic,
@@ -1633,48 +1550,6 @@ fn run_guest(
 
     let status = runner::run(config)?;
     std::process::exit(status);
-}
-
-fn ensure_default_package_store(
-    layout: &Layout,
-    cpus: u8,
-    memory_mib: u32,
-    no_host_shares: bool,
-) -> Result<()> {
-    if !should_bootstrap_default_package_store(
-        &layout.instance,
-        no_host_shares,
-        std::env::var_os("LNX_SKIP_DEFAULT_PACKAGES").is_some(),
-    ) {
-        return Ok(());
-    }
-
-    let package_layout = StoreLayout::resolve(&layout.base);
-    if package_layout.prepare_readonly()? {
-        return Ok(());
-    }
-
-    eprintln!("first run: package store missing, installing default packages");
-    run_packages_install(
-        layout,
-        PackagesInstallArgs {
-            builder: packages::DEFAULT_BUILDER_INSTANCE.to_string(),
-            builder_image: packages::DEFAULT_BUILDER_IMAGE.to_string(),
-            binaries: Vec::new(),
-            packages: Vec::new(),
-        },
-        cpus,
-        memory_mib,
-    )
-    .context("install default packages")
-}
-
-fn should_bootstrap_default_package_store(
-    instance: &str,
-    no_host_shares: bool,
-    skip_env: bool,
-) -> bool {
-    !no_host_shares && !skip_env && !instance.ends_with("-oci-builder")
 }
 
 fn run_fs_unshare(layout: &Layout, args: FsUnshareArgs) -> Result<()> {
@@ -1837,10 +1712,10 @@ fn restore_snapshot_for_run(
 }
 
 fn filter_default_restore_for_package_store(
-    layout: &Layout,
     snapshot: Option<PathBuf>,
     explicit_restore_snapshot: bool,
     no_host_shares: bool,
+    mode: GuestStoreMode,
 ) -> Result<Option<PathBuf>> {
     if explicit_restore_snapshot {
         return Ok(snapshot);
@@ -1848,57 +1723,11 @@ fn filter_default_restore_for_package_store(
     let Some(snapshot) = snapshot else {
         return Ok(None);
     };
-    if default_restore_package_store_matches(layout, &snapshot, no_host_shares)? {
+    if runner::default_restore_package_store_matches(&snapshot, mode, no_host_shares)? {
         return Ok(Some(snapshot));
     }
+    eprintln!("package store changed since the latest snapshot was taken; cold-booting without it");
     Ok(None)
-}
-
-fn default_restore_package_store_matches(
-    layout: &Layout,
-    snapshot: &Path,
-    no_host_shares: bool,
-) -> Result<bool> {
-    let snapshot_stamp = match fs::read_to_string(snapshot.join("launch.json")) {
-        Ok(stamp) => package_store_stamp_from_launch(&stamp),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(e) => return Err(e).with_context(|| format!("read {}", snapshot.display())),
-    };
-    Ok(snapshot_stamp == current_package_store_stamp(layout, no_host_shares)?)
-}
-
-fn current_package_store_stamp(layout: &Layout, no_host_shares: bool) -> Result<String> {
-    if no_host_shares {
-        return Ok(PACKAGE_STORE_DISABLED.to_string());
-    }
-    let package_layout = StoreLayout::resolve(&layout.base);
-    if package_layout.prepare_readonly()? {
-        return Ok(format!(
-            "readonly-v1 root={}",
-            package_layout.root.display()
-        ));
-    }
-    Ok(PACKAGE_STORE_DISABLED.to_string())
-}
-
-const PACKAGE_STORE_DISABLED: &str = "disabled-v1";
-
-fn package_store_stamp_from_launch(raw: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(raw)
-        .ok()
-        .and_then(|value| {
-            let packages = value.get("compatibility")?.get("packages")?;
-            let mode = packages.get("mode")?.as_str()?;
-            match mode {
-                "disabled" => Some(PACKAGE_STORE_DISABLED.to_string()),
-                "readonly" | "writable" => {
-                    let root = packages.get("root")?.as_str()?;
-                    Some(format!("{mode}-v1 root={root}"))
-                }
-                _ => None,
-            }
-        })
-        .unwrap_or_else(|| PACKAGE_STORE_DISABLED.to_string())
 }
 
 fn ensure_vm_initialized(
@@ -2835,11 +2664,6 @@ fn validate_vhost_user_fs_mount(mount: &runner::VhostUserFsMount) -> Result<(), 
         );
     }
     Ok(())
-}
-
-fn parse_package_store_mode(value: &str) -> Result<GuestStoreMode, String> {
-    GuestStoreMode::parse(value)
-        .ok_or_else(|| format!("expected auto, disabled, or writable, got {value}"))
 }
 
 #[cfg(test)]

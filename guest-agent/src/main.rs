@@ -77,6 +77,7 @@ const RNDADDENTROPY: c_ulong = 0x4008_5203;
 const RNDRESEEDCRNG: c_ulong = 0x5207;
 const CLOCK_REALTIME: c_int = 0;
 const MS_RDONLY: c_ulong = 1;
+const MS_REMOUNT: c_ulong = 32;
 const MS_BIND: c_ulong = 4096;
 const MS_REC: c_ulong = 16384;
 const MS_PRIVATE: c_ulong = 262144;
@@ -397,12 +398,6 @@ fn mount_vhost_user_fs() {
     }
 }
 
-fn mount_package_store() {
-    if env::var("LNX_VIRTIOFS_NIX_STORE").ok().as_deref() == Some("1") {
-        mount_virtiofs("lnx-nix-store", "/nix/store", true);
-    }
-}
-
 fn mount_package_output() {
     if env::var("LNX_VIRTIOFS_NIX_ROOT").ok().as_deref() == Some("1") {
         let read_only = env::var("LNX_VIRTIOFS_NIX_ROOT_RW").ok().as_deref() != Some("1");
@@ -410,31 +405,123 @@ fn mount_package_output() {
     }
 }
 
-fn mount_package_profile() {
-    let read_only = env::var("LNX_VIRTIOFS_PACKAGE_PROFILE_RW").ok().as_deref() != Some("1");
-    if env::var("LNX_VIRTIOFS_PACKAGE_PROFILE").ok().as_deref() == Some("1") {
-        mount_virtiofs("lnx-packages", "/run/lnx/packages", read_only);
-        link_package_binaries();
+// The host shares only the store root (mounted at /run/lnx/nix); its store/
+// and profiles/ subdirectories are bound to their canonical guest paths.
+fn setup_package_profile() {
+    clean_stale_package_links();
+    if env::var("LNX_PACKAGE_PROFILE").ok().as_deref() != Some("1") {
+        return;
+    }
+    bind_mount_read_only("/run/lnx/nix/store", "/nix/store");
+    bind_mount_read_only("/run/lnx/nix/profiles", "/run/lnx/packages");
+    link_package_binaries();
+}
+
+fn bind_mount_read_only(source: &str, target: &str) {
+    let source_path = format!("/newroot{source}");
+    let target_path = format!("/newroot{target}");
+    if fs::metadata(&target_path).is_err() {
+        ensure_dir(&target_path);
+    }
+    let source_c = CString::new(source_path).unwrap();
+    let target_c = CString::new(target_path).unwrap();
+    if unsafe {
+        mount(
+            source_c.as_ptr(),
+            target_c.as_ptr(),
+            ptr::null(),
+            MS_BIND,
+            ptr::null(),
+        )
+    } < 0
+    {
+        die("bind package mount");
+    }
+    if unsafe {
+        mount(
+            ptr::null(),
+            target_c.as_ptr(),
+            ptr::null(),
+            MS_BIND | MS_REMOUNT | MS_RDONLY,
+            ptr::null(),
+        )
+    } < 0
+    {
+        die("remount package mount read-only");
+    }
+}
+
+// Package links live in /usr/local/bin of the persistent rootfs, so links
+// from an earlier boot must be removed even when the store is now absent:
+// otherwise they dangle. Only lnx-owned links (into /run/lnx/packages) are
+// touched; regular files and foreign symlinks are left alone.
+fn clean_stale_package_links() {
+    let Ok(entries) = fs::read_dir("/newroot/usr/local/bin") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(link) = fs::read_link(&path) else {
+            continue;
+        };
+        if link.to_string_lossy().starts_with("/run/lnx/packages/") {
+            let _ = fs::remove_file(&path);
+        }
     }
 }
 
 fn link_package_binaries() {
-    let binaries = env::var("LNX_PACKAGE_BINARIES").unwrap_or_default();
-    for binary in binaries.split(':').filter(|binary| !binary.is_empty()) {
-        if binary.contains('/') || binary.contains('\0') {
+    let profile = format!(
+        "/newroot/run/lnx/packages/{}",
+        lnx_protocol::PACKAGE_PROFILE_NAME
+    );
+    let Some(profile) = resolve_newroot_symlinks(profile) else {
+        log!("package profile link loops");
+        return;
+    };
+    let Some(bin_dir) = resolve_newroot_symlinks(format!("{profile}/bin")) else {
+        log!("package profile bin link loops");
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&bin_dir) else {
+        log!("package profile has no bin directory: {bin_dir}");
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let target = format!("/newroot/usr/local/bin/{name}");
+        if fs::symlink_metadata(&target).is_ok() {
             continue;
         }
-        let target = format!("/newroot/usr/local/bin/{binary}");
-        let source = format!("/run/lnx/packages/default/bin/{binary}");
-        let _ = fs::remove_file(&target);
-        let Ok(target) = CString::new(target) else {
-            continue;
-        };
-        let Ok(source) = CString::new(source) else {
-            continue;
-        };
-        let _ = unsafe { symlink(source.as_ptr(), target.as_ptr()) };
+        let source = format!(
+            "/run/lnx/packages/{}/bin/{name}",
+            lnx_protocol::PACKAGE_PROFILE_NAME
+        );
+        let _ = std::os::unix::fs::symlink(&source, &target);
     }
+}
+
+// Profile symlinks point at guest-absolute /nix/store paths, but the agent
+// runs before switch_root, so absolute link targets must be re-rooted under
+// /newroot by hand.
+fn resolve_newroot_symlinks(mut path: String) -> Option<String> {
+    for _ in 0..16 {
+        let link = match fs::read_link(&path) {
+            Ok(link) => link,
+            Err(_) => return Some(path),
+        };
+        let link = link.to_string_lossy();
+        path = if link.starts_with('/') {
+            format!("/newroot{link}")
+        } else {
+            let parent = &path[..path.rfind('/')?];
+            format!("{parent}/{link}")
+        };
+    }
+    None
 }
 
 fn restore_sync_guest_entropy(entropy: &[u8]) -> Result<(), String> {
@@ -1007,7 +1094,6 @@ fn init_mode() -> ! {
     );
     mount_host_shares();
     mount_vhost_user_fs();
-    mount_package_store();
 
     ensure_dir("/newroot/usr/local/lib/lnx");
     ensure_dir("/newroot/usr/local/bin");
@@ -1034,7 +1120,7 @@ fn init_mode() -> ! {
     };
     ensure_dir("/newroot/run/lnx");
     mount_package_output();
-    mount_package_profile();
+    setup_package_profile();
     ensure_dir(&format!("/newroot{WANTS_DIR}"));
 
     for (source, target) in [

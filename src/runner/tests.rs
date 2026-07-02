@@ -646,6 +646,7 @@ fn snapshot_launch_compatibility_requires_matching_package_store() {
         test_host_share_cache(false),
         LaunchPackages::Readonly {
             root: PathBuf::from("/Users/ramon/.lnx/stores/nix-linux-aarch64"),
+            topology: PACKAGES_READONLY_TOPOLOGY,
         },
         Vec::new(),
     );
@@ -655,9 +656,70 @@ fn snapshot_launch_compatibility_requires_matching_package_store() {
     assert_eq!(
         snapshot_launch_incompatibility(temp.path(), &enabled),
         Some(
-            "share_mismatch: packages: snapshot=disabled current=readonly root=/Users/ramon/.lnx/stores/nix-linux-aarch64"
+            "share_mismatch: packages: snapshot=disabled current=readonly-t2 root=/Users/ramon/.lnx/stores/nix-linux-aarch64"
                 .to_string()
         )
+    );
+
+    // launch.json written before the topology field existed deserializes as
+    // topology 0 and must not restore into the current single-mount layout.
+    let legacy = serde_json::to_string(&enabled)
+        .expect("encode launch metadata")
+        .replace(",\"topology\":2", "");
+    assert!(legacy.contains("\"mode\":\"readonly\""));
+    assert!(!legacy.contains("topology"));
+    fs::write(temp.path().join(LAUNCH_METADATA), legacy).expect("write legacy launch metadata");
+    assert_eq!(
+        snapshot_launch_incompatibility(temp.path(), &enabled),
+        Some(
+            "share_mismatch: packages: snapshot=readonly-t0 root=/Users/ramon/.lnx/stores/nix-linux-aarch64 current=readonly-t2 root=/Users/ramon/.lnx/stores/nix-linux-aarch64"
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn default_restore_package_store_matching_reads_launch_metadata() {
+    let temp = TempDir::new("default-restore-packages");
+    fs::create_dir_all(temp.path()).expect("create snapshot dir");
+
+    // No launch metadata: leave the decision to the general snapshot check.
+    assert!(
+        default_restore_package_store_matches(temp.path(), GuestStoreMode::Auto, true)
+            .expect("match without metadata")
+    );
+
+    let disabled = test_launch_metadata(
+        "/Users/ramon",
+        None,
+        true,
+        test_host_share_cache(false),
+        LaunchPackages::Disabled,
+        Vec::new(),
+    );
+    write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &disabled)
+        .expect("write launch metadata");
+    assert!(
+        default_restore_package_store_matches(temp.path(), GuestStoreMode::Auto, true)
+            .expect("disabled matches disabled")
+    );
+
+    let enabled = test_launch_metadata(
+        "/Users/ramon",
+        None,
+        false,
+        test_host_share_cache(false),
+        LaunchPackages::Readonly {
+            root: PathBuf::from("/Users/ramon/.lnx/stores/nix-linux-aarch64"),
+            topology: PACKAGES_READONLY_TOPOLOGY,
+        },
+        Vec::new(),
+    );
+    write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &enabled)
+        .expect("write launch metadata");
+    assert!(
+        !default_restore_package_store_matches(temp.path(), GuestStoreMode::Auto, true)
+            .expect("readonly snapshot does not match disabled store")
     );
 }
 
