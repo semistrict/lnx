@@ -1723,43 +1723,11 @@ fn filter_default_restore_for_package_store(
     let Some(snapshot) = snapshot else {
         return Ok(None);
     };
-    if default_restore_package_store_matches(&snapshot, no_host_shares, mode)? {
+    if runner::default_restore_package_store_matches(&snapshot, mode, no_host_shares)? {
         return Ok(Some(snapshot));
     }
     eprintln!("package store changed since the latest snapshot was taken; cold-booting without it");
     Ok(None)
-}
-
-fn default_restore_package_store_matches(
-    snapshot: &Path,
-    no_host_shares: bool,
-    mode: GuestStoreMode,
-) -> Result<bool> {
-    let snapshot_stamp = match fs::read_to_string(snapshot.join("shares.stamp")) {
-        Ok(stamp) => package_store_stamp_from_shares(&stamp),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(e) => return Err(e).with_context(|| format!("read {}", snapshot.display())),
-    };
-    Ok(snapshot_stamp == current_package_store_stamp(no_host_shares, mode)?)
-}
-
-fn current_package_store_stamp(no_host_shares: bool, mode: GuestStoreMode) -> Result<String> {
-    if no_host_shares || matches!(mode, GuestStoreMode::Disabled) {
-        return Ok(packages::STAMP_DISABLED.to_string());
-    }
-    let store = StoreLayout::resolve_global()?;
-    if store.prepare_readonly()? {
-        return Ok(store.stamp_value(false));
-    }
-    Ok(packages::STAMP_DISABLED.to_string())
-}
-
-fn package_store_stamp_from_shares(stamp: &str) -> String {
-    stamp
-        .lines()
-        .find_map(|line| line.strip_prefix("packages="))
-        .unwrap_or(packages::STAMP_DISABLED)
-        .to_string()
 }
 
 fn ensure_vm_initialized(

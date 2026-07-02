@@ -1118,7 +1118,7 @@ print("mac-source-after", flush=True)
         "vmstate.bin",
         "pages.img",
         "rootfs.ext4",
-        "shares.stamp",
+        "launch.json",
         "initramfs.stamp",
       ]) {
         const path = join(snapshot, file);
@@ -1134,17 +1134,13 @@ print("mac-source-after", flush=True)
         4,
         "source snapshot is shared vmstate v4",
       );
-      const sharesStamp = await Bun.file(join(snapshot, "shares.stamp")).text();
+      const launch = JSON.parse(await Bun.file(join(snapshot, "launch.json")).text());
       assertContains(
-        sharesStamp,
-        "host-shares=disabled-v1",
+        String(launch.shares.no_host_shares),
+        "true",
         "source snapshot has host shares disabled",
       );
-      assertContains(
-        sharesStamp,
-        "net=gvproxy",
-        "source snapshot uses portable gvproxy backing",
-      );
+      assertEq("net" in launch.compatibility, false, "network is not a launch option");
 
       const stagedSnapshot = join(cwd, "macos-linux-snapshot");
       await rm(stagedSnapshot, { recursive: true, force: true });
@@ -1170,8 +1166,8 @@ print("mac-source-after", flush=True)
       await run(
         [
           "cp",
-          join(snapshot, "shares.stamp"),
-          join(stagedSnapshot, "shares.stamp"),
+          join(snapshot, "launch.json"),
+          join(stagedSnapshot, "launch.json"),
         ],
         {
           timeoutMs: 180_000,
@@ -1231,7 +1227,7 @@ print("mac-source-after", flush=True)
         `cp --sparse=always ${quoteShell(join(stagedSnapshot, "rootfs.ext4"))} ${quoteShell(`${outerLocalSnapshot}/rootfs.ext4`)}`,
         `cp --sparse=always ${quoteShell(join(stagedSnapshot, "pages.img"))} ${quoteShell(`${outerLocalSnapshot}/pages.img`)}`,
         `cp ${quoteShell(join(stagedSnapshot, "vmstate.bin"))} ${quoteShell(`${outerLocalSnapshot}/vmstate.bin`)}`,
-        `cp ${quoteShell(join(stagedSnapshot, "shares.stamp"))} ${quoteShell(`${outerLocalSnapshot}/shares.stamp`)}`,
+        `cp ${quoteShell(join(stagedSnapshot, "launch.json"))} ${quoteShell(`${outerLocalSnapshot}/launch.json`)}`,
         `cp ${quoteShell(join(stagedSnapshot, "initramfs.stamp"))} ${quoteShell(`${outerLocalSnapshot}/initramfs.stamp`)}`,
       ];
       const exportPostlude = exportSnapshot
@@ -1241,7 +1237,7 @@ print("mac-source-after", flush=True)
             `"$LNX_BIN" _sparse-copy ${quoteShell(`${outerLocalLatest}/rootfs.ext4`)} ${quoteShell(join(exportedLatest, "rootfs.ext4"))}`,
             `"$LNX_BIN" _sparse-copy ${quoteShell(`${outerLocalLatest}/pages.img`)} ${quoteShell(join(exportedLatest, "pages.img"))}`,
             `cp ${quoteShell(`${outerLocalLatest}/vmstate.bin`)} ${quoteShell(join(exportedLatest, "vmstate.bin"))}`,
-            `cp ${quoteShell(`${outerLocalLatest}/shares.stamp`)} ${quoteShell(join(exportedLatest, "shares.stamp"))}`,
+            `cp ${quoteShell(`${outerLocalLatest}/launch.json`)} ${quoteShell(join(exportedLatest, "launch.json"))}`,
             `cp ${quoteShell(`${outerLocalLatest}/initramfs.stamp`)} ${quoteShell(join(exportedLatest, "initramfs.stamp"))}`,
           ]
         : [];
@@ -1314,7 +1310,7 @@ print("mac-source-after", flush=True)
           "vmstate.bin",
           "pages.img",
           "rootfs.ext4",
-          "shares.stamp",
+          "launch.json",
           "initramfs.stamp",
         ]) {
           const path = join(latest, file);
@@ -1332,7 +1328,7 @@ print("mac-source-after", flush=True)
           join(latest, "pages.img"),
           join(exportSnapshot, "pages.img"),
         );
-        for (const file of ["vmstate.bin", "shares.stamp", "initramfs.stamp"]) {
+        for (const file of ["vmstate.bin", "launch.json", "initramfs.stamp"]) {
           await run(["cp", join(latest, file), join(exportSnapshot, file)], {
             timeoutMs: 180_000,
           });

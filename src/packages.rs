@@ -30,9 +30,6 @@ pub const DEFAULT_PACKAGES: &[&str] = &[
 
 pub const SKIP_DEFAULT_PACKAGES_ENV: &str = "LNX_SKIP_DEFAULT_PACKAGES";
 
-/// Stamp value recorded in shares.stamp when no package store is mounted.
-pub const STAMP_DISABLED: &str = "disabled-v1";
-
 fn store_root_dir() -> String {
     format!("stores/nix-linux-{}", std::env::consts::ARCH)
 }
@@ -120,18 +117,6 @@ impl StoreLayout {
 
     fn closure_file(&self) -> PathBuf {
         self.mount.join(CLOSURE_FILE)
-    }
-
-    /// Stamp value recorded in shares.stamp for a mounted store. Bump the
-    /// version when the guest-visible mount topology changes: a restored
-    /// snapshot keeps its snapshot-time virtiofs devices and mounts.
-    pub fn stamp_value(&self, writable: bool) -> String {
-        let mode = if writable {
-            "writable-v1"
-        } else {
-            "readonly-v2"
-        };
-        format!("{mode} root={}", self.root.display())
     }
 
     pub fn is_ready(&self) -> bool {
@@ -765,17 +750,6 @@ mod tests {
             layout.profile_link(),
             PathBuf::from(format!("{root}/mount/profiles/default"))
         );
-    }
-
-    #[test]
-    fn stamp_value_reflects_mode_and_root() {
-        let layout = StoreLayout::resolve(Path::new("/tmp/base"));
-        let root = arch_store_root("/tmp/base");
-        assert_eq!(
-            layout.stamp_value(false),
-            format!("readonly-v2 root={root}")
-        );
-        assert_eq!(layout.stamp_value(true), format!("writable-v1 root={root}"));
     }
 
     #[test]

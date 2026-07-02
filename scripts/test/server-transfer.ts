@@ -25,12 +25,19 @@ const sourceInstance = "server-source";
 const targetInstance = "server-target";
 const port = await freePort();
 const url = `http://127.0.0.1:${port}`;
-const sharesStamp = [
-  "host-share-cache=nodax+close-to-open+writeback+restore-sync-v2",
-  `home=${homedir()}`,
-  "net=gvproxy",
-  "",
-].join("\n");
+const launchMetadata = JSON.stringify({
+  version: 1,
+  owner_args: [],
+  compatibility: {
+    host_share_cache: { dax: false },
+    packages: { mode: "disabled" },
+  },
+  shares: {
+    no_host_shares: false,
+    host_home: homedir(),
+    outside_home_cwd: null,
+  },
+}, null, 2) + "\n";
 
 try {
   await rm(base, { recursive: true, force: true });
@@ -45,7 +52,7 @@ try {
   );
   await writeFile(join(sourceBase, "instances", sourceInstance, "memory-snapshots", "latest", "pages.img"), "pages");
   await writeFile(join(sourceBase, "instances", sourceInstance, "memory-snapshots", "latest", "vmstate.bin"), "vmstate");
-  await writeFile(join(sourceBase, "instances", sourceInstance, "memory-snapshots", "latest", "shares.stamp"), sharesStamp);
+  await writeFile(join(sourceBase, "instances", sourceInstance, "memory-snapshots", "latest", "launch.json"), launchMetadata);
   await writeFile(join(sourceBase, "instances", sourceInstance, "memory-snapshots", "latest", "initramfs.stamp"), "stamp");
 
   const server = spawn([lnxBin, "server", "--listen", `127.0.0.1:${port}`], {

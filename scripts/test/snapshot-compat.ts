@@ -18,7 +18,7 @@ Bun.env.LNX_BROKER_IDLE_TTL_MS ??= "500";
 const ctx = defaultContext("snapshot-compat");
 const badSnapshot = join(ctx.tmpdir, "bad-memory-snapshot");
 const corruptSectionSnapshot = join(ctx.tmpdir, "corrupt-section-snapshot");
-const legacyCacheSnapshot = join(ctx.tmpdir, "legacy-cache-snapshot");
+const missingLaunchSnapshot = join(ctx.tmpdir, "missing-launch-snapshot");
 const shareMismatchSnapshot = join(ctx.tmpdir, "share-mismatch-snapshot");
 
 try {
@@ -62,16 +62,14 @@ try {
     assertContains(failure.stderr, "snapshot VM config mismatch", "config mismatch rejected");
   });
 
-  await testStep("legacy host-share cache policy stamp rejects memory restore clearly", async () => {
+  await testStep("snapshot without launch metadata rejects memory restore clearly", async () => {
     await waitForVmSuspend(ctx);
-    await cp(join(ctx.snapshotDir, "latest"), legacyCacheSnapshot, { recursive: true });
-    const stampPath = join(legacyCacheSnapshot, "shares.stamp");
-    const currentStamp = await readFile(stampPath, "utf8");
-    await writeFile(stampPath, currentStamp.replace(/^host-share-cache=.*\n/, ""));
+    await cp(join(ctx.snapshotDir, "latest"), missingLaunchSnapshot, { recursive: true });
+    await Bun.file(join(missingLaunchSnapshot, "launch.json")).delete();
 
     const failure = await ctx.vm.cli([
       "--snapshot",
-      legacyCacheSnapshot,
+      missingLaunchSnapshot,
       "bash",
       "-lc",
       "echo should-not-run",
@@ -84,8 +82,8 @@ try {
     }
     assertContains(
       failure.stderr,
-      "snapshot host-share/network stamp is incompatible (host_share_cache_policy:",
-      "legacy cache policy rejected",
+      "snapshot launch metadata is incompatible (launch_metadata: snapshot has no launch.json",
+      "missing launch metadata rejected",
     );
   });
 
@@ -129,9 +127,10 @@ try {
   await testStep("share root drift rejects restore", async () => {
     await waitForVmSuspend(ctx);
     await cp(join(ctx.snapshotDir, "latest"), shareMismatchSnapshot, { recursive: true });
-    const stampPath = join(shareMismatchSnapshot, "shares.stamp");
-    const currentStamp = await readFile(stampPath, "utf8");
-    await writeFile(stampPath, currentStamp.replace(/^home=.*\n/m, "home=/Users/lnx-share-drift\n"));
+    const metadataPath = join(shareMismatchSnapshot, "launch.json");
+    const launchMetadata = JSON.parse(await readFile(metadataPath, "utf8"));
+    launchMetadata.shares.host_home = "/Users/lnx-share-drift";
+    await writeFile(metadataPath, JSON.stringify(launchMetadata, null, 2) + "\n");
 
     const drifted = await ctx.vm.cli([
       "--snapshot",
@@ -148,7 +147,7 @@ try {
     }
     assertContains(
       drifted.stderr,
-      "snapshot host-share/network stamp is incompatible (share_mismatch:",
+      "snapshot launch metadata is incompatible (share_mismatch:",
       "share root drift rejects the restore",
     );
   });

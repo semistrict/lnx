@@ -329,22 +329,6 @@ fn clear_latest_snapshot_removes_snapshot_runtime_state() {
 }
 
 #[test]
-fn package_store_stamp_from_shares_defaults_to_disabled() {
-    assert_eq!(
-        package_store_stamp_from_shares(
-            "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\nnet=gvproxy\n"
-        ),
-        "disabled-v1"
-    );
-    assert_eq!(
-        package_store_stamp_from_shares(
-            "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1\npackages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64\nnet=gvproxy\n"
-        ),
-        "readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64"
-    );
-}
-
-#[test]
 fn nested_deterministic_inner_args_preserve_requested_run() {
     let layout = Layout {
         base: PathBuf::from("/Users/test/.lnx"),
