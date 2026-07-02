@@ -318,7 +318,7 @@ fn build_rootfs_with_instance(
     // Only root can preserve ownership and device nodes while unpacking.
     let mut command = Command::new(exe);
     command.arg("--instance").arg(builder_instance);
-    command.env("LNX_SKIP_DEFAULT_PACKAGES", "1");
+    command.env(crate::packages::SKIP_DEFAULT_PACKAGES_ENV, "1");
     if let Some(base) = base {
         command.env("LNX_BASE", base);
     }

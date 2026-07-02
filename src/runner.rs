@@ -341,18 +341,16 @@ fn validate_runtime_share_compatibility(config: &RunConfig) -> Result<()> {
 fn current_shares_stamp_for_config(config: &RunConfig, net_stamp_line: &str) -> Result<String> {
     let host_home = host_home_for_cwd(&config.cwd)?;
     let outside_home_cwd = (!config.cwd.starts_with(&host_home)).then(|| config.cwd.clone());
-    let package_store_stamp = package_store_stamp_line(
-        &config.layout.base,
-        config.package_store,
-        config.no_host_shares,
-    )?;
-    let mut stamp = shares_stamp_content_with_package_store(
-        &host_home,
-        outside_home_cwd.as_deref(),
+    let package_store_stamp =
+        package_store_stamp_line(config.package_store, config.no_host_shares)?;
+    let mut stamp = render_shares_stamp(SharesStampSpec {
+        host_home: &host_home,
+        outside_home_cwd: outside_home_cwd.as_deref(),
         net_stamp_line,
-        config.no_host_shares,
-        &package_store_stamp,
-    );
+        no_host_shares: config.no_host_shares,
+        host_share_cache_stamp: current_host_share_cache_stamp(),
+        package_store_stamp_line: Some(&package_store_stamp),
+    });
     append_vhost_user_fs_stamp(&mut stamp, &config.vhost_user_fs);
     Ok(stamp)
 }
@@ -1061,7 +1059,6 @@ fn start_vm(
     }
     let package_env = configure_package_store(
         &mut vm_builder,
-        &config.layout.base,
         config.package_store,
         share_layout.no_host_shares,
         &run_log,
@@ -2147,7 +2144,10 @@ const LEGACY_HOST_SHARE_CACHE_DAX_KEEP_CACHE_STAMP: &str =
 const LEGACY_HOST_SHARE_CACHE_NODAX_KEEP_CACHE_STAMP: &str =
     "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1";
 const HOST_SHARES_DISABLED_STAMP: &str = "host-shares=disabled-v1";
-const PACKAGE_STORE_DISABLED_STAMP: &str = "packages=disabled-v1";
+
+fn package_store_disabled_stamp_line() -> String {
+    format!("packages={}", crate::packages::STAMP_DISABLED)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ShareLayout {
@@ -2168,6 +2168,45 @@ struct SnapshotShareLayout {
 // host directory, a drifted network would strand the guest's addresses, and an
 // old cache policy can preserve stale host-file contents or size after the
 // host changed while the VM was stopped.
+struct SharesStampSpec<'a> {
+    host_home: &'a Path,
+    outside_home_cwd: Option<&'a Path>,
+    net_stamp_line: &'a str,
+    no_host_shares: bool,
+    host_share_cache_stamp: &'a str,
+    package_store_stamp_line: Option<&'a str>,
+}
+
+fn render_shares_stamp(spec: SharesStampSpec) -> String {
+    let mut lines = Vec::new();
+    if spec.no_host_shares {
+        lines.push(HOST_SHARES_DISABLED_STAMP.to_string());
+    } else {
+        lines.push(spec.host_share_cache_stamp.to_string());
+        lines.push(format!("home={}", spec.host_home.display()));
+    }
+    if let Some(line) = spec.package_store_stamp_line {
+        lines.push(line.to_string());
+    }
+    if !spec.no_host_shares
+        && let Some(cwd) = spec.outside_home_cwd
+    {
+        lines.push(format!("cwd={}", cwd.display()));
+    }
+    lines.push(spec.net_stamp_line.to_string());
+    let mut content = lines.join("\n");
+    content.push('\n');
+    content
+}
+
+fn current_host_share_cache_stamp() -> &'static str {
+    if crate::krun::host_share_dax_enabled() {
+        HOST_SHARE_CACHE_DAX_STAMP
+    } else {
+        HOST_SHARE_CACHE_NODAX_STAMP
+    }
+}
+
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 fn shares_stamp_content(
     host_home: &Path,
@@ -2175,40 +2214,14 @@ fn shares_stamp_content(
     net_stamp_line: &str,
     no_host_shares: bool,
 ) -> String {
-    let host_share_cache_stamp = if crate::krun::host_share_dax_enabled() {
-        HOST_SHARE_CACHE_DAX_STAMP
-    } else {
-        HOST_SHARE_CACHE_NODAX_STAMP
-    };
-    shares_stamp_content_with_cache_stamp(
+    render_shares_stamp(SharesStampSpec {
         host_home,
         outside_home_cwd,
         net_stamp_line,
         no_host_shares,
-        host_share_cache_stamp,
-    )
-}
-
-fn shares_stamp_content_with_package_store(
-    host_home: &Path,
-    outside_home_cwd: Option<&Path>,
-    net_stamp_line: &str,
-    no_host_shares: bool,
-    package_store_stamp_line: &str,
-) -> String {
-    let host_share_cache_stamp = if crate::krun::host_share_dax_enabled() {
-        HOST_SHARE_CACHE_DAX_STAMP
-    } else {
-        HOST_SHARE_CACHE_NODAX_STAMP
-    };
-    shares_stamp_content_with_cache_and_package_store(
-        host_home,
-        outside_home_cwd,
-        net_stamp_line,
-        no_host_shares,
-        host_share_cache_stamp,
-        package_store_stamp_line,
-    )
+        host_share_cache_stamp: current_host_share_cache_stamp(),
+        package_store_stamp_line: None,
+    })
 }
 
 fn append_vhost_user_fs_stamp(stamp: &mut String, mounts: &[VhostUserFsMount]) {
@@ -2252,61 +2265,12 @@ fn vhost_user_fs_guest_env(mounts: &[VhostUserFsMount]) -> String {
         .join(";")
 }
 
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-fn shares_stamp_content_with_cache_stamp(
-    host_home: &Path,
-    outside_home_cwd: Option<&Path>,
-    net_stamp_line: &str,
-    no_host_shares: bool,
-    host_share_cache_stamp: &str,
-) -> String {
-    if no_host_shares {
-        return format!("{HOST_SHARES_DISABLED_STAMP}\n{net_stamp_line}\n");
-    }
-    let mut content = format!("{host_share_cache_stamp}\nhome={}\n", host_home.display());
-    if let Some(cwd) = outside_home_cwd {
-        content.push_str(&format!("cwd={}\n", cwd.display()));
-    }
-    content.push_str(net_stamp_line);
-    content.push('\n');
-    content
-}
-
-fn shares_stamp_content_with_cache_and_package_store(
-    host_home: &Path,
-    outside_home_cwd: Option<&Path>,
-    net_stamp_line: &str,
-    no_host_shares: bool,
-    host_share_cache_stamp: &str,
-    package_store_stamp_line: &str,
-) -> String {
-    if no_host_shares {
-        return format!(
-            "{HOST_SHARES_DISABLED_STAMP}\n{package_store_stamp_line}\n{net_stamp_line}\n"
-        );
-    }
-    let mut content = format!(
-        "{host_share_cache_stamp}\nhome={}\n{package_store_stamp_line}\n",
-        host_home.display()
-    );
-    if let Some(cwd) = outside_home_cwd {
-        content.push_str(&format!("cwd={}\n", cwd.display()));
-    }
-    content.push_str(net_stamp_line);
-    content.push('\n');
-    content
-}
-
-fn package_store_stamp_line(
-    base: &Path,
-    mode: GuestStoreMode,
-    no_host_shares: bool,
-) -> Result<String> {
+fn package_store_stamp_line(mode: GuestStoreMode, no_host_shares: bool) -> Result<String> {
     if package_store_disabled(mode, no_host_shares) {
-        return Ok(PACKAGE_STORE_DISABLED_STAMP.to_string());
+        return Ok(package_store_disabled_stamp_line());
     }
 
-    let layout = StoreLayout::resolve(base);
+    let layout = StoreLayout::resolve_global()?;
     let writable = matches!(mode, GuestStoreMode::Writable);
     let enabled = if writable {
         layout.ensure()?;
@@ -2315,15 +2279,9 @@ fn package_store_stamp_line(
         layout.prepare_readonly()?
     };
     if !enabled {
-        return Ok(PACKAGE_STORE_DISABLED_STAMP.to_string());
+        return Ok(package_store_disabled_stamp_line());
     }
-
-    let mode = if writable {
-        "writable-v1"
-    } else {
-        "readonly-v1"
-    };
-    Ok(format!("packages={mode} root={}", layout.root.display()))
+    Ok(format!("packages={}", layout.stamp_value(writable)))
 }
 
 fn package_store_disabled(mode: GuestStoreMode, no_host_shares: bool) -> bool {
@@ -2432,7 +2390,7 @@ fn comparable_share_stamp_fields(stamp: &str) -> BTreeMap<String, String> {
     fields.remove("cwd");
     fields
         .entry("packages".to_string())
-        .or_insert_with(|| "disabled-v1".to_string());
+        .or_insert_with(|| crate::packages::STAMP_DISABLED.to_string());
     fields
 }
 
@@ -2441,7 +2399,7 @@ fn share_stamp_field_value<'a>(fields: &'a BTreeMap<String, String>, key: &str) 
         .get(key)
         .map(String::as_str)
         .unwrap_or(if key == "packages" {
-            "disabled-v1"
+            crate::packages::STAMP_DISABLED
         } else {
             "<absent>"
         })
@@ -5481,9 +5439,11 @@ fn cwd_write_allowlist() -> Vec<String> {
     vec![".".to_string()]
 }
 
+// The store is exposed as a single virtiofs share of the store root; the
+// guest agent bind-mounts store/ to /nix/store and profiles/ to
+// /run/lnx/packages and links profile binaries into /usr/local/bin.
 fn configure_package_store(
     builder: &mut VmBuilder,
-    base: &Path,
     mode: GuestStoreMode,
     no_host_shares: bool,
     run_log: &RunLog,
@@ -5492,7 +5452,7 @@ fn configure_package_store(
         return Ok(Vec::new());
     }
 
-    let layout = StoreLayout::resolve(base);
+    let layout = StoreLayout::resolve_global()?;
     let writable = matches!(mode, GuestStoreMode::Writable);
     if writable {
         layout.ensure()?;
@@ -5511,27 +5471,14 @@ fn configure_package_store(
         return Ok(Vec::new());
     }
     builder.virtiofs(krun::shared_virtiofs("lnx-nix-root", &layout.mount, true))?;
-    builder.virtiofs(krun::shared_virtiofs(
-        "lnx-nix-store",
-        &layout.store,
-        !writable,
-    ))?;
-    builder.virtiofs(krun::shared_virtiofs(
-        "lnx-packages",
-        &layout.profiles,
-        !writable,
-    ))?;
-    let env = vec![
-        "LNX_VIRTIOFS_NIX_ROOT=1".to_string(),
-        "LNX_VIRTIOFS_NIX_STORE=1".to_string(),
-        "LNX_VIRTIOFS_PACKAGE_PROFILE=1".to_string(),
-        format!("LNX_PACKAGE_BINARIES={}", layout.binaries()?.join(":")),
-    ];
     run_log.line(format!(
         "packages.store.mounted mode=readonly root={}",
         layout.root.display()
     ));
-    Ok(env)
+    Ok(vec![
+        "LNX_VIRTIOFS_NIX_ROOT=1".to_string(),
+        "LNX_PACKAGE_PROFILE=1".to_string(),
+    ])
 }
 
 fn host_share_unshare_dir(layout: &Layout, tag: &str) -> PathBuf {

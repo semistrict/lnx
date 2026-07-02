@@ -80,6 +80,29 @@ can wedge SQLite WAL close/unmap paths on macOS host shares; set
 is recorded in the snapshot compatibility stamp, so snapshots created under
 one mode do not restore into the other mode.
 
+Packages:
+
+`lnx` keeps a per-user Nix package store shared by every instance and every
+project (under `LNX_BASE` when set, otherwise `~/.lnx/stores/nix-linux-<arch>`;
+on macOS it is a case-sensitive APFS sparsebundle). Packages are built inside a
+throwaway `nixos/nix` builder VM and the resulting store is mounted read-only
+into guests, where the profile's binaries are linked into `/usr/local/bin`.
+
+```sh
+lnx packages install ripgrep            # bare names mean nixpkgs#<name>
+lnx packages install nixpkgs#go --bin go  # --bin asserts the profile provides it
+lnx packages list
+lnx packages gc                         # drop store paths outside the profile closure
+lnx packages paths
+```
+
+The first run of any instance installs a default Node.js toolchain
+(node/npm/npx/pnpm). Skip that with `--package-store disabled` (which also
+skips mounting the store for that run) or by setting
+`LNX_SKIP_DEFAULT_PACKAGES=1`. The mounted store is part of the snapshot
+compatibility stamp: when the store appears, disappears, or moves, the next
+run cold-boots instead of restoring the latest memory snapshot.
+
 Nested KVM testing:
 
 ```sh
