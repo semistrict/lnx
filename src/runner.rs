@@ -1118,14 +1118,6 @@ fn start_vm(
         format!("LNX_ROOT_DEVICE={root_device}"),
         format!("LNX_NET_IP={net_ip}"),
         format!("LNX_NET_GATEWAY={net_gateway}"),
-        format!(
-            "LNX_VIRTIOFS_DAX={}",
-            if crate::krun::host_share_dax_enabled() {
-                "1"
-            } else {
-                "0"
-            }
-        ),
         format!("LNX_VIRTIOFS_HOME={guest_home}"),
         share_layout
             .outside_home_cwd
@@ -2140,7 +2132,7 @@ fn snapshot_initramfs_is_compatible(snapshot_path: &Path, current_stamp: &Path) 
 
 const HOST_SHARE_CACHE_DAX_STAMP: &str =
     "host-share-cache=dax+close-to-open+writeback+restore-sync-v2";
-const HOST_SHARE_CACHE_NODAX_STAMP: &str =
+const LEGACY_HOST_SHARE_CACHE_NODAX_STAMP: &str =
     "host-share-cache=nodax+close-to-open+writeback+restore-sync-v2";
 const LEGACY_HOST_SHARE_CACHE_DAX_KEEP_CACHE_STAMP: &str =
     "host-share-cache=dax+keep-cache+writeback+restore-sync-v1";
@@ -2175,17 +2167,12 @@ fn shares_stamp_content(
     net_stamp_line: &str,
     no_host_shares: bool,
 ) -> String {
-    let host_share_cache_stamp = if crate::krun::host_share_dax_enabled() {
-        HOST_SHARE_CACHE_DAX_STAMP
-    } else {
-        HOST_SHARE_CACHE_NODAX_STAMP
-    };
     shares_stamp_content_with_cache_stamp(
         host_home,
         outside_home_cwd,
         net_stamp_line,
         no_host_shares,
-        host_share_cache_stamp,
+        HOST_SHARE_CACHE_DAX_STAMP,
     )
 }
 
@@ -2196,17 +2183,12 @@ fn shares_stamp_content_with_package_store(
     no_host_shares: bool,
     package_store_stamp_line: &str,
 ) -> String {
-    let host_share_cache_stamp = if crate::krun::host_share_dax_enabled() {
-        HOST_SHARE_CACHE_DAX_STAMP
-    } else {
-        HOST_SHARE_CACHE_NODAX_STAMP
-    };
     shares_stamp_content_with_cache_and_package_store(
         host_home,
         outside_home_cwd,
         net_stamp_line,
         no_host_shares,
-        host_share_cache_stamp,
+        HOST_SHARE_CACHE_DAX_STAMP,
         package_store_stamp_line,
     )
 }
@@ -2356,7 +2338,7 @@ fn snapshot_shares_incompatibility(snapshot_path: &Path, current: &str) -> Optio
         Ok(stamp)
             if !stamp.lines().any(|line| {
                 line == HOST_SHARE_CACHE_DAX_STAMP
-                    || line == HOST_SHARE_CACHE_NODAX_STAMP
+                    || line == LEGACY_HOST_SHARE_CACHE_NODAX_STAMP
                     || line == LEGACY_HOST_SHARE_CACHE_DAX_KEEP_CACHE_STAMP
                     || line == LEGACY_HOST_SHARE_CACHE_NODAX_KEEP_CACHE_STAMP
                     || line == HOST_SHARES_DISABLED_STAMP

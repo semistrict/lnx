@@ -98,7 +98,6 @@ const OLD_SERVICE_PATH: &str = "/etc/systemd/system/lnx-agent.service";
 const OLD_WANTS_LINK: &str = "/etc/systemd/system/multi-user.target.wants/lnx-agent.service";
 const CONTROL_SOCKET: &str = "/run/lnx-agent.sock";
 const CONTROL_SOCKET_ENV: &str = "LNX_CONTROL_SOCKET";
-const VIRTIOFS_DAX_ENV: &str = "LNX_VIRTIOFS_DAX";
 const VMSTATE_RESEED_MARKER: &str = "/run/lnx-vmstate-reseed";
 const SERVICE_PATH: &str = "/run/systemd/system/lnx-agent.service";
 const WANTS_DIR: &str = "/run/systemd/system/multi-user.target.wants";
@@ -362,14 +361,7 @@ fn mount_virtiofs_with_dax(tag: &str, guest_path: &str, read_only: bool, dax: bo
 }
 
 fn mount_virtiofs(tag: &str, guest_path: &str, read_only: bool) {
-    mount_virtiofs_with_dax(tag, guest_path, read_only, virtiofs_dax_enabled());
-}
-
-fn virtiofs_dax_enabled() -> bool {
-    !matches!(
-        env::var(VIRTIOFS_DAX_ENV).as_deref(),
-        Ok("0" | "false" | "off" | "no")
-    )
+    mount_virtiofs_with_dax(tag, guest_path, read_only, true);
 }
 
 fn mount_host_shares() {

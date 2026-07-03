@@ -502,59 +502,35 @@ fn snapshot_rootfs_promotion_rejects_ext4_errors() {
 #[test]
 fn shares_stamp_content_lists_home_cwd_and_network() {
     assert_eq!(
-        shares_stamp_content_with_cache_stamp(
-            Path::new("/Users/ramon"),
-            None,
-            "net=gvproxy",
-            false,
-            HOST_SHARE_CACHE_NODAX_STAMP,
-        ),
-        "host-share-cache=nodax+close-to-open+writeback+restore-sync-v2\nhome=/Users/ramon\nnet=gvproxy\n"
+        shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", false),
+        "host-share-cache=dax+close-to-open+writeback+restore-sync-v2\nhome=/Users/ramon\nnet=gvproxy\n"
     );
     assert_eq!(
-        shares_stamp_content_with_cache_stamp(
+        shares_stamp_content(
             Path::new("/Users/ramon"),
             Some(Path::new("/tmp/build")),
             "net=other",
             false,
-            HOST_SHARE_CACHE_NODAX_STAMP,
         ),
-        "host-share-cache=nodax+close-to-open+writeback+restore-sync-v2\nhome=/Users/ramon\ncwd=/tmp/build\nnet=other\n"
+        "host-share-cache=dax+close-to-open+writeback+restore-sync-v2\nhome=/Users/ramon\ncwd=/tmp/build\nnet=other\n"
     );
     assert_eq!(
-        shares_stamp_content_with_cache_stamp(
-            Path::new("/Users/ramon"),
-            None,
-            "net=gvproxy",
-            true,
-            HOST_SHARE_CACHE_NODAX_STAMP,
-        ),
+        shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", true),
         "host-shares=disabled-v1\nnet=gvproxy\n"
-    );
-    assert_eq!(
-        shares_stamp_content_with_cache_stamp(
-            Path::new("/Users/ramon"),
-            None,
-            "net=gvproxy",
-            false,
-            HOST_SHARE_CACHE_DAX_STAMP,
-        ),
-        "host-share-cache=dax+close-to-open+writeback+restore-sync-v2\nhome=/Users/ramon\nnet=gvproxy\n"
     );
 }
 
 #[test]
 fn shares_stamp_content_records_package_store() {
     assert_eq!(
-        shares_stamp_content_with_cache_and_package_store(
+        shares_stamp_content_with_package_store(
             Path::new("/Users/ramon"),
             None,
             "net=gvproxy",
             false,
-            HOST_SHARE_CACHE_NODAX_STAMP,
             "packages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64",
         ),
-        "host-share-cache=nodax+close-to-open+writeback+restore-sync-v2\nhome=/Users/ramon\npackages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64\nnet=gvproxy\n"
+        "host-share-cache=dax+close-to-open+writeback+restore-sync-v2\nhome=/Users/ramon\npackages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64\nnet=gvproxy\n"
     );
 }
 
@@ -568,12 +544,11 @@ fn shares_stamp_content_records_vhost_user_fs() {
         socket: PathBuf::from("/tmp/testfs.sock"),
         read_only: true,
     }];
-    let mut current = shares_stamp_content_with_cache_and_package_store(
+    let mut current = shares_stamp_content_with_package_store(
         Path::new("/Users/ramon"),
         None,
         "net=gvproxy",
         false,
-        HOST_SHARE_CACHE_NODAX_STAMP,
         PACKAGE_STORE_DISABLED_STAMP,
     );
     append_vhost_user_fs_stamp(&mut current, &mounts);
@@ -582,12 +557,11 @@ fn shares_stamp_content_records_vhost_user_fs() {
     fs::write(temp.path().join("shares.stamp"), &current).expect("write stamp");
     assert_eq!(snapshot_shares_incompatibility(temp.path(), &current), None);
 
-    let mut changed_socket = shares_stamp_content_with_cache_and_package_store(
+    let mut changed_socket = shares_stamp_content_with_package_store(
         Path::new("/Users/ramon"),
         None,
         "net=gvproxy",
         false,
-        HOST_SHARE_CACHE_NODAX_STAMP,
         PACKAGE_STORE_DISABLED_STAMP,
     );
     append_vhost_user_fs_stamp(
@@ -630,7 +604,7 @@ fn snapshot_shares_compatibility_requires_identical_stamp() {
     assert_eq!(
         snapshot_shares_incompatibility(temp.path(), &current),
         Some(
-            "share_mismatch: host-share-cache: snapshot=nodax+keep-cache+writeback+restore-sync-v1 current=nodax+close-to-open+writeback+restore-sync-v2"
+            "share_mismatch: host-share-cache: snapshot=nodax+keep-cache+writeback+restore-sync-v1 current=dax+close-to-open+writeback+restore-sync-v2"
                 .to_string()
         )
     );
@@ -669,7 +643,7 @@ fn snapshot_shares_compatibility_requires_identical_stamp() {
     assert_eq!(
             snapshot_shares_incompatibility(temp.path(), &current),
             Some(
-                "share_mismatch: host-shares: snapshot=disabled current=enabled; host-share-cache: snapshot=<absent> current=nodax+close-to-open+writeback+restore-sync-v2; home: snapshot=<absent> current=/Users/ramon"
+                "share_mismatch: host-shares: snapshot=disabled current=enabled; host-share-cache: snapshot=<absent> current=dax+close-to-open+writeback+restore-sync-v2; home: snapshot=<absent> current=/Users/ramon"
                     .to_string()
             )
         );
@@ -678,20 +652,23 @@ fn snapshot_shares_compatibility_requires_identical_stamp() {
     assert_eq!(
             snapshot_shares_incompatibility(temp.path(), &disabled),
             Some(
-                "share_mismatch: host-shares: snapshot=enabled current=disabled; host-share-cache: snapshot=nodax+close-to-open+writeback+restore-sync-v2 current=<absent>; home: snapshot=/Users/ramon current=<absent>"
+                "share_mismatch: host-shares: snapshot=enabled current=disabled; host-share-cache: snapshot=dax+close-to-open+writeback+restore-sync-v2 current=<absent>; home: snapshot=/Users/ramon current=<absent>"
                     .to_string()
             )
         );
 
-    let dax_current = shares_stamp_content_with_cache_stamp(
+    // Snapshots from the removed non-DAX mode must not memory-restore into
+    // the always-DAX runtime.
+    let legacy_nodax_snapshot = shares_stamp_content_with_cache_stamp(
         Path::new("/Users/ramon"),
         None,
         "net=gvproxy",
         false,
-        HOST_SHARE_CACHE_DAX_STAMP,
+        LEGACY_HOST_SHARE_CACHE_NODAX_STAMP,
     );
+    fs::write(temp.path().join("shares.stamp"), &legacy_nodax_snapshot).expect("write stamp");
     assert_eq!(
-            snapshot_shares_incompatibility(temp.path(), &dax_current),
+            snapshot_shares_incompatibility(temp.path(), &current),
             Some(
                 "share_mismatch: host-share-cache: snapshot=nodax+close-to-open+writeback+restore-sync-v2 current=dax+close-to-open+writeback+restore-sync-v2"
                     .to_string()
@@ -704,12 +681,11 @@ fn snapshot_shares_compatibility_requires_matching_package_store() {
     let temp = TempDir::new("snapshot-package-shares");
     fs::create_dir_all(temp.path()).expect("create snapshot dir");
     let disabled = shares_stamp_content(Path::new("/Users/ramon"), None, "net=gvproxy", false);
-    let enabled = shares_stamp_content_with_cache_and_package_store(
+    let enabled = shares_stamp_content_with_package_store(
         Path::new("/Users/ramon"),
         None,
         "net=gvproxy",
         false,
-        HOST_SHARE_CACHE_NODAX_STAMP,
         "packages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64",
     );
 
@@ -722,12 +698,11 @@ fn snapshot_shares_compatibility_requires_matching_package_store() {
         )
     );
 
-    let disabled_with_explicit_package = shares_stamp_content_with_cache_and_package_store(
+    let disabled_with_explicit_package = shares_stamp_content_with_package_store(
         Path::new("/Users/ramon"),
         None,
         "net=gvproxy",
         false,
-        HOST_SHARE_CACHE_NODAX_STAMP,
         PACKAGE_STORE_DISABLED_STAMP,
     );
     fs::write(
