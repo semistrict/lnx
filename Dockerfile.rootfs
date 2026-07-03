@@ -30,7 +30,7 @@ RUN set -eux; \
     npm install -g pnpm; \
     node --version; npm --version; pnpm --version
 
-FROM ubuntu:26.04
+FROM ubuntu:26.04 AS image
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     e2fsprogs \
@@ -40,3 +40,7 @@ COPY --from=rootfs / /rootfs
 
 RUN truncate -s 4G /rootfs.ext4 && \
     mke2fs -F -t ext4 -b 16384 -d /rootfs -L lnx /rootfs.ext4
+
+# Artifact-only stage so `--output type=local` exports just the ext4 image.
+FROM scratch
+COPY --from=image /rootfs.ext4 /rootfs.ext4
