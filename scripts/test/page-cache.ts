@@ -91,7 +91,7 @@ print(f"after={cache_kib()}")
 PY
 `,
       ],
-      { cwd, timeoutMs: 180_000, env: { LNX_HOST_SHARE_DAX: "1" } },
+      { cwd, timeoutMs: 180_000 },
     );
 
     const before = Number(result.stdout.match(/^before=(\d+)$/m)?.[1]);

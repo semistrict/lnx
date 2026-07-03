@@ -37,7 +37,6 @@ async function waitForSourceReady(): Promise<void> {
     const result = await ctx.vm.cli(["bash", "-lc", "test -e /tmp/virtiofs-fork-ready"], {
       check: false,
       cwd,
-      env: { LNX_HOST_SHARE_DAX: "1" },
     });
     if (result.status === 0) return;
     await sleep(250);
@@ -60,7 +59,6 @@ try {
       {
         cwd,
         timeoutMs: 180_000,
-        env: { LNX_HOST_SHARE_DAX: "1" },
         stdin: String.raw`
 import mmap
 import os
@@ -150,7 +148,7 @@ finally:
         "python3",
         "-",
       ],
-      { cwd, stdin: "pipe", env: { LNX_HOST_SHARE_DAX: "1" } },
+      { cwd, stdin: "pipe" },
     );
     const ownerScript = String.raw`
 import mmap
@@ -220,7 +218,6 @@ finally:
       assertEq(
         (await run([ctx.lnxBin, "--instance", ctx.instance, "fork", forkInstance], {
           timeoutMs: 240_000,
-          env: { LNX_HOST_SHARE_DAX: "1" },
         })).stdout,
         forkInstance,
         "fork name",
@@ -234,7 +231,7 @@ finally:
           "-lc",
           "touch /tmp/virtiofs-fork-go; for i in $(seq 1 600); do test -s /tmp/virtiofs-fork-result && break; sleep 0.1; done; test -s /tmp/virtiofs-fork-result; cat /tmp/virtiofs-fork-result",
         ],
-        { cwd, timeoutMs: 180_000, env: { LNX_HOST_SHARE_DAX: "1" } },
+        { cwd, timeoutMs: 180_000 },
       );
       assertEq(forked.stdout, "ok", "fork restored process kept fd and mmap usable");
       const host = await read(join(cwd, "fork-open.bin"));

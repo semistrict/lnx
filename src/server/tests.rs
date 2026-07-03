@@ -81,7 +81,7 @@ fn imports_bundle_into_target_layout() {
   "owner_args": [],
   "compatibility": {
     "host_share_cache": {
-      "dax": false
+      "dax": true
     },
     "packages": {
       "mode": "disabled"

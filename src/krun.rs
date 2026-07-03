@@ -7,10 +7,6 @@ use anyhow::Result;
 use libkrun::{LogLevel, VirtioFs};
 
 const VIRTIOFS_DAX_WINDOW_BYTES: u64 = 8 << 30;
-/// Opt back into the old host-share DAX path. Writable host-share DAX can
-/// wedge SQLite WAL close/unmap paths on macOS, so the default is the safer
-/// non-DAX virtio-fs mount.
-pub(crate) const HOST_SHARE_DAX_ENV: &str = "LNX_HOST_SHARE_DAX";
 
 pub(crate) fn log_level_from_verbosity(level: u32) -> LogLevel {
     match level {
@@ -54,7 +50,7 @@ impl Drop for DeterministicHostActivity {
 
 pub(crate) fn shared_virtiofs(tag: &str, path: &Path, read_only: bool) -> VirtioFs {
     VirtioFs::shared(tag, path)
-        .dax_window_bytes(host_share_dax_window_bytes())
+        .dax_window_bytes(VIRTIOFS_DAX_WINDOW_BYTES)
         .read_only(read_only)
 }
 
@@ -65,22 +61,7 @@ pub(crate) fn host_share_virtiofs(
     unshare_dir: &Path,
 ) -> VirtioFs {
     VirtioFs::shared(tag, path)
-        .dax_window_bytes(host_share_dax_window_bytes())
+        .dax_window_bytes(VIRTIOFS_DAX_WINDOW_BYTES)
         .write_allowlist(write_allowlist.iter().map(PathBuf::from))
         .unshare_dir(unshare_dir)
-}
-
-pub(crate) fn host_share_dax_enabled() -> bool {
-    matches!(
-        std::env::var(HOST_SHARE_DAX_ENV).as_deref(),
-        Ok("1" | "true" | "on" | "yes")
-    )
-}
-
-fn host_share_dax_window_bytes() -> u64 {
-    if host_share_dax_enabled() {
-        VIRTIOFS_DAX_WINDOW_BYTES
-    } else {
-        0
-    }
 }

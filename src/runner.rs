@@ -1092,14 +1092,6 @@ fn start_vm(
         format!("LNX_ROOT_DEVICE={root_device}"),
         format!("LNX_NET_IP={net_ip}"),
         format!("LNX_NET_GATEWAY={net_gateway}"),
-        format!(
-            "LNX_VIRTIOFS_DAX={}",
-            if crate::krun::host_share_dax_enabled() {
-                "1"
-            } else {
-                "0"
-            }
-        ),
         format!("LNX_VIRTIOFS_HOME={guest_home}"),
         share_layout
             .outside_home_cwd
@@ -2284,9 +2276,7 @@ fn owner_restart_args(config: &RunConfig) -> Vec<String> {
 }
 
 fn host_share_cache_metadata() -> LaunchHostShareCache {
-    LaunchHostShareCache {
-        dax: crate::krun::host_share_dax_enabled(),
-    }
+    LaunchHostShareCache { dax: true }
 }
 
 fn package_store_metadata(mode: GuestStoreMode, no_host_shares: bool) -> Result<LaunchPackages> {
