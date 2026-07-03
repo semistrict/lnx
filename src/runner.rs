@@ -3512,7 +3512,31 @@ fn forwarded_exec_env() -> Vec<(String, String)> {
             env.push((key, value));
         }
     }
+    if !env.iter().any(|(key, _)| key == "TZ") {
+        if let Some(zone) = host_timezone() {
+            env.push(("TZ".to_string(), zone));
+        }
+    }
     env
+}
+
+/// IANA zone name of the host when `$TZ` is unset: `/etc/localtime` is a
+/// symlink into a zoneinfo tree on macOS and most Linux distributions, with
+/// `/etc/timezone` as the Debian fallback.
+fn host_timezone() -> Option<String> {
+    if let Ok(target) = std::fs::read_link("/etc/localtime") {
+        if let Some(zone) = zone_from_localtime_target(&target.to_string_lossy()) {
+            return Some(zone);
+        }
+    }
+    let zone = std::fs::read_to_string("/etc/timezone").ok()?;
+    let zone = zone.trim();
+    (!zone.is_empty()).then(|| zone.to_string())
+}
+
+fn zone_from_localtime_target(target: &str) -> Option<String> {
+    let (_, zone) = target.rsplit_once("/zoneinfo/")?;
+    (!zone.is_empty()).then(|| zone.to_string())
 }
 
 fn run_broker_client_retry(
