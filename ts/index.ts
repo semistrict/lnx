@@ -163,18 +163,6 @@ export type HostShareState = {
   raw: string;
 };
 
-export type PackageInstallOptions = CommandOptions & {
-  builder?: string;
-  builderImage?: string;
-  packages?: string[];
-  binaries?: string[];
-};
-
-export type PackagePaths = {
-  raw: string;
-  [key: string]: string;
-};
-
 export type IngressStatus = {
   enabled: boolean;
   raw: string;
@@ -211,7 +199,6 @@ export type LnxClient = {
     list(options?: CommandOptions): Promise<InstanceSummary[]>;
   };
   ingress: IngressClient;
-  packages: PackageStoreClient;
   cli(args: string[], options?: CommandOptions): Promise<CommandResult>;
 };
 
@@ -242,11 +229,6 @@ export type IngressClient = {
   status(options?: CommandOptions): Promise<IngressStatus>;
   enable(options?: CommandOptions): Promise<void>;
   disable(options?: CommandOptions): Promise<void>;
-};
-
-export type PackageStoreClient = {
-  install(options?: PackageInstallOptions): Promise<void>;
-  paths(options?: CommandOptions): Promise<PackagePaths>;
 };
 
 class BinaryLnxClient implements LnxClient {
@@ -284,20 +266,6 @@ class BinaryLnxClient implements LnxClient {
       disable: async (options: CommandOptions = {}) => {
         await this.cli(["ingress", "disable"], options);
       },
-    };
-  }
-
-  get packages(): PackageStoreClient {
-    return {
-      install: async (options: PackageInstallOptions = {}) => {
-        const args = ["packages", "install"];
-        if (options.builder) args.push("--builder", options.builder);
-        if (options.builderImage) args.push("--builder-image", options.builderImage);
-        for (const binary of options.binaries ?? []) args.push("--bin", binary);
-        args.push(...(options.packages ?? []));
-        await this.cli(args, options);
-      },
-      paths: async (options: CommandOptions = {}) => parsePackagePaths((await this.cli(["packages", "paths"], options)).stdout),
     };
   }
 
@@ -691,10 +659,6 @@ function parseIngressStatus(stdout: string): IngressStatus {
   parsed.raw = stdout;
   parsed.enabled = stdout.split("\n")[0]?.trim() === "enabled";
   return parsed;
-}
-
-function parsePackagePaths(stdout: string): PackagePaths {
-  return { raw: stdout, ...parseKeyValueOutput(stdout) };
 }
 
 export function defaultLnxBinary(): string {

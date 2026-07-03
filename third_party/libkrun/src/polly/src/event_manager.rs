@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::io;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};

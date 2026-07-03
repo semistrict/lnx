@@ -49,6 +49,8 @@ use crate::resources::TeeConfig;
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 #[cfg(target_arch = "x86_64")]
 use cpuid::{VmSpec, c3, filter_cpuid, t2};
+#[cfg(not(feature = "tee"))]
+use kvm_bindings::kvm_userspace_memory_region;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
     CpuId, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
@@ -62,8 +64,6 @@ use kvm_bindings::{
 };
 #[cfg(feature = "tee")]
 use kvm_bindings::{KVM_CAP_EXIT_HYPERCALL, KVM_MEMORY_EXIT_FLAG_PRIVATE};
-#[cfg(not(feature = "tee"))]
-use kvm_bindings::kvm_userspace_memory_region;
 #[cfg(all(feature = "tee", target_arch = "x86_64"))]
 use kvm_bindings::{
     KVM_MEM_GUEST_MEMFD, KVM_MEMORY_ATTRIBUTE_PRIVATE, kvm_create_guest_memfd,

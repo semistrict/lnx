@@ -62,32 +62,19 @@ fn init_path_accepts_default_instance_seed() {
 }
 
 #[test]
-fn package_store_flag_parses_and_defaults_to_auto() {
-    let cli = Cli::try_parse_from(["lnx", "run", "true"]).expect("parse run");
-    assert_eq!(cli.package_store, GuestStoreMode::Auto);
-
+fn package_store_flag_and_packages_subcommand_are_gone() {
+    // With the nix package store removed, both parse as plain guest commands.
     let cli = Cli::try_parse_from(["lnx", "--package-store", "disabled", "run", "true"])
-        .expect("parse run with package store mode");
-    assert_eq!(cli.package_store, GuestStoreMode::Disabled);
-}
+        .expect("unknown flags fall through to the guest command");
+    assert!(cli.command.is_none());
+    assert_eq!(
+        cli.guest_command,
+        vec!["--package-store", "disabled", "run", "true"]
+    );
 
-#[test]
-fn packages_subcommands_parse() {
-    let cli = Cli::try_parse_from(["lnx", "packages", "install", "ripgrep", "--bin", "rg"])
-        .expect("parse packages install");
-    let Some(Command::Packages(args)) = cli.command else {
-        panic!("expected packages command");
-    };
-    let PackagesCommand::Install(install) = args.command else {
-        panic!("expected install subcommand");
-    };
-    assert_eq!(install.packages, vec!["ripgrep".to_string()]);
-    assert_eq!(install.binaries, vec!["rg".to_string()]);
-
-    for subcommand in ["list", "gc", "paths"] {
-        Cli::try_parse_from(["lnx", "packages", subcommand])
-            .unwrap_or_else(|e| panic!("parse packages {subcommand}: {e}"));
-    }
+    let cli = Cli::try_parse_from(["lnx", "packages", "list"])
+        .expect("`packages` is no longer a subcommand");
+    assert_eq!(cli.guest_command, vec!["packages", "list"]);
 }
 
 #[test]

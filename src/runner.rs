@@ -28,11 +28,7 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{
-    host_share, initramfs, krun,
-    packages::{GuestStoreMode, StoreLayout},
-    paths::Layout,
-};
+use crate::{host_share, initramfs, krun, paths::Layout};
 
 const AGENT_PORT: u32 = 10240;
 const SNAPSHOT_PORT: u32 = 10241;
@@ -95,7 +91,6 @@ pub struct RunConfig {
     pub snapshot_output: Option<PathBuf>,
     pub run_as_root: bool,
     pub no_host_shares: bool,
-    pub package_store: GuestStoreMode,
     pub vhost_user_fs: Vec<VhostUserFsMount>,
     pub reuse_owner: bool,
     pub deterministic: Option<DeterministicConfig>,
@@ -1034,12 +1029,6 @@ fn start_vm(
             mount.read_only
         ));
     }
-    let package_env = configure_package_store(
-        &mut vm_builder,
-        config.package_store,
-        share_layout.no_host_shares,
-        &run_log,
-    )?;
     let mut kernel_cmdline =
         format!("console=hvc0 reboot=k panic=1 root={root_device} rw rootfstype=ext4");
     #[cfg(target_arch = "aarch64")]
@@ -1085,7 +1074,7 @@ fn start_vm(
             .as_secs(),
     };
     let (net_ip, net_gateway) = network.guest_env();
-    let mut init_env = vec![
+    let init_env = vec![
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
         "container=lnx".to_string(),
         format!("LNX_HOST_UNIX_SECS={init_unix_secs}"),
@@ -1104,7 +1093,6 @@ fn start_vm(
             vhost_user_fs_guest_env(&config.vhost_user_fs)
         ),
     ];
-    init_env.extend(package_env);
     vm_builder.exec("/init", &["--init".to_string()], &init_env);
     timings.event("krun.exec.configured");
 
@@ -2129,7 +2117,6 @@ struct LaunchMetadata {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct LaunchCompatibility {
     host_share_cache: LaunchHostShareCache,
-    packages: LaunchPackages,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2138,24 +2125,10 @@ struct LaunchHostShareCache {
 }
 
 // A restored snapshot keeps its snapshot-time virtiofs devices and guest
-// mounts, so the guest-visible store mount topology is part of snapshot
-// compatibility. Bump when it changes; launch metadata written before the
-// field existed deserializes as 0 and mismatches, forcing a cold boot.
-const PACKAGES_READONLY_TOPOLOGY: u32 = 2;
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "mode", rename_all = "kebab-case")]
-enum LaunchPackages {
-    Disabled,
-    Readonly {
-        root: PathBuf,
-        #[serde(default)]
-        topology: u32,
-    },
-    Writable {
-        root: PathBuf,
-    },
-}
+// mounts, so the device topology is part of snapshot compatibility. Version 2
+// dropped the nix package-store mount; version-1 snapshots carry its virtiofs
+// device and must cold-boot.
+const LAUNCH_METADATA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct LaunchShares {
@@ -2181,14 +2154,12 @@ struct LaunchVhostUserFsMount {
 fn launch_metadata_for_config(config: &RunConfig) -> Result<LaunchMetadata> {
     let host_home = host_home_for_cwd(&config.cwd)?;
     let outside_home_cwd = (!config.cwd.starts_with(&host_home)).then(|| config.cwd.clone());
-    let package_store = package_store_metadata(config.package_store, config.no_host_shares)?;
     Ok(launch_metadata_for_parts(
         config,
         host_home,
         outside_home_cwd,
         config.no_host_shares,
         host_share_cache_metadata(),
-        package_store,
     ))
 }
 
@@ -2198,15 +2169,11 @@ fn launch_metadata_for_parts(
     outside_home_cwd: Option<PathBuf>,
     no_host_shares: bool,
     host_share_cache: LaunchHostShareCache,
-    packages: LaunchPackages,
 ) -> LaunchMetadata {
     LaunchMetadata {
-        version: 1,
+        version: LAUNCH_METADATA_VERSION,
         owner_args: owner_restart_args(config),
-        compatibility: LaunchCompatibility {
-            host_share_cache,
-            packages,
-        },
+        compatibility: LaunchCompatibility { host_share_cache },
         shares: LaunchShares {
             no_host_shares,
             host_home: (!no_host_shares).then_some(host_home),
@@ -2266,8 +2233,6 @@ fn owner_restart_args(config: &RunConfig) -> Vec<String> {
     args.push("_vm-owner".to_string());
     args.push("--cwd".to_string());
     args.push(config.cwd.display().to_string());
-    args.push("--package-store".to_string());
-    args.push(config.package_store.as_arg().to_string());
     if let Some(snapshot) = &config.restore_snapshot {
         args.push("--restore".to_string());
         args.push(snapshot.display().to_string());
@@ -2279,52 +2244,15 @@ fn host_share_cache_metadata() -> LaunchHostShareCache {
     LaunchHostShareCache { dax: true }
 }
 
-fn package_store_metadata(mode: GuestStoreMode, no_host_shares: bool) -> Result<LaunchPackages> {
-    if package_store_disabled(mode, no_host_shares) {
-        return Ok(LaunchPackages::Disabled);
+/// Whether the default restore snapshot was written by the current launch
+/// metadata version. Missing launch metadata is treated as matching; deciding
+/// on it is the general snapshot compatibility check's job.
+pub fn default_restore_version_matches(snapshot: &Path) -> Result<bool> {
+    match read_launch_metadata(snapshot) {
+        Ok(metadata) => Ok(metadata.version == LAUNCH_METADATA_VERSION),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(_) => Ok(false),
     }
-
-    let layout = StoreLayout::resolve_global()?;
-    let writable = matches!(mode, GuestStoreMode::Writable);
-    let enabled = if writable {
-        layout.ensure()?;
-        true
-    } else {
-        layout.prepare_readonly()?
-    };
-    if !enabled {
-        return Ok(LaunchPackages::Disabled);
-    }
-
-    Ok(if writable {
-        LaunchPackages::Writable { root: layout.root }
-    } else {
-        LaunchPackages::Readonly {
-            root: layout.root,
-            topology: PACKAGES_READONLY_TOPOLOGY,
-        }
-    })
-}
-
-/// Whether the default restore snapshot's package-store compatibility matches
-/// what the next run would mount. Missing launch metadata is treated as
-/// matching; deciding on it is the general snapshot compatibility check's job.
-pub fn default_restore_package_store_matches(
-    snapshot: &Path,
-    mode: GuestStoreMode,
-    no_host_shares: bool,
-) -> Result<bool> {
-    let snapshot_packages = match read_launch_metadata(snapshot) {
-        Ok(metadata) => metadata.compatibility.packages,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(_) => LaunchPackages::Disabled,
-    };
-    Ok(snapshot_packages == package_store_metadata(mode, no_host_shares)?)
-}
-
-fn package_store_disabled(mode: GuestStoreMode, no_host_shares: bool) -> bool {
-    matches!(mode, GuestStoreMode::Disabled)
-        || (no_host_shares && !matches!(mode, GuestStoreMode::Writable))
 }
 
 pub fn snapshot_shares_incompatibility_for_import(
@@ -2335,11 +2263,10 @@ pub fn snapshot_shares_incompatibility_for_import(
     let host_home = host_home_for_cwd(cwd)?;
     let outside_home_cwd = (!cwd.starts_with(&host_home)).then(|| cwd.to_path_buf());
     let current = LaunchMetadata {
-        version: 1,
+        version: LAUNCH_METADATA_VERSION,
         owner_args: Vec::new(),
         compatibility: LaunchCompatibility {
             host_share_cache: host_share_cache_metadata(),
-            packages: LaunchPackages::Disabled,
         },
         shares: LaunchShares {
             no_host_shares,
@@ -2400,13 +2327,6 @@ fn describe_launch_mismatch(snapshot: &LaunchMetadata, current: &LaunchMetadata)
             optional_path_display(current.shares.host_home.as_deref())
         ));
     }
-    if snapshot.compatibility.packages != current.compatibility.packages {
-        mismatches.push(format!(
-            "packages: snapshot={} current={}",
-            describe_packages(&snapshot.compatibility.packages),
-            describe_packages(&current.compatibility.packages)
-        ));
-    }
     if normalized_vhost_user_fs(&snapshot.vhost_user_fs)
         != normalized_vhost_user_fs(&current.vhost_user_fs)
     {
@@ -2433,16 +2353,6 @@ fn describe_host_share_cache(cache: &LaunchHostShareCache) -> String {
         "dax".to_string()
     } else {
         "nodax".to_string()
-    }
-}
-
-fn describe_packages(packages: &LaunchPackages) -> String {
-    match packages {
-        LaunchPackages::Disabled => "disabled".to_string(),
-        LaunchPackages::Readonly { root, topology } => {
-            format!("readonly-t{topology} root={}", root.display())
-        }
-        LaunchPackages::Writable { root } => format!("writable root={}", root.display()),
     }
 }
 
@@ -4384,12 +4294,7 @@ fn spawn_owner_process(config: &RunConfig, run_log: &RunLog, run_id: &str) -> Re
     for mount in &config.vhost_user_fs {
         command.arg("--vhost-user-fs").arg(vhost_user_fs_arg(mount));
     }
-    command
-        .arg("_vm-owner")
-        .arg("--cwd")
-        .arg(&config.cwd)
-        .arg("--package-store")
-        .arg(config.package_store.as_arg());
+    command.arg("_vm-owner").arg("--cwd").arg(&config.cwd);
     if let Some(snapshot) = &config.restore_snapshot {
         command.arg("--restore").arg(snapshot);
     }
@@ -5470,48 +5375,6 @@ fn home_write_allowlist(cwd: &Path, host_home: &Path) -> Vec<String> {
 
 fn cwd_write_allowlist() -> Vec<String> {
     vec![".".to_string()]
-}
-
-// The store is exposed as a single virtiofs share of the store root; the
-// guest agent bind-mounts store/ to /nix/store and profiles/ to
-// /run/lnx/packages and links profile binaries into /usr/local/bin.
-fn configure_package_store(
-    builder: &mut VmBuilder,
-    mode: GuestStoreMode,
-    no_host_shares: bool,
-    run_log: &RunLog,
-) -> Result<Vec<String>> {
-    if package_store_disabled(mode, no_host_shares) {
-        return Ok(Vec::new());
-    }
-
-    let layout = StoreLayout::resolve_global()?;
-    let writable = matches!(mode, GuestStoreMode::Writable);
-    if writable {
-        layout.ensure()?;
-        builder.virtiofs(krun::shared_virtiofs("lnx-nix-root", &layout.mount, false))?;
-        run_log.line(format!(
-            "packages.store.mounted mode=writable root={}",
-            layout.root.display()
-        ));
-        return Ok(vec![
-            "LNX_VIRTIOFS_NIX_ROOT=1".to_string(),
-            "LNX_VIRTIOFS_NIX_ROOT_RW=1".to_string(),
-        ]);
-    }
-
-    if !layout.prepare_readonly()? {
-        return Ok(Vec::new());
-    }
-    builder.virtiofs(krun::shared_virtiofs("lnx-nix-root", &layout.mount, true))?;
-    run_log.line(format!(
-        "packages.store.mounted mode=readonly root={}",
-        layout.root.display()
-    ));
-    Ok(vec![
-        "LNX_VIRTIOFS_NIX_ROOT=1".to_string(),
-        "LNX_PACKAGE_PROFILE=1".to_string(),
-    ])
 }
 
 fn host_share_unshare_dir(layout: &Layout, tag: &str) -> PathBuf {

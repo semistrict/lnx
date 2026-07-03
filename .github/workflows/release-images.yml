@@ -122,6 +122,8 @@ jobs:
           zstd -d --force --sparse -o rootfs.ext4 rootfs.ext4.zst
           debugfs -R 'stat /sbin/init' rootfs.ext4
           debugfs -R 'stat /usr/lib/systemd/systemd' rootfs.ext4
+          debugfs -R 'stat /usr/local/bin/node' rootfs.ext4
+          debugfs -R 'stat /usr/local/bin/pnpm' rootfs.ext4
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -132,7 +134,7 @@ jobs:
             Pre-built kernel and rootfs images for lnx.
 
             - `vmlinuz.gz` — Linux kernel (arm64, gzip compressed)
-            - `rootfs.ext4.zst` — Ubuntu rootfs (64G sparse ext4, 16K block size, zstd compressed)
+            - `rootfs.ext4.zst` — Ubuntu rootfs with node/npm/pnpm baked in (64G sparse ext4, 16K block size, zstd compressed)
             - `lnx-linux-aarch64` — Linux helper used by nested deterministic runs on macOS
 
             Place the decompressed images at `~/.lnx/vmlinuz` and

@@ -77,14 +77,11 @@ fn imports_bundle_into_target_layout() {
             .path()
             .join("instances/source/memory-snapshots/latest/launch.json"),
         br#"{
-  "version": 1,
+  "version": 2,
   "owner_args": [],
   "compatibility": {
     "host_share_cache": {
       "dax": true
-    },
-    "packages": {
-      "mode": "disabled"
     }
   },
   "shares": {
@@ -172,14 +169,11 @@ fn rejects_sparse_bundle_with_incompatible_launch_metadata() {
     fs::write(
         source.snapshot_dir.join("latest/launch.json"),
         br#"{
-  "version": 1,
+  "version": 2,
   "owner_args": [],
   "compatibility": {
     "host_share_cache": {
       "dax": true
-    },
-    "packages": {
-      "mode": "disabled"
     }
   },
   "shares": {

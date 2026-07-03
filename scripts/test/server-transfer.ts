@@ -26,11 +26,10 @@ const targetInstance = "server-target";
 const port = await freePort();
 const url = `http://127.0.0.1:${port}`;
 const launchMetadata = JSON.stringify({
-  version: 1,
+  version: 2,
   owner_args: [],
   compatibility: {
     host_share_cache: { dax: false },
-    packages: { mode: "disabled" },
   },
   shares: {
     no_host_shares: false,

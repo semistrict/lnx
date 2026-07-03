@@ -2587,7 +2587,8 @@ fn autoconfigure_console_ports(
             forwarding_sigint = true;
             let sigint_input = port_io::PortInputSigInt::new();
             let sigint_input_fd = sigint_input.sigint_evt().as_raw_fd();
-            register_sigint_handler(sigint_input_fd).map_err(StartMicrovmError::RegisterFsSigwinch)?;
+            register_sigint_handler(sigint_input_fd)
+                .map_err(StartMicrovmError::RegisterFsSigwinch)?;
             Some(Box::new(sigint_input) as _)
         }
         #[cfg(not(target_os = "linux"))]

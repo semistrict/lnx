@@ -107,6 +107,18 @@ try {
     );
   });
 
+  await testStep("baked toolchain", async () => {
+    assertEq(
+      (await ctx.vm.cli(["which", "node"])).stdout,
+      "/usr/local/bin/node",
+      "node is baked into the rootfs, not linked from a package store",
+    );
+    assertEq((await ctx.vm.cli(["node", "-e", "console.log(6 * 7)"])).stdout, "42", "node runs");
+    assertEq((await ctx.vm.cli(["bash", "-lc", "npm --version >/dev/null && echo npm-ok"])).stdout, "npm-ok", "npm runs");
+    assertEq((await ctx.vm.cli(["bash", "-lc", "npx --version >/dev/null && echo npx-ok"])).stdout, "npx-ok", "npx runs");
+    assertEq((await ctx.vm.cli(["bash", "-lc", "pnpm --version >/dev/null && echo pnpm-ok"])).stdout, "pnpm-ok", "pnpm runs");
+  });
+
   await testStep("network and lnxctl", async () => {
     const probe = await ctx.vm.cli([
       "bash",

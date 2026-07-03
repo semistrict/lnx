@@ -504,16 +504,12 @@ fn test_launch_metadata(
     outside_home_cwd: Option<&str>,
     no_host_shares: bool,
     host_share_cache: LaunchHostShareCache,
-    packages: LaunchPackages,
     vhost_user_fs: Vec<LaunchVhostUserFsMount>,
 ) -> LaunchMetadata {
     LaunchMetadata {
-        version: 1,
+        version: LAUNCH_METADATA_VERSION,
         owner_args: vec!["lnx".to_string(), "_vm-owner".to_string()],
-        compatibility: LaunchCompatibility {
-            host_share_cache,
-            packages,
-        },
+        compatibility: LaunchCompatibility { host_share_cache },
         shares: LaunchShares {
             no_host_shares,
             host_home: (!no_host_shares).then(|| PathBuf::from(host_home)),
@@ -540,7 +536,6 @@ fn launch_metadata_records_vhost_user_fs_and_restart_args() {
         None,
         false,
         test_host_share_cache(false),
-        LaunchPackages::Disabled,
         vec![LaunchVhostUserFsMount {
             tag: "testfs".to_string(),
             mount: "/mnt/testfs".to_string(),
@@ -575,7 +570,6 @@ fn snapshot_launch_compatibility_requires_matching_json() {
         None,
         false,
         test_host_share_cache(false),
-        LaunchPackages::Disabled,
         Vec::new(),
     );
 
@@ -600,7 +594,6 @@ fn snapshot_launch_compatibility_requires_matching_json() {
         None,
         true,
         test_host_share_cache(false),
-        LaunchPackages::Disabled,
         Vec::new(),
     );
     write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &disabled)
@@ -628,99 +621,32 @@ fn snapshot_launch_compatibility_requires_matching_json() {
 }
 
 #[test]
-fn snapshot_launch_compatibility_requires_matching_package_store() {
-    let temp = TempDir::new("snapshot-package-launch");
-    fs::create_dir_all(temp.path()).expect("create snapshot dir");
-    let disabled = test_launch_metadata(
-        "/Users/ramon",
-        None,
-        false,
-        test_host_share_cache(false),
-        LaunchPackages::Disabled,
-        Vec::new(),
-    );
-    let enabled = test_launch_metadata(
-        "/Users/ramon",
-        None,
-        false,
-        test_host_share_cache(false),
-        LaunchPackages::Readonly {
-            root: PathBuf::from("/Users/ramon/.lnx/stores/nix-linux-aarch64"),
-            topology: PACKAGES_READONLY_TOPOLOGY,
-        },
-        Vec::new(),
-    );
-
-    write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &disabled)
-        .expect("write launch metadata");
-    assert_eq!(
-        snapshot_launch_incompatibility(temp.path(), &enabled),
-        Some(
-            "share_mismatch: packages: snapshot=disabled current=readonly-t2 root=/Users/ramon/.lnx/stores/nix-linux-aarch64"
-                .to_string()
-        )
-    );
-
-    // launch.json written before the topology field existed deserializes as
-    // topology 0 and must not restore into the current single-mount layout.
-    let legacy = serde_json::to_string(&enabled)
-        .expect("encode launch metadata")
-        .replace(",\"topology\":2", "");
-    assert!(legacy.contains("\"mode\":\"readonly\""));
-    assert!(!legacy.contains("topology"));
-    fs::write(temp.path().join(LAUNCH_METADATA), legacy).expect("write legacy launch metadata");
-    assert_eq!(
-        snapshot_launch_incompatibility(temp.path(), &enabled),
-        Some(
-            "share_mismatch: packages: snapshot=readonly-t0 root=/Users/ramon/.lnx/stores/nix-linux-aarch64 current=readonly-t2 root=/Users/ramon/.lnx/stores/nix-linux-aarch64"
-                .to_string()
-        )
-    );
-}
-
-#[test]
-fn default_restore_package_store_matching_reads_launch_metadata() {
-    let temp = TempDir::new("default-restore-packages");
+fn default_restore_version_matching_reads_launch_metadata() {
+    let temp = TempDir::new("default-restore-version");
     fs::create_dir_all(temp.path()).expect("create snapshot dir");
 
     // No launch metadata: leave the decision to the general snapshot check.
-    assert!(
-        default_restore_package_store_matches(temp.path(), GuestStoreMode::Auto, true)
-            .expect("match without metadata")
-    );
+    assert!(default_restore_version_matches(temp.path()).expect("match without metadata"));
 
-    let disabled = test_launch_metadata(
+    let current = test_launch_metadata(
         "/Users/ramon",
         None,
         true,
         test_host_share_cache(false),
-        LaunchPackages::Disabled,
         Vec::new(),
     );
-    write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &disabled)
+    write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &current)
         .expect("write launch metadata");
-    assert!(
-        default_restore_package_store_matches(temp.path(), GuestStoreMode::Auto, true)
-            .expect("disabled matches disabled")
-    );
+    assert!(default_restore_version_matches(temp.path()).expect("current version matches"));
 
-    let enabled = test_launch_metadata(
-        "/Users/ramon",
-        None,
-        false,
-        test_host_share_cache(false),
-        LaunchPackages::Readonly {
-            root: PathBuf::from("/Users/ramon/.lnx/stores/nix-linux-aarch64"),
-            topology: PACKAGES_READONLY_TOPOLOGY,
-        },
-        Vec::new(),
-    );
-    write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &enabled)
-        .expect("write launch metadata");
-    assert!(
-        !default_restore_package_store_matches(temp.path(), GuestStoreMode::Auto, true)
-            .expect("readonly snapshot does not match disabled store")
-    );
+    // A version-1 snapshot may carry the nix package-store virtiofs device
+    // and must cold-boot instead of restoring.
+    let legacy = serde_json::to_string(&current)
+        .expect("encode launch metadata")
+        .replace("\"version\":2", "\"version\":1");
+    assert!(legacy.contains("\"version\":1"));
+    fs::write(temp.path().join(LAUNCH_METADATA), legacy).expect("write legacy launch metadata");
+    assert!(!default_restore_version_matches(temp.path()).expect("legacy version mismatches"));
 }
 
 #[test]
@@ -732,7 +658,6 @@ fn snapshot_launch_compatibility_tolerates_cwd_share_changes() {
         None,
         false,
         test_host_share_cache(false),
-        LaunchPackages::Disabled,
         Vec::new(),
     );
     let current = test_launch_metadata(
@@ -740,7 +665,6 @@ fn snapshot_launch_compatibility_tolerates_cwd_share_changes() {
         Some("/private/tmp"),
         false,
         test_host_share_cache(false),
-        LaunchPackages::Disabled,
         Vec::new(),
     );
 
@@ -758,7 +682,6 @@ fn snapshot_share_layout_reads_recorded_launch_metadata() {
         Some("/tmp/build"),
         false,
         test_host_share_cache(false),
-        LaunchPackages::Disabled,
         Vec::new(),
     );
     write_launch_metadata(&temp.path().join(LAUNCH_METADATA), &metadata)
