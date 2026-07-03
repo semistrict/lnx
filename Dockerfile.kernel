@@ -1,4 +1,4 @@
-FROM ubuntu:26.04
+FROM ubuntu:26.04 AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -33,4 +33,6 @@ RUN for patch in /kernel-patches/*.patch; do patch -p1 < "$patch"; done
 COPY kernel.config .config
 RUN make olddefconfig && make -j$(nproc)
 
-# Output is arch/arm64/boot/Image
+# Artifact-only stage so `--output type=local` exports just the kernel image.
+FROM scratch
+COPY --from=build /build/arch/arm64/boot/Image /vmlinuz
