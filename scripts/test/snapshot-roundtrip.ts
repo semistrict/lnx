@@ -94,7 +94,7 @@ async function assertSnapshotFiles(path: string, label: string) {
     "vmstate.bin",
     "pages.img",
     "rootfs.ext4",
-    "shares.stamp",
+    "launch.json",
     "initramfs.stamp",
   ]) {
     const candidate = join(path, file);

@@ -75,10 +75,27 @@ fn imports_bundle_into_target_layout() {
     fs::write(
         source
             .path()
-            .join("instances/source/memory-snapshots/latest/shares.stamp"),
-        b"host-shares=disabled-v1\nnet=gvproxy\n",
+            .join("instances/source/memory-snapshots/latest/launch.json"),
+        br#"{
+  "version": 1,
+  "owner_args": [],
+  "compatibility": {
+    "host_share_cache": {
+      "dax": false
+    },
+    "packages": {
+      "mode": "disabled"
+    }
+  },
+  "shares": {
+    "no_host_shares": true,
+    "host_home": null,
+    "outside_home_cwd": null
+  }
+}
+"#,
     )
-    .expect("shares stamp");
+    .expect("launch metadata");
     fs::write(
         source.path().join("instances/source/lnx.json"),
         br#"{"name":"source"}"#,
@@ -138,7 +155,7 @@ fn imports_bundle_into_target_layout() {
 
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn rejects_sparse_bundle_with_incompatible_snapshot_stamp() {
+fn rejects_sparse_bundle_with_incompatible_launch_metadata() {
     let source_base = TempDir::new().expect("source tempdir");
     let dest_base = TempDir::new().expect("dest tempdir");
     let source = test_layout(source_base.path(), "source");
@@ -153,10 +170,27 @@ fn rejects_sparse_bundle_with_incompatible_snapshot_stamp() {
     fs::write(&source.vm_initialized, b"1\n").expect("vm initialized");
     fs::write(source.snapshot_dir.join("latest/vmstate.bin"), b"vmstate").expect("write vmstate");
     fs::write(
-            source.snapshot_dir.join("latest/shares.stamp"),
-            b"host-share-cache=dax+keep-cache+writeback+restore-sync-v1\nhome=/different\nnet=gvproxy\n",
-        )
-        .expect("write shares stamp");
+        source.snapshot_dir.join("latest/launch.json"),
+        br#"{
+  "version": 1,
+  "owner_args": [],
+  "compatibility": {
+    "host_share_cache": {
+      "dax": true
+    },
+    "packages": {
+      "mode": "disabled"
+    }
+  },
+  "shares": {
+    "no_host_shares": false,
+    "host_home": "/different",
+    "outside_home_cwd": null
+  }
+}
+"#,
+    )
+    .expect("write launch metadata");
 
     let bundle = SparseBundle::open(&source).expect("open sparse bundle");
     let bundle_file = tempfile::NamedTempFile::new().expect("bundle file");

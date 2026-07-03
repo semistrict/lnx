@@ -62,33 +62,32 @@ fn init_path_accepts_default_instance_seed() {
 }
 
 #[test]
-fn default_package_bootstrap_skips_internal_builders() {
-    assert!(should_bootstrap_default_package_store(
-        "default", false, false
-    ));
-    assert!(!should_bootstrap_default_package_store(
-        "default", true, false
-    ));
-    assert!(!should_bootstrap_default_package_store(
-        "default", false, true
-    ));
-    assert!(!should_bootstrap_default_package_store(
-        "nix-builder-oci-builder",
-        false,
-        false
-    ));
+fn package_store_flag_parses_and_defaults_to_auto() {
+    let cli = Cli::try_parse_from(["lnx", "run", "true"]).expect("parse run");
+    assert_eq!(cli.package_store, GuestStoreMode::Auto);
+
+    let cli = Cli::try_parse_from(["lnx", "--package-store", "disabled", "run", "true"])
+        .expect("parse run with package store mode");
+    assert_eq!(cli.package_store, GuestStoreMode::Disabled);
 }
 
 #[test]
-fn explicit_package_install_infers_binary_from_flake_attr() {
-    assert_eq!(
-        infer_package_binaries(&["nixpkgs#go".to_string()]),
-        vec!["go".to_string()]
-    );
-    assert_eq!(
-        infer_package_binaries(&["github:NixOS/nixpkgs/nixos-unstable#nodejs_latest".to_string()]),
-        vec!["nodejs_latest".to_string()]
-    );
+fn packages_subcommands_parse() {
+    let cli = Cli::try_parse_from(["lnx", "packages", "install", "ripgrep", "--bin", "rg"])
+        .expect("parse packages install");
+    let Some(Command::Packages(args)) = cli.command else {
+        panic!("expected packages command");
+    };
+    let PackagesCommand::Install(install) = args.command else {
+        panic!("expected install subcommand");
+    };
+    assert_eq!(install.packages, vec!["ripgrep".to_string()]);
+    assert_eq!(install.binaries, vec!["rg".to_string()]);
+
+    for subcommand in ["list", "gc", "paths"] {
+        Cli::try_parse_from(["lnx", "packages", subcommand])
+            .unwrap_or_else(|e| panic!("parse packages {subcommand}: {e}"));
+    }
 }
 
 #[test]
@@ -327,22 +326,6 @@ fn clear_latest_snapshot_removes_snapshot_runtime_state() {
     for path in &paths {
         assert!(!path.exists(), "{} should be removed", path.display());
     }
-}
-
-#[test]
-fn package_store_stamp_from_shares_defaults_to_disabled() {
-    assert_eq!(
-        package_store_stamp_from_shares(
-            "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1\nhome=/Users/ramon\nnet=gvproxy\n"
-        ),
-        "disabled-v1"
-    );
-    assert_eq!(
-        package_store_stamp_from_shares(
-            "host-share-cache=nodax+keep-cache+writeback+restore-sync-v1\npackages=readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64\nnet=gvproxy\n"
-        ),
-        "readonly-v1 root=/Users/ramon/.lnx/stores/nix-linux-aarch64"
-    );
 }
 
 #[test]

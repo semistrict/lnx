@@ -99,7 +99,7 @@ try {
 
   await testStep("share root drift rejects restore", async () => {
     // Running from the other side of the $HOME boundary changes the host
-    // share roots, so the pre-flight must skip the restore and boot cold; a
+    // share roots, so the pre-flight must refuse the restore; a
     // restored guest would keep mounts backed by the old share roots.
     await waitForVmSuspend(ctx, 120_000);
     const home = Bun.env.HOME ?? "/";
@@ -117,7 +117,7 @@ try {
     }
     assertContains(
       drifted.stderr,
-      "snapshot host-share/network stamp is incompatible (share_mismatch)",
+      "snapshot launch metadata is incompatible (share_mismatch)",
       "share root drift rejects the restore",
     );
   });

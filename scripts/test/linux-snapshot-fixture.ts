@@ -278,7 +278,7 @@ try {
   );
 
   const snapshot = await checkpointPathByName(join(innerBase, "instances", innerInstance), checkpointName);
-  for (const file of ["vmstate.bin", "pages.img", "rootfs.ext4", "shares.stamp", "initramfs.stamp"]) {
+  for (const file of ["vmstate.bin", "pages.img", "rootfs.ext4", "launch.json", "initramfs.stamp"]) {
     const path = join(snapshot, file);
     if (!existsSync(path)) {
       throw new Error(`missing Linux snapshot file: ${path}`);
@@ -286,14 +286,14 @@ try {
   }
   const vmstate = await Bun.file(join(snapshot, "vmstate.bin")).arrayBuffer();
   assertEq(new DataView(vmstate).getUint32(8, true), 4, "source snapshot is shared vmstate v4");
-  const sharesStamp = await Bun.file(join(snapshot, "shares.stamp")).text();
-  assertContains(sharesStamp, "host-shares=disabled-v1", "source snapshot has host shares disabled");
-  assertContains(sharesStamp, "net=gvproxy", "source snapshot uses portable gvproxy backing");
+  const launch = JSON.parse(await Bun.file(join(snapshot, "launch.json")).text());
+  assertEq(launch.shares.no_host_shares, true, "source snapshot has host shares disabled");
+  assertEq("net" in launch.compatibility, false, "network is not a launch option");
 
   await mkdir(output, { recursive: true });
   await cloneSparseImage(join(snapshot, "rootfs.ext4"), join(output, "rootfs.ext4"));
   await cloneSparseImage(join(snapshot, "pages.img"), join(output, "pages.img"));
-  for (const file of ["vmstate.bin", "shares.stamp", "initramfs.stamp"]) {
+  for (const file of ["vmstate.bin", "launch.json", "initramfs.stamp"]) {
     await run(["cp", join(snapshot, file), join(output, file)], { timeoutMs: 180_000 });
   }
   await run(["cp", kernel, join(output, "vmlinuz")], { timeoutMs: 180_000 });

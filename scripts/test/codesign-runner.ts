@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { mkdirSync, rmdirSync } from "node:fs";
+import { mkdirSync, readFileSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 
 const [binary, ...args] = Bun.argv.slice(2);
 const entitlements = new URL("../../entitlements.plist", import.meta.url).pathname;
@@ -28,45 +28,51 @@ async function run(argv: string[]): Promise<number> {
   return await proc.exited;
 }
 
-async function hasHypervisorEntitlement(): Promise<boolean> {
-  const proc = Bun.spawn(["codesign", "-d", "--entitlements", "-", binary], {
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "ignore",
-  });
-  const [status, stdout] = await Promise.all([
-    proc.exited,
-    new Response(proc.stdout).text(),
-  ]);
-  return status === 0 && stdout.includes("com.apple.security.hypervisor");
-}
-
-// Concurrent runners for the same binary (nextest spawns one process per
-// test, plus parallel normal/ignored list passes) must not re-sign it while
-// a sibling is signing or executing it: codesign --force replaces the file,
-// and macOS kills running instances of a replaced binary. Serialize the
-// signing behind a lock directory and skip it once the binary already
-// carries the entitlements, so only the first invocation ever rewrites.
-async function signOnce(): Promise<number> {
-  const lockDir = `${binary}.codesign.lock`;
-  const deadline = Date.now() + 120_000;
+// Test harnesses (cargo-nextest) invoke this runner several times for the
+// same binary, concurrently. codesign --force rewrites the file in place, so
+// concurrent signing corrupts or momentarily removes it. Serialize with a
+// lock directory and skip re-signing an unchanged binary via a stamp file.
+async function withSignLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
+  const lockDir = `${path}.sign-lock`;
+  const start = Date.now();
   for (;;) {
     try {
       mkdirSync(lockDir);
       break;
     } catch {
-      if (Date.now() > deadline) {
-        console.error(`timed out waiting for ${lockDir}; signing unlocked`);
-        break;
+      if (Date.now() - start > 30_000) {
+        try {
+          rmdirSync(lockDir);
+        } catch {}
       }
-      await Bun.sleep(50);
+      await Bun.sleep(25);
     }
   }
   try {
-    if (await hasHypervisorEntitlement()) {
+    return await fn();
+  } finally {
+    try {
+      rmdirSync(lockDir);
+    } catch {}
+  }
+}
+
+function binaryStamp(path: string): string {
+  const stat = statSync(path);
+  return `${stat.size}:${stat.mtimeMs}`;
+}
+
+if (process.platform === "darwin" && (await exists(binary))) {
+  const stampFile = `${binary}.signed`;
+  const status = await withSignLock(binary, async () => {
+    let previous = "";
+    try {
+      previous = readFileSync(stampFile, "utf8");
+    } catch {}
+    if (previous === binaryStamp(binary)) {
       return 0;
     }
-    return await run([
+    const signStatus = await run([
       "codesign",
       "--entitlements",
       entitlements,
@@ -75,18 +81,14 @@ async function signOnce(): Promise<number> {
       "-",
       binary,
     ]);
-  } finally {
-    try {
-      rmdirSync(lockDir);
-    } catch {}
-  }
-}
-
-if (process.platform === "darwin" && (await exists(binary))) {
-  const signStatus = await signOnce();
-  if (signStatus !== 0) {
+    if (signStatus === 0) {
+      writeFileSync(stampFile, binaryStamp(binary));
+    }
+    return signStatus;
+  });
+  if (status !== 0) {
     console.error(`codesign failed for ${binary}`);
-    process.exit(signStatus);
+    process.exit(status);
   }
 }
 

@@ -1,11 +1,11 @@
 #[cfg(target_os = "macos")]
 mod platform {
     use std::{
-        ffi::{c_char, c_int, c_longlong, CStr, CString},
+        ffi::{CStr, CString, c_char, c_int, c_longlong},
         path::Path,
     };
 
-    use anyhow::{bail, Context, Result};
+    use anyhow::{Context, Result, bail};
 
     unsafe extern "C" {
         fn lnx_gvproxy_start(
@@ -108,3 +108,17 @@ mod platform {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use platform::EmbeddedGvproxy;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub struct EmbeddedGvproxy;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl EmbeddedGvproxy {
+    pub fn start(
+        _socket: &std::path::Path,
+        _log: &std::path::Path,
+        _ssh_port: u16,
+    ) -> anyhow::Result<Self> {
+        anyhow::bail!("embedded gvproxy is not available on this platform")
+    }
+}

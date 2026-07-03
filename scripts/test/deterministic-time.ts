@@ -84,7 +84,7 @@ async function clonePreparedCheckpoint() {
   );
   for (const name of [
     "lnx.json",
-    "shares.stamp",
+    "launch.json",
     "deterministic.stamp",
     "initramfs.cpio",
     "initramfs.stamp",
@@ -97,7 +97,7 @@ async function clonePreparedCheckpoint() {
   const destSnapshot = join(secondCtx.imageDir, "memory-snapshots", "latest");
   await mkdir(destSnapshot, { recursive: true });
   for (const name of [
-    "shares.stamp",
+    "launch.json",
     "deterministic.stamp",
     "initramfs.stamp",
     "deterministic-clock.state",

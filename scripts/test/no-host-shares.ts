@@ -2,6 +2,7 @@ import {
   join } from "node:path";
 import {
   assertContains,
+  assertEq,
   cleanupContext,
   defaultContext,
   prepareContext,
@@ -37,9 +38,9 @@ try {
     const log = await Bun.file(join(ctx.runDir, "lnx.log")).text();
     assertContains(log, "host_shares.disabled", "host shares disabled log line");
 
-    const sharesStamp = await Bun.file(join(ctx.runDir, "shares.stamp")).text();
-    assertContains(sharesStamp, "host-shares=disabled-v1", "disabled share stamp");
-    assertContains(sharesStamp, "net=gvproxy", "portable network stamp");
+    const launch = JSON.parse(await Bun.file(join(ctx.runDir, "launch.json")).text());
+    assertEq(launch.shares.no_host_shares, true, "host shares disabled in launch metadata");
+    assertEq("net" in launch.compatibility, false, "network is not a launch option");
   });
 } finally {
   await cleanupContext(ctx);
