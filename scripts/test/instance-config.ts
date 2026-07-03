@@ -89,7 +89,7 @@ try {
     assertEq(inspect.memory_mib, 2048, "inspect effective memory");
     assertEq(inspect.settings.cpus, 1, "inspect persisted cpus");
     assertEq(inspect.settings.memory_mib, 2048, "inspect persisted memory");
-    assertEq(inspect.image, "release:images-v0.5.0", "inspect image source");
+    assertEq(inspect.image, "release:images-v0.6.0", "inspect image source");
     assertEq(inspect.checkpoints, 0, "inspect checkpoint count");
     assertEq(inspect.rootfs, ctx.imageDir + "/rootfs.ext4", "inspect rootfs path");
     assertEq(typeof inspect.created, "string", "inspect created timestamp");
