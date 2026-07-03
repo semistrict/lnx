@@ -74,8 +74,8 @@ jobs:
         with:
           targets: aarch64-unknown-linux-musl
 
-      - name: Install Linux musl cross compiler
-        run: brew install FiloSottile/musl-cross/musl-cross
+      - name: Install Linux musl cross compiler and sccache
+        run: brew install FiloSottile/musl-cross/musl-cross sccache
 
       - name: Build Linux helper binary
         run: |
