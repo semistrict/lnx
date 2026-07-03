@@ -500,13 +500,24 @@ fn restore_sync_guest_caches(entropy: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn wait_for_path(path: &str) -> bool {
+/// Wait until the root block device is openable, not merely visible in
+/// devtmpfs. The kernel publishes the /dev node (device_add) before it hashes
+/// the bdev inode (bdev_add) that mount's blkdev_get_no_open() looks up, so a
+/// freshly created node can still fail to open with ENXIO. Probing with
+/// open() goes through the same lookup as mount, making success the exact
+/// "openable" condition; it is the udev-less equivalent of waiting for the
+/// disk's ADD uevent, which the kernel emits only after bdev_add.
+fn wait_for_block_device(path: &str) -> bool {
+    const ENOENT: i32 = 2;
+    const ENXIO: i32 = 6;
     for _ in 0..100 {
-        if fs::metadata(path).is_ok() {
-            return true;
-        }
-        unsafe {
-            usleep(50_000);
+        match fs::File::open(path) {
+            Ok(_) => return true,
+            Err(e) if matches!(e.raw_os_error(), Some(ENOENT | ENXIO)) => unsafe {
+                usleep(50_000);
+            },
+            // Anything else is a real error; let mount surface it.
+            Err(_) => return true,
         }
     }
     false
@@ -980,7 +991,7 @@ fn init_mode() -> ! {
         )
     };
     let root_device = env::var("LNX_ROOT_DEVICE").unwrap_or_else(|_| "/dev/pmem0".to_string());
-    if !wait_for_path(&root_device) {
+    if !wait_for_block_device(&root_device) {
         log!("timed out waiting for {root_device}");
     }
     let root_device =
