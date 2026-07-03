@@ -48,12 +48,6 @@ impl Drop for DeterministicHostActivity {
     }
 }
 
-pub(crate) fn shared_virtiofs(tag: &str, path: &Path, read_only: bool) -> VirtioFs {
-    VirtioFs::shared(tag, path)
-        .dax_window_bytes(VIRTIOFS_DAX_WINDOW_BYTES)
-        .read_only(read_only)
-}
-
 pub(crate) fn host_share_virtiofs(
     tag: &str,
     path: &Path,

@@ -9,12 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
-use crate::{
-    checkpoints, descriptor, host_share, ingress, init,
-    packages::{self, GuestStoreMode, StoreLayout},
-    paths::Layout,
-    runner,
-};
+use crate::{checkpoints, descriptor, host_share, ingress, init, paths::Layout, runner};
 
 const DEFAULT_CPUS: u8 = 2;
 const DEFAULT_MEMORY_MIB: u32 = 4096;
@@ -72,14 +67,6 @@ pub struct Cli {
 
     #[arg(
         long,
-        value_enum,
-        default_value_t = GuestStoreMode::Auto,
-        help = "Shared package store mode; disabled also skips the first-run default install"
-    )]
-    package_store: GuestStoreMode,
-
-    #[arg(
-        long,
         help = "Run the guest command as root instead of the host-matching user"
     )]
     root: bool,
@@ -114,8 +101,6 @@ enum Command {
     Run(RunArgs),
     #[command(about = "Print instance paths")]
     Paths,
-    #[command(about = "Manage the shared Nix package store")]
-    Packages(PackagesArgs),
     #[command(about = "Create a checkpoint of the current instance")]
     Checkpoint(CheckpointArgs),
     #[command(about = "List checkpoints")]
@@ -199,39 +184,6 @@ struct InitArgs {
 struct RunArgs {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
-}
-
-#[derive(Debug, Args)]
-struct PackagesArgs {
-    #[command(subcommand)]
-    command: PackagesCommand,
-}
-
-#[derive(Debug, Subcommand)]
-enum PackagesCommand {
-    #[command(about = "Install packages into the shared Linux Nix store")]
-    Install(PackagesInstallArgs),
-    #[command(about = "List installed packages and linked binaries")]
-    List,
-    #[command(about = "Remove store paths no longer referenced by the package profile")]
-    Gc,
-    #[command(about = "Print shared package store paths")]
-    Paths,
-}
-
-#[derive(Debug, Args)]
-struct PackagesInstallArgs {
-    #[arg(long, default_value_t = packages::DEFAULT_BUILDER_INSTANCE.to_string())]
-    builder: String,
-
-    #[arg(long, default_value_t = packages::DEFAULT_BUILDER_IMAGE.to_string())]
-    builder_image: String,
-
-    #[arg(long = "bin", value_name = "NAME")]
-    binaries: Vec<String>,
-
-    #[arg(value_name = "FLAKE_REF_OR_PACKAGE")]
-    packages: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -390,9 +342,6 @@ struct HiddenVmOwnerArgs {
 
     #[arg(long)]
     trace_events: bool,
-
-    #[arg(long, value_enum, default_value_t = GuestStoreMode::Auto, hide = true)]
-    package_store: GuestStoreMode,
 }
 
 #[derive(Debug, Args)]
@@ -427,7 +376,6 @@ impl Cli {
             deterministic,
             trace_events,
             no_host_shares,
-            package_store,
             root,
             forwards,
             vhost_user_fs,
@@ -524,7 +472,6 @@ impl Cli {
                         snapshot_path,
                         nested_kvm,
                         effective_no_host_shares,
-                        package_store,
                         deterministic.clone(),
                         trace_events,
                         root,
@@ -544,7 +491,6 @@ impl Cli {
                 println!("snapshots: {}", layout.snapshot_dir.display());
                 Ok(())
             }
-            Some(Command::Packages(args)) => run_packages_command(args, cpus, memory_mib),
             Some(Command::Checkpoint(args)) => {
                 if cfg!(target_os = "macos") && deterministic.is_some() {
                     let mut subcommand = vec!["checkpoint".to_string()];
@@ -695,7 +641,6 @@ impl Cli {
                 snapshot_output: None,
                 run_as_root: false,
                 no_host_shares: effective_no_host_shares || args.no_host_shares,
-                package_store: args.package_store,
                 vhost_user_fs: vhost_user_fs.clone(),
                 reuse_owner: true,
                 deterministic: args
@@ -728,7 +673,6 @@ impl Cli {
                         snapshot_path,
                         nested_kvm,
                         effective_no_host_shares,
-                        package_store,
                         deterministic,
                         trace_events,
                         root,
@@ -922,79 +866,6 @@ fn set_instance_settings(layout: &Layout, settings: &[String]) -> Result<()> {
     }
     descriptor::save(layout, &config)?;
     println!("{}", serde_json::to_string_pretty(&config)?);
-    Ok(())
-}
-
-fn run_packages_command(args: PackagesArgs, cpus: u8, memory_mib: u32) -> Result<()> {
-    match args.command {
-        PackagesCommand::Install(args) => {
-            let manifest = packages::install(
-                packages::InstallRequest {
-                    builder: args.builder,
-                    builder_image: args.builder_image,
-                    binaries: args.binaries,
-                    packages: args.packages,
-                },
-                cpus,
-                memory_mib,
-            )?;
-            let store = StoreLayout::resolve_global()?;
-            println!("packages installed");
-            println!("profile: {}", store.profile_link().display());
-            println!("packages: {}", manifest.packages.join(", "));
-            if !manifest.binaries.is_empty() {
-                println!("checked binaries: {}", manifest.binaries.join(", "));
-            }
-            Ok(())
-        }
-        PackagesCommand::List => run_packages_list(),
-        PackagesCommand::Gc => {
-            let outcome = packages::gc()?;
-            println!(
-                "removed {} store paths ({:.1} MiB), kept {}",
-                outcome.removed,
-                outcome.removed_bytes as f64 / (1024.0 * 1024.0),
-                outcome.kept
-            );
-            Ok(())
-        }
-        PackagesCommand::Paths => {
-            let store = StoreLayout::resolve_global()?;
-            println!("root: {}", store.root.display());
-            println!("image: {}", store.image.display());
-            println!("mount: {}", store.mount.display());
-            println!("store: {}", store.store.display());
-            println!("var: {}", store.var.display());
-            println!("profiles: {}", store.profiles.display());
-            println!("profile: {}", store.profile_link().display());
-            println!("manifest: {}", store.manifest.display());
-            Ok(())
-        }
-    }
-}
-
-fn run_packages_list() -> Result<()> {
-    let store = StoreLayout::resolve_global()?;
-    let ready = store.prepare_readonly()?;
-    let Some(manifest) = store.read_manifest()? else {
-        println!("no packages installed (run: lnx packages install [PACKAGE...])");
-        return Ok(());
-    };
-    println!(
-        "store: {} ({})",
-        store.root.display(),
-        if ready { "ready" } else { "not ready" }
-    );
-    if let Some(target) = &manifest.profile_target {
-        println!("profile: {target}");
-    }
-    println!("closure: {} store paths", manifest.closure.len());
-    for package in &manifest.packages {
-        println!("package: {package}");
-    }
-    for binary in &manifest.binaries {
-        println!("binary: {binary}");
-    }
     Ok(())
 }
 
@@ -1466,7 +1337,6 @@ fn run_guest(
     snapshot_path: Option<PathBuf>,
     nested_kvm: bool,
     no_host_shares: bool,
-    package_store: GuestStoreMode,
     deterministic: Option<runner::DeterministicConfig>,
     trace_events: bool,
     run_as_root: bool,
@@ -1476,13 +1346,6 @@ fn run_guest(
     explicit_rootfs: bool,
 ) -> Result<()> {
     ensure_image_and_instance(&layout, explicit_kernel, explicit_rootfs)?;
-    packages::ensure_default_store(
-        &layout.instance,
-        cpus,
-        memory_mib,
-        no_host_shares,
-        package_store,
-    )?;
     ensure_vm_initialized(
         &layout,
         cpus,
@@ -1522,12 +1385,8 @@ fn run_guest(
     let explicit_restore_snapshot = snapshot_path.is_some();
     let restore_snapshot =
         restore_snapshot_for_run(&layout, snapshot_path, explicit_kernel, explicit_rootfs);
-    let restore_snapshot = filter_default_restore_for_package_store(
-        restore_snapshot,
-        explicit_restore_snapshot,
-        no_host_shares,
-        package_store,
-    )?;
+    let restore_snapshot =
+        filter_default_restore_for_version(restore_snapshot, explicit_restore_snapshot)?;
 
     let config = runner::RunConfig {
         layout,
@@ -1541,7 +1400,6 @@ fn run_guest(
         run_as_root,
         snapshot_output: None,
         no_host_shares,
-        package_store,
         vhost_user_fs,
         reuse_owner: true,
         deterministic,
@@ -1711,11 +1569,9 @@ fn restore_snapshot_for_run(
     latest.exists().then_some(latest)
 }
 
-fn filter_default_restore_for_package_store(
+fn filter_default_restore_for_version(
     snapshot: Option<PathBuf>,
     explicit_restore_snapshot: bool,
-    no_host_shares: bool,
-    mode: GuestStoreMode,
 ) -> Result<Option<PathBuf>> {
     if explicit_restore_snapshot {
         return Ok(snapshot);
@@ -1723,10 +1579,10 @@ fn filter_default_restore_for_package_store(
     let Some(snapshot) = snapshot else {
         return Ok(None);
     };
-    if runner::default_restore_package_store_matches(&snapshot, mode, no_host_shares)? {
+    if runner::default_restore_version_matches(&snapshot)? {
         return Ok(Some(snapshot));
     }
-    eprintln!("package store changed since the latest snapshot was taken; cold-booting without it");
+    eprintln!("latest snapshot was taken by an older lnx; cold-booting without it");
     Ok(None)
 }
 
@@ -1890,7 +1746,6 @@ fn run_nested_deterministic_on_macos(
         snapshot_output: None,
         run_as_root: false,
         no_host_shares: false,
-        package_store: GuestStoreMode::Disabled,
         vhost_user_fs: Vec::new(),
         reuse_owner: true,
         deterministic: None,
@@ -2088,7 +1943,6 @@ fn initialize_vm_instance(
         snapshot_output,
         run_as_root: false,
         no_host_shares,
-        package_store: GuestStoreMode::Auto,
         vhost_user_fs,
         reuse_owner: true,
         deterministic,
@@ -2403,7 +2257,6 @@ fn create_checkpoint(
             snapshot_output: Some(path.clone()),
             run_as_root: false,
             no_host_shares,
-            package_store: GuestStoreMode::Auto,
             vhost_user_fs,
             reuse_owner: true,
             deterministic,
@@ -2536,7 +2389,6 @@ fn create_internal_fork_checkpoint(
             snapshot_output: Some(path.clone()),
             run_as_root: false,
             no_host_shares,
-            package_store: GuestStoreMode::Auto,
             vhost_user_fs,
             reuse_owner: true,
             deterministic,
@@ -2641,10 +2493,7 @@ fn validate_vhost_user_fs_mount(mount: &runner::VhostUserFsMount) -> Result<(), 
     {
         return Err("vhost-user fs tag may only contain letters, numbers, '.', '_', or '-'".into());
     }
-    if matches!(
-        mount.tag.as_str(),
-        "home" | "cwd" | "lnx-nix-store" | "lnx-nix-root" | "lnx-packages"
-    ) {
+    if matches!(mount.tag.as_str(), "home" | "cwd") {
         return Err(format!("vhost-user fs tag is reserved: {}", mount.tag));
     }
     if !mount.mountpoint.starts_with('/')

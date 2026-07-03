@@ -3,11 +3,6 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_VERSION: u16 = 10;
 pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
-/// Name of the package profile inside the shared Nix store. The host install
-/// script publishes `profiles/<name>` and the guest agent links binaries from
-/// `/run/lnx/packages/<name>/bin`.
-pub const PACKAGE_PROFILE_NAME: &str = "default";
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
     Hello {

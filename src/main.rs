@@ -8,7 +8,6 @@ mod init;
 mod initramfs;
 mod krun;
 mod oci;
-mod packages;
 mod paths;
 mod runner;
 mod server;
