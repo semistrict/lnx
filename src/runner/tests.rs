@@ -912,6 +912,20 @@ fn deterministic_exec_identity_and_env_are_host_independent() {
 }
 
 #[test]
+fn zone_from_localtime_target_parses_zoneinfo_paths() {
+    assert_eq!(
+        zone_from_localtime_target("/var/db/timezone/zoneinfo/America/New_York"),
+        Some("America/New_York".to_string())
+    );
+    assert_eq!(
+        zone_from_localtime_target("/usr/share/zoneinfo/Europe/Berlin"),
+        Some("Europe/Berlin".to_string())
+    );
+    assert_eq!(zone_from_localtime_target("/usr/share/zoneinfo/"), None);
+    assert_eq!(zone_from_localtime_target("/etc/localtime.copy"), None);
+}
+
+#[test]
 fn deterministic_stamp_records_network_policy() {
     let config = DeterministicConfig {
         seed: "seed42".to_string(),
