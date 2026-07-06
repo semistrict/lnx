@@ -8,12 +8,44 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
-    # Depot-managed macOS runner (M4, macOS 26): GitHub-hosted macOS runners
-    # do not support Apple nested virtualization, so lnx tests cannot boot
-    # VMs there. Depot CI (.depot/workflows) is Linux-only, so the test
-    # workflow stays on GitHub Actions with a Depot runner label.
-    runs-on: depot-macos-26
+  # Unit tests do not boot VMs, so they run fine on GitHub-hosted runners.
+  unit:
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      CC_LINUX: /opt/homebrew/bin/aarch64-linux-musl-gcc
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: third_party/gvproxy-bridge/go.mod
+
+      - name: Install host dependencies
+        run: brew install FiloSottile/musl-cross/musl-cross llvm
+
+      - name: Rust formatting
+        run: cargo fmt --check
+
+      - name: Rust tests
+        run: bun run test
+
+  # The system suite boots VMs, which needs Hypervisor.framework on bare-metal
+  # macOS. No hosted CI provides that (macOS VMs cannot nest HVF), so this job
+  # targets a self-hosted Mac and only runs on manual dispatch until one is
+  # registered.
+  system:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 180
     env:
       CC_LINUX: /opt/homebrew/bin/aarch64-linux-musl-gcc
@@ -43,12 +75,6 @@ jobs:
         run: |
           brew install FiloSottile/musl-cross/musl-cross
           brew install e2fsprogs zstd podman llvm
-
-      - name: Rust formatting
-        run: cargo fmt --check
-
-      - name: Rust tests
-        run: bun run test
 
       - name: Full system tests
         run: bun run test:full
