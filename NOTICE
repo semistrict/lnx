@@ -1,0 +1,12 @@
+lnx
+Copyright 2026 Ramon Nogueira
+
+This product includes software developed as part of the libkrun project
+(https://github.com/containers/libkrun), licensed under the Apache License,
+Version 2.0. A modified copy of libkrun (with snapshot/restore support) is
+vendored under third_party/libkrun; see third_party/libkrun/LICENSE and
+third_party/libkrun/AUTHORS.
+
+This product includes gvproxy-bridge under third_party/gvproxy-bridge, which
+builds against gvisor-tap-vsock (https://github.com/containers/gvisor-tap-vsock),
+licensed under the Apache License, Version 2.0.

@@ -13,11 +13,14 @@ jobs:
     timeout-minutes: 180
     env:
       CC_LINUX: /opt/homebrew/bin/aarch64-linux-musl-gcc
-      LNX_BASE: ${{ runner.temp }}/lnx-state
       LNX_RUN_BROWSER_TEST: "1"
       LNX_RUN_PRIVILEGED_INGRESS_TEST: "1"
     steps:
       - uses: actions/checkout@v6
+
+      # The runner context is not available in job-level env.
+      - name: Set LNX_BASE
+        run: echo "LNX_BASE=$RUNNER_TEMP/lnx-state" >> "$GITHUB_ENV"
 
       - name: Set up Depot CLI
         uses: depot/setup-action@v1
@@ -33,13 +36,13 @@ jobs:
       - name: Install host dependencies
         run: |
           brew install FiloSottile/musl-cross/musl-cross
-          brew install e2fsprogs zstd
+          brew install e2fsprogs zstd podman llvm
 
       - name: Rust formatting
         run: cargo fmt --check
 
       - name: Rust tests
-        run: cargo test
+        run: bun run test
 
       - name: Full system tests
         run: bun run test:full

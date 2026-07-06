@@ -109,9 +109,28 @@ pub fn disable(config: &Config) -> Result<()> {
     let _ = start_helper(config, &["_ingress", "--uninstall-service"]);
     if stopped || !config.resolver_path().exists() {
         println!("ingress disabled");
+        println!(
+            "the local lnx CA stays trusted so re-enable skips the auth dialog; run `lnx ingress uninstall` to remove it"
+        );
     } else {
         println!("ingress already disabled");
     }
+    Ok(())
+}
+
+pub fn uninstall(config: &Config) -> Result<()> {
+    if config.needs_privileges() {
+        ensure_sudo_can_prompt_or_is_cached()?;
+        println!(
+            "lnx needs your password to remove the .{} resolver, the launchd service, and the trusted lnx CA from the System keychain.",
+            config.domain
+        );
+    }
+    if stop(config).is_ok() {
+        let _ = wait_for_stop(config, Duration::from_secs(5));
+    }
+    start_helper(config, &["_ingress", "--uninstall-service", "--purge-ca"])?;
+    println!("ingress uninstalled; local CA removed from the System keychain");
     Ok(())
 }
 
@@ -147,32 +166,28 @@ pub fn print_status(config: &Config) -> Result<()> {
     Ok(())
 }
 
-pub fn run_hidden(
-    spawn: bool,
-    cleanup: bool,
-    install_service_flag: bool,
-    uninstall_service_flag: bool,
-    refresh_if_running: bool,
-    config: Config,
-) -> Result<()> {
-    if cleanup {
-        let _ = fs::remove_file(config.resolver_path());
-        let _ = fs::remove_file(config.socket_path());
-        return Ok(());
+pub enum HiddenAction {
+    Cleanup,
+    RefreshIfRunning,
+    InstallService,
+    UninstallService { purge_ca: bool },
+    Spawn,
+    RunDaemon,
+}
+
+pub fn run_hidden(action: HiddenAction, config: Config) -> Result<()> {
+    match action {
+        HiddenAction::Cleanup => {
+            let _ = fs::remove_file(config.resolver_path());
+            let _ = fs::remove_file(config.socket_path());
+            Ok(())
+        }
+        HiddenAction::RefreshIfRunning => refresh_if_running_service(&config),
+        HiddenAction::UninstallService { purge_ca } => uninstall_service(&config, purge_ca),
+        HiddenAction::InstallService => install_service(&config),
+        HiddenAction::Spawn => spawn_daemon(&config),
+        HiddenAction::RunDaemon => run_daemon(config),
     }
-    if refresh_if_running {
-        return refresh_if_running_service(&config);
-    }
-    if uninstall_service_flag {
-        return uninstall_service(&config);
-    }
-    if install_service_flag {
-        return install_service(&config);
-    }
-    if spawn {
-        return spawn_daemon(&config);
-    }
-    run_daemon(config)
 }
 
 impl Config {
@@ -481,7 +496,7 @@ fn refresh_if_running_service(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn uninstall_service(config: &Config) -> Result<()> {
+fn uninstall_service(config: &Config, purge_ca: bool) -> Result<()> {
     unload_service(config);
     let _ = fs::remove_file(config.launchd_path());
     let _ = fs::remove_file(config.resolver_path());
@@ -489,8 +504,14 @@ fn uninstall_service(config: &Config) -> Result<()> {
     if config.requires_privileged_service() {
         let _ = fs::remove_file(SYSTEM_HELPER_PATH);
     }
-    // Leave the CA trusted: re-trusting on the next enable would re-open the
-    // Security auth dialog. The local dev CA persists like mkcert's.
+    if purge_ca {
+        untrust_ca(config)?;
+        let _ = fs::remove_dir_all(config.ca_dir());
+        let _ = fs::remove_dir_all(config.cert_dir());
+    }
+    // On plain disable, leave the CA trusted: re-trusting on the next enable
+    // would re-open the Security auth dialog. The CA is name-constrained to
+    // the ingress domain, and `lnx ingress uninstall` removes it entirely.
     Ok(())
 }
 
@@ -1154,6 +1175,14 @@ fn generate_ca(config: &Config) -> Result<()> {
             .arg("2048"),
     )
     .context("generate ingress CA key")?;
+    // Name-constrain the CA to the ingress domain so that trusting it cannot
+    // enable interception of any other host. IP-address names are excluded
+    // entirely; leaf certificates only ever carry .<domain> DNS names.
+    let name_constraints = format!(
+        "nameConstraints=critical,permitted;DNS:.{domain},permitted;DNS:{domain},\
+         excluded;IP:0.0.0.0/0.0.0.0,excluded;IP:0:0:0:0:0:0:0:0/0:0:0:0:0:0:0:0",
+        domain = config.domain
+    );
     run_command(
         Command::new("openssl")
             .arg("req")
@@ -1167,6 +1196,12 @@ fn generate_ca(config: &Config) -> Result<()> {
             .arg("3650")
             .arg("-subj")
             .arg(format!("/CN={CA_COMMON_NAME}"))
+            .arg("-addext")
+            .arg("basicConstraints=critical,CA:TRUE,pathlen:0")
+            .arg("-addext")
+            .arg("keyUsage=critical,keyCertSign,cRLSign")
+            .arg("-addext")
+            .arg(&name_constraints)
             .arg("-out")
             .arg(&cert),
     )
@@ -1180,6 +1215,9 @@ fn trust_ca(config: &Config) -> Result<()> {
     if !cfg!(target_os = "macos") {
         return Ok(());
     }
+    // Each enable regenerates the CA; drop stale trusted copies first so old
+    // roots do not accumulate in the System keychain.
+    remove_trusted_ca_certs();
     run_command(
         Command::new("security")
             .arg("add-trusted-cert")
@@ -1193,19 +1231,33 @@ fn trust_ca(config: &Config) -> Result<()> {
     .context("trust ingress CA")
 }
 
-// Retained for an explicit teardown; normal disable leaves the CA trusted.
-#[allow(dead_code)]
+// Normal disable leaves the CA trusted so re-enable does not re-open the
+// Security auth dialog; `lnx ingress uninstall` removes it.
 fn untrust_ca(_config: &Config) -> Result<()> {
     if !cfg!(target_os = "macos") {
         return Ok(());
     }
-    let _ = Command::new("security")
-        .arg("delete-certificate")
-        .arg("-c")
-        .arg(CA_COMMON_NAME)
-        .arg("/Library/Keychains/System.keychain")
-        .status();
+    remove_trusted_ca_certs();
     Ok(())
+}
+
+fn remove_trusted_ca_certs() {
+    // delete-certificate removes one match per invocation; loop until none
+    // remain so repeated enables cannot leave stale roots behind.
+    loop {
+        let status = Command::new("security")
+            .arg("delete-certificate")
+            .arg("-c")
+            .arg(CA_COMMON_NAME)
+            .arg("/Library/Keychains/System.keychain")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match status {
+            Ok(status) if status.success() => continue,
+            _ => break,
+        }
+    }
 }
 
 fn run_command(command: &mut Command) -> Result<()> {
