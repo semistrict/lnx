@@ -58,14 +58,15 @@ lnx echo hello         # downloads the kernel + rootfs image on first run
 Or build from source:
 
 ```sh
-brew install FiloSottile/musl-cross/musl-cross podman
+brew install FiloSottile/musl-cross/musl-cross
 git clone https://github.com/semistrict/lnx && cd lnx
 bun run install        # builds, signs, installs to ~/.cargo/bin
 lnx echo hello
 ```
 
-Guest networking uses podman's `gvproxy` (`brew install podman`, or set
-`GVPROXY_PATH`).
+Everything is in the single binary — guest networking (gvisor-tap-vsock),
+the guest agent, and the VMM are statically linked; only the kernel and
+rootfs images are downloaded on first run.
 
 ## Usage
 
@@ -120,7 +121,7 @@ More in [docs/architecture.md](docs/architecture.md).
 ## Building and developing
 
 ```sh
-brew install FiloSottile/musl-cross/musl-cross podman llvm
+brew install FiloSottile/musl-cross/musl-cross llvm
 bun run build          # debug build + codesign
 bun run test           # Rust unit tests
 bun run test:system    # core integration suite

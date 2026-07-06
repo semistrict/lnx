@@ -7,7 +7,8 @@ Thanks for your interest in lnx!
 - Apple Silicon Mac
 - Rust (stable, 1.85+) with the `aarch64-unknown-linux-musl` target
 - [Bun](https://bun.sh) for the build/test scripts
-- `brew install FiloSottile/musl-cross/musl-cross podman llvm`
+- `brew install FiloSottile/musl-cross/musl-cross llvm`
+- Go (builds the statically linked gvisor-tap-vsock network stack)
 
 ## Building
 

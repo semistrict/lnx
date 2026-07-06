@@ -17,11 +17,6 @@ or sign manually:
 codesign --entitlements entitlements.plist --force -s - target/debug/lnx
 ```
 
-## `gvproxy` not found
-
-Guest networking uses podman's `gvproxy`. Install podman
-(`brew install podman`) or point `GVPROXY_PATH` at a gvproxy binary.
-
 ## Snapshot refuses to restore after upgrading lnx
 
 Snapshots carry a compatibility stamp. When the VM configuration changes

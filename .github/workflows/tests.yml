@@ -74,7 +74,7 @@ jobs:
       - name: Install host dependencies
         run: |
           brew install FiloSottile/musl-cross/musl-cross
-          brew install e2fsprogs zstd podman llvm
+          brew install e2fsprogs zstd llvm
 
       - name: Full system tests
         run: bun run test:full
