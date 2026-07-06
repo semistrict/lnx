@@ -11,9 +11,11 @@ lnx psql --version    # same machine, still installed
 
 Between commands there is **no VM running**. When a command finishes and the
 instance goes idle, `lnx` snapshots the VM — RAM, devices, disk — and exits.
-The next command restores from that snapshot: systemd is already up, services
-are still running, the page cache is still warm. Rapid-fire commands reuse the
-live VM without a restore at all.
+The next command restores from that snapshot: systemd is already up and
+services are still running. The rootfs is mapped into the guest as pmem with
+DAX, so there is no guest page cache to snapshot or rewarm — file data stays
+in the host's cache and snapshots hold only the RAM the workload actually
+uses. Rapid-fire commands reuse the live VM without a restore at all.
 
 On an M5 Pro, `lnx /bin/true` completes in about **0.9s** when it restores a
 4 GiB VM from a memory snapshot, and about **40ms** when the VM is still live

@@ -5,8 +5,10 @@
 Those tools all keep a Linux VM (or several) running and give you fast access
 to it. `lnx` is built around a different primitive: **the VM's memory and disk
 state are a snapshot on disk**. When no command is running, there is no VM —
-the next command restores systemd, running services, page cache, and all, from
-the last snapshot. That enables things the others don't do:
+the next command restores systemd, running services, and all, from the last
+snapshot. The rootfs is pmem/DAX-mapped, so guest file data needs no page
+cache of its own — snapshots stay small and restores stay fast. That enables
+things the others don't do:
 
 - **No idle cost.** Nothing runs between commands; state still feels warm.
 - **Fork.** `lnx fork` clones an instance — including its disk — using APFS
