@@ -90,6 +90,15 @@ async function cloneShrunkRootfs(src: string, dest: string) {
   await shrinkRootfsToMinimum(dest);
 }
 
+// The outer guest stages the inner base on its own disk, so the shrunk outer
+// rootfs needs free space again; the file stays sparse on the host.
+async function growRootfs(path: string, sizeBytes: number) {
+  const resize2fs = e2fsTool("resize2fs");
+  await run(["truncate", "-s", String(sizeBytes), path], { timeoutMs: 180_000 });
+  await run([resize2fs, path], { timeoutMs: 180_000 });
+  await alignRootfsForPmem(path);
+}
+
 async function checkpointPathByName(imageDir: string, name: string): Promise<string> {
   const checkpointDir = join(imageDir, "checkpoints");
   for (const entry of await readdir(checkpointDir, { withFileTypes: true })) {
@@ -147,7 +156,18 @@ print("linux-source-after", flush=True)
   return [
     "set -euo pipefail",
     "test -c /dev/kvm",
-    `export LNX_BASE=${quoteShell(innerBase)}`,
+    `inner_instance=${quoteShell(innerInstance)}`,
+    // The inner VMM maps its rootfs as pmem via mmap, and nested KVM cannot
+    // map virtiofs-DAX pages (vcpu faults with EFAULT). Stage the inner base
+    // on guest-local disk and copy the checkpoint back out afterwards.
+    `host_base=${quoteShell(innerBase)}`,
+    "local_base=/root/lnx-linux-fixture-base",
+    "rm -rf \"$local_base\"",
+    "mkdir -p \"$local_base/instances/$inner_instance\"",
+    "cp \"$host_base/vmlinuz\" \"$local_base/vmlinuz\"",
+    "cp --sparse=always \"$host_base/instances/$inner_instance/rootfs.ext4\" \"$local_base/instances/$inner_instance/rootfs.ext4\"",
+    "cp \"$host_base/instances/$inner_instance/vm-initialized\" \"$local_base/instances/$inner_instance/vm-initialized\"",
+    "export LNX_BASE=\"$local_base\"",
     `export LNX_RUN_BASE=${quoteShell(innerRunBase)}`,
     "rm -rf \"$LNX_RUN_BASE\"",
     "nested_tools=/tmp/lnx-linux-fixture-tools",
@@ -157,7 +177,6 @@ print("linux-source-after", flush=True)
     "chmod +x \"$nested_tools\"/*",
     "export LNX_BIN=\"$nested_tools/lnx\"",
     "export LNX_BROKER_IDLE_TTL_MS=250",
-    `inner_instance=${quoteShell(innerInstance)}`,
     `checkpointName=${quoteShell(checkpointName)}`,
     "source_out=/tmp/lnx-linux-fixture-source.out",
     "source_err=/tmp/lnx-linux-fixture-source.err",
@@ -195,6 +214,7 @@ print("linux-source-after", flush=True)
     "  [ ! -e \"$pidfile\" ] && break",
     "  sleep 0.1",
     "done",
+    "cp -R --sparse=always \"$local_base/instances/$inner_instance/checkpoints\" \"$host_base/instances/$inner_instance/\"",
   ].join("\n");
 }
 
@@ -214,6 +234,7 @@ try {
   await ensureLinuxTools();
   await run(["cp", kernel, join(innerBase, "vmlinuz")], { timeoutMs: 180_000 });
   await cloneShrunkRootfs(rootfs, outerRootfs);
+  await growRootfs(outerRootfs, 16 * 1024 * 1024 * 1024);
   const innerRootfs = join(innerBase, "instances", innerInstance, "rootfs.ext4");
   await cloneSparseImage(rootfs, innerRootfs);
   await shrinkRootfsToMinimum(innerRootfs);

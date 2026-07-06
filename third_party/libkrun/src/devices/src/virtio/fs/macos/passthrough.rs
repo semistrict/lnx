@@ -4568,16 +4568,12 @@ impl FileSystem for PassthroughFs {
             .cloned()
             .ok_or_else(ebadf)?;
 
-        // SEEK_DATA and SEEK_HOLE have slightly different semantics
-        // in Linux vs. macOS, which means we can't support them.
-        let mwhence = if whence == 3 {
-            // SEEK_DATA
-            return Ok(offset);
-        } else if whence == 4 {
-            // SEEK_HOLE
-            libc::SEEK_END
-        } else {
-            whence as i32
+        // The guest passes Linux whence values, where SEEK_DATA=3 and
+        // SEEK_HOLE=4; macOS supports both but with the numbering swapped.
+        let mwhence = match whence {
+            3 => libc::SEEK_DATA,
+            4 => libc::SEEK_HOLE,
+            w => w as i32,
         };
 
         let fd = data.file.write().unwrap().as_raw_fd();

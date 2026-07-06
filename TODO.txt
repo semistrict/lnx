@@ -1,5 +1,0 @@
-Reliability test gaps and opt-in prerequisites:
-
-- Browser pixel/cursor verification still needs a reliable VNC client dependency such as vncdotool or a Playwright-controlled noVNC canvas check. `scripts/test/browser-snapshot.ts` is opt-in with `LNX_RUN_BROWSER_TEST=1` and currently verifies stock snap Chromium install plus noVNC endpoint survival across checkpoint/fork, but not actual rendered pixels or cursor visibility.
-- Privileged ingress launchd install is opt-in with `LNX_RUN_PRIVILEGED_INGRESS_TEST=1` because it uses sudo, `/etc/resolver`, launchd, and privileged ports.
-- Dirty filesystem offline fsck requires host `e2fsck`; the test skips clearly when it is unavailable.

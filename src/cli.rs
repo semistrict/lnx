@@ -313,6 +313,8 @@ enum IngressCommand {
     Enable,
     Disable,
     Status,
+    #[command(about = "Disable ingress and remove the trusted lnx CA")]
+    Uninstall,
 }
 
 #[derive(Debug, Args)]
@@ -358,8 +360,31 @@ struct HiddenIngressArgs {
     #[arg(long)]
     uninstall_service: bool,
 
+    #[arg(long, requires = "uninstall_service")]
+    purge_ca: bool,
+
     #[arg(long)]
     refresh_if_running: bool,
+}
+
+impl HiddenIngressArgs {
+    fn action(&self) -> ingress::HiddenAction {
+        if self.cleanup {
+            ingress::HiddenAction::Cleanup
+        } else if self.refresh_if_running {
+            ingress::HiddenAction::RefreshIfRunning
+        } else if self.uninstall_service {
+            ingress::HiddenAction::UninstallService {
+                purge_ca: self.purge_ca,
+            }
+        } else if self.install_service {
+            ingress::HiddenAction::InstallService
+        } else if self.spawn {
+            ingress::HiddenAction::Spawn
+        } else {
+            ingress::HiddenAction::RunDaemon
+        }
+    }
 }
 
 impl Cli {
@@ -596,6 +621,7 @@ impl Cli {
                     IngressCommand::Enable => ingress::enable(&config),
                     IngressCommand::Disable => ingress::disable(&config),
                     IngressCommand::Status => ingress::print_status(&config),
+                    IngressCommand::Uninstall => ingress::uninstall(&config),
                 }
             }
             Some(Command::Instances(args)) => match args.command {
@@ -606,14 +632,7 @@ impl Cli {
             Some(Command::Logs(args)) => print_instance_logs(&layout, args.console, args.owner),
             Some(Command::HiddenIngress(args)) => {
                 let config = ingress::load_config()?;
-                ingress::run_hidden(
-                    args.spawn,
-                    args.cleanup,
-                    args.install_service,
-                    args.uninstall_service,
-                    args.refresh_if_running,
-                    config,
-                )
+                ingress::run_hidden(args.action(), config)
             }
             Some(Command::HiddenVmInit) => initialize_vm_instance(
                 layout,

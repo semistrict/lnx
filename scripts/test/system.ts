@@ -107,6 +107,44 @@ try {
     );
   });
 
+  await testStep("virtiofs preserves sparse file geometry", async () => {
+    // Regression: the virtiofs server used to fake SEEK_DATA/SEEK_HOLE
+    // (macOS numbers them the other way around), so `cp --sparse` in the
+    // guest dropped trailing holes and truncated copies of aligned images.
+    const sparseDir = join(ctx.base, "test-work", `${ctx.instance}-sparse`);
+    const sparseFile = join(sparseDir, "sparse.bin");
+    await run(["rm", "-rf", sparseDir]);
+    await run(["mkdir", "-p", sparseDir]);
+    await run([
+      "python3",
+      "-c",
+      "import sys\nwith open(sys.argv[1], 'wb') as f:\n    f.write(b'A' * 4096)\n    f.seek(50 * 1024 * 1024)\n    f.write(b'B' * 4096)\n    f.truncate(64 * 1024 * 1024)\n",
+      sparseFile,
+    ]);
+
+    assertEq(
+      (await ctx.vm.cli(["stat", "-c", "%s", sparseFile])).stdout,
+      "67108864",
+      "guest sees full sparse file size",
+    );
+    const seeks = await ctx.vm.cli([
+      "python3",
+      "-c",
+      "import errno, os, sys\nfd = os.open(sys.argv[1], os.O_RDONLY)\nprint(os.lseek(fd, 0, 4))\ntry:\n    os.lseek(fd, 67108864, 3)\n    print('no-enxio')\nexcept OSError as e:\n    print(errno.errorcode[e.errno])\n",
+      sparseFile,
+    ]);
+    // APFS reports extents at 16 KiB granularity, so the 4 KiB data head
+    // rounds up to one host block.
+    assertEq(seeks.stdout, "16384\nENXIO", "guest SEEK_HOLE/SEEK_DATA follow Linux semantics");
+    const copy = await ctx.vm.cli([
+      "bash",
+      "-lc",
+      `cp --sparse=always ${sparseFile} /tmp/sparse-copy.bin && stat -c %s /tmp/sparse-copy.bin && cmp ${sparseFile} /tmp/sparse-copy.bin && echo identical`,
+    ]);
+    assertEq(copy.stdout, "67108864\nidentical", "sparse guest copy keeps size and content");
+    await run(["rm", "-rf", sparseDir]);
+  });
+
   await testStep("baked toolchain", async () => {
     assertEq(
       (await ctx.vm.cli(["which", "node"])).stdout,

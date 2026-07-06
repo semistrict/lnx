@@ -15,7 +15,10 @@ import { assertContains,
 } from "./lib";
 
 const ctx = defaultContext("browser-snapshot");
-const forkName = `${ctx.instance}-browser-fork`;
+const forkNames = Array.from(
+  { length: Number(Bun.env.LNX_BROWSER_FORK_COUNT ?? "10") },
+  (_, i) => `${ctx.instance}-browser-fork-${i}`,
+);
 
 async function freePort(): Promise<number> {
   return await new Promise((resolve, reject) => {
@@ -157,7 +160,9 @@ if (Bun.env.LNX_RUN_BROWSER_TEST !== "1") {
 
 try {
   await prepareContext(ctx);
-  await run(["rm", "-rf", `${ctx.base}/instances/${forkName}`, `${ctx.base}/instances/${forkName}`], { check: false });
+  for (const forkName of forkNames) {
+    await run(["rm", "-rf", `${ctx.base}/instances/${forkName}`], { check: false });
+  }
 
   await testStep("install stock browser stack", async () => {
     await ctx.vm.cli([
@@ -273,14 +278,24 @@ exit 1
     assertEq(checkpointCreated, true, "browser checkpoint created");
   });
 
-  await testStep("fork browser checkpoint and verify noVNC endpoint survives", async () => {
-    assertEq((await run([ctx.lnxBin, "--instance", ctx.instance, "fork", "--checkpoint", "browser-ready", forkName], { timeoutMs: 240_000 })).stdout, forkName, "browser fork");
-    const page = await run([ctx.lnxBin, "--instance", forkName, "curl", "-fsS", "http://127.0.0.1:6080/vnc.html"], { timeoutMs: 240_000 });
-    assertContains(page.stdout.toLowerCase(), "novnc", "fork noVNC page");
+  await testStep(`fork browser checkpoint ${forkNames.length}x and verify every noVNC endpoint`, async () => {
+    await Promise.all(
+      forkNames.map(async (forkName) => {
+        assertEq(
+          (await run([ctx.lnxBin, "--instance", ctx.instance, "fork", "--checkpoint", "browser-ready", forkName], { timeoutMs: 240_000 })).stdout,
+          forkName,
+          `browser fork ${forkName}`,
+        );
+        const page = await run([ctx.lnxBin, "--instance", forkName, "curl", "-fsS", "http://127.0.0.1:6080/vnc.html"], { timeoutMs: 240_000 });
+        assertContains(page.stdout.toLowerCase(), "novnc", `fork ${forkName} noVNC page`);
+      }),
+    );
   });
 } finally {
   await cleanupContext(ctx);
-  await cleanupInstance(ctx, forkName);
+  for (const forkName of forkNames) {
+    await cleanupInstance(ctx, forkName);
+  }
 }
 
 process.exit(0);

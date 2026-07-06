@@ -332,3 +332,43 @@ fn preserves_other_proxy_host_headers() {
 
     assert_eq!(rewrite_proxy_request_host(request.clone(), 6080), request);
 }
+
+#[test]
+fn generated_ca_is_name_constrained_to_the_ingress_domain() {
+    let state_dir = tempfile::tempdir().expect("tempdir");
+    let config = Config {
+        domain: "lnx".to_string(),
+        dns_addr: "127.0.0.1:5354".to_string(),
+        http_addr: "127.0.0.1:8080".to_string(),
+        https_addr: "127.0.0.1:8443".to_string(),
+        resolver_dir: state_dir.path().join("resolver"),
+        state_dir: state_dir.path().to_path_buf(),
+    };
+    fs::create_dir_all(config.ca_dir()).expect("create ca dir");
+
+    generate_ca(&config).expect("generate ca");
+
+    let output = Command::new("openssl")
+        .arg("x509")
+        .arg("-in")
+        .arg(config.ca_cert_path())
+        .arg("-text")
+        .arg("-noout")
+        .output()
+        .expect("read ca cert");
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("utf8 cert text");
+
+    assert!(text.contains("X509v3 Name Constraints: critical"), "{text}");
+    assert!(text.contains("Permitted:"), "{text}");
+    assert!(text.contains("DNS:.lnx"), "{text}");
+    assert!(text.contains("DNS:lnx"), "{text}");
+    assert!(text.contains("Excluded:"), "{text}");
+    assert!(text.contains("IP:0.0.0.0/0.0.0.0"), "{text}");
+    assert!(
+        text.contains("X509v3 Basic Constraints: critical"),
+        "{text}"
+    );
+    assert!(text.contains("CA:TRUE, pathlen:0"), "{text}");
+    assert!(text.contains("Certificate Sign, CRL Sign"), "{text}");
+}

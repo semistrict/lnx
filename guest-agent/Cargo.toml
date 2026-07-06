@@ -3,6 +3,8 @@ name = "lnx-agent"
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/semistrict/lnx"
 
 [dependencies]
 lnx-protocol = { path = "../lnx-protocol" }

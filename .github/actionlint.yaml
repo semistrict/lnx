@@ -1,0 +1,7 @@
+self-hosted-runner:
+  # Depot-managed GitHub Actions runners (https://depot.dev/docs/github-actions/runner-types)
+  labels:
+    - depot-macos-26
+    - depot-macos-latest
+    - depot-ubuntu-latest
+    - depot-ubuntu-24.04-arm

@@ -29,7 +29,7 @@ const launchMetadata = JSON.stringify({
   version: 2,
   owner_args: [],
   compatibility: {
-    host_share_cache: { dax: false },
+    host_share_cache: { dax: true },
   },
   shares: {
     no_host_shares: false,

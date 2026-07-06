@@ -1,120 +1,133 @@
 # lnx
 
-`lnx` is a Rust/libkrun Linux VM runner for macOS. It boots a Linux kernel
-directly, uses a normal systemd rootfs, and preserves VM memory plus disk state
-with libkrun snapshots between commands.
-
-The important architectural difference from libkrun's simple `krun_set_root`
-examples is that `lnx` keeps using the existing `rootfs.ext4` as the real
-systemd root:
-
-1. `krun_add_disk(ctx, "rootfs", rootfs.ext4, false)` attaches the rootfs image.
-2. The host generates an initramfs containing `lnx-agent` as both `/init` and
-   `/lnx-agent`.
-3. libkrun's bootstrap init execs `/init --init`.
-4. `/init --init` mounts `/dev/vda` at `/newroot`, copies `/lnx-agent` into
-   `/newroot/usr/local/lib/lnx/lnx-agent`, writes a systemd unit in
-   `/newroot/etc/systemd/system`, then `chroot`s and execs `/sbin/init`.
-5. Linux userspace therefore comes from the existing ext4 image, not from a
-   host-directory virtiofs root.
-
-Basic exec flow:
-
-1. The Rust build script compiles `guest-agent/src/main.rs` into a static Linux
-   binary named `lnx-agent`.
-2. Before boot, the host writes an initramfs containing that binary.
-3. The binary's `--init` mode stages itself into `/usr/local/lib/lnx` in the
-   real root.
-4. systemd starts `lnx-agent --agent 10240`.
-5. The host connects to `lnx-agent` over libkrun's vsock-to-Unix-socket port
-   mapping, sends one argv vector, streams stdout/stderr frames, and exits with
-   the guest command status.
-
-Build requirements on macOS:
+Linux VMs on macOS that wake up with their memory, disk, and systemd state
+intact.
 
 ```sh
-brew install FiloSottile/musl-cross/musl-cross
-brew install podman
-CC_LINUX=/opt/homebrew/bin/aarch64-linux-musl-gcc cargo build
-codesign --entitlements entitlements.plist --force -s - target/debug/lnx
-target/debug/lnx /bin/echo hello
+lnx echo hello        # boots a full Linux VM, runs the command, exits
+lnx apt-get install -y postgresql
+lnx psql --version    # same machine, still installed
 ```
 
-`lnx` builds against the `wip/snapshot-restore-20260525-0606` branch of
-`https://github.com/semistrict/libkrun`. `CC_LINUX` is needed because libkrun
-compiles its own embedded Linux init helper.
+Between commands there is **no VM running**. When a command finishes and the
+instance goes idle, `lnx` snapshots the VM — RAM, devices, disk — and exits.
+The next command restores from that snapshot: systemd is already up, services
+are still running, the page cache is still warm. Rapid-fire commands reuse the
+live VM without a restore at all.
 
-Networking uses podman's `gvproxy` via libkrun's `krun_add_net_unixgram`
-backend. The default path is `/opt/homebrew/opt/podman/libexec/podman/gvproxy`;
-set `GVPROXY_PATH` if it lives somewhere else.
+On an M5 Pro, `lnx /bin/true` completes in about **0.9s** when it restores a
+4 GiB VM from a memory snapshot, and about **40ms** when the VM is still live
+from a previous command.
 
-Ingress:
+Because instance state is just files (APFS clones for disk, snapshot files for
+RAM), instances are cheap to **fork**: prepare one instance — repo checked
+out, dependencies installed, server running — then stamp out copies of it, one
+per experiment, test shard, or coding agent.
+
+## What you get
+
+- **A real Linux machine, not a container.** Ubuntu userland with systemd,
+  its own kernel, apt, Docker-in-VM if you want it. Persistent per-instance
+  rootfs.
+- **Memory snapshots between commands.** Warm restores via libkrun dirty-page
+  tracking and APFS clones — only changed RAM and disk blocks are written.
+- **Instance forking and checkpoints.** `lnx fork` clones a prepared instance;
+  checkpoints roll the filesystem back to a known-good state.
+- **Host integration.** The current directory is shared into the guest
+  (virtio-fs with DAX), host timezone forwarded, ports forwarded with
+  `--forward`, and optional `https://p<port>-<instance>.lnx` URLs via ingress.
+- **Nested KVM.** Pass `--nested-kvm` and run KVM workloads (including lnx
+  itself) inside the guest.
+
+Requirements: Apple Silicon Mac. The guest is arm64 Linux.
+
+## Install
+
+Download the latest release from
+[GitHub Releases](https://github.com/semistrict/lnx/releases):
+
+```sh
+curl -LO https://github.com/semistrict/lnx/releases/latest/download/lnx-macos-arm64.tar.gz
+tar -xzf lnx-macos-arm64.tar.gz
+mv lnx ~/.local/bin/   # or anywhere on PATH
+lnx echo hello         # downloads the kernel + rootfs image on first run
+```
+
+Or build from source:
+
+```sh
+brew install FiloSottile/musl-cross/musl-cross podman
+git clone https://github.com/semistrict/lnx && cd lnx
+bun run install        # builds, signs, installs to ~/.cargo/bin
+lnx echo hello
+```
+
+Guest networking uses podman's `gvproxy` (`brew install podman`, or set
+`GVPROXY_PATH`).
+
+## Usage
+
+```sh
+lnx bash                          # interactive shell in the default instance
+lnx --instance dev bash           # named instances are isolated machines
+lnx --forward 8080:80 nginx       # forward Mac localhost:8080 to guest :80
+lnx checkpoint -m "deps installed"
+lnx fork dev2                     # clone the instance, disk and all
+lnx instances list
+lnx set cpus=4 memory-mib=8192    # persist per-instance settings
+```
+
+Optional HTTPS ingress — stable local URLs for every instance:
 
 ```sh
 sudo lnx ingress enable
-open https://p6080.default.lnx/
+open https://p6080-default.lnx/
 ```
 
-`ingress enable` installs the `.lnx` resolver, starts local HTTP and HTTPS
-listeners, and trusts a local `lnx` CA in the macOS System keychain. HTTPS
-certificates are generated per `.lnx` host on first use and terminate at the
-host ingress before proxying plain HTTP/WebSocket traffic to the guest port.
+Ingress installs a `.lnx` resolver, loopback listeners, and a local CA that is
+**name-constrained to `.lnx` hosts only** — it cannot sign certificates for
+real domains. `lnx ingress disable` removes the CA from the keychain;
+`sudo lnx ingress uninstall` removes every trace. Details in
+[docs/security.md](docs/security.md).
 
-Memory snapshot restore defaults to `~/.lnx/instances/<instance>/memory-snapshots/latest`
-and can be overridden with `--snapshot <dir>`. The VM runs in a detached
-`_vm-owner` process, so `lnx` exits as soon as the guest command's status
-arrives. The owner keeps the VM alive for an idle grace period (5s by default,
-`LNX_BROKER_IDLE_TTL_MS` to override) so rapid-fire commands reuse the live VM
-without a restore; once idle it asks the guest to quiesce, snapshots, and
-exits, so the next exec restores systemd, the agent, and the rootfs from that
-point. A fresh boot writes a full memory snapshot; restored runs use libkrun
-dirty tracking and APFS clones to patch only changed RAM and disk blocks.
+## How it works
 
-Per-run timings are appended to `~/.lnx/instances/<instance>/timings.log`.
-Incremental snapshots skip `fsync` by default for speed; set
-`KRUN_SNAPSHOT_SYNC=1` to make snapshot files crash-durable before returning.
+`lnx` boots a Linux kernel directly with [libkrun](https://github.com/containers/libkrun)
+on Hypervisor.framework. A small static agent is injected via initramfs,
+stages itself into the real ext4 rootfs, and hands off to systemd; commands
+stream over vsock. A detached owner process holds the VM through an idle grace
+period (default 5s), then quiesces the guest and snapshots. Snapshot restore
+brings back the full machine state.
 
-Host shares always mount with virtio-fs DAX. The cache mode is recorded in
-the snapshot compatibility stamp, so snapshots created under the removed
-non-DAX mode refuse to memory-restore; clear them with
-`lnx --instance <instance> snapshots clear`.
+The snapshot/restore support is carried as patches on a copy of libkrun
+vendored in-tree at `third_party/libkrun`; upstreaming is planned once the
+interface stabilizes.
 
-Packages:
+More in [docs/architecture.md](docs/architecture.md).
 
-The managed rootfs image ships with a development toolchain baked in: the
-latest Node.js (node/npm/npx, from the official nodejs.org tarball) plus pnpm
-in `/usr/local`, alongside the Ubuntu userland. Install anything else with
-`apt-get` inside the guest; each instance's rootfs is persistent.
+## Documentation
 
-Nested KVM testing:
+- [Architecture](docs/architecture.md)
+- [Security notes](docs/security.md) — what ingress installs, the
+  name-constrained CA, full uninstall
+- [FAQ](docs/faq.md) — vs OrbStack/Lima/Apple `container`, vendored libkrun,
+  platform support
+- [Troubleshooting](docs/troubleshooting.md)
+- [Testing](docs/testing.md)
+
+## Building and developing
 
 ```sh
-bun run test:nested-kvm
+brew install FiloSottile/musl-cross/musl-cross podman llvm
+bun run build          # debug build + codesign
+bun run test           # Rust unit tests
+bun run test:system    # core integration suite
 ```
 
-The nested test compiles `lnx` for `aarch64-unknown-linux-musl`, boots an outer
-`lnx --nested-kvm` guest, verifies that an inner `lnx` VM can boot after the
-outer VM has gone through `lnxctl snapshot-exit`, then runs the Linux-host
-compatible part of the integration suite inside the nested-capable guest.
+The hypervisor entitlement requires every runnable binary to be codesigned;
+the `bun run` scripts handle that. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Current caveats:
+## License
 
-- Inner nested `lnx` runs use `LNX_ROOTFS_BACKEND=block`; pmem/DAX rootfs inside
-  the nested Linux host still hits KVM mapping limitations.
-- Linux libkrun snapshot APIs are wired for a full-RAM KVM/aarch64 capture and
-  restore path. Incremental dirty-log snapshots are not implemented yet, so the
-  Linux path is expected to be correct but heavier than the macOS/HVF path until
-  it grows KVM dirty-log support.
-- `system` and `stress` have nested-safe coverage for their non-snapshot
-  behavior; their snapshot-specific assertions should move into the nested
-  Linux suite after the Linux full-RAM restore path has end-to-end runtime
-  coverage.
-- Linux virtiofs write allowlist enforcement is not active today, so the
-  policy-specific virtiofs restore/fork checks do not run inside the nested
-  Linux host.
-- `stock-ubuntu` remains excluded: `snapd` panics while parsing the nested guest
-  kernel command line under nested KVM, and a stock boot/apt probe hung instead
-  of producing bounded signal.
-- Browser snapshot coverage remains opt-in and snapshot/fork-dependent.
-- Ingress and privileged ingress tests are macOS host tests because they depend
-  on launchd, `/etc/resolver`, keychain/sudo setup, and privileged host ports.
+Apache-2.0. Vendored third-party code retains its own notices; see
+[NOTICE](NOTICE).

@@ -4,12 +4,21 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: macos-26
+    env:
+      # Set when the Developer ID secrets are configured; release binaries are
+      # then notarized instead of ad-hoc signed.
+      HAVE_SIGNING: ${{ secrets.MACOS_SIGN_P12 != '' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -35,7 +44,35 @@ jobs:
             CC_LINUX=/opt/homebrew/bin/aarch64-linux-musl-gcc \
             cargo build --release --target aarch64-unknown-linux-musl
 
-      - name: Codesign release binary
+      - name: Import Developer ID certificate
+        if: env.HAVE_SIGNING == 'true'
+        env:
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          echo "$MACOS_SIGN_P12" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -k "$keychain" \
+            -P "$MACOS_SIGN_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain
+
+      - name: Sign and notarize release binary
+        if: env.HAVE_SIGNING == 'true'
+        env:
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+        run: scripts/sign-notarize.sh target/release/lnx
+
+      - name: Codesign release binary (ad-hoc fallback)
+        if: env.HAVE_SIGNING != 'true'
         run: codesign --entitlements entitlements.plist --force -s - target/release/lnx
 
       - name: Package artifact
@@ -53,3 +90,14 @@ jobs:
           path: |
             lnx-macos-arm64.tar.gz
             lnx-macos-arm64.tar.gz.sha256
+
+      - name: Attach binary to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --title "lnx $tag" --generate-notes
+          gh release upload "$tag" --clobber \
+            lnx-macos-arm64.tar.gz lnx-macos-arm64.tar.gz.sha256
