@@ -42,7 +42,7 @@ because a known bug reproduces.
 - `src/` — host CLI and VM runner (Rust, libkrun)
 - `guest-agent/` — static Linux agent, PID-1 staging and exec service
 - `lnx-protocol/` — host/guest wire protocol
-- `third_party/libkrun` — vendored libkrun fork with snapshot/restore support
+- `third_party/libkrun` — vendored libkrun with snapshot/restore patches
 - `scripts/test/` — integration suites (Bun/TypeScript)
 - `docs/` — architecture, security, testing notes
 

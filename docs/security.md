@@ -25,7 +25,8 @@ permitting only `DNS:.lnx` names and excluding all IP addresses, plus
 `basicConstraints` with `pathlen:0`. Even with the CA trusted in the System
 keychain, certificates it signs are only valid for `.lnx` hosts — it cannot be
 used to intercept traffic to any real domain. The CA key never leaves
-`~/.lnx/ingress/ca` and each `ingress enable` regenerates it.
+`~/.lnx/ingress/ca`, each `ingress enable` regenerates it, and
+`ingress disable` removes it from the keychain.
 
 You can verify the constraints yourself:
 
@@ -35,18 +36,18 @@ openssl x509 -in ~/.lnx/ingress/ca/lnx-ca.crt -text -noout
 
 ## Removing everything
 
-`lnx ingress disable` stops the listeners and removes the resolver and
-launchd service, but leaves the CA trusted so a later re-enable does not
-prompt for authorization again.
+`lnx ingress disable` stops the listeners, removes the resolver file and the
+launchd service, and removes the CA from the System keychain. (Re-enabling
+later regenerates a fresh CA and prompts for authorization again.)
 
-To remove the CA and all ingress state as well:
+To also delete the on-disk CA and certificate state:
 
 ```sh
 sudo lnx ingress uninstall
 ```
 
-This deletes the launchd service, the resolver file, the trusted CA from the
-System keychain, and the CA/certificate state under `~/.lnx/ingress`.
+This does everything `disable` does and additionally removes the
+CA/certificate state under `~/.lnx/ingress`.
 
 To remove lnx entirely: run `sudo lnx ingress uninstall` (if you ever enabled
 ingress), then delete `~/.lnx` and the `lnx` binary.

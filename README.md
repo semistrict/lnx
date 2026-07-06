@@ -86,8 +86,9 @@ open https://p6080-default.lnx/
 
 Ingress installs a `.lnx` resolver, loopback listeners, and a local CA that is
 **name-constrained to `.lnx` hosts only** — it cannot sign certificates for
-real domains. `sudo lnx ingress uninstall` removes all of it, trusted CA
-included. Details in [docs/security.md](docs/security.md).
+real domains. `lnx ingress disable` removes the CA from the keychain;
+`sudo lnx ingress uninstall` removes every trace. Details in
+[docs/security.md](docs/security.md).
 
 ## How it works
 
@@ -98,8 +99,9 @@ stream over vsock. A detached owner process holds the VM through an idle grace
 period (default 5s), then quiesces the guest and snapshots. Snapshot restore
 brings back the full machine state.
 
-The snapshot/restore support lives in a vendored fork of libkrun
-(`third_party/libkrun`); upstreaming is planned once the interface stabilizes.
+The snapshot/restore support is carried as patches on a copy of libkrun
+vendored in-tree at `third_party/libkrun`; upstreaming is planned once the
+interface stabilizes.
 
 More in [docs/architecture.md](docs/architecture.md).
 
@@ -108,7 +110,7 @@ More in [docs/architecture.md](docs/architecture.md).
 - [Architecture](docs/architecture.md)
 - [Security notes](docs/security.md) — what ingress installs, the
   name-constrained CA, full uninstall
-- [FAQ](docs/faq.md) — vs OrbStack/Lima/Apple `container`, libkrun fork,
+- [FAQ](docs/faq.md) — vs OrbStack/Lima/Apple `container`, vendored libkrun,
   platform support
 - [Troubleshooting](docs/troubleshooting.md)
 - [Testing](docs/testing.md)

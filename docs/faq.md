@@ -18,14 +18,13 @@ If you want a always-on Docker replacement, OrbStack is great. If you want
 disposable-but-stateful Linux environments that appear on demand, that's
 `lnx`.
 
-## Why a libkrun fork?
+## Why is libkrun vendored?
 
-Upstream libkrun has no memory snapshot/restore. The vendored copy in
-`third_party/libkrun` (from
-[semistrict/libkrun](https://github.com/semistrict/libkrun)) adds snapshot
-capture/restore with dirty-page tracking on macOS/HVF. The plan is to upstream
-it once the interface stabilizes. The copy is vendored, so building `lnx` does
-not depend on a moving branch.
+Upstream [libkrun](https://github.com/containers/libkrun) has no memory
+snapshot/restore. The copy vendored in-tree at `third_party/libkrun` adds
+snapshot capture/restore with dirty-page tracking on macOS/HVF. The plan is to
+upstream it once the interface stabilizes. Everything needed to build `lnx`
+lives in this repository.
 
 ## Does it run on Intel Macs?
 
@@ -50,9 +49,10 @@ two vowels.
 ## Why does ingress install a trusted CA?
 
 So `https://p<port>-<instance>.lnx` URLs work without per-site warnings. The
-CA is name-constrained to `.lnx` hosts only and removable with
-`sudo lnx ingress uninstall` — see [security.md](security.md). Ingress is
-entirely optional; port forwarding with `--forward` works without it.
+CA is name-constrained to `.lnx` hosts only, `lnx ingress disable` removes it
+from the keychain, and `sudo lnx ingress uninstall` deletes its on-disk state
+too — see [security.md](security.md). Ingress is entirely optional; port
+forwarding with `--forward` works without it.
 
 ## Where does my data live?
 

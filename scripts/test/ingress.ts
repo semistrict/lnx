@@ -54,14 +54,14 @@ try {
     assertContains(response.stdout, "503 Service Unavailable", "attach is unavailable");
   });
 
-  await testStep("unprivileged ingress disable keeps the ca", async () => {
+  await testStep("unprivileged ingress disable keeps ca files for re-enable", async () => {
     await run([ctx.lnxBin, "ingress", "disable"], { env, timeoutMs: 30_000 });
     const disabled = await run([ctx.lnxBin, "ingress", "status"], { env });
     assertContains(disabled.stdout, "disabled", "ingress disabled");
-    assertEq((await run(["test", "-f", `${ctx.tmpdir}/state/ca/lnx-ca.crt`], { check: false })).status, 0, "ca survives disable");
+    assertEq((await run(["test", "-f", `${ctx.tmpdir}/state/ca/lnx-ca.crt`], { check: false })).status, 0, "ca files survive disable");
   });
 
-  await testStep("unprivileged ingress uninstall removes the ca", async () => {
+  await testStep("unprivileged ingress uninstall removes ca state", async () => {
     await run([ctx.lnxBin, "ingress", "uninstall"], { env, timeoutMs: 30_000 });
     assertEq((await run(["test", "-e", `${ctx.tmpdir}/state/ca`], { check: false })).status, 1, "ca dir removed");
     assertEq((await run(["test", "-e", `${ctx.tmpdir}/state/certs`], { check: false })).status, 1, "cert dir removed");

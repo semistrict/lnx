@@ -108,10 +108,7 @@ pub fn disable(config: &Config) -> Result<()> {
     }
     let _ = start_helper(config, &["_ingress", "--uninstall-service"]);
     if stopped || !config.resolver_path().exists() {
-        println!("ingress disabled");
-        println!(
-            "the local lnx CA stays trusted so re-enable skips the auth dialog; run `lnx ingress uninstall` to remove it"
-        );
+        println!("ingress disabled; local lnx CA removed from the System keychain");
     } else {
         println!("ingress already disabled");
     }
@@ -504,14 +501,11 @@ fn uninstall_service(config: &Config, purge_ca: bool) -> Result<()> {
     if config.requires_privileged_service() {
         let _ = fs::remove_file(SYSTEM_HELPER_PATH);
     }
+    untrust_ca(config)?;
     if purge_ca {
-        untrust_ca(config)?;
         let _ = fs::remove_dir_all(config.ca_dir());
         let _ = fs::remove_dir_all(config.cert_dir());
     }
-    // On plain disable, leave the CA trusted: re-trusting on the next enable
-    // would re-open the Security auth dialog. The CA is name-constrained to
-    // the ingress domain, and `lnx ingress uninstall` removes it entirely.
     Ok(())
 }
 
@@ -1231,8 +1225,8 @@ fn trust_ca(config: &Config) -> Result<()> {
     .context("trust ingress CA")
 }
 
-// Normal disable leaves the CA trusted so re-enable does not re-open the
-// Security auth dialog; `lnx ingress uninstall` removes it.
+// Disable removes keychain trust; `lnx ingress uninstall` also deletes the
+// on-disk CA and certificate state.
 fn untrust_ca(_config: &Config) -> Result<()> {
     if !cfg!(target_os = "macos") {
         return Ok(());

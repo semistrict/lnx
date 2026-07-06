@@ -99,13 +99,12 @@ compatible part of the integration suite inside the nested-capable guest.
   policy-specific virtiofs restore/fork checks do not run inside the nested
   Linux host.
 
-## libkrun fork
+## Vendored libkrun
 
-`lnx` builds against a vendored copy of libkrun (`third_party/libkrun`) from
-the `wip/snapshot-restore` branch of
-[semistrict/libkrun](https://github.com/semistrict/libkrun). The fork adds
-memory snapshot capture/restore with dirty tracking on macOS/HVF, which
-upstream libkrun does not have yet. The copy is vendored so builds are
-reproducible; the intent is to upstream the snapshot work once it stabilizes.
-`CC_LINUX` is needed at build time because libkrun compiles its own embedded
-Linux init helper.
+`lnx` builds against the copy of libkrun vendored in-tree at
+`third_party/libkrun`. It carries patches adding memory snapshot
+capture/restore with dirty tracking on macOS/HVF, which
+[upstream libkrun](https://github.com/containers/libkrun) does not have yet;
+the intent is to upstream the snapshot work once it stabilizes. `CC_LINUX` is
+needed at build time because libkrun compiles its own embedded Linux init
+helper.
