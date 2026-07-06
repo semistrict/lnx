@@ -56,9 +56,10 @@ non-DAX mode refuse to memory-restore; clear them with
 
 ## Networking
 
-Networking uses podman's `gvproxy` via libkrun's `krun_add_net_unixgram`
-backend. The default path is `/opt/homebrew/opt/podman/libexec/podman/gvproxy`;
-set `GVPROXY_PATH` if it lives somewhere else.
+Networking uses [gvisor-tap-vsock](https://github.com/containers/gvisor-tap-vsock)
+via libkrun's `krun_add_net_unixgram` backend. The Go network stack is
+statically linked into the `lnx` binary (`third_party/gvproxy-bridge`); no
+external gvproxy is needed.
 
 ## Ingress
 
