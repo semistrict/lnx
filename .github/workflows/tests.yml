@@ -1,12 +1,5 @@
-# Depot CI Migration
-# Source: .github/workflows/tests.yml (now removed; Depot is the only test CI)
-#
-# Changes made:
-# - Changed GitHub runs-on labels to their Depot equivalents
-# - depot-macos-26 runs on M4 with macOS 26, so Hypervisor.framework nested
-#   virtualization is available; GitHub-hosted macOS runners cannot boot VMs
-
 name: Test lnx
+
 on:
   push:
     branches:
@@ -16,6 +9,10 @@ on:
 
 jobs:
   test:
+    # Depot-managed macOS runner (M4, macOS 26): GitHub-hosted macOS runners
+    # do not support Apple nested virtualization, so lnx tests cannot boot
+    # VMs there. Depot CI (.depot/workflows) is Linux-only, so the test
+    # workflow stays on GitHub Actions with a Depot runner label.
     runs-on: depot-macos-26
     timeout-minutes: 180
     env:
