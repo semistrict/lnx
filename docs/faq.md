@@ -11,10 +11,12 @@ cache of its own — snapshots stay small and restores stay fast. That enables
 things the others don't do:
 
 - **No idle cost.** Nothing runs between commands; state still feels warm.
-- **Fork.** `lnx fork` clones an instance — including its disk — using APFS
-  clones, so fan-out is cheap. Prepare one instance (checkout, deps installed,
+- **Fork.** `lnx fork` clones an instance — memory and disk — using APFS
+  clones, so fan-out is cheap and the copy resumes with the original's
+  processes still running. Prepare one instance (checkout, deps installed,
   server running), then fork it per experiment or per agent.
-- **Checkpoints.** Roll an instance's filesystem back to a known-good point.
+- **Checkpoints.** Capture the whole machine — RAM, devices, disk — at a
+  known-good point and roll back to it, or fork new instances from it.
 
 If you want a always-on Docker replacement, OrbStack is great. If you want
 disposable-but-stateful Linux environments that appear on demand, that's
@@ -24,9 +26,8 @@ disposable-but-stateful Linux environments that appear on demand, that's
 
 Upstream [libkrun](https://github.com/containers/libkrun) has no memory
 snapshot/restore. The copy vendored in-tree at `third_party/libkrun` adds
-snapshot capture/restore with dirty-page tracking on macOS/HVF. The plan is to
-upstream it once the interface stabilizes. Everything needed to build `lnx`
-lives in this repository.
+snapshot capture/restore with dirty-page tracking on macOS/HVF. Everything
+needed to build `lnx` lives in this repository.
 
 ## Does it run on Intel Macs?
 

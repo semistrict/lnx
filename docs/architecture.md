@@ -105,7 +105,6 @@ compatible part of the integration suite inside the nested-capable guest.
 `lnx` builds against the copy of libkrun vendored in-tree at
 `third_party/libkrun`. It carries patches adding memory snapshot
 capture/restore with dirty tracking on macOS/HVF, which
-[upstream libkrun](https://github.com/containers/libkrun) does not have yet;
-the intent is to upstream the snapshot work once it stabilizes. `CC_LINUX` is
-needed at build time because libkrun compiles its own embedded Linux init
-helper.
+[upstream libkrun](https://github.com/containers/libkrun) does not have.
+`CC_LINUX` is needed at build time because libkrun compiles its own embedded
+Linux init helper.
