@@ -1,5 +1,12 @@
-name: Test lnx
+# Depot CI Migration
+# Source: .github/workflows/tests.yml (now removed; Depot is the only test CI)
+#
+# Changes made:
+# - Changed GitHub runs-on labels to their Depot equivalents
+# - depot-macos-26 runs on M4 with macOS 26, so Hypervisor.framework nested
+#   virtualization is available; GitHub-hosted macOS runners cannot boot VMs
 
+name: Test lnx
 on:
   push:
     branches:
@@ -9,7 +16,7 @@ on:
 
 jobs:
   test:
-    runs-on: macos-26
+    runs-on: depot-macos-26
     timeout-minutes: 180
     env:
       CC_LINUX: /opt/homebrew/bin/aarch64-linux-musl-gcc
@@ -22,9 +29,6 @@ jobs:
       - name: Set LNX_BASE
         run: echo "LNX_BASE=$RUNNER_TEMP/lnx-state" >> "$GITHUB_ENV"
 
-      - name: Set up Depot CLI
-        uses: depot/setup-action@v1
-
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -32,6 +36,11 @@ jobs:
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: third_party/gvproxy-bridge/go.mod
 
       - name: Install host dependencies
         run: |
