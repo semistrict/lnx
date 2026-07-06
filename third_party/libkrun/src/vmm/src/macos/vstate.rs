@@ -1217,6 +1217,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     use std::time::Duration;
 
+    use std::ffi::CString;
+
     use super::*;
     use arch::aarch64::layout::DRAM_MEM_START_EFI;
     use devices::legacy::VcpuList;
@@ -1347,8 +1349,30 @@ mod tests {
         assert!(vcpu.mmio_bus.is_some());
     }
 
+    // CI macOS runners are VMs without Hypervisor.framework; every other test
+    // in this module avoids creating a real HVF VM, but this one cannot.
+    fn hvf_available() -> bool {
+        let name = CString::new("kern.hv_support").unwrap();
+        let mut value: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        let ret = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut value as *mut libc::c_int as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        ret == 0 && value == 1
+    }
+
     #[test]
     fn test_vm_memory_init() {
+        if !hvf_available() {
+            eprintln!("skipping test_vm_memory_init: host has no Hypervisor.framework support");
+            return;
+        }
         let mut vm = Vm::new(false).expect("Cannot create new vm");
 
         // Use a realistic guest physical address; hv_vm_map rejects GPA 0.
