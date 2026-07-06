@@ -17,7 +17,6 @@ class Lnx < Formula
 
   depends_on :macos
   depends_on arch: :arm64
-  depends_on "podman" # provides gvproxy for guest networking
 
   def install
     bin.install "lnx"

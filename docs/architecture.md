@@ -54,11 +54,33 @@ the snapshot compatibility stamp, so snapshots created under the removed
 non-DAX mode refuse to memory-restore; clear them with
 `lnx --instance <instance> snapshots clear`.
 
+## Filesystem
+
+The rootfs is not a virtual disk in the usual sense. The ext4 image (a sparse
+file on APFS) is mapped into the guest as a virtio-pmem device and mounted
+with `rootflags=dax`, so guest file access faults directly onto the
+host-mapped pages of the image — there is no block-I/O path and no guest page
+cache duplicating host memory. That is what keeps memory snapshots small
+(cache pages never exist in guest RAM) and makes disk state instant to clone:
+checkpoints and forks copy the image with APFS `clonefile`, sharing all
+blocks copy-on-write.
+
+Host directories (the home directory and the working directory the command
+started in) are exported over virtio-fs with DAX and mounted at their host
+paths inside the guest, so absolute paths work unchanged on both sides. Guest
+writes to shared trees pass through only for allowlisted paths; everything
+else is diverted into per-instance copy-on-write state
+(`instances/<instance>/host-share-state` with upper files and whiteouts), so
+a guest can never mutate the host tree outside the allowlist. `lnx fs
+unshare` lists and clears that state. Additional read-only virtio-fs mounts
+from external vhost-user backends attach with `--vhost-user-fs`.
+
 ## Networking
 
-Networking uses podman's `gvproxy` via libkrun's `krun_add_net_unixgram`
-backend. The default path is `/opt/homebrew/opt/podman/libexec/podman/gvproxy`;
-set `GVPROXY_PATH` if it lives somewhere else.
+Networking uses [gvisor-tap-vsock](https://github.com/containers/gvisor-tap-vsock)
+via libkrun's `krun_add_net_unixgram` backend. The Go network stack is
+statically linked into the `lnx` binary (`third_party/gvproxy-bridge`); no
+external gvproxy is needed.
 
 ## Ingress
 
@@ -104,7 +126,6 @@ compatible part of the integration suite inside the nested-capable guest.
 `lnx` builds against the copy of libkrun vendored in-tree at
 `third_party/libkrun`. It carries patches adding memory snapshot
 capture/restore with dirty tracking on macOS/HVF, which
-[upstream libkrun](https://github.com/containers/libkrun) does not have yet;
-the intent is to upstream the snapshot work once it stabilizes. `CC_LINUX` is
-needed at build time because libkrun compiles its own embedded Linux init
-helper.
+[upstream libkrun](https://github.com/containers/libkrun) does not have.
+`CC_LINUX` is needed at build time because libkrun compiles its own embedded
+Linux init helper.

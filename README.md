@@ -11,18 +11,21 @@ lnx psql --version    # same machine, still installed
 
 Between commands there is **no VM running**. When a command finishes and the
 instance goes idle, `lnx` snapshots the VM — RAM, devices, disk — and exits.
-The next command restores from that snapshot: systemd is already up, services
-are still running, the page cache is still warm. Rapid-fire commands reuse the
-live VM without a restore at all.
+The next command restores from that snapshot: systemd is already up and
+services are still running. The rootfs is mapped into the guest as pmem with
+DAX, so there is no guest page cache to snapshot or rewarm — file data stays
+in the host's cache and snapshots hold only the RAM the workload actually
+uses. Rapid-fire commands reuse the live VM without a restore at all.
 
 On an M5 Pro, `lnx /bin/true` completes in about **0.9s** when it restores a
 4 GiB VM from a memory snapshot, and about **40ms** when the VM is still live
 from a previous command.
 
 Because instance state is just files (APFS clones for disk, snapshot files for
-RAM), instances are cheap to **fork**: prepare one instance — repo checked
-out, dependencies installed, server running — then stamp out copies of it, one
-per experiment, test shard, or coding agent.
+RAM), instances are cheap to **fork** — and a fork clones the memory too, so
+every copy wakes up with the original's processes still running. Prepare one
+instance — repo checked out, dependencies installed, server running — then
+stamp out copies of it, one per experiment, test shard, or coding agent.
 
 ## What you get
 
@@ -31,8 +34,10 @@ per experiment, test shard, or coding agent.
   rootfs.
 - **Memory snapshots between commands.** Warm restores via libkrun dirty-page
   tracking and APFS clones — only changed RAM and disk blocks are written.
-- **Instance forking and checkpoints.** `lnx fork` clones a prepared instance;
-  checkpoints roll the filesystem back to a known-good state.
+- **Instance forking and checkpoints.** Checkpoints capture the whole
+  machine — memory and disk — and `lnx fork` clones one into a new instance,
+  running processes included. Fork a checkpoint of a running browser and the
+  copy answers HTTP in well under a second.
 - **Host integration.** The current directory is shared into the guest
   (virtio-fs with DAX), host timezone forwarded, ports forwarded with
   `--forward`, and optional `https://p<port>-<instance>.lnx` URLs via ingress.
@@ -56,14 +61,15 @@ lnx echo hello         # downloads the kernel + rootfs image on first run
 Or build from source:
 
 ```sh
-brew install FiloSottile/musl-cross/musl-cross podman
+brew install FiloSottile/musl-cross/musl-cross
 git clone https://github.com/semistrict/lnx && cd lnx
 bun run install        # builds, signs, installs to ~/.cargo/bin
 lnx echo hello
 ```
 
-Guest networking uses podman's `gvproxy` (`brew install podman`, or set
-`GVPROXY_PATH`).
+Everything is in the single binary — guest networking (gvisor-tap-vsock),
+the guest agent, and the VMM are statically linked; only the kernel and
+rootfs images are downloaded on first run.
 
 ## Usage
 
@@ -72,7 +78,7 @@ lnx bash                          # interactive shell in the default instance
 lnx --instance dev bash           # named instances are isolated machines
 lnx --forward 8080:80 nginx       # forward Mac localhost:8080 to guest :80
 lnx checkpoint -m "deps installed"
-lnx fork dev2                     # clone the instance, disk and all
+lnx fork dev2                     # clone the instance, memory and disk
 lnx instances list
 lnx set cpus=4 memory-mib=8192    # persist per-instance settings
 ```
@@ -100,8 +106,7 @@ period (default 5s), then quiesces the guest and snapshots. Snapshot restore
 brings back the full machine state.
 
 The snapshot/restore support is carried as patches on a copy of libkrun
-vendored in-tree at `third_party/libkrun`; upstreaming is planned once the
-interface stabilizes.
+vendored in-tree at `third_party/libkrun`.
 
 More in [docs/architecture.md](docs/architecture.md).
 
@@ -118,7 +123,7 @@ More in [docs/architecture.md](docs/architecture.md).
 ## Building and developing
 
 ```sh
-brew install FiloSottile/musl-cross/musl-cross podman llvm
+brew install FiloSottile/musl-cross/musl-cross llvm
 bun run build          # debug build + codesign
 bun run test           # Rust unit tests
 bun run test:system    # core integration suite
