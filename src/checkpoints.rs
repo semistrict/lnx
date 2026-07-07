@@ -93,6 +93,18 @@ pub fn resolve(layout: &Layout, identifier: &str) -> Result<Checkpoint> {
     }
 }
 
+pub fn delete(layout: &Layout, checkpoint: &Checkpoint) -> Result<()> {
+    if !checkpoint.path.starts_with(&layout.checkpoint_dir) {
+        bail!(
+            "refusing to delete checkpoint outside {}: {}",
+            layout.checkpoint_dir.display(),
+            checkpoint.path.display()
+        );
+    }
+    fs::remove_dir_all(&checkpoint.path)
+        .with_context(|| format!("remove {}", checkpoint.path.display()))
+}
+
 pub fn fork(_source: &Layout, checkpoint: &Checkpoint, dest: &Layout) -> Result<()> {
     if dest.rootfs.exists() {
         bail!(

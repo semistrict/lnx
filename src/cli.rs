@@ -104,7 +104,7 @@ enum Command {
     #[command(about = "Create a checkpoint of the current instance")]
     Checkpoint(CheckpointArgs),
     #[command(about = "List checkpoints")]
-    Checkpoints,
+    Checkpoints(CheckpointsArgs),
     #[command(about = "Manage memory snapshots")]
     Snapshots(SnapshotsArgs),
     #[command(about = "Fork a checkpoint into a new instance")]
@@ -190,6 +190,18 @@ struct RunArgs {
 struct CheckpointArgs {
     #[arg(short = 'm')]
     message: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct CheckpointsArgs {
+    #[command(subcommand)]
+    command: Option<CheckpointsCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum CheckpointsCommand {
+    #[command(about = "Delete a checkpoint by id or name")]
+    Delete { identifier: String },
 }
 
 #[derive(Debug, Args)]
@@ -557,7 +569,12 @@ impl Cli {
                     )
                 }
             }
-            Some(Command::Checkpoints) => list_checkpoints(&layout),
+            Some(Command::Checkpoints(args)) => match args.command {
+                None => list_checkpoints(&layout),
+                Some(CheckpointsCommand::Delete { identifier }) => {
+                    delete_checkpoint(&layout, &identifier)
+                }
+            },
             Some(Command::Snapshots(args)) => run_snapshots_command(&layout, args),
             Some(Command::Fork(args)) => {
                 let macos_deterministic =
@@ -2325,6 +2342,13 @@ fn list_checkpoints(layout: &Layout) -> Result<()> {
             ),
         }
     }
+    Ok(())
+}
+
+fn delete_checkpoint(layout: &Layout, identifier: &str) -> Result<()> {
+    let checkpoint = checkpoints::resolve(layout, identifier)?;
+    checkpoints::delete(layout, &checkpoint)?;
+    println!("deleted {}", checkpoint.id);
     Ok(())
 }
 
