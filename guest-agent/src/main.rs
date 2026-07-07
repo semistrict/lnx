@@ -2177,10 +2177,7 @@ fn drain_output_message(
     buf: &mut [u8],
 ) -> bool {
     let mut saw_eof = false;
-    loop {
-        let Some(revents) = poll_output(output_fd) else {
-            break;
-        };
+    while let Some(revents) = poll_output(output_fd) {
         if revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL) == 0 {
             break;
         }
