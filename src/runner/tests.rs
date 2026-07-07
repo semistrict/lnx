@@ -1,4 +1,5 @@
 use super::*;
+use rusqlite::Connection;
 use std::ffi::CString;
 use std::os::unix::{ffi::OsStrExt, process::CommandExt};
 use std::{
