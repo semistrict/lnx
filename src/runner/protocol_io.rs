@@ -4,8 +4,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use lnx_protocol::Message;
 pub(crate) use lnx_protocol::MAX_MESSAGE_SIZE;
+use lnx_protocol::Message;
 
 use super::INTERRUPTED;
 

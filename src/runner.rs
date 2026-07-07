@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
-    io::{ErrorKind, Read, Seek, SeekFrom, Write},
+    io::{ErrorKind, Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
     os::fd::AsRawFd,
     os::unix::ffi::OsStrExt,
@@ -24,7 +24,6 @@ use std::os::unix::process::CommandExt;
 use anyhow::{Context, Result, anyhow, bail};
 use libkrun::{Error as KrunError, Kernel, Network, VmBuilder, VmHandle};
 use lnx_protocol::{Message, PROTOCOL_VERSION};
-use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -1296,23 +1295,6 @@ pub fn proxy_stream_to_guest(
     }
 }
 
-struct TimingLog {
-    path: PathBuf,
-    state_path: PathBuf,
-    base_unix_nanos: u128,
-    state: Mutex<TimingState>,
-}
-
-struct RunLog {
-    path: PathBuf,
-    file: Mutex<fs::File>,
-}
-
-struct TraceLog {
-    path: PathBuf,
-    state: Mutex<TraceState>,
-}
-
 struct SnapshotVmConfig {
     #[cfg_attr(
         any(not(all(target_os = "linux", target_arch = "aarch64")), not(test)),
@@ -1331,28 +1313,6 @@ impl SnapshotVmConfig {
     fn matches(&self, cpus: u8, memory_mib: u32) -> bool {
         self.vcpu_count == cpus as u32 && self.memory_mib() == memory_mib as u64
     }
-}
-
-struct TimingState {
-    file: fs::File,
-    state_file: fs::File,
-}
-
-struct TraceState {
-    connection: Connection,
-    next_sequence: i64,
-}
-
-struct TraceField {
-    key: &'static str,
-    ordinal: Option<i64>,
-    value: TraceValue,
-}
-
-enum TraceValue {
-    Text(String),
-    Integer(i64),
-    Blob(Vec<u8>),
 }
 
 struct ActiveReservation {
@@ -1420,20 +1380,6 @@ fn drain_broker_channels(
     active_owned
 }
 
-fn json_escape(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|ch| match ch {
-            '"' => "\\\"".chars().collect::<Vec<_>>(),
-            '\\' => "\\\\".chars().collect::<Vec<_>>(),
-            '\n' => "\\n".chars().collect::<Vec<_>>(),
-            '\r' => "\\r".chars().collect::<Vec<_>>(),
-            '\t' => "\\t".chars().collect::<Vec<_>>(),
-            ch => vec![ch],
-        })
-        .collect()
-}
-
 fn install_signal_handlers() {
     SIGNAL_INIT.call_once(|| unsafe {
         libc::signal(
@@ -1441,27 +1387,6 @@ fn install_signal_handlers() {
             handle_sigint as *const () as libc::sighandler_t,
         );
     });
-}
-
-fn current_run_id() -> String {
-    std::env::var(RUN_ID_ENV)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(|value| log_value(&value))
-        .unwrap_or_else(|| new_lifecycle_id("run"))
-}
-
-fn new_lifecycle_id(prefix: &str) -> String {
-    let sequence = LIFECYCLE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
-    format!(
-        "{prefix}-{}-{}-{sequence}",
-        unix_nanos(),
-        std::process::id()
-    )
-}
-
-fn log_value(value: &str) -> String {
-    value.replace(['\r', '\n', '\t', ' '], "_")
 }
 
 fn snapshot_generation_id(snapshot: &Path) -> String {
@@ -1566,302 +1491,6 @@ fn append_snapshot_file_manifest(content: &mut String, snapshot_path: &Path, nam
         }
         Err(e) => content.push_str(&format!("{name}.stat_error={e}\n")),
     }
-}
-
-fn system_time_unix_nanos(time: SystemTime) -> Option<u128> {
-    time.duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|time| time.as_nanos())
-}
-
-impl RunLog {
-    fn open(layout: &Layout) -> Result<Self> {
-        let path = layout.run_dir.join("lnx.log");
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("open {}", path.display()))?;
-        Ok(Self {
-            path,
-            file: Mutex::new(file),
-        })
-    }
-
-    fn line(&self, message: impl AsRef<str>) {
-        let mut file = match self.file.lock() {
-            Ok(file) => file,
-            Err(_) => return,
-        };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        let message = message.as_ref().replace('\r', "").replace('\n', " | ");
-        let _ = writeln!(
-            file,
-            "{}.{:09} {}",
-            now.as_secs(),
-            now.subsec_nanos(),
-            message
-        );
-    }
-}
-
-impl TraceLog {
-    fn open(layout: &Layout) -> Result<Self> {
-        let path = layout.run_dir.join("deterministic-trace.sqlite3");
-        remove_path_if_exists(&path)?;
-        let connection =
-            Connection::open(&path).with_context(|| format!("open {}", path.display()))?;
-        connection
-            .execute_batch(
-                r#"
-                PRAGMA journal_mode = WAL;
-                PRAGMA synchronous = NORMAL;
-                PRAGMA foreign_keys = ON;
-
-                CREATE TABLE trace_metadata (
-                    key TEXT PRIMARY KEY NOT NULL,
-                    value TEXT NOT NULL
-                ) STRICT;
-
-                CREATE TABLE events (
-                    sequence INTEGER PRIMARY KEY NOT NULL,
-                    event TEXT NOT NULL
-                ) STRICT;
-
-                CREATE INDEX events_event_idx ON events(event);
-
-                CREATE TABLE event_text_fields (
-                    sequence INTEGER NOT NULL REFERENCES events(sequence) ON DELETE CASCADE,
-                    key TEXT NOT NULL,
-                    ordinal INTEGER,
-                    value TEXT NOT NULL
-                ) STRICT;
-
-                CREATE TABLE event_integer_fields (
-                    sequence INTEGER NOT NULL REFERENCES events(sequence) ON DELETE CASCADE,
-                    key TEXT NOT NULL,
-                    ordinal INTEGER,
-                    value INTEGER NOT NULL
-                ) STRICT;
-
-                CREATE TABLE event_blob_fields (
-                    sequence INTEGER NOT NULL REFERENCES events(sequence) ON DELETE CASCADE,
-                    key TEXT NOT NULL,
-                    ordinal INTEGER,
-                    value BLOB NOT NULL
-                ) STRICT;
-
-                CREATE INDEX event_text_fields_lookup_idx
-                    ON event_text_fields(sequence, key, ordinal);
-                CREATE INDEX event_integer_fields_lookup_idx
-                    ON event_integer_fields(sequence, key, ordinal);
-                CREATE INDEX event_blob_fields_lookup_idx
-                    ON event_blob_fields(sequence, key, ordinal);
-                "#,
-            )
-            .with_context(|| format!("initialize {}", path.display()))?;
-        connection
-            .execute(
-                "INSERT INTO trace_metadata (key, value) VALUES (?1, ?2)",
-                params!["format", "lnx-deterministic-trace-v1"],
-            )
-            .with_context(|| format!("write trace metadata {}", path.display()))?;
-        Ok(Self {
-            path,
-            state: Mutex::new(TraceState {
-                connection,
-                next_sequence: 0,
-            }),
-        })
-    }
-
-    fn event(&self, event: &str, fields: Vec<TraceField>) {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(_) => return,
-        };
-        let sequence = state.next_sequence;
-        if insert_trace_event(&mut state.connection, sequence, event, &fields).is_err() {
-            return;
-        }
-        state.next_sequence = state.next_sequence.saturating_add(1);
-    }
-
-    fn set_next_sequence(&self, sequence: u64) {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(_) => return,
-        };
-        state.next_sequence = i64::try_from(sequence).unwrap_or(i64::MAX);
-    }
-
-    fn next_sequence(&self) -> u64 {
-        let state = match self.state.lock() {
-            Ok(state) => state,
-            Err(_) => return 0,
-        };
-        u64::try_from(state.next_sequence).unwrap_or(0)
-    }
-}
-
-fn insert_trace_event(
-    connection: &mut Connection,
-    sequence: i64,
-    event: &str,
-    fields: &[TraceField],
-) -> Result<()> {
-    let transaction = connection.transaction()?;
-    transaction.execute(
-        "INSERT INTO events (sequence, event) VALUES (?1, ?2)",
-        params![sequence, event],
-    )?;
-    for field in fields {
-        match &field.value {
-            TraceValue::Text(value) => {
-                transaction.execute(
-                    "INSERT INTO event_text_fields (sequence, key, ordinal, value) VALUES (?1, ?2, ?3, ?4)",
-                    params![sequence, field.key, field.ordinal, value],
-                )?;
-            }
-            TraceValue::Integer(value) => {
-                transaction.execute(
-                    "INSERT INTO event_integer_fields (sequence, key, ordinal, value) VALUES (?1, ?2, ?3, ?4)",
-                    params![sequence, field.key, field.ordinal, value],
-                )?;
-            }
-            TraceValue::Blob(value) => {
-                transaction.execute(
-                    "INSERT INTO event_blob_fields (sequence, key, ordinal, value) VALUES (?1, ?2, ?3, ?4)",
-                    params![sequence, field.key, field.ordinal, value],
-                )?;
-            }
-        }
-    }
-    transaction.commit()?;
-    Ok(())
-}
-
-fn trace_text(key: &'static str, value: impl Into<String>) -> TraceField {
-    TraceField {
-        key,
-        ordinal: None,
-        value: TraceValue::Text(value.into()),
-    }
-}
-
-fn trace_text_ordinal(key: &'static str, ordinal: usize, value: impl Into<String>) -> TraceField {
-    TraceField {
-        key,
-        ordinal: Some(ordinal as i64),
-        value: TraceValue::Text(value.into()),
-    }
-}
-
-fn trace_integer(key: &'static str, value: impl Into<i64>) -> TraceField {
-    TraceField {
-        key,
-        ordinal: None,
-        value: TraceValue::Integer(value.into()),
-    }
-}
-
-fn trace_bool(key: &'static str, value: bool) -> TraceField {
-    trace_integer(key, if value { 1 } else { 0 })
-}
-
-fn trace_blob(key: &'static str, value: &[u8]) -> TraceField {
-    TraceField {
-        key,
-        ordinal: None,
-        value: TraceValue::Blob(value.to_vec()),
-    }
-}
-
-impl TimingLog {
-    fn open(layout: &Layout, command: &[String], restore_snapshot: Option<&Path>) -> Result<Self> {
-        let path = layout.run_dir.join("timings.log");
-        let state_path = layout.run_dir.join("timings.state");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("open {}", path.display()))?;
-        let mut state_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(true)
-            .open(&state_path)
-            .with_context(|| format!("open {}", state_path.display()))?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        let base_unix_nanos = now.as_nanos();
-        write!(state_file, "{base_unix_nanos}")?;
-        writeln!(
-            file,
-            "\nrun pid={} unix={} instance={} restore={} cmd={:?}",
-            std::process::id(),
-            now.as_secs(),
-            layout.instance,
-            restore_snapshot
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "false".to_string()),
-            command
-        )?;
-        Ok(Self {
-            path,
-            state_path,
-            base_unix_nanos,
-            state: Mutex::new(TimingState { file, state_file }),
-        })
-    }
-
-    fn install_for_libkrun(&self) {
-        // This happens before the libkrun thread is spawned; libkrun reads these
-        // process-local values only to append profiling milestones.
-        unsafe {
-            std::env::set_var("KRUN_TIMINGS_LOG", &self.path);
-            std::env::set_var("KRUN_TIMINGS_STATE", &self.state_path);
-            std::env::set_var(
-                "KRUN_TIMINGS_BASE_UNIX_NANOS",
-                self.base_unix_nanos.to_string(),
-            );
-        }
-    }
-
-    fn event(&self, label: &str) {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(_) => return,
-        };
-        let now = unix_nanos();
-        if lock_file(&state.state_file).is_err() {
-            return;
-        }
-        let delta_nanos = replace_timing_state(&mut state.state_file, self.base_unix_nanos, now)
-            .unwrap_or_default();
-        let elapsed_nanos = now.saturating_sub(self.base_unix_nanos);
-
-        let line = format!(
-            "{:>10.3}ms +{:>9.3}ms {}",
-            elapsed_nanos as f64 / 1_000_000.0,
-            delta_nanos as f64 / 1_000_000.0,
-            label
-        );
-        let _ = state.file.write_all(line.as_bytes());
-        let _ = state.file.write_all(b"\n");
-        let _ = unlock_file(&state.state_file);
-    }
-}
-
-fn unix_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
 }
 
 fn snapshot_vm_config(snapshot: &Path) -> Result<Option<SnapshotVmConfig>> {
@@ -2552,17 +2181,6 @@ fn initramfs_stamp_key(path: &Path) -> Option<String> {
         }
     }
     None
-}
-
-fn replace_timing_state(file: &mut fs::File, base: u128, now: u128) -> std::io::Result<u128> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut raw = String::new();
-    file.read_to_string(&mut raw)?;
-    let previous = raw.trim().parse::<u128>().unwrap_or(base);
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    write!(file, "{now}")?;
-    Ok(now.saturating_sub(previous))
 }
 
 struct Gvproxy {
@@ -5955,8 +5573,10 @@ fn console_hint(path: &Path) -> String {
 }
 
 mod locks;
+mod logs;
 mod protocol_io;
 pub(crate) use locks::*;
+pub(crate) use logs::*;
 pub(crate) use protocol_io::*;
 
 #[cfg(test)]
