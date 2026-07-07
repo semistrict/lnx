@@ -101,3 +101,26 @@ jobs:
             gh release create "$tag" --title "lnx $tag" --generate-notes
           gh release upload "$tag" --clobber \
             lnx-macos-arm64.tar.gz lnx-macos-arm64.tar.gz.sha256
+
+      - name: Update Homebrew formula
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#v}"
+          sha="$(cut -d' ' -f1 lnx-macos-arm64.tar.gz.sha256)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout main
+          sed -i '' -e "s|^  version \".*\"|  version \"${version}\"|" \
+                    -e "s|^  sha256 \".*\"|  sha256 \"${sha}\"|" Formula/lnx.rb
+          if git diff --quiet Formula/lnx.rb; then
+            echo "formula already current"; exit 0
+          fi
+          git add Formula/lnx.rb
+          git commit -m "Point Homebrew formula at ${tag}"
+          git push origin main
+          ruby -c Formula/lnx.rb

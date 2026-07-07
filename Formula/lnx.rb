@@ -4,15 +4,14 @@
 #   brew tap semistrict/lnx https://github.com/semistrict/lnx
 #   brew install semistrict/lnx/lnx
 #
-# When tagging a release, update `version` and `sha256` below to match the
-# lnx-macos-arm64.tar.gz asset produced by .github/workflows/release-binary.yml
-# (the .sha256 file is published next to it).
+# CI updates `version` and `sha256` below on every `v*` tag via the "Update
+# Homebrew formula" step in .github/workflows/release-binary.yml.
 class Lnx < Formula
   desc "Linux VMs on macOS that resume with memory and disk state intact"
   homepage "https://github.com/semistrict/lnx"
   version "0.3.0"
   url "https://github.com/semistrict/lnx/releases/download/v#{version}/lnx-macos-arm64.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000" # TODO: set from the release .sha256 asset
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "Apache-2.0"
 
   depends_on :macos
