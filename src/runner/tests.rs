@@ -403,6 +403,116 @@ fn fresh_owner_slot_replace_stops_recorded_owner() {
 }
 
 #[test]
+fn bootstrap_lock_stale_reclaim_takes_ownership() {
+    let temp = TempDir::new("bootstrap-lock-stale-reclaim");
+    let lock_path = temp.path().join("bootstrap.lock.d");
+    fs::create_dir(&lock_path).expect("create lock dir");
+    // pid 0 is never alive per process_alive, so the lock is stale.
+    fs::write(lock_path.join("owner.pid"), "0").expect("write stale owner pid");
+
+    let lock = BootstrapLock::try_acquire(&lock_path).expect("try_acquire should not error");
+
+    assert!(lock.is_some());
+    let owner_pid = fs::read_to_string(lock_path.join("owner.pid")).expect("read owner pid");
+    assert_eq!(owner_pid, std::process::id().to_string());
+}
+
+#[test]
+fn bootstrap_lock_live_lock_is_not_reclaimed() {
+    let temp = TempDir::new("bootstrap-lock-live");
+    let lock_path = temp.path().join("bootstrap.lock.d");
+    fs::create_dir(&lock_path).expect("create lock dir");
+    let live_pid = std::process::id().to_string();
+    fs::write(lock_path.join("owner.pid"), &live_pid).expect("write live owner pid");
+
+    let lock = BootstrapLock::try_acquire(&lock_path).expect("try_acquire should not error");
+
+    assert!(lock.is_none());
+    let owner_pid = fs::read_to_string(lock_path.join("owner.pid")).expect("read owner pid");
+    assert_eq!(owner_pid, live_pid);
+}
+
+#[test]
+fn bootstrap_lock_concurrent_stale_reclaim_has_single_winner() {
+    let temp = TempDir::new("bootstrap-lock-concurrent");
+    let lock_path = temp.path().join("bootstrap.lock.d");
+    fs::create_dir(&lock_path).expect("create lock dir");
+    fs::write(lock_path.join("owner.pid"), "0").expect("write stale owner pid");
+
+    const THREADS: usize = 8;
+    let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+    // Pre-fix, this test failed only probabilistically (the race window is
+    // narrow); it exists as the regression guard for the invariant that
+    // exactly one thread may reclaim a stale lock.
+    let winners: Arc<Mutex<Vec<BootstrapLock>>> = Arc::new(Mutex::new(Vec::new()));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let lock_path = lock_path.clone();
+            let barrier = Arc::clone(&barrier);
+            let winners = Arc::clone(&winners);
+            thread::spawn(move || {
+                barrier.wait();
+                if let Ok(Some(lock)) = BootstrapLock::try_acquire(&lock_path) {
+                    // Keep the winning lock alive until every thread has
+                    // finished: dropping it early would remove the lock dir
+                    // and let a later thread win too.
+                    winners.lock().unwrap().push(lock);
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("thread should not panic");
+    }
+
+    let winners = Arc::try_unwrap(winners)
+        .unwrap_or_else(|_| panic!("winners still shared"))
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(winners.len(), 1);
+}
+
+#[test]
+fn owner_start_lock_concurrent_stale_reclaim_has_single_winner() {
+    let temp = TempDir::new("owner-start-lock-concurrent");
+    let lock_path = temp.path().join("owner-start.lock.d");
+    fs::create_dir(&lock_path).expect("create lock dir");
+    fs::write(lock_path.join("starter.pid"), "0").expect("write stale starter pid");
+
+    const THREADS: usize = 8;
+    let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+    // Pre-fix, this test failed only probabilistically (the race window is
+    // narrow); it exists as the regression guard for the invariant that
+    // exactly one thread may reclaim a stale lock.
+    let winners: Arc<Mutex<Vec<OwnerStartLock>>> = Arc::new(Mutex::new(Vec::new()));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let lock_path = lock_path.clone();
+            let barrier = Arc::clone(&barrier);
+            let winners = Arc::clone(&winners);
+            thread::spawn(move || {
+                barrier.wait();
+                if let Ok(Some(lock)) = OwnerStartLock::try_acquire(&lock_path) {
+                    // Keep the winning lock alive until every thread has
+                    // finished: dropping it early would remove the lock dir
+                    // and let a later thread win too.
+                    winners.lock().unwrap().push(lock);
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("thread should not panic");
+    }
+
+    let winners = Arc::try_unwrap(winners)
+        .unwrap_or_else(|_| panic!("winners still shared"))
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(winners.len(), 1);
+}
+
+#[test]
 fn owner_attempt_log_reset_truncates_stale_diagnostics() {
     let temp = TempDir::new("owner-log-reset");
     let layout = temp_layout(&temp, "vm");

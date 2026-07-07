@@ -1472,26 +1472,63 @@ impl BootstrapLock {
                 }))
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if bootstrap_lock_is_stale(path)? {
-                    let _ = fs::remove_dir_all(path);
-                    match fs::create_dir(path) {
-                        Ok(()) => {
-                            write_owner_lease(path)?;
-                            return Ok(Some(Self {
-                                path: path.to_path_buf(),
-                            }));
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                        Err(e) => {
-                            return Err(e).with_context(|| format!("create {}", path.display()));
-                        }
-                    }
+                if reclaim_stale_lock_dir(path, bootstrap_lock_is_stale, write_owner_lease)? {
+                    return Ok(Some(Self {
+                        path: path.to_path_buf(),
+                    }));
                 }
                 Ok(None)
             }
             Err(e) => Err(e).with_context(|| format!("create {}", path.display())),
         }
     }
+}
+
+/// Serializes the stale-check/remove/recreate sequence for a directory lock.
+/// The guard file lives beside the lock dir and is never removed; flock on it
+/// ensures only one process acts on a stale lock at a time.
+fn reclaim_stale_lock_dir(
+    path: &Path,
+    is_stale: impl Fn(&Path) -> Result<bool>,
+    write_lease: impl Fn(&Path) -> Result<()>,
+) -> Result<bool> {
+    let guard_path = {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(".guard");
+        path.with_file_name(name)
+    };
+    let guard = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&guard_path)
+        .with_context(|| format!("open {}", guard_path.display()))?;
+    lock_file(&guard).with_context(|| format!("lock {}", guard_path.display()))?;
+    let result = (|| {
+        // Re-check under the guard: the previous holder may have already
+        // reclaimed and now legitimately owns a fresh lock dir.
+        match is_stale(path) {
+            Ok(false) => return Ok(false),
+            Ok(true) => {}
+            Err(_) if !path.exists() => {
+                // The dir vanished between the caller's observation and this
+                // guarded re-check (e.g. the previous holder's Drop ran).
+                // Fall through to try creating it fresh.
+            }
+            Err(e) => return Err(e),
+        }
+        let _ = fs::remove_dir_all(path);
+        match fs::create_dir(path) {
+            Ok(()) => {
+                write_lease(path)?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("create {}", path.display())),
+        }
+    })();
+    let _ = unlock_file(&guard);
+    result
 }
 
 impl Drop for BootstrapLock {
@@ -1512,20 +1549,12 @@ impl OwnerStartLock {
                 }))
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if owner_start_lock_is_stale(path)? {
-                    let _ = fs::remove_dir_all(path);
-                    match fs::create_dir(path) {
-                        Ok(()) => {
-                            write_pid_file(path, "starter.pid")?;
-                            return Ok(Some(Self {
-                                path: path.to_path_buf(),
-                            }));
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                        Err(e) => {
-                            return Err(e).with_context(|| format!("create {}", path.display()));
-                        }
-                    }
+                if reclaim_stale_lock_dir(path, owner_start_lock_is_stale, |p| {
+                    write_pid_file(p, "starter.pid")
+                })? {
+                    return Ok(Some(Self {
+                        path: path.to_path_buf(),
+                    }));
                 }
                 Ok(None)
             }
