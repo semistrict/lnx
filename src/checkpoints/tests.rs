@@ -73,6 +73,52 @@ fn resolve_rejects_ambiguous_checkpoint_names() {
 }
 
 #[test]
+fn delete_removes_checkpoint_directory() {
+    let temp = TempDir::new("checkpoint-delete");
+    let layout = layout(&temp.path);
+    let (checkpoint, _) = new_checkpoint_path(&layout, None).expect("new");
+    write_metadata(&layout, &checkpoint).expect("write metadata");
+    assert_eq!(list(&layout).expect("list checkpoints").len(), 1);
+
+    delete(&layout, &checkpoint).expect("delete checkpoint");
+
+    assert!(!checkpoint.path.exists());
+    assert_eq!(list(&layout).expect("list checkpoints"), Vec::new());
+}
+
+#[test]
+fn delete_refuses_path_outside_checkpoint_dir() {
+    let temp = TempDir::new("checkpoint-delete-outside");
+    let layout = layout(&temp.path);
+    let outside = temp.path.join("outside-checkpoint");
+    fs::create_dir_all(&outside).expect("create outside dir");
+    let checkpoint = Checkpoint {
+        id: "outside".to_string(),
+        name: None,
+        created_unix: now_unix(),
+        path: outside.clone(),
+    };
+
+    let err = delete(&layout, &checkpoint).expect_err("delete outside checkpoint_dir should fail");
+
+    assert!(err.to_string().contains("refusing to delete"));
+    assert!(outside.exists());
+}
+
+#[test]
+fn resolve_then_delete_by_name() {
+    let temp = TempDir::new("checkpoint-delete-by-name");
+    let layout = layout(&temp.path);
+    let (checkpoint, _) = new_checkpoint_path(&layout, Some("named")).expect("new");
+    write_metadata(&layout, &checkpoint).expect("write metadata");
+
+    let resolved = resolve(&layout, "named").expect("resolve by name");
+    delete(&layout, &resolved).expect("delete resolved checkpoint");
+
+    assert_eq!(list(&layout).expect("list checkpoints"), Vec::new());
+}
+
+#[test]
 fn fork_clones_checkpoint_files_to_destination_layout() {
     let temp = TempDir::new("checkpoint-fork");
     let source = layout(&temp.path.join("source"));

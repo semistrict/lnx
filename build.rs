@@ -112,6 +112,9 @@ fn build_macos_gvproxy_bridge(out_dir: &Path) {
 fn build_linux_gvproxy_bridge(out_dir: &Path) {
     let executable = out_dir.join("lnx-gvproxy-bridge");
     build_gvproxy_bridge("linux", &executable, |command| {
+        // Single `-ldflags` value (one argv entry passed to `go build`), not
+        // two separate flags — the embedded space is intentional.
+        #[allow(clippy::suspicious_command_arg_space)]
         command
             .arg("-ldflags")
             .arg("-linkmode external -extldflags -static");

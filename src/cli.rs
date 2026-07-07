@@ -104,7 +104,7 @@ enum Command {
     #[command(about = "Create a checkpoint of the current instance")]
     Checkpoint(CheckpointArgs),
     #[command(about = "List checkpoints")]
-    Checkpoints,
+    Checkpoints(CheckpointsArgs),
     #[command(about = "Manage memory snapshots")]
     Snapshots(SnapshotsArgs),
     #[command(about = "Fork a checkpoint into a new instance")]
@@ -190,6 +190,18 @@ struct RunArgs {
 struct CheckpointArgs {
     #[arg(short = 'm')]
     message: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct CheckpointsArgs {
+    #[command(subcommand)]
+    command: Option<CheckpointsCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum CheckpointsCommand {
+    #[command(about = "Delete a checkpoint by id or name")]
+    Delete { identifier: String },
 }
 
 #[derive(Debug, Args)]
@@ -474,13 +486,15 @@ impl Cli {
                 trace_events,
             ),
             Some(Command::Run(args)) => {
-                if cfg!(target_os = "macos") && deterministic.is_some() {
+                let macos_deterministic =
+                    deterministic.as_ref().filter(|_| cfg!(target_os = "macos"));
+                if let Some(det) = macos_deterministic {
                     run_nested_deterministic_on_macos(
                         &layout,
                         cpus,
                         memory_mib,
                         snapshot_path.as_deref(),
-                        deterministic.as_ref().unwrap(),
+                        det,
                         trace_events,
                         root,
                         &args.command,
@@ -517,7 +531,9 @@ impl Cli {
                 Ok(())
             }
             Some(Command::Checkpoint(args)) => {
-                if cfg!(target_os = "macos") && deterministic.is_some() {
+                let macos_deterministic =
+                    deterministic.as_ref().filter(|_| cfg!(target_os = "macos"));
+                if let Some(det) = macos_deterministic {
                     let mut subcommand = vec!["checkpoint".to_string()];
                     if let Some(message) = args.message {
                         subcommand.push("-m".to_string());
@@ -528,7 +544,7 @@ impl Cli {
                         cpus,
                         memory_mib,
                         snapshot_path.as_deref(),
-                        deterministic.as_ref().unwrap(),
+                        det,
                         trace_events,
                         root,
                         &[],
@@ -553,10 +569,17 @@ impl Cli {
                     )
                 }
             }
-            Some(Command::Checkpoints) => list_checkpoints(&layout),
+            Some(Command::Checkpoints(args)) => match args.command {
+                None => list_checkpoints(&layout),
+                Some(CheckpointsCommand::Delete { identifier }) => {
+                    delete_checkpoint(&layout, &identifier)
+                }
+            },
             Some(Command::Snapshots(args)) => run_snapshots_command(&layout, args),
             Some(Command::Fork(args)) => {
-                if cfg!(target_os = "macos") && deterministic.is_some() {
+                let macos_deterministic =
+                    deterministic.as_ref().filter(|_| cfg!(target_os = "macos"));
+                if let Some(det) = macos_deterministic {
                     let mut subcommand = vec!["fork".to_string()];
                     if let Some(checkpoint) = args.checkpoint {
                         subcommand.push("--checkpoint".to_string());
@@ -568,7 +591,7 @@ impl Cli {
                         cpus,
                         memory_mib,
                         snapshot_path.as_deref(),
-                        deterministic.as_ref().unwrap(),
+                        det,
                         trace_events,
                         root,
                         &[],
@@ -669,13 +692,15 @@ impl Cli {
                 trace_events: trace_events || args.trace_events,
             }),
             None => {
-                if cfg!(target_os = "macos") && deterministic.is_some() {
+                let macos_deterministic =
+                    deterministic.as_ref().filter(|_| cfg!(target_os = "macos"));
+                if let Some(det) = macos_deterministic {
                     run_nested_deterministic_on_macos(
                         &layout,
                         cpus,
                         memory_mib,
                         snapshot_path.as_deref(),
-                        deterministic.as_ref().unwrap(),
+                        det,
                         trace_events,
                         root,
                         &guest_command,
@@ -738,6 +763,7 @@ fn init_local_target(path: Option<&Path>) -> Result<Option<InitLocalTarget>> {
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_init_command(
     layout: &Layout,
     local_target: Option<InitLocalTarget>,
@@ -802,6 +828,7 @@ fn run_init_command(
     init::run(layout, args.kernel.as_deref(), args.rootfs.as_deref())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn init_local_default_instance(
     dest: &Layout,
     default_instance: &str,
@@ -901,6 +928,7 @@ fn should_init_local_fork(
         && std::env::var_os("LNX_BASE").is_none()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn init_local_fork_from_base(
     instance: &str,
     dest_base: PathBuf,
@@ -1005,6 +1033,7 @@ fn init_from_source_base_files(dest: &Layout, source_base: &Path) -> Result<bool
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn maybe_auto_init_git_worktree(
     instance: &str,
     command: Option<&Command>,
@@ -1250,7 +1279,7 @@ fn list_instances(base: &Path) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     instances.sort_by_key(|row| (instance_state_rank(row.state), row.name.clone()));
 
-    println!("{:<36} {:<12} {}", "NAME", "STATE", "PIDS");
+    println!("{:<36} {:<12} PIDS", "NAME", "STATE");
     for row in instances {
         println!("{:<36} {:<12} {}", row.name, row.state, row.pids);
     }
@@ -1348,6 +1377,7 @@ fn process_alive(pid: i32) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_guest(
     layout: Layout,
     command: Vec<String>,
@@ -1605,6 +1635,7 @@ fn filter_default_restore_for_version(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ensure_vm_initialized(
     layout: &Layout,
     cpus: u8,
@@ -1699,6 +1730,7 @@ fn effective_cpus(configured: u8, deterministic: Option<&runner::DeterministicCo
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_nested_deterministic_on_macos(
     layout: &Layout,
     cpus: u8,
@@ -1778,6 +1810,7 @@ fn nested_deterministic_outer_instance(instance: &str) -> String {
     format!("{instance}-deterministic-outer")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn nested_deterministic_inner_args(
     layout: &Layout,
     cpus: u8,
@@ -1935,6 +1968,7 @@ fn require_executable_file(path: PathBuf, label: &str) -> Result<PathBuf> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn initialize_vm_instance(
     layout: Layout,
     cpus: u8,
@@ -2231,6 +2265,7 @@ fn run_lnx_child(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_checkpoint(
     layout: Layout,
     name: Option<&str>,
@@ -2310,6 +2345,13 @@ fn list_checkpoints(layout: &Layout) -> Result<()> {
     Ok(())
 }
 
+fn delete_checkpoint(layout: &Layout, identifier: &str) -> Result<()> {
+    let checkpoint = checkpoints::resolve(layout, identifier)?;
+    checkpoints::delete(layout, &checkpoint)?;
+    println!("deleted {}", checkpoint.id);
+    Ok(())
+}
+
 fn run_snapshots_command(layout: &Layout, args: SnapshotsArgs) -> Result<()> {
     match args.command {
         SnapshotsCommand::Clear => clear_latest_snapshot(layout),
@@ -2326,6 +2368,7 @@ fn clear_latest_snapshot(layout: &Layout) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fork_checkpoint(
     source: Layout,
     checkpoint: Option<&str>,
@@ -2364,6 +2407,7 @@ fn fork_checkpoint(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_internal_fork_checkpoint(
     layout: &Layout,
     cpus: u8,
