@@ -36,8 +36,19 @@ jobs:
       - name: Rust formatting
         run: cargo fmt --check
 
+      - name: Clippy
+        run: bun run lint
+
       - name: Rust tests
         run: bun run test
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Typecheck server-ui feature
+        run: CC_LINUX=/opt/homebrew/bin/aarch64-linux-musl-gcc cargo check --features server-ui
 
   # The system suite boots VMs, which needs Hypervisor.framework on bare-metal
   # macOS. No hosted CI provides that (macOS VMs cannot nest HVF), so this job

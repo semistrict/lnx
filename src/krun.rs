@@ -48,6 +48,13 @@ impl Drop for DeterministicHostActivity {
     }
 }
 
+// Mirrors the linux-aarch64 impl above: the guard is droppable on every
+// platform, so explicit drops of it are never platform-conditional no-ops.
+#[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+impl Drop for DeterministicHostActivity {
+    fn drop(&mut self) {}
+}
+
 pub(crate) fn host_share_virtiofs(
     tag: &str,
     path: &Path,

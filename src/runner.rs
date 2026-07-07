@@ -751,7 +751,7 @@ fn start_vm(
     });
     let requested_restore_snapshot = config.restore_snapshot.clone();
     let initramfs_stamp = config.layout.run_dir.join("initramfs.stamp");
-    let mut network = start_network(&config, &run_log, &timings)?;
+    let mut network = start_network(config, run_log, &timings)?;
     let current_host_home = host_home_for_cwd(&config.cwd)?;
     let current_outside_home_cwd =
         (!config.cwd.starts_with(&current_host_home)).then(|| config.cwd.clone());
@@ -892,7 +892,7 @@ fn start_vm(
         None
     };
     if let Some(snapshot) = &requested_restore_snapshot {
-        log_snapshot_summary(&run_log, "snapshot.requested", snapshot);
+        log_snapshot_summary(run_log, "snapshot.requested", snapshot);
     }
     let restore_generation = restore_snapshot.as_deref().map(snapshot_generation_id);
     match (&requested_restore_snapshot, &restore_snapshot, &restore_generation) {
@@ -918,13 +918,13 @@ fn start_vm(
         &config.layout,
         restore_snapshot.as_deref(),
         restore_generation.as_deref(),
-        &run_log,
+        run_log,
     )
     .context("prepare restore snapshot")?;
     let vm_restore_snapshot = prepared_restore
         .as_ref()
         .map(|restore| restore.snapshot.clone());
-    configure_snapshot_restore_compat(vm_restore_snapshot.as_deref(), &run_log);
+    configure_snapshot_restore_compat(vm_restore_snapshot.as_deref(), run_log);
 
     let socket = config.layout.run_dir.join("lnx-agent.sock");
     let snapshot_socket = config.layout.run_dir.join("lnx-snapshot.sock");
@@ -932,7 +932,7 @@ fn start_vm(
     let listener = bind_unix_listener(&socket)?;
     let snapshot_listener = bind_unix_listener(&snapshot_socket)?;
     let control_listener = bind_unix_listener(&control_socket)?;
-    let broker_listener = bind_unix_listener(&broker_socket)?;
+    let broker_listener = bind_unix_listener(broker_socket)?;
     timings.event("listeners.ready");
     run_log.line(format!(
         "listeners.ready agent={} snapshot={} control={} broker={}",
@@ -981,7 +981,7 @@ fn start_vm(
         ));
         e
     })?;
-    log_file_summary(&run_log, "rootfs.selected", &rootfs);
+    log_file_summary(run_log, "rootfs.selected", &rootfs);
     let rootfs_backend = RootfsBackend::from_env(std::env::var(ROOTFS_BACKEND_ENV).ok())?;
     let root_device = match rootfs_backend {
         RootfsBackend::Pmem => {
@@ -997,7 +997,7 @@ fn start_vm(
             share_layout
                 .outside_home_cwd
                 .as_deref()
-                .map(|cwd| guest_cwd(cwd, &share_layout.host_home))
+                .map(guest_cwd)
                 .unwrap_or_default(),
         )
     };
@@ -1100,7 +1100,7 @@ fn start_vm(
     let ctx = Arc::new(vm.handle());
     let console_log = config.layout.console_log.clone();
     let vm_timings = Arc::clone(&timings);
-    let vm_run_log = Arc::clone(&run_log);
+    let vm_run_log = Arc::clone(run_log);
     let (vm_error_tx, vm_error_rx) = mpsc::channel::<KrunError>();
     thread::spawn(move || {
         vm_timings.event("krun.start_enter.begin");
@@ -1149,7 +1149,7 @@ fn start_vm(
         deterministic_clock_state.clone(),
         idle,
         Arc::clone(&timings),
-        Arc::clone(&run_log),
+        Arc::clone(run_log),
         trace_log.clone(),
         vm_error_rx,
         owner_run_id.to_string(),
@@ -1159,9 +1159,9 @@ fn start_vm(
         Err(e) => {
             timings.event(&format!("restore.owner.error {e:#}"));
             run_log.line(format!("owner.start.error {e:#}"));
-            log_console_tail(&run_log, &config.layout.console_log);
+            log_console_tail(run_log, &config.layout.console_log);
             cleanup_runtime_sockets(
-                &run_log,
+                run_log,
                 &[broker_socket, &socket, &snapshot_socket, &control_socket],
             );
             return Err(e);
@@ -2925,6 +2925,7 @@ pub(crate) fn is_timeout_error(error: &anyhow::Error) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn acquire_bootstrap_or_run_client(
     lock_path: &Path,
     socket: &Path,
@@ -2976,6 +2977,7 @@ fn acquire_bootstrap_or_run_client(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn acquire_owner_start_or_run_client(
     lock_path: &Path,
     socket: &Path,
@@ -3030,6 +3032,7 @@ fn acquire_owner_start_or_run_client(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_existing_broker_client(
     socket: &Path,
     command: &[String],
@@ -3128,11 +3131,14 @@ fn run_broker_session(
     instance: &str,
 ) -> Result<i32> {
     INTERRUPTED.store(false, Ordering::SeqCst);
-    let host_home = host_home_for_cwd(cwd)?;
+    // Validate the cwd resolves to a host home directory even when
+    // no_host_shares is set, matching the eager-validation pattern used
+    // elsewhere (e.g. snapshot_shares_incompatibility_for_import).
+    host_home_for_cwd(cwd)?;
     let guest_cwd = if no_host_shares {
         "/".to_string()
     } else {
-        guest_cwd(cwd, &host_home)
+        guest_cwd(cwd)
     };
     let use_pty = if deterministic.is_some() {
         false
@@ -3419,9 +3425,7 @@ fn localhost_url_forward(url: &str) -> Option<(&'static str, u16)> {
     if scheme != "http" && scheme != "https" {
         return None;
     }
-    let authority_end = rest
-        .find(|c| matches!(c, '/' | '?' | '#'))
-        .unwrap_or(rest.len());
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     if authority.contains('@') {
         return None;
@@ -3440,6 +3444,7 @@ fn localhost_url_forward(url: &str) -> Option<(&'static str, u16)> {
     Some(("127.0.0.1", port.parse().ok()?))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ensure_auto_forward_port(
     listen_host: &str,
     port: u16,
@@ -3539,6 +3544,7 @@ fn zone_from_localtime_target(target: &str) -> Option<String> {
     (!zone.is_empty()).then(|| zone.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_broker_client_retry(
     socket: &Path,
     command: &[String],
@@ -3579,6 +3585,7 @@ fn run_broker_client_retry(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_broker_owner(
     listener: UnixListener,
     layout: Layout,
@@ -4343,6 +4350,7 @@ pub(crate) fn vhost_user_fs_arg(mount: &VhostUserFsMount) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_broker_client_awaiting_owner(
     socket: &Path,
     command: &[String],
@@ -4489,6 +4497,7 @@ fn agent_accept_timeout_from_env(value: Option<String>) -> Duration {
         .unwrap_or(DEFAULT_AGENT_ACCEPT_TIMEOUT)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_broker_client(
     mut client: UnixStream,
     agent_tx: mpsc::Sender<Message>,
@@ -5378,12 +5387,10 @@ fn host_home_for_cwd(cwd: &Path) -> Result<PathBuf> {
     dirs::home_dir().context("host home directory")
 }
 
-fn guest_cwd(cwd: &Path, host_home: &Path) -> String {
-    if cwd.starts_with(host_home) {
-        cwd.to_string_lossy().into_owned()
-    } else {
-        cwd.to_string_lossy().into_owned()
-    }
+fn guest_cwd(cwd: &Path) -> String {
+    // Host directories are mounted at identical paths inside the guest (see
+    // docs/architecture.md), so the guest cwd is always the host cwd verbatim.
+    cwd.to_string_lossy().into_owned()
 }
 
 fn home_write_allowlist(cwd: &Path, host_home: &Path) -> Vec<String> {
@@ -5672,6 +5679,7 @@ fn replace_home_write_allowlist(_ctx: &VmHandle, _cwd: &Path, _host_home: &Path)
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_snapshot(
     listener: UnixListener,
     ctx: &VmHandle,
@@ -5817,6 +5825,7 @@ fn promote_snapshot_rootfs(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_snapshot_for_publish(
     ctx: &VmHandle,
     snapshot_path: &Path,

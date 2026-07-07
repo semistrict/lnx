@@ -1014,7 +1014,7 @@ fn import_archive_to_layout(
     options: ImportOptions,
     state: AppState,
 ) -> Result<ImportResponse> {
-    reject_running_instance(&dest)?;
+    reject_running_instance(dest)?;
     if (dest.rootfs.exists() || dest.snapshot_dir.exists()) && !options.replace {
         bail!("target instance already exists: {target_instance} (use --replace)");
     }

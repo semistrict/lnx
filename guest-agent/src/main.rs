@@ -77,7 +77,6 @@ const RNDADDENTROPY: c_ulong = 0x4008_5203;
 const RNDRESEEDCRNG: c_ulong = 0x5207;
 const CLOCK_REALTIME: c_int = 0;
 const MS_RDONLY: c_ulong = 1;
-const MS_REMOUNT: c_ulong = 32;
 const MS_BIND: c_ulong = 4096;
 const MS_REC: c_ulong = 16384;
 const MS_PRIVATE: c_ulong = 262144;
@@ -736,6 +735,7 @@ fn replace_default_route(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn netlink_request<T>(
     fd: c_int,
     message_type: u16,
@@ -2211,6 +2211,7 @@ fn drain_output_message(
     saw_eof
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_channel_pty(
     agent_fd: Arc<Mutex<c_int>>,
     channel_id: u64,
@@ -2414,6 +2415,7 @@ fn run_channel_pty(
     send_status(&agent_fd, channel_id, status);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_channel_pipe(
     agent_fd: Arc<Mutex<c_int>>,
     channel_id: u64,

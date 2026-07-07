@@ -1311,17 +1311,14 @@ fn existing_broker_client_treats_missing_hello_as_not_ready() {
 #[test]
 fn guest_cwd_uses_host_path_under_home() {
     assert_eq!(
-        guest_cwd(Path::new("/Users/ramon/src/lnx"), Path::new("/Users/ramon")),
+        guest_cwd(Path::new("/Users/ramon/src/lnx")),
         "/Users/ramon/src/lnx"
     );
 }
 
 #[test]
 fn guest_cwd_uses_host_path_outside_home() {
-    assert_eq!(
-        guest_cwd(Path::new("/tmp/build"), Path::new("/Users/ramon")),
-        "/tmp/build"
-    );
+    assert_eq!(guest_cwd(Path::new("/tmp/build")), "/tmp/build");
 }
 
 #[test]

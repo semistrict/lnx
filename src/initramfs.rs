@@ -16,10 +16,11 @@ pub fn write_from_agent(
     let stamp_path = dir.join("initramfs.stamp");
     let stamp = stamp(agent_source_stamp);
 
-    if path.exists() && stamp_path.exists() {
-        if fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str()) {
-            return Ok((path, false));
-        }
+    if path.exists()
+        && stamp_path.exists()
+        && fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str())
+    {
+        return Ok((path, false));
     }
 
     write_agent(agent, &path)?;
@@ -36,7 +37,7 @@ fn write_agent(agent: &[u8], path: &Path) -> Result<()> {
     if buf.len() % 512 != 0 {
         buf.resize(buf.len() + (512 - buf.len() % 512), 0);
     }
-    fs::write(&path, buf).with_context(|| format!("write {}", path.display()))?;
+    fs::write(path, buf).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 

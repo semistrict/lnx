@@ -21,6 +21,7 @@
     "apt-update": "bun run build && target/debug/lnx /usr/bin/apt-get update",
     "deps": "brew install FiloSottile/musl-cross/musl-cross llvm",
     "check": "CC_LINUX=${CC_LINUX:-/opt/homebrew/bin/aarch64-linux-musl-gcc} cargo check",
+    "lint": "LIBCLANG_PATH=${LIBCLANG_PATH:-/opt/homebrew/opt/llvm/lib} DYLD_LIBRARY_PATH=${DYLD_LIBRARY_PATH:-/opt/homebrew/opt/llvm/lib} CC_LINUX=${CC_LINUX:-/opt/homebrew/bin/aarch64-linux-musl-gcc} cargo clippy -p lnx -p lnx-agent -p lnx-protocol --no-deps --all-targets -- -D warnings",
     "test": "LIBCLANG_PATH=${LIBCLANG_PATH:-/opt/homebrew/opt/llvm/lib} DYLD_LIBRARY_PATH=${DYLD_LIBRARY_PATH:-/opt/homebrew/opt/llvm/lib} CC_LINUX=${CC_LINUX:-/opt/homebrew/bin/aarch64-linux-musl-gcc} CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER=\"bun $PWD/scripts/test/codesign-runner.ts\" cargo test --workspace",
     "test-system": "bun run test:system",
     "test-checkpoint": "bun run test:checkpoint",

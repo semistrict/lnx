@@ -235,7 +235,7 @@ impl Config {
         is_privileged_addr(&self.http_addr)
             || is_privileged_addr(&self.https_addr)
             || is_privileged_addr(&self.dns_addr)
-            || self.resolver_dir == PathBuf::from("/etc/resolver")
+            || self.resolver_dir == Path::new("/etc/resolver")
     }
 
     fn launchd_path(&self) -> PathBuf {
@@ -659,7 +659,7 @@ fn privileged_service_helper_stale_error_with_paths(
     if current == helper || !helper.exists() {
         return Ok(None);
     }
-    if files_same_contents(&current, helper)? {
+    if files_same_contents(current, helper)? {
         return Ok(None);
     }
     Ok(Some(format!(
@@ -1726,11 +1726,11 @@ fn route_http_host(
     };
     let layout = Layout::resolve(&route.instance, None, None)?;
     let broker_socket = layout.run_dir.join("broker.sock");
-    ensure_instance_broker(&route.instance, &broker_socket, &config)?;
+    ensure_instance_broker(&route.instance, &broker_socket, config)?;
     Ok(Some((broker_socket, route)))
 }
 
-fn ensure_instance_broker(instance: &str, broker_socket: &PathBuf, config: &Config) -> Result<()> {
+fn ensure_instance_broker(instance: &str, broker_socket: &Path, config: &Config) -> Result<()> {
     if broker_accepts_connections(broker_socket).is_ok() {
         return Ok(());
     }
@@ -1739,11 +1739,11 @@ fn ensure_instance_broker(instance: &str, broker_socket: &PathBuf, config: &Conf
         .with_context(|| format!("start lnx instance {instance}"))
 }
 
-fn broker_accepts_connections(broker_socket: &PathBuf) -> Result<()> {
+fn broker_accepts_connections(broker_socket: &Path) -> Result<()> {
     runner::connect_broker(broker_socket).map(|_| ())
 }
 
-fn wait_for_broker(broker_socket: &PathBuf, timeout: Duration) -> Result<()> {
+fn wait_for_broker(broker_socket: &Path, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let mut last = None;
     while Instant::now() < deadline {
