@@ -100,6 +100,30 @@ fn snapshots_clear_parses() {
 }
 
 #[test]
+fn checkpoints_bare_parses_as_list() {
+    let cli = Cli::try_parse_from(["lnx", "checkpoints"]).expect("parse checkpoints");
+    let Some(Command::Checkpoints(args)) = cli.command else {
+        panic!("expected checkpoints command");
+    };
+
+    assert!(args.command.is_none());
+}
+
+#[test]
+fn checkpoints_delete_parses_identifier() {
+    let cli = Cli::try_parse_from(["lnx", "checkpoints", "delete", "abc"])
+        .expect("parse checkpoints delete");
+    let Some(Command::Checkpoints(args)) = cli.command else {
+        panic!("expected checkpoints command");
+    };
+    let Some(CheckpointsCommand::Delete { identifier }) = args.command else {
+        panic!("expected checkpoints delete command");
+    };
+
+    assert_eq!(identifier, "abc");
+}
+
+#[test]
 fn vhost_user_fs_mount_parses() {
     let cli = Cli::try_parse_from([
         "lnx",
