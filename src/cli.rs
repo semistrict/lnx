@@ -1351,8 +1351,8 @@ fn terminate_instance_owner(layout: &Layout) -> Result<()> {
 /// deletes anything outside that shape, even if callers pass a mismatched
 /// `instances_root`/`name` pair.
 fn remove_contained_instance_dir(dir: &Path, instances_root: &Path, name: &str) -> Result<()> {
-    let is_contained =
-        dir.starts_with(instances_root) && dir.file_name().and_then(|n| n.to_str()) == Some(name);
+    let is_contained = dir.parent() == Some(instances_root)
+        && dir.file_name().and_then(|n| n.to_str()) == Some(name);
     if !is_contained {
         bail!(
             "refusing to delete instance dir outside {}: {}",

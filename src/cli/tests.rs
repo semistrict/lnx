@@ -407,6 +407,27 @@ fn remove_contained_instance_dir_refuses_name_mismatch() {
 }
 
 #[test]
+fn remove_contained_instance_dir_refuses_nested_path() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let instances_root = temp.path().join("instances");
+    let nested_dir = instances_root.join("sub").join("dev");
+    fs::create_dir_all(&nested_dir).expect("create nested dir");
+
+    let err = remove_contained_instance_dir(&nested_dir, &instances_root, "dev")
+        .expect_err("expect containment guard to reject nested path");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "refusing to delete instance dir outside {}: {}",
+            instances_root.display(),
+            nested_dir.display()
+        )
+    );
+    assert!(nested_dir.exists());
+}
+
+#[test]
 fn remove_contained_instance_dir_refuses_outside_root() {
     let temp = tempfile::tempdir().expect("tempdir");
     let instances_root = temp.path().join("instances");
