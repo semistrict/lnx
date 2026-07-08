@@ -40,6 +40,7 @@
     "test-ingress": "bun run test:ingress",
     "test-longevity": "bun run test:longevity",
     "test-full": "bun run test:full",
+    "test:computesdk": "bun run build && cd ts/computesdk && bun install && LNX_BIN=$PWD/../../target/debug/lnx bun run test",
     "test:oci-import": "bun run build && LNX_BIN=$PWD/target/debug/lnx bun test scripts/test/oci-import.test.ts",
     "test:instance-config": "bun run build && LNX_BIN=$PWD/target/debug/lnx bun test scripts/test/instance-config.test.ts",
     "test:system": "bun run build && LNX_BIN=target/debug/lnx bun test scripts/test/system.test.ts",

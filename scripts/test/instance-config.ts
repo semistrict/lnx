@@ -1,12 +1,14 @@
 import {
   readFile,
   rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   assertContains,
   assertEq,
   assertFile,
   cleanupContext,
+  cleanupInstance,
   defaultContext,
   prepareContext,
   run,
@@ -108,6 +110,33 @@ try {
       { check: false },
     );
     assertEq(missing.status === 0, false, "logs for unstarted instance fails");
+  });
+
+  await testStep("instances delete removes a throwaway instance", async () => {
+    const throwaway = `${ctx.instance}-delete`;
+    const throwawayImageDir = join(ctx.base, "instances", throwaway);
+    try {
+      await run([ctx.lnxBin, "--instance", throwaway, "/bin/true"]);
+
+      const listedBefore = await ctx.client.instances.list();
+      assertEq(
+        listedBefore.some((row) => row.name === throwaway),
+        true,
+        "throwaway instance appears in instances list before delete",
+      );
+
+      await ctx.client.instances.delete(throwaway);
+
+      const listedAfter = await ctx.client.instances.list();
+      assertEq(
+        listedAfter.some((row) => row.name === throwaway),
+        false,
+        "throwaway instance is gone from instances list after delete",
+      );
+      assertEq(existsSync(throwawayImageDir), false, "throwaway instance directory removed");
+    } finally {
+      await cleanupInstance(ctx, throwaway);
+    }
   });
 } finally {
   await cleanupContext(ctx);

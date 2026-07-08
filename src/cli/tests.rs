@@ -124,6 +124,30 @@ fn checkpoints_delete_parses_identifier() {
 }
 
 #[test]
+fn instances_list_parses() {
+    let cli = Cli::try_parse_from(["lnx", "instances", "list"]).expect("parse instances list");
+    let Some(Command::Instances(args)) = cli.command else {
+        panic!("expected instances command");
+    };
+
+    assert!(matches!(args.command, InstancesCommand::List));
+}
+
+#[test]
+fn instances_delete_parses_name() {
+    let cli =
+        Cli::try_parse_from(["lnx", "instances", "delete", "abc"]).expect("parse instances delete");
+    let Some(Command::Instances(args)) = cli.command else {
+        panic!("expected instances command");
+    };
+    let InstancesCommand::Delete { name } = args.command else {
+        panic!("expected instances delete command");
+    };
+
+    assert_eq!(name, "abc");
+}
+
+#[test]
 fn vhost_user_fs_mount_parses() {
     let cli = Cli::try_parse_from([
         "lnx",
@@ -337,6 +361,91 @@ fn clear_latest_snapshot_removes_snapshot_runtime_state() {
     for path in &paths {
         assert!(!path.exists(), "{} should be removed", path.display());
     }
+}
+
+#[test]
+fn delete_instance_missing_instance_reports_not_found() {
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    let err = delete_instance(temp.path(), "missing-instance").expect_err("expect not found");
+
+    assert_eq!(err.to_string(), "instance not found: missing-instance");
+}
+
+#[test]
+fn remove_contained_instance_dir_removes_matching_dir() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let instances_root = temp.path().join("instances");
+    let dir = instances_root.join("dev");
+    fs::create_dir_all(dir.join("nested")).expect("create instance dir");
+    fs::write(dir.join("nested/marker"), b"x").expect("write marker");
+
+    remove_contained_instance_dir(&dir, &instances_root, "dev").expect("remove instance dir");
+
+    assert!(!dir.exists());
+}
+
+#[test]
+fn remove_contained_instance_dir_refuses_name_mismatch() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let instances_root = temp.path().join("instances");
+    let dir = instances_root.join("dev");
+    fs::create_dir_all(&dir).expect("create instance dir");
+
+    let err = remove_contained_instance_dir(&dir, &instances_root, "other")
+        .expect_err("expect containment guard to reject mismatched name");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "refusing to delete instance dir outside {}: {}",
+            instances_root.display(),
+            dir.display()
+        )
+    );
+    assert!(dir.exists());
+}
+
+#[test]
+fn remove_contained_instance_dir_refuses_nested_path() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let instances_root = temp.path().join("instances");
+    let nested_dir = instances_root.join("sub").join("dev");
+    fs::create_dir_all(&nested_dir).expect("create nested dir");
+
+    let err = remove_contained_instance_dir(&nested_dir, &instances_root, "dev")
+        .expect_err("expect containment guard to reject nested path");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "refusing to delete instance dir outside {}: {}",
+            instances_root.display(),
+            nested_dir.display()
+        )
+    );
+    assert!(nested_dir.exists());
+}
+
+#[test]
+fn remove_contained_instance_dir_refuses_outside_root() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let instances_root = temp.path().join("instances");
+    let outside_dir = temp.path().join("dev");
+    fs::create_dir_all(&outside_dir).expect("create outside dir");
+
+    let err = remove_contained_instance_dir(&outside_dir, &instances_root, "dev")
+        .expect_err("expect containment guard to reject dir outside instances root");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "refusing to delete instance dir outside {}: {}",
+            instances_root.display(),
+            outside_dir.display()
+        )
+    );
+    assert!(outside_dir.exists());
 }
 
 #[test]

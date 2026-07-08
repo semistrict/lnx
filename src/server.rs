@@ -2573,7 +2573,7 @@ fn new_upload_session_id(target_instance: &str) -> Result<String> {
     ))
 }
 
-fn validate_instance_name(name: &str) -> Result<()> {
+pub(crate) fn validate_instance_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name == "."
         || name == ".."
