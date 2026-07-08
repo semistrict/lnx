@@ -197,6 +197,7 @@ export type LnxClient = {
   instance(name?: string, options?: Partial<RunOptions>): LnxInstance;
   instances: {
     list(options?: CommandOptions): Promise<InstanceSummary[]>;
+    delete(name: string, options?: CommandOptions): Promise<void>;
   };
   ingress: IngressClient;
   cli(args: string[], options?: CommandOptions): Promise<CommandResult>;
@@ -253,6 +254,9 @@ class BinaryLnxClient implements LnxClient {
       list: async (options: CommandOptions = {}) => {
         const result = await this.cli(["instances", "list"], options);
         return parseInstances(result.stdout);
+      },
+      delete: async (name: string, options: CommandOptions = {}) => {
+        await this.cli(["instances", "delete", name], options);
       },
     };
   }

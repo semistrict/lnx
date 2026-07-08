@@ -4,6 +4,8 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -318,6 +320,10 @@ struct InstancesArgs {
 #[derive(Debug, Subcommand)]
 enum InstancesCommand {
     List,
+    #[command(about = "Delete an instance and all its state")]
+    Delete {
+        name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -649,6 +655,7 @@ impl Cli {
             }
             Some(Command::Instances(args)) => match args.command {
                 InstancesCommand::List => list_instances(&layout.base),
+                InstancesCommand::Delete { name } => delete_instance(&layout.base, &name),
             },
             Some(Command::Set(args)) => set_instance_settings(&layout, &args.settings),
             Some(Command::Inspect) => inspect_instance(&layout, cpus, memory_mib),
@@ -1284,6 +1291,80 @@ fn list_instances(base: &Path) -> Result<()> {
         println!("{:<36} {:<12} {}", row.name, row.state, row.pids);
     }
     Ok(())
+}
+
+fn delete_instance(base: &Path, name: &str) -> Result<()> {
+    crate::server::validate_instance_name(name)?;
+    let layout = Layout::resolve_in_base(name, base.to_path_buf(), None, None);
+    if !layout.instance_dir.exists() {
+        bail!("instance not found: {name}");
+    }
+
+    let state = instance_state(&layout);
+    if state == "running" || state == "starting" {
+        terminate_instance_owner(&layout)?;
+    }
+
+    remove_contained_instance_dir(&layout.instance_dir, &base.join("instances"), name)?;
+    if layout.run_dir != layout.instance_dir {
+        let run_base = std::env::var_os("LNX_RUN_BASE")
+            .map(PathBuf::from)
+            .context("instance run directory is split from its instance directory but LNX_RUN_BASE is unset")?;
+        remove_contained_instance_dir(&layout.run_dir, &run_base.join("instances"), name)?;
+    }
+
+    println!("deleted {name}");
+    Ok(())
+}
+
+fn terminate_instance_owner(layout: &Layout) -> Result<()> {
+    let lock_dir = layout.run_dir.join("bootstrap.lock.d");
+    let Some(pid) = alive_owner_pid(&lock_dir) else {
+        return Ok(());
+    };
+
+    runner::signal_process_group(pid, libc::SIGTERM)?;
+    let term_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < term_deadline {
+        if alive_owner_pid(&lock_dir).is_none() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    runner::signal_process_group(pid, libc::SIGKILL)?;
+    let kill_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < kill_deadline {
+        if alive_owner_pid(&lock_dir).is_none() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    bail!(
+        "owner process {pid} for instance {} did not exit after SIGTERM/SIGKILL; refusing to delete a live instance",
+        layout.instance
+    );
+}
+
+/// Removes `dir`, but only if it is exactly `<instances_root>/<name>`. Never
+/// deletes anything outside that shape, even if callers pass a mismatched
+/// `instances_root`/`name` pair.
+fn remove_contained_instance_dir(dir: &Path, instances_root: &Path, name: &str) -> Result<()> {
+    let is_contained =
+        dir.starts_with(instances_root) && dir.file_name().and_then(|n| n.to_str()) == Some(name);
+    if !is_contained {
+        bail!(
+            "refusing to delete instance dir outside {}: {}",
+            instances_root.display(),
+            dir.display()
+        );
+    }
+    match fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("remove {}", dir.display())),
+    }
 }
 
 struct InstanceRow {
