@@ -365,20 +365,16 @@ async fn stop_instance(
     AxumPath(instance): AxumPath<String>,
 ) -> std::result::Result<Json<LifecycleResponse>, ApiError> {
     validate_instance_name(&instance).map_err(ApiError::bad_request)?;
-    let instance_name = instance.clone();
-    let response = tokio::task::spawn_blocking(move || {
-        let layout = Layout::resolve(&instance_name, None, None)?;
-        stop_existing_instance(&layout)?;
-        Ok::<_, anyhow::Error>(LifecycleResponse {
-            ok: true,
-            instance: instance_name,
-            state: instance_state(&layout),
-            message: "stopped",
-        })
-    })
-    .await
-    .map_err(ApiError::internal)?
-    .map_err(ApiError::bad_request)?;
+    let layout = Layout::resolve(&instance, None, None).map_err(ApiError::bad_request)?;
+    stop_existing_instance(&layout)
+        .await
+        .map_err(ApiError::bad_request)?;
+    let response = LifecycleResponse {
+        ok: true,
+        instance,
+        state: instance_state(&layout),
+        message: "stopped",
+    };
     Ok(Json(response))
 }
 
@@ -667,7 +663,8 @@ fn collect_child_dir_names(parent: &Path, names: &mut BTreeSet<String>) -> Resul
     };
     for entry in entries {
         let entry = entry?;
-        if entry.file_type()?.is_dir() {
+        if entry.file_type()?.is_dir() && !crate::paths::is_instance_transaction_root(&entry.path())
+        {
             names.insert(entry.file_name().to_string_lossy().into_owned());
         }
     }
@@ -708,12 +705,16 @@ fn instance_pids(layout: &Layout) -> Vec<i32> {
 }
 
 fn alive_owner_pid(lock_dir: &Path) -> Option<i32> {
-    let pid = fs::read_to_string(lock_dir.join("owner.pid"))
+    let pid = recorded_owner_pid(lock_dir)?;
+    process_alive(pid).then_some(pid)
+}
+
+fn recorded_owner_pid(lock_dir: &Path) -> Option<i32> {
+    fs::read_to_string(lock_dir.join("owner.pid"))
         .ok()?
         .trim()
         .parse::<i32>()
-        .ok()?;
-    process_alive(pid).then_some(pid)
+        .ok()
 }
 
 fn host_pids_for_instance(instance: &str) -> Vec<i32> {
@@ -1661,45 +1662,183 @@ fn build_instance_start_command(
     Ok(command)
 }
 
-fn stop_existing_instance(layout: &Layout) -> Result<()> {
-    let Some(pid) = alive_owner_pid(&layout.run_dir.join("bootstrap.lock.d")) else {
+async fn stop_existing_instance(layout: &Layout) -> Result<()> {
+    stop_existing_instance_with_timeout(layout, Duration::from_secs(120)).await
+}
+
+async fn stop_existing_instance_with_timeout(layout: &Layout, timeout: Duration) -> Result<()> {
+    if !layout.instance_dir.exists() && !layout.snapshot_dir.exists() && !layout.run_dir.exists() {
+        return Ok(());
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    let lock_dir = layout.run_dir.join("bootstrap.lock.d");
+    let mut signaled_pid = alive_owner_pid(&lock_dir);
+    if let Some(pid) = signaled_pid {
+        // The process that launched the initial command keeps owner-start.lock
+        // until that command returns. Signal the established owner first so
+        // shutdown can release that client and, in turn, the start lock.
+        signal_owner_process(pid)?;
+    }
+    let start_lock_path = layout.run_dir.join("owner-start.lock.d");
+    let _start_lock = loop {
+        if let Some(lock) = runner::OwnerStartLock::try_acquire(&start_lock_path)? {
+            break lock;
+        }
+        if let Some(pid) = alive_owner_pid(&lock_dir)
+            && signaled_pid != Some(pid)
+        {
+            signal_owner_process(pid)?;
+            signaled_pid = Some(pid);
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "instance {} did not finish starting within {} seconds; retry stop",
+                layout.instance,
+                timeout.as_secs_f64()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let pid = loop {
+        if let Some(pid) = alive_owner_pid(&lock_dir) {
+            if signaled_pid != Some(pid) {
+                signal_owner_process(pid)?;
+            }
+            break pid;
+        }
+        let (lock_exists, recorded_pid, maintenance_pid) = runner::with_lock_dir_guard(
+            &lock_dir,
+            || {
+                let recorded_pid = runner::recorded_owner_pid_from_lock(&lock_dir).with_context(|| {
+                format!(
+                    "instance {} has a corrupt owner lease; recovery: lnx --instance {} snapshots clear to acknowledge and explicitly cold-boot",
+                    layout.instance, layout.instance
+                )
+            })?;
+                let maintenance_pid = runner::recorded_maintenance_pid_from_lock(&lock_dir)
+                    .context("read instance state-copy lease")?;
+                Ok((lock_dir.exists(), recorded_pid, maintenance_pid))
+            },
+        )?;
+        if recorded_pid.is_some_and(process_alive) {
+            continue;
+        }
+        if maintenance_pid.is_some_and(process_alive) {
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "instance {} state copy did not finish within {} seconds; retry stop",
+                    layout.instance,
+                    timeout.as_secs_f64()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            continue;
+        }
+        if lock_exists && recorded_pid.is_none() && maintenance_pid.is_none() {
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "instance {} owner lease remained incomplete at {} for {} seconds; run lnx --instance {} snapshots clear to acknowledge and explicitly cold-boot",
+                    layout.instance,
+                    lock_dir.display(),
+                    timeout.as_secs_f64(),
+                    layout.instance
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            continue;
+        }
+        let expected_pid = signaled_pid.or(recorded_pid);
+        ensure_shutdown_state_under_guard(layout, expected_pid)?;
         return Ok(());
     };
-    terminate_process_group(pid)?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if !process_alive(pid) {
-            return Ok(());
+        match alive_owner_pid(&lock_dir) {
+            None => {
+                ensure_shutdown_state_under_guard(layout, Some(pid))?;
+                return Ok(());
+            }
+            Some(current_pid) if current_pid != pid => {
+                bail!(
+                    "instance {} changed VM owner from pid {pid} to pid {current_pid} while stopping",
+                    layout.instance
+                );
+            }
+            Some(_) => {}
         }
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    kill_process_group(pid)?;
+    match alive_owner_pid(&lock_dir) {
+        None => ensure_shutdown_state_under_guard(layout, Some(pid)),
+        Some(current_pid) if current_pid != pid => bail!(
+            "instance {} changed VM owner from pid {pid} to pid {current_pid} while stopping",
+            layout.instance
+        ),
+        Some(_) => bail!(
+            "owner process {pid} for instance {} did not finish its shutdown snapshot within {} seconds; it was left running so recoverable state is not discarded",
+            layout.instance,
+            timeout.as_secs_f64()
+        ),
+    }
+}
+
+fn ensure_shutdown_state_under_guard(layout: &Layout, expected_pid: Option<i32>) -> Result<()> {
+    let lock_dir = layout.run_dir.join("bootstrap.lock.d");
+    let checked = runner::with_lock_dir_guard(&lock_dir, || {
+        if lock_dir.exists() && !runner::bootstrap_lock_is_stale(&lock_dir)? {
+            return Ok(false);
+        }
+        ensure_no_failed_shutdown_state(layout, expected_pid)?;
+        if lock_dir.exists() {
+            fs::remove_dir_all(&lock_dir)
+                .with_context(|| format!("remove {}", lock_dir.display()))?;
+        }
+        Ok(true)
+    })?;
+    if !checked {
+        bail!(
+            "instance {} acquired a new VM owner while shutdown was being verified; retry stop",
+            layout.instance
+        );
+    }
     Ok(())
 }
 
-fn terminate_process_group(pid: i32) -> Result<()> {
-    signal_process_group(pid, libc::SIGTERM)
+fn ensure_no_failed_shutdown_state(layout: &Layout, expected_pid: Option<i32>) -> Result<()> {
+    if runner::restore_work_is_active(layout) {
+        bail!(
+            "instance {} stopped without publishing its final snapshot; recoverable state remains at {}\nrecovery: preserve it for inspection, or run lnx --instance {} snapshots clear to explicitly discard it",
+            layout.instance,
+            layout
+                .snapshot_dir
+                .join(runner::RESTORE_WORK_SNAPSHOT)
+                .display(),
+            layout.instance
+        );
+    }
+    let expected_pid = expected_pid
+        .map(u32::try_from)
+        .transpose()
+        .context("owner pid does not fit final snapshot outcome")?;
+    if let Some(pid) = expected_pid {
+        runner::validate_or_record_final_snapshot_failure(layout, pid)
+    } else {
+        runner::validate_final_snapshot_outcome(layout, None)
+    }
 }
 
-fn kill_process_group(pid: i32) -> Result<()> {
-    signal_process_group(pid, libc::SIGKILL)
+fn signal_owner_process(pid: i32) -> Result<()> {
+    signal_process(pid, libc::SIGTERM)
 }
 
-fn signal_process_group(pid: i32, signal: i32) -> Result<()> {
+fn signal_process(pid: i32, signal: i32) -> Result<()> {
     if pid <= 0 {
         bail!("invalid owner pid: {pid}");
     }
-    let pgid = -(pid as libc::pid_t);
-    let rc = unsafe { libc::kill(pgid, signal) };
-    if rc == 0 {
-        return Ok(());
-    }
-    let group_error = std::io::Error::last_os_error();
     let rc = unsafe { libc::kill(pid as libc::pid_t, signal) };
     if rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
         return Ok(());
     }
-    Err(group_error).with_context(|| format!("signal process group {pid}"))
+    Err(std::io::Error::last_os_error()).with_context(|| format!("signal process {pid}"))
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<()> {
@@ -2057,20 +2196,24 @@ fn collect_sparse_bundle_files(layout: &Layout) -> Result<Vec<SparseBundleCollec
     if layout.kernel == layout.base.join("vmlinuz") && layout.kernel.exists() {
         collect_sparse_bundle_file(&layout.base, &layout.kernel, &mut files)?;
     }
-    collect_sparse_bundle_tree(&layout.base, &layout.instance_dir, &mut files)?;
+    collect_sparse_bundle_tree(layout, &layout.base, &layout.instance_dir, &mut files)?;
     files.sort_by(|a, b| a.relative.cmp(&b.relative));
     Ok(files)
 }
 
 fn collect_sparse_bundle_tree(
+    layout: &Layout,
     base: &Path,
     path: &Path,
     files: &mut Vec<SparseBundleCollectedFile>,
 ) -> Result<()> {
+    if bundle_runtime_path_is_excluded(layout, path) {
+        return Ok(());
+    }
     let meta = fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
     if meta.is_dir() {
         for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
-            collect_sparse_bundle_tree(base, &entry?.path(), files)?;
+            collect_sparse_bundle_tree(layout, base, &entry?.path(), files)?;
         }
         return Ok(());
     }
@@ -2081,6 +2224,43 @@ fn collect_sparse_bundle_tree(
         );
     }
     collect_sparse_bundle_file(base, path, files)
+}
+
+fn bundle_runtime_path_is_excluded(layout: &Layout, path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let runtime_exact = [
+        "bootstrap.lock.d",
+        "bootstrap.lock.d.guard",
+        "owner-start.lock.d",
+        "owner-start.lock.d.guard",
+        "broker.sock",
+        "checkpoint-broker.sock",
+        "lnx-agent.sock",
+        "lnx-snapshot.sock",
+        "lnx-control.sock",
+        "gvproxy.sock",
+    ]
+    .into_iter()
+    .any(|runtime| path == layout.run_dir.join(runtime));
+    let runtime_lock_descendant = path.starts_with(layout.run_dir.join("bootstrap.lock.d"))
+        || path.starts_with(layout.run_dir.join("owner-start.lock.d"));
+    let runtime_socket =
+        path.parent() == Some(layout.run_dir.as_path()) && name.ends_with("-krun.sock");
+    let persistent_transaction_file = path.parent() == Some(layout.instance_dir.as_path())
+        && (name == ".lnx-fork-lease" || name.starts_with(".lnx-descriptor-"));
+    let snapshot_runtime = path.parent() == Some(layout.snapshot_dir.as_path())
+        && (matches!(
+            name,
+            ".restore-work" | ".restore-work.active" | ".latest.next" | ".latest.previous"
+        ) || (name.starts_with('.') && name.contains(".clear-"))
+            || name.starts_with(".final-snapshot.outcome.tmp-"));
+    runtime_exact
+        || runtime_lock_descendant
+        || runtime_socket
+        || persistent_transaction_file
+        || snapshot_runtime
 }
 
 fn collect_sparse_bundle_file(
@@ -2293,8 +2473,8 @@ fn draw_progress(label: &str, done: u64, total: u64, started: std::time::Instant
 }
 
 fn prepare_push_source(layout: &Layout) -> Result<PushSource> {
-    let broker = layout.run_dir.join("broker.sock");
-    if broker.exists() && runner::connect_broker(&broker).is_ok() {
+    let owner_is_live = runner::validate_restore_work_for_command(layout)?;
+    if owner_is_live {
         eprintln!(
             "source instance {} is running; checkpointing before push",
             layout.instance
@@ -2304,30 +2484,74 @@ fn prepare_push_source(layout: &Layout) -> Result<PushSource> {
             .tempdir()
             .context("create temporary push bundle")?;
         let bundle = checkpoint_bundle_layout(layout, tempdir.path());
-        materialize_running_source_checkpoint(layout, &broker, &bundle)?;
+        materialize_running_source_checkpoint(layout, &bundle)?;
         return Ok(PushSource {
             layout: bundle,
             _tempdir: Some(tempdir),
         });
     }
 
+    let tempdir = tempfile::Builder::new()
+        .prefix("lnx-server-push-stopped-")
+        .tempdir()
+        .context("create stable stopped-source push bundle")?;
+    let bundle = checkpoint_bundle_layout(layout, tempdir.path());
+    let copied = runner::with_validated_stopped_instance(layout, || {
+        materialize_stopped_push_copy(layout, &bundle)
+    })?;
+    if copied.is_none() {
+        bail!(
+            "source instance {} started while its push snapshot was being prepared; retry so it can be checkpointed coherently",
+            layout.instance
+        );
+    }
     Ok(PushSource {
-        layout: layout.clone(),
-        _tempdir: None,
+        layout: bundle,
+        _tempdir: Some(tempdir),
     })
 }
 
-fn materialize_running_source_checkpoint(
-    source: &Layout,
-    broker: &Path,
-    bundle: &Layout,
-) -> Result<()> {
+fn materialize_stopped_push_copy(source: &Layout, bundle: &Layout) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for file in collect_sparse_bundle_files(source)? {
+        let destination = bundle.base.join(&file.relative);
+        sparse_copy::clone_or_copy_file(&file.source, &destination).with_context(|| {
+            format!(
+                "clone stable push source {} to {}",
+                file.source.display(),
+                destination.display()
+            )
+        })?;
+        fs::set_permissions(&destination, fs::Permissions::from_mode(file.mode))
+            .with_context(|| format!("set permissions on {}", destination.display()))?;
+    }
+    Ok(())
+}
+
+fn materialize_running_source_checkpoint(source: &Layout, bundle: &Layout) -> Result<()> {
     fs::create_dir_all(&source.checkpoint_dir)
         .with_context(|| format!("create {}", source.checkpoint_dir.display()))?;
     let (checkpoint, path) = checkpoints::new_checkpoint_path(source, None)?;
-    runner::request_checkpoint(broker, &path).context("checkpoint running source before push")?;
-    checkpoints::write_metadata(source, &checkpoint)?;
-    materialize_checkpoint_bundle(source, &checkpoint, bundle)
+    let result = (|| {
+        runner::request_coherent_checkpoint_awaiting_owner(source, &path, Duration::from_secs(120))
+            .context("checkpoint running source before push")?;
+        checkpoints::write_metadata(source, &checkpoint)?;
+        materialize_checkpoint_bundle(source, &checkpoint, bundle)
+    })();
+    let cleanup = match fs::remove_dir_all(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    };
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => Err(error.context(format!(
+            "also failed to clean temporary checkpoint: {cleanup_error:#}"
+        ))),
+    }
 }
 
 fn materialize_checkpoint_bundle(
@@ -2335,10 +2559,7 @@ fn materialize_checkpoint_bundle(
     checkpoint: &checkpoints::Checkpoint,
     bundle: &Layout,
 ) -> Result<()> {
-    checkpoints::fork(source, checkpoint, bundle)?;
-    let descriptor = descriptor::load(source)?;
-    descriptor::save(bundle, &descriptor)?;
-    Ok(())
+    checkpoints::fork(source, checkpoint, bundle)
 }
 
 fn checkpoint_bundle_layout(source: &Layout, base: &Path) -> Layout {

@@ -1,13 +1,18 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::paths::Layout;
+use crate::{
+    descriptor,
+    paths::{Layout, ensure_instance_transaction_root, instance_transaction_roots},
+    runner::{self, SNAPSHOT_RESTORE_FILES},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
@@ -105,7 +110,7 @@ pub fn delete(layout: &Layout, checkpoint: &Checkpoint) -> Result<()> {
         .with_context(|| format!("remove {}", checkpoint.path.display()))
 }
 
-pub fn fork(_source: &Layout, checkpoint: &Checkpoint, dest: &Layout) -> Result<()> {
+pub fn fork(source: &Layout, checkpoint: &Checkpoint, dest: &Layout) -> Result<()> {
     if dest.rootfs.exists() {
         bail!(
             "destination rootfs already exists: {}",
@@ -118,17 +123,301 @@ pub fn fork(_source: &Layout, checkpoint: &Checkpoint, dest: &Layout) -> Result<
             dest.snapshot_dir.display()
         );
     }
-    fs::create_dir_all(
-        dest.rootfs
-            .parent()
-            .context("destination rootfs has no parent")?,
-    )
-    .with_context(|| format!("create {}", dest.rootfs.parent().unwrap().display()))?;
-    clone_or_copy(&checkpoint.path.join("rootfs.ext4"), &dest.rootfs)?;
-    clone_snapshot_dir(&checkpoint.path, &dest.snapshot_dir.join("latest"))?;
-    clone_host_share_state(&checkpoint.path.join("host-share-state"), dest)?;
-    mark_vm_initialized(dest)?;
+    validate_memory_checkpoint(&checkpoint.path)?;
+    let dest_descriptor = destination_descriptor(source, checkpoint, dest)?;
+    if dest.instance_dir.exists() {
+        bail!(
+            "destination instance already exists: {}",
+            dest.instance_dir.display()
+        );
+    }
+    let parent = dest
+        .instance_dir
+        .parent()
+        .context("destination instance has no parent")?;
+    if parent != dest.base.join("instances") {
+        bail!(
+            "destination instance is outside its instance store: {}",
+            dest.instance_dir.display()
+        );
+    }
+    cleanup_stale_fork_transactions(parent)?;
+    let transaction_root = ensure_instance_transaction_root(parent)?;
+    let fork_staging_root = transaction_root.join("fork");
+    fs::create_dir_all(&fork_staging_root)
+        .with_context(|| format!("create {}", fork_staging_root.display()))?;
+    let staging_creation_guard = lock_fork_transaction_root(&fork_staging_root)?;
+    let staging = tempfile::Builder::new()
+        .prefix("fork-")
+        .tempdir_in(&fork_staging_root)
+        .with_context(|| {
+            format!(
+                "create fork staging directory in {}",
+                fork_staging_root.display()
+            )
+        })?;
+    let staging_lease_path = staging.path().join(".lnx-fork-lease");
+    let staging_lease = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&staging_lease_path)
+        .with_context(|| format!("create {}", staging_lease_path.display()))?;
+    if unsafe { libc::flock(staging_lease.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("lock {}", staging_lease_path.display()));
+    }
+    drop(staging_creation_guard);
+    let staging_layout = staging_layout(dest, staging.path())?;
+    clone_or_copy(&checkpoint.path.join("rootfs.ext4"), &staging_layout.rootfs)?;
+    clone_snapshot_dir(
+        &checkpoint.path,
+        &staging_layout.snapshot_dir.join("latest"),
+    )?;
+    clone_host_share_state(&checkpoint.path.join("host-share-state"), &staging_layout)?;
+    descriptor::save_in_instance_dir(&staging_layout.instance_dir, &dest_descriptor)?;
+    mark_vm_initialized(&staging_layout)?;
+    if dest.instance_dir.exists() {
+        bail!(
+            "destination instance appeared while forking: {}",
+            dest.instance_dir.display()
+        );
+    }
+    fs::rename(staging.path(), &dest.instance_dir).with_context(|| {
+        format!(
+            "publish staged fork {} to {}",
+            staging.path().display(),
+            dest.instance_dir.display()
+        )
+    })?;
+    if let Err(error) = fs::remove_file(dest.instance_dir.join(".lnx-fork-lease")) {
+        eprintln!(
+            "warning: fork was published but its internal lease file could not be removed from {}: {error}",
+            dest.instance_dir.display()
+        );
+    }
     Ok(())
+}
+
+fn lock_fork_transaction_root(fork_root: &Path) -> Result<fs::File> {
+    let path = fork_root.join(".guard");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("lock {}", path.display()));
+    }
+    Ok(file)
+}
+
+fn cleanup_stale_fork_transactions(instances_root: &Path) -> Result<()> {
+    for transaction_root in instance_transaction_roots(instances_root)? {
+        let fork_root = transaction_root.join("fork");
+        let entries = match fs::read_dir(&fork_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", fork_root.display()));
+            }
+        };
+        drop(entries);
+        let _guard = lock_fork_transaction_root(&fork_root)?;
+        let entries =
+            fs::read_dir(&fork_root).with_context(|| format!("read {}", fork_root.display()))?;
+        for entry in entries {
+            let entry = entry.with_context(|| format!("read {}", fork_root.display()))?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            let lease_path = path.join(".lnx-fork-lease");
+            let stale = match OpenOptions::new().read(true).write(true).open(&lease_path) {
+                Ok(lease) => {
+                    let locked = unsafe {
+                        libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0
+                    };
+                    if !locked {
+                        let error = std::io::Error::last_os_error();
+                        let would_block = matches!(
+                            error.raw_os_error(),
+                            Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK
+                        );
+                        if !would_block {
+                            return Err(error)
+                                .with_context(|| format!("lock {}", lease_path.display()));
+                        }
+                    }
+                    locked
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age >= Duration::from_secs(10)),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("open {}", lease_path.display()));
+                }
+            };
+            if stale {
+                fs::remove_dir_all(&path)
+                    .with_context(|| format!("remove stale fork staging {}", path.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_memory_checkpoint(path: &Path) -> Result<()> {
+    for name in ["rootfs.ext4", "vmstate.bin"] {
+        let file = path.join(name);
+        let metadata = fs::symlink_metadata(&file).with_context(|| {
+            format!(
+                "checkpoint is missing required memory state: {}",
+                file.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            bail!(
+                "checkpoint memory state is not a regular file: {}",
+                file.display()
+            );
+        }
+    }
+    runner::snapshot_vm_config(path)?
+        .with_context(|| format!("checkpoint has no VM state: {}", path.display()))?;
+    let pages = path.join("pages.img");
+    let metadata = fs::symlink_metadata(&pages).with_context(|| {
+        format!(
+            "checkpoint is missing required memory state: {}",
+            pages.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        bail!(
+            "checkpoint memory state is not a regular file: {}",
+            pages.display()
+        );
+    }
+    let initramfs_stamp = path.join("initramfs.stamp");
+    let initramfs_metadata = fs::symlink_metadata(&initramfs_stamp).with_context(|| {
+        format!(
+            "checkpoint is missing initramfs compatibility stamp: {}",
+            initramfs_stamp.display()
+        )
+    })?;
+    if !initramfs_metadata.is_file() || runner::initramfs_stamp_key(&initramfs_stamp).is_none() {
+        bail!(
+            "checkpoint has no valid initramfs compatibility stamp: {}",
+            initramfs_stamp.display()
+        );
+    }
+    let launch = path.join("launch.json");
+    let launch_metadata = fs::symlink_metadata(&launch).with_context(|| {
+        format!(
+            "checkpoint is missing launch metadata: {}",
+            launch.display()
+        )
+    })?;
+    if !launch_metadata.is_file() {
+        bail!(
+            "checkpoint launch metadata is not a regular file: {}",
+            launch.display()
+        );
+    }
+    runner::read_launch_metadata(path)
+        .with_context(|| format!("read checkpoint launch metadata from {}", launch.display()))?;
+    if !runner::default_restore_version_matches(path)? {
+        bail!(
+            "checkpoint launch metadata version is not restorable: {}",
+            launch.display()
+        );
+    }
+    let deterministic_stamp = path.join("deterministic.stamp");
+    let deterministic_stamp = match fs::read_to_string(&deterministic_stamp) {
+        Ok(stamp) => Some(stamp),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("read checkpoint stamp at {}", deterministic_stamp.display())
+            });
+        }
+    };
+    if deterministic_stamp
+        .as_deref()
+        .is_some_and(|stamp| stamp.lines().any(|line| line == "deterministic=true"))
+    {
+        let clock = path.join("deterministic-clock.state");
+        if !fs::symlink_metadata(&clock).is_ok_and(|metadata| metadata.is_file()) {
+            bail!(
+                "deterministic checkpoint is missing clock state: {}",
+                clock.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn staging_layout(dest: &Layout, staging_dir: &Path) -> Result<Layout> {
+    let relocate = |path: &Path| -> Result<PathBuf> {
+        let relative = path.strip_prefix(&dest.instance_dir).with_context(|| {
+            format!(
+                "destination path {} is outside instance {}",
+                path.display(),
+                dest.instance_dir.display()
+            )
+        })?;
+        Ok(staging_dir.join(relative))
+    };
+    let staging_instance = staging_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("fork staging directory name is not UTF-8")?
+        .to_string();
+    Ok(Layout {
+        base: dest.base.clone(),
+        instance: staging_instance,
+        kernel: dest.kernel.clone(),
+        rootfs: relocate(&dest.rootfs)?,
+        instance_dir: staging_dir.to_path_buf(),
+        snapshot_dir: relocate(&dest.snapshot_dir)?,
+        checkpoint_dir: relocate(&dest.checkpoint_dir)?,
+        vm_initialized: relocate(&dest.vm_initialized)?,
+        // Fork publication only materializes persistent instance state. A
+        // split runtime directory intentionally lives outside instance_dir,
+        // so use staging-local placeholders for descriptor helpers.
+        run_dir: staging_dir.to_path_buf(),
+        console_log: staging_dir.join("console.log"),
+    })
+}
+
+fn destination_descriptor(
+    source: &Layout,
+    checkpoint: &Checkpoint,
+    dest: &Layout,
+) -> Result<descriptor::InstanceDescriptor> {
+    let mut config = descriptor::load(source)?;
+    config.name = Some(dest.instance.clone());
+    config.created = OffsetDateTime::now_utc().format(&Rfc3339).ok();
+    if let Some(snapshot_config) = runner::snapshot_vm_config(&checkpoint.path)? {
+        config.cpus = Some(
+            snapshot_config
+                .vcpu_count
+                .try_into()
+                .context("checkpoint vCPU count does not fit instance descriptor")?,
+        );
+        config.memory_mib = Some(
+            snapshot_config
+                .memory_mib()
+                .try_into()
+                .context("checkpoint memory does not fit instance descriptor")?,
+        );
+    }
+    Ok(config)
 }
 
 fn mark_vm_initialized(layout: &Layout) -> Result<()> {
@@ -198,18 +487,24 @@ fn sanitize_name(name: &str) -> String {
 
 fn clone_snapshot_dir(src: &Path, dest: &Path) -> Result<()> {
     fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
-    for name in [
-        "vmstate.bin",
-        "pages.img",
-        "rootfs.ext4",
-        "snapshot.meta",
-        "checkpoint.meta",
-        "initramfs.stamp",
-        "launch.json",
-    ] {
+    for name in SNAPSHOT_RESTORE_FILES
+        .iter()
+        .copied()
+        .chain(["checkpoint.meta"])
+    {
         let src_file = src.join(name);
-        if src_file.exists() {
-            clone_or_copy(&src_file, &dest.join(name))?;
+        match fs::symlink_metadata(&src_file) {
+            Ok(metadata) if metadata.is_file() => {
+                clone_or_copy(&src_file, &dest.join(name))?;
+            }
+            Ok(_) => bail!(
+                "checkpoint restore state is not a regular file: {}",
+                src_file.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("stat {}", src_file.display()));
+            }
         }
     }
     Ok(())

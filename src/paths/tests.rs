@@ -193,3 +193,21 @@ fn resolve_in_base_places_new_instances_in_selected_store() {
         PathBuf::from("/tmp/lnx-selected-base/instances/new/rootfs.ext4")
     );
 }
+
+#[test]
+fn transaction_root_coexists_with_a_legacy_reserved_name() {
+    let temp = TempDir::new("transaction-root-collision");
+    let instances = temp.path.join("instances");
+    let legacy = instances.join(INSTANCE_TRANSACTION_DIR);
+    fs::create_dir_all(&legacy).expect("create legacy instance");
+    fs::write(legacy.join("rootfs.ext4"), b"legacy").expect("write legacy state");
+
+    let transaction =
+        ensure_instance_transaction_root(&instances).expect("create suffixed transaction root");
+
+    assert_ne!(transaction, legacy);
+    assert!(transaction.starts_with(&instances));
+    assert!(is_instance_transaction_root(&transaction));
+    assert!(!is_instance_transaction_root(&legacy));
+    assert_eq!(fs::read(legacy.join("rootfs.ext4")).unwrap(), b"legacy");
+}

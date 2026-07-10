@@ -4,6 +4,46 @@ use tempfile::TempDir;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+struct ChildGuard(std::process::Child);
+
+impl ChildGuard {
+    fn new(child: std::process::Child) -> Self {
+        Self(child)
+    }
+
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.0.wait()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+async fn wait_for_ready(path: &Path) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if path.exists() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 struct LnxBaseGuard {
     _guard: MutexGuard<'static, ()>,
     previous: Option<std::ffi::OsString>,
@@ -41,6 +81,25 @@ fn rejects_path_like_instance_names() {
     assert!(validate_instance_name("../nope").is_err());
     assert!(validate_instance_name("bad/name").is_err());
     assert!(validate_instance_name("").is_err());
+}
+
+#[test]
+fn server_instance_listing_keeps_valid_dot_names_and_hides_transactions() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let instances = temp.path().join("instances");
+    fs::create_dir_all(instances.join(".dev")).expect("create dot instance");
+    fs::create_dir_all(instances.join("@legacy-name")).expect("create legacy invalid name");
+    let transaction_root = crate::paths::ensure_instance_transaction_root(&instances)
+        .expect("create transaction root");
+    fs::create_dir_all(transaction_root.join("delete/dev/1-0")).expect("create delete transaction");
+    let mut names = BTreeSet::new();
+
+    collect_child_dir_names(&instances, &mut names).expect("collect instances");
+
+    assert_eq!(
+        names,
+        BTreeSet::from([".dev".to_string(), "@legacy-name".to_string()])
+    );
 }
 
 #[test]
@@ -161,7 +220,7 @@ fn rejects_sparse_bundle_with_incompatible_launch_metadata() {
     fs::write(&source.rootfs, b"rootfs").expect("write rootfs");
     fs::write(
         source.instance_dir.join("lnx.json"),
-        br#"{"name":"source","cpus":1,"memory_mib":512}"#,
+        br#"{"name":"source","cpus":3,"memory_mib":3072}"#,
     )
     .expect("write descriptor");
     fs::write(&source.vm_initialized, b"1\n").expect("vm initialized");
@@ -234,7 +293,12 @@ fn materializes_checkpoint_bundle_for_running_push() {
         br#"{"name":"source","cpus":1,"memory_mib":512}"#,
     )
     .expect("write descriptor");
-
+    fs::write(
+        source.instance_dir.join(".lnx-descriptor-partial"),
+        b"partial descriptor",
+    )
+    .expect("write stale descriptor staging file");
+    fs::write(source.instance_dir.join(".lnx-fork-lease"), b"").expect("write stale fork lease");
     let checkpoint = checkpoints::Checkpoint {
         id: "checkpoint-for-push".to_string(),
         name: None,
@@ -244,8 +308,32 @@ fn materializes_checkpoint_bundle_for_running_push() {
     fs::create_dir_all(&checkpoint.path).expect("create checkpoint");
     fs::write(checkpoint.path.join("rootfs.ext4"), b"checkpoint-rootfs")
         .expect("write checkpoint rootfs");
-    fs::write(checkpoint.path.join("vmstate.bin"), b"checkpoint-vmstate")
-        .expect("write checkpoint vmstate");
+    let mut vmstate = [0u8; 40];
+    vmstate[0..8].copy_from_slice(b"LKRNSS01");
+    vmstate[8..12].copy_from_slice(&runner::SNAPSHOT_VMSTATE_VERSION.to_le_bytes());
+    vmstate[16..24].copy_from_slice(&(512u64 * 1024 * 1024).to_le_bytes());
+    vmstate[32..36].copy_from_slice(&1u32.to_le_bytes());
+    fs::write(checkpoint.path.join("vmstate.bin"), vmstate).expect("write checkpoint vmstate");
+    fs::write(checkpoint.path.join("pages.img"), b"pages").expect("write checkpoint pages");
+    fs::write(
+        checkpoint.path.join("initramfs.stamp"),
+        b"source=test-agent\n",
+    )
+    .expect("write checkpoint initramfs stamp");
+    fs::write(
+        checkpoint.path.join("launch.json"),
+        br#"{
+  "version": 2,
+  "owner_args": [],
+  "compatibility": { "host_share_cache": { "dax": false } },
+  "shares": {
+    "no_host_shares": true,
+    "host_home": null,
+    "outside_home_cwd": null
+  }
+}"#,
+    )
+    .expect("write checkpoint launch metadata");
     checkpoints::write_metadata(&source, &checkpoint).expect("write checkpoint metadata");
 
     let bundle = checkpoint_bundle_layout(&source, bundle_base.path());
@@ -257,7 +345,7 @@ fn materializes_checkpoint_bundle_for_running_push() {
     );
     assert_eq!(
         fs::read(bundle.snapshot_dir.join("latest/vmstate.bin")).expect("read bundle vmstate"),
-        b"checkpoint-vmstate"
+        vmstate
     );
     assert!(!bundle.kernel.exists());
     assert!(bundle.vm_initialized.exists());
@@ -267,6 +355,131 @@ fn materializes_checkpoint_bundle_for_running_push() {
             .name
             .as_deref(),
         Some("source")
+    );
+    let bundle_descriptor = descriptor::load(&bundle).expect("load bundle descriptor");
+    assert_eq!(bundle_descriptor.cpus, Some(1));
+    assert_eq!(bundle_descriptor.memory_mib, Some(512));
+}
+
+#[test]
+fn stopped_push_refuses_failed_final_snapshot_outcome() {
+    let source_base = TempDir::new().expect("source tempdir");
+    let source = test_layout(source_base.path(), "source");
+    fs::create_dir_all(&source.instance_dir).expect("create source instance");
+    fs::write(&source.rootfs, b"newer-canonical-rootfs").expect("write source rootfs");
+    runner::write_final_snapshot_outcome(&source, &Err(anyhow::anyhow!("snapshot failed")))
+        .expect("write failed outcome");
+
+    let error = prepare_push_source(&source)
+        .err()
+        .expect("failed snapshot blocks stopped push");
+
+    assert!(error.to_string().contains("final snapshot failed"));
+    assert!(error.to_string().contains("snapshots clear"));
+}
+
+#[test]
+fn push_refuses_live_owner_without_broker() {
+    let source_base = TempDir::new().expect("source tempdir");
+    let source = test_layout(source_base.path(), "source");
+    fs::create_dir_all(&source.instance_dir).expect("create source instance");
+    fs::write(&source.rootfs, b"live-rootfs").expect("write source rootfs");
+    let owner = runner::BootstrapLock::try_acquire(&source.run_dir.join("bootstrap.lock.d"))
+        .expect("acquire owner lock")
+        .expect("owner lock");
+
+    let error = runner::request_coherent_checkpoint_awaiting_owner(
+        &source,
+        &source.checkpoint_dir.join("test"),
+        Duration::from_millis(25),
+    )
+    .expect_err("unavailable live broker blocks push");
+
+    assert!(error.to_string().contains("timed out waiting"));
+    drop(owner);
+}
+
+#[test]
+fn stopped_push_uses_stable_copy_without_runtime_leases() {
+    let source_base = TempDir::new().expect("source tempdir");
+    let source = test_layout(source_base.path(), "source");
+    fs::create_dir_all(&source.instance_dir).expect("create source instance");
+    fs::write(&source.rootfs, b"stable-rootfs").expect("write source rootfs");
+    fs::write(
+        source.instance_dir.join("lnx.json"),
+        br#"{"name":"source","cpus":1,"memory_mib":512}"#,
+    )
+    .expect("write descriptor");
+    let deferred_clear = source.snapshot_dir.join(".latest.clear-123-0");
+    fs::create_dir_all(&deferred_clear).expect("create deferred clear trash");
+    fs::write(deferred_clear.join("discarded-secret"), b"discarded")
+        .expect("write deferred clear trash");
+    let nested_reserved_name = source
+        .instance_dir
+        .join("host-share-state/home/upper/project/lnx-agent.sock");
+    fs::create_dir_all(nested_reserved_name.parent().unwrap())
+        .expect("create nested state directory");
+    fs::write(&nested_reserved_name, b"guest-visible-state")
+        .expect("write nested reserved-name file");
+    let stale_agent_socket = source.run_dir.join("lnx-agent.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&stale_agent_socket)
+        .expect("create stale runtime socket");
+    let stale_checkpoint_broker = source.run_dir.join("checkpoint-broker.sock");
+    let _checkpoint_listener = std::os::unix::net::UnixListener::bind(&stale_checkpoint_broker)
+        .expect("create stale checkpoint broker socket");
+
+    let prepared = prepare_push_source(&source).expect("prepare stopped push");
+
+    assert_eq!(
+        fs::read(&prepared.layout.rootfs).expect("read stable rootfs copy"),
+        b"stable-rootfs"
+    );
+    assert!(!prepared.layout.run_dir.join("bootstrap.lock.d").exists());
+    assert!(
+        !prepared
+            .layout
+            .run_dir
+            .join("bootstrap.lock.d.guard")
+            .exists()
+    );
+    assert!(!prepared.layout.run_dir.join("lnx-agent.sock").exists());
+    assert!(
+        !prepared
+            .layout
+            .instance_dir
+            .join(".lnx-descriptor-partial")
+            .exists()
+    );
+    assert!(
+        !prepared
+            .layout
+            .instance_dir
+            .join(".lnx-fork-lease")
+            .exists()
+    );
+    assert!(
+        !prepared
+            .layout
+            .run_dir
+            .join("checkpoint-broker.sock")
+            .exists()
+    );
+    assert!(
+        !prepared
+            .layout
+            .snapshot_dir
+            .join(".latest.clear-123-0")
+            .exists()
+    );
+    assert_eq!(
+        fs::read(
+            prepared
+                .layout
+                .instance_dir
+                .join("host-share-state/home/upper/project/lnx-agent.sock")
+        )
+        .expect("nested reserved-name file is preserved"),
+        b"guest-visible-state"
     );
 }
 
@@ -570,4 +783,145 @@ fn test_layout(base: &Path, instance: &str) -> Layout {
         run_dir: base.join("instances").join(instance),
         console_log: base.join("instances").join(instance).join("console.log"),
     }
+}
+
+#[tokio::test]
+async fn stop_reports_final_snapshot_failure_from_recovery_marker() {
+    let temp = TempDir::new().expect("tempdir");
+    let layout = test_layout(temp.path(), "stop-failed-snapshot");
+    let lock = layout.run_dir.join("bootstrap.lock.d");
+    fs::create_dir_all(&lock).expect("create owner lock");
+    fs::create_dir_all(layout.snapshot_dir.join(runner::RESTORE_WORK_SNAPSHOT))
+        .expect("create restore work");
+    fs::write(
+        layout.snapshot_dir.join(runner::RESTORE_WORK_ACTIVE_MARKER),
+        b"generation_id=recovery\n",
+    )
+    .expect("write recovery marker");
+    let ready = layout.run_dir.join("owner-ready");
+    let mut owner = ChildGuard::new(
+        Command::new("/bin/sh")
+        .arg("-c")
+        .arg(
+            "trap 'rm -rf \"$LOCK_PATH\"; exit 1' TERM; touch \"$READY_PATH\"; while :; do sleep 1; done",
+        )
+        .env("LOCK_PATH", &lock)
+        .env("READY_PATH", &ready)
+        .spawn()
+        .expect("spawn fake owner"),
+    );
+    fs::write(lock.join("owner.pid"), owner.id().to_string()).expect("write owner pid");
+    wait_for_ready(&ready).await;
+
+    let error = stop_existing_instance_with_timeout(&layout, Duration::from_secs(2))
+        .await
+        .expect_err("recovery marker reports failed shutdown snapshot");
+
+    assert!(
+        error
+            .to_string()
+            .contains("without publishing its final snapshot")
+    );
+    assert!(error.to_string().contains("snapshots clear"));
+    assert!(runner::restore_work_is_active(&layout));
+    let _ = owner.wait();
+}
+
+#[tokio::test]
+async fn stop_reports_missing_fresh_owner_snapshot_outcome() {
+    let temp = TempDir::new().expect("tempdir");
+    let layout = test_layout(temp.path(), "stop-missing-outcome");
+    let lock = layout.run_dir.join("bootstrap.lock.d");
+    fs::create_dir_all(&lock).expect("create owner lock");
+    let ready = layout.run_dir.join("owner-ready");
+    let mut owner = ChildGuard::new(
+        Command::new("/bin/sh")
+        .arg("-c")
+        .arg(
+            "trap 'rm -rf \"$LOCK_PATH\"; exit 1' TERM; touch \"$READY_PATH\"; while :; do sleep 1; done",
+        )
+        .env("LOCK_PATH", &lock)
+        .env("READY_PATH", &ready)
+        .spawn()
+        .expect("spawn fake owner"),
+    );
+    fs::write(lock.join("owner.pid"), owner.id().to_string()).expect("write owner pid");
+    wait_for_ready(&ready).await;
+
+    let error = stop_existing_instance_with_timeout(&layout, Duration::from_secs(2))
+        .await
+        .expect_err("missing fresh-owner outcome is a stop failure");
+
+    assert!(error.to_string().contains("without reporting whether"));
+    let _ = owner.wait();
+    let persisted = runner::read_final_snapshot_outcome(&layout)
+        .expect("read persisted failure")
+        .expect("missing outcome is replaced by a failure tombstone");
+    assert_eq!(persisted.pid, owner.id());
+    assert!(!persisted.succeeded);
+    let retry = runner::validate_restore_work_for_command(&layout)
+        .expect_err("the next start remains blocked");
+    assert!(retry.to_string().contains("final snapshot failed"));
+}
+
+#[tokio::test]
+async fn stop_reports_missing_snapshot_outcome_after_owner_crash() {
+    let temp = TempDir::new().expect("tempdir");
+    let layout = test_layout(temp.path(), "stop-crashed-owner");
+    let lock = layout.run_dir.join("bootstrap.lock.d");
+    fs::create_dir_all(&lock).expect("create stale owner lock");
+    let mut exited = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("spawn short-lived owner");
+    let stale_pid = exited.id();
+    exited.wait().expect("reap short-lived owner");
+    fs::write(lock.join("owner.pid"), stale_pid.to_string()).expect("write stale owner pid");
+
+    let error = stop_existing_instance_with_timeout(&layout, Duration::from_millis(50))
+        .await
+        .expect_err("a crashed owner without an outcome is a stop failure");
+
+    assert!(error.to_string().contains("without reporting whether"));
+    assert!(error.to_string().contains(&stale_pid.to_string()));
+    assert!(
+        lock.exists(),
+        "failed verification must retain PID evidence"
+    );
+    let retry = runner::validate_restore_work_for_command(&layout)
+        .expect_err("a later start must remain blocked");
+    assert!(retry.to_string().contains("final snapshot failed"));
+    let persisted = runner::read_final_snapshot_outcome(&layout)
+        .expect("read persisted crash outcome")
+        .expect("crash outcome is persisted");
+    assert_eq!(persisted.pid, stale_pid);
+    assert!(!persisted.succeeded);
+}
+
+#[tokio::test]
+async fn stop_timeout_leaves_unresponsive_owner_running() {
+    let temp = TempDir::new().expect("tempdir");
+    let layout = test_layout(temp.path(), "stop-timeout");
+    let lock = layout.run_dir.join("bootstrap.lock.d");
+    fs::create_dir_all(&lock).expect("create owner lock");
+    let ready = layout.run_dir.join("owner-ready");
+    let mut owner = ChildGuard::new(
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; touch \"$READY_PATH\"; while :; do sleep 1; done")
+            .env("READY_PATH", &ready)
+            .spawn()
+            .expect("spawn fake owner"),
+    );
+    fs::write(lock.join("owner.pid"), owner.id().to_string()).expect("write owner pid");
+    wait_for_ready(&ready).await;
+
+    let error = stop_existing_instance_with_timeout(&layout, Duration::from_millis(50))
+        .await
+        .expect_err("unresponsive owner times out");
+
+    assert!(error.to_string().contains("left running"));
+    assert!(process_alive(owner.id() as i32));
+    unsafe { libc::kill(owner.id() as i32, libc::SIGKILL) };
+    let _ = owner.wait();
 }

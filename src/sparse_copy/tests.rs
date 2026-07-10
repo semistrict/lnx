@@ -1,6 +1,8 @@
 use super::*;
 use std::io::{Seek, SeekFrom, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 struct TempDir {
     path: PathBuf,
@@ -48,4 +50,26 @@ fn copies_sparse_file_without_materializing_holes() {
         "destination must stay sparse, allocated {} bytes",
         allocated_bytes(&dst)
     );
+}
+
+#[test]
+fn preserves_read_only_permissions_and_timestamps() {
+    let dir = TempDir::new("sparse-copy-metadata");
+    let src = dir.path.join("src.img");
+    let dst = dir.path.join("dst.img");
+    fs::write(&src, b"snapshot data").expect("write source");
+    let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    fs::File::open(&src)
+        .expect("open source")
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .expect("set source timestamp");
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o444)).expect("make source read-only");
+
+    clone_or_copy_file(&src, &dst).expect("clone read-only source");
+
+    let source = fs::metadata(&src).expect("stat source");
+    let destination = fs::metadata(&dst).expect("stat destination");
+    assert_eq!(destination.permissions().mode() & 0o777, 0o444);
+    assert_eq!(destination.modified().expect("destination mtime"), modified);
+    assert_eq!(destination.modified().unwrap(), source.modified().unwrap());
 }

@@ -1,6 +1,110 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
+
+pub(crate) const INSTANCE_TRANSACTION_DIR: &str = "@lnx-transactions";
+const INSTANCE_TRANSACTION_MARKER: &str = ".lnx-transactions-v1";
+const INSTANCE_TRANSACTION_MARKER_CONTENT: &[u8] = b"lnx-instance-transactions-v1\n";
+
+pub(crate) fn existing_instance_transaction_root(instances_root: &Path) -> Result<Option<PathBuf>> {
+    Ok(instance_transaction_roots(instances_root)?
+        .into_iter()
+        .next())
+}
+
+pub(crate) fn instance_transaction_roots(instances_root: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(instances_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", instances_root.display()));
+        }
+    };
+    let mut roots = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read {}", instances_root.display()))?;
+        if entry.file_type()?.is_dir() && is_instance_transaction_root(&entry.path()) {
+            roots.push(entry.path());
+        }
+    }
+    roots.sort();
+    Ok(roots)
+}
+
+pub(crate) fn ensure_instance_transaction_root(instances_root: &Path) -> Result<PathBuf> {
+    if let Some(root) = existing_instance_transaction_root(instances_root)? {
+        return Ok(root);
+    }
+    fs::create_dir_all(instances_root)
+        .with_context(|| format!("create {}", instances_root.display()))?;
+    let mut attempt = 0_u64;
+    let root = loop {
+        let name = if attempt == 0 {
+            INSTANCE_TRANSACTION_DIR.to_string()
+        } else {
+            format!("{INSTANCE_TRANSACTION_DIR}-{attempt}")
+        };
+        let candidate = instances_root.join(name);
+        match fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if is_instance_transaction_root(&candidate) {
+                    return Ok(candidate);
+                }
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("create {}", candidate.display()));
+            }
+        }
+    };
+    let marker = root.join(INSTANCE_TRANSACTION_MARKER);
+    let write_result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+            .with_context(|| format!("create {}", marker.display()))?;
+        file.write_all(INSTANCE_TRANSACTION_MARKER_CONTENT)
+            .with_context(|| format!("write {}", marker.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", marker.display()))?;
+        fs::File::open(&root)
+            .with_context(|| format!("open {}", root.display()))?
+            .sync_all()
+            .with_context(|| format!("sync {}", root.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_dir(&root);
+        return Err(error);
+    }
+    Ok(root)
+}
+
+pub(crate) fn is_instance_transaction_root(path: &Path) -> bool {
+    let valid_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name == INSTANCE_TRANSACTION_DIR
+                || name
+                    .strip_prefix(INSTANCE_TRANSACTION_DIR)
+                    .and_then(|suffix| suffix.strip_prefix('-'))
+                    .is_some_and(|suffix| {
+                        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+        });
+    valid_name
+        && fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        && fs::read(path.join(INSTANCE_TRANSACTION_MARKER))
+            .is_ok_and(|contents| contents == INSTANCE_TRANSACTION_MARKER_CONTENT)
+}
 
 #[derive(Debug, Clone)]
 pub struct Layout {

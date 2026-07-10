@@ -1,8 +1,9 @@
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,7 +21,19 @@ use super::{
 // section, not in the header version.
 pub(crate) const SNAPSHOT_VMSTATE_VERSION: u32 = 4;
 pub(crate) const RESTORE_WORK_SNAPSHOT: &str = ".restore-work";
+pub(crate) const RESTORE_WORK_ACTIVE_MARKER: &str = ".restore-work.active";
+pub(crate) const FINAL_SNAPSHOT_OUTCOME: &str = "final-snapshot.outcome";
 pub(crate) const SNAPSHOT_LIFECYCLE_META: &str = "snapshot.meta";
+pub(crate) const SNAPSHOT_RESTORE_FILES: &[&str] = &[
+    "vmstate.bin",
+    "pages.img",
+    "rootfs.ext4",
+    "initramfs.stamp",
+    LAUNCH_METADATA,
+    "deterministic.stamp",
+    DETERMINISTIC_CLOCK_STATE,
+    SNAPSHOT_LIFECYCLE_META,
+];
 
 pub(crate) struct SnapshotVmConfig {
     #[cfg_attr(
@@ -182,6 +195,46 @@ pub(crate) fn snapshot_initramfs_is_compatible(snapshot_path: &Path, current_sta
     snapshot_key == current_key
 }
 
+pub(crate) fn validate_snapshot_initramfs_compatibility(
+    snapshot_path: &Path,
+    current_stamp: &Path,
+    layout: &Layout,
+) -> Result<()> {
+    if snapshot_initramfs_is_compatible(snapshot_path, current_stamp) {
+        return Ok(());
+    }
+    bail!(
+        "snapshot initramfs is incompatible with the current guest agent: snapshot={} current={}\n{}",
+        snapshot_path.join("initramfs.stamp").display(),
+        current_stamp.display(),
+        snapshot_restore_recovery_guidance(layout, snapshot_path)
+    )
+}
+
+pub(crate) fn snapshot_restore_recovery_guidance(layout: &Layout, snapshot_path: &Path) -> String {
+    let latest = layout.snapshot_dir.join("latest");
+    let is_latest = paths_refer_to_same_snapshot(snapshot_path, &latest);
+    if is_latest {
+        format!(
+            "recovery: lnx --instance {} snapshots clear to explicitly cold-boot",
+            layout.instance
+        )
+    } else {
+        format!(
+            "recovery: provide a compatible snapshot; to explicitly cold-boot, run lnx --instance {} snapshots clear and retry without --snapshot",
+            layout.instance
+        )
+    }
+}
+
+pub(crate) fn paths_refer_to_same_snapshot(left: &Path, right: &Path) -> bool {
+    left == right
+        || fs::canonicalize(left)
+            .ok()
+            .zip(fs::canonicalize(right).ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
 pub(crate) fn initramfs_stamp_key(path: &Path) -> Option<String> {
     let stamp = fs::read_to_string(path).ok()?;
     for line in stamp.lines() {
@@ -206,6 +259,308 @@ pub(crate) struct PreparedRestore {
 
 fn restore_work_snapshot(layout: &Layout) -> PathBuf {
     layout.snapshot_dir.join(RESTORE_WORK_SNAPSHOT)
+}
+
+fn restore_work_active_marker(layout: &Layout) -> PathBuf {
+    layout.snapshot_dir.join(RESTORE_WORK_ACTIVE_MARKER)
+}
+
+pub(crate) fn restore_work_is_active(layout: &Layout) -> bool {
+    restore_work_snapshot(layout).exists() && restore_work_active_marker(layout).exists()
+}
+
+pub(crate) fn refuse_active_restore_work(layout: &Layout) -> Result<()> {
+    if !restore_work_is_active(layout) {
+        return Ok(());
+    }
+    let marker = restore_work_active_marker(layout);
+    let generation = fs::read_to_string(&marker)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    bail!(
+        "a previous restored VM did not publish a final snapshot; refusing to delete recoverable state at {} ({})\nrecovery: preserve the directory for inspection, or run lnx --instance {} snapshots clear to explicitly discard it",
+        restore_work_snapshot(layout).display(),
+        if generation.is_empty() {
+            "generation unknown"
+        } else {
+            generation.as_str()
+        },
+        layout.instance
+    )
+}
+
+pub(crate) fn mark_restore_work_active(layout: &Layout, generation_id: &str) -> Result<()> {
+    fs::create_dir_all(&layout.snapshot_dir)
+        .with_context(|| format!("create {}", layout.snapshot_dir.display()))?;
+    let marker = restore_work_active_marker(layout);
+    fs::write(&marker, format!("generation_id={generation_id}\n"))
+        .with_context(|| format!("write {}", marker.display()))
+}
+
+pub(crate) fn clear_restore_work_active(layout: &Layout) -> Result<()> {
+    let marker = restore_work_active_marker(layout);
+    match fs::remove_file(&marker) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("remove {}", marker.display())),
+    }
+}
+
+pub(crate) fn finish_restore_work_after_final_snapshot(
+    layout: &Layout,
+    restored_from_work: bool,
+    snapshot_result: Result<()>,
+) -> Result<()> {
+    snapshot_result?;
+    if restored_from_work {
+        clear_restore_work_active(layout)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FinalSnapshotOutcome {
+    pub(crate) pid: u32,
+    pub(crate) pending: bool,
+    pub(crate) succeeded: bool,
+    pub(crate) error: Option<String>,
+}
+
+pub(crate) fn clear_final_snapshot_outcome(layout: &Layout) -> Result<()> {
+    let path = layout.snapshot_dir.join(FINAL_SNAPSHOT_OUTCOME);
+    match fs::remove_file(&path) {
+        Ok(()) => sync_snapshot_directory(layout),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+pub(crate) fn write_final_snapshot_outcome(
+    layout: &Layout,
+    snapshot_result: &Result<()>,
+) -> Result<()> {
+    let (status, error) = match snapshot_result {
+        Ok(()) => ("success", None),
+        Err(error) => ("error", Some(super::log_value(&format!("{error:#}")))),
+    };
+    write_final_snapshot_outcome_status(layout, std::process::id(), status, error.as_deref())
+}
+
+pub(crate) fn write_final_snapshot_pending(layout: &Layout) -> Result<()> {
+    write_final_snapshot_outcome_status(layout, std::process::id(), "pending", None)
+}
+
+pub(crate) fn write_final_snapshot_failure(layout: &Layout, pid: u32, error: &str) -> Result<()> {
+    let error = super::log_value(error);
+    write_final_snapshot_outcome_status(layout, pid, "error", Some(&error))
+}
+
+pub(crate) fn acknowledge_final_snapshot_outcome(layout: &Layout, pid: u32) -> Result<()> {
+    let path = layout.snapshot_dir.join(FINAL_SNAPSHOT_OUTCOME);
+    match fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            if !file
+                .metadata()
+                .with_context(|| format!("stat {}", path.display()))?
+                .is_file()
+            {
+                bail!(
+                    "final snapshot outcome is not a regular file: {}",
+                    path.display()
+                );
+            }
+            let content = format!("version=1\npid={pid}\nstatus=cleared\n");
+            file.write_all(content.as_bytes())
+                .with_context(|| format!("acknowledge {}", path.display()))?;
+            file.set_len(content.len() as u64)
+                .with_context(|| format!("truncate {}", path.display()))?;
+            file.sync_data()
+                .with_context(|| format!("sync {}", path.display()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_final_snapshot_outcome_status(layout, pid, "cleared", None)
+        }
+        Err(error) => Err(error).with_context(|| format!("open {}", path.display())),
+    }
+}
+
+fn write_final_snapshot_outcome_status(
+    layout: &Layout,
+    pid: u32,
+    status: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    fs::create_dir_all(&layout.snapshot_dir)
+        .with_context(|| format!("create {}", layout.snapshot_dir.display()))?;
+    let path = layout.snapshot_dir.join(FINAL_SNAPSHOT_OUTCOME);
+    let (temp, mut file) = (0_u32..1000)
+        .find_map(|attempt| {
+            let temp = layout.snapshot_dir.join(format!(
+                ".{FINAL_SNAPSHOT_OUTCOME}.tmp-{}-{}-{attempt}",
+                std::process::id(),
+                unix_nanos()
+            ));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&temp)
+            {
+                Ok(file) => Some(Ok((temp, file))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => {
+                    Some(Err(error).with_context(|| format!("create {}", temp.display())))
+                }
+            }
+        })
+        .transpose()?
+        .context("could not allocate a unique final snapshot outcome temp file")?;
+    let mut content = format!("version=1\npid={pid}\nstatus={status}\n");
+    if let Some(error) = error {
+        content.push_str(&format!("error={error}\n"));
+    }
+    let publish_result = (|| -> Result<()> {
+        file.write_all(content.as_bytes())
+            .with_context(|| format!("write {}", temp.display()))?;
+        file.sync_data()
+            .with_context(|| format!("sync {}", temp.display()))?;
+        drop(file);
+        fs::rename(&temp, &path)
+            .with_context(|| format!("publish {} to {}", temp.display(), path.display()))?;
+        sync_snapshot_directory(layout)
+    })();
+    if publish_result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    publish_result
+}
+
+pub(crate) fn sync_snapshot_directory(layout: &Layout) -> Result<()> {
+    fs::File::open(&layout.snapshot_dir)
+        .with_context(|| format!("open {} for sync", layout.snapshot_dir.display()))?
+        .sync_all()
+        .with_context(|| format!("sync {}", layout.snapshot_dir.display()))
+}
+
+pub(crate) fn read_final_snapshot_outcome(layout: &Layout) -> Result<Option<FinalSnapshotOutcome>> {
+    let path = layout.snapshot_dir.join(FINAL_SNAPSHOT_OUTCOME);
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("open {}", path.display())),
+    };
+    if !file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .is_file()
+    {
+        bail!(
+            "final snapshot outcome is not a regular file: {}",
+            path.display()
+        );
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .with_context(|| format!("read {}", path.display()))?;
+    let mut pid = None;
+    let mut status = None;
+    let mut error = None;
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "pid" => pid = value.parse::<u32>().ok(),
+            "status" => status = Some(value),
+            "error" => error = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    let pid = pid.with_context(|| format!("invalid pid in {}", path.display()))?;
+    let (pending, succeeded) = match status {
+        Some("pending") => (true, false),
+        Some("success" | "cleared") => (false, true),
+        Some("error") => (false, false),
+        _ => bail!("invalid status in {}", path.display()),
+    };
+    Ok(Some(FinalSnapshotOutcome {
+        pid,
+        pending,
+        succeeded,
+        error,
+    }))
+}
+
+pub(crate) fn validate_final_snapshot_outcome(
+    layout: &Layout,
+    expected_pid: Option<u32>,
+) -> Result<()> {
+    let outcome = read_final_snapshot_outcome(layout)?;
+    let recovery = format!(
+        "recovery: lnx --instance {} snapshots clear to acknowledge and explicitly cold-boot",
+        layout.instance
+    );
+    match (expected_pid, outcome) {
+        (Some(pid), None) => bail!(
+            "instance {} stopped without reporting whether its final snapshot succeeded (owner pid {pid})\n{recovery}",
+            layout.instance
+        ),
+        (Some(pid), Some(outcome)) if outcome.pid != pid => bail!(
+            "instance {} reported a final snapshot outcome for pid {}, expected pid {pid}\n{recovery}",
+            layout.instance,
+            outcome.pid
+        ),
+        (_, Some(outcome)) if outcome.pending => bail!(
+            "instance {} owner pid {} did not finish reporting its final snapshot\n{recovery}",
+            layout.instance,
+            outcome.pid
+        ),
+        (_, Some(outcome)) if !outcome.succeeded => bail!(
+            "instance {} final snapshot failed for owner pid {}: {}\n{recovery}",
+            layout.instance,
+            outcome.pid,
+            outcome.error.as_deref().unwrap_or("unknown snapshot error")
+        ),
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn validate_or_record_final_snapshot_failure(
+    layout: &Layout,
+    expected_pid: u32,
+) -> Result<()> {
+    let validation = validate_final_snapshot_outcome(layout, Some(expected_pid));
+    if let Err(error) = validation {
+        let already_blocks = read_final_snapshot_outcome(layout)
+            .ok()
+            .flatten()
+            .is_some_and(|outcome| {
+                outcome.pid == expected_pid && (outcome.pending || !outcome.succeeded)
+            });
+        if !already_blocks
+            && let Err(tombstone_error) = write_final_snapshot_failure(
+                layout,
+                expected_pid,
+                &format!("owner stopped without a valid final snapshot outcome: {error:#}"),
+            )
+        {
+            return Err(error.context(format!(
+                "also failed to persist shutdown failure evidence: {tombstone_error:#}"
+            )));
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 pub(crate) fn prepare_restore_for_start(
@@ -245,16 +600,7 @@ pub(crate) fn prepare_restore_for_start(
 
 fn clone_restore_snapshot(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst).with_context(|| format!("create {}", dst.display()))?;
-    for name in [
-        "vmstate.bin",
-        "pages.img",
-        "rootfs.ext4",
-        "initramfs.stamp",
-        LAUNCH_METADATA,
-        "deterministic.stamp",
-        DETERMINISTIC_CLOCK_STATE,
-        SNAPSHOT_LIFECYCLE_META,
-    ] {
+    for name in SNAPSHOT_RESTORE_FILES {
         let src_file = src.join(name);
         if src_file.exists() {
             clone_or_copy_file(&src_file, &dst.join(name)).with_context(|| {
@@ -297,6 +643,15 @@ fn clone_tree(src: &Path, dest: &Path) -> Result<()> {
 
 pub(crate) fn cleanup_snapshot_runtime_state(layout: &Layout, run_log: &RunLog) -> Result<()> {
     let work = restore_work_snapshot(layout);
+    let active_marker = restore_work_active_marker(layout);
+    refuse_active_restore_work(layout)?;
+    if active_marker.exists() {
+        run_log.line(format!(
+            "snapshot.work.active_marker.remove_without_work path={}",
+            active_marker.display()
+        ));
+        clear_restore_work_active(layout)?;
+    }
     if work.exists() {
         run_log.line(format!("snapshot.work.remove path={}", work.display()));
         remove_path_if_exists(&work)?;

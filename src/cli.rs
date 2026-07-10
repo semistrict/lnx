@@ -11,7 +11,14 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
-use crate::{checkpoints, descriptor, host_share, ingress, init, paths::Layout, runner};
+use crate::{
+    checkpoints, descriptor, host_share, ingress, init,
+    paths::{
+        Layout, ensure_instance_transaction_root, instance_transaction_roots,
+        is_instance_transaction_root,
+    },
+    runner,
+};
 
 const DEFAULT_CPUS: u8 = 2;
 const DEFAULT_MEMORY_MIB: u32 = 4096;
@@ -355,6 +362,9 @@ struct HiddenVmOwnerArgs {
     restore: Option<PathBuf>,
 
     #[arg(long)]
+    restore_latest_if_available: bool,
+
+    #[arg(long)]
     no_host_shares: bool,
 
     #[arg(long, value_name = "SEED")]
@@ -469,6 +479,12 @@ impl Cli {
             ),
             None => Layout::resolve(&instance, kernel.clone(), rootfs.clone())?,
         };
+        if is_instance_transaction_root(&layout.instance_dir) {
+            bail!(
+                "instance name resolves to internal transaction state: {}",
+                layout.instance_dir.display()
+            );
+        }
         let persisted = descriptor::load(&layout)?;
         let cpus = cpus.or(persisted.cpus).unwrap_or(DEFAULT_CPUS);
         let memory_mib = memory_mib
@@ -686,6 +702,7 @@ impl Cli {
                 memory_mib,
                 nested_kvm,
                 restore_snapshot: args.restore,
+                restore_latest_if_available: args.restore_latest_if_available,
                 forwards,
                 snapshot_output: None,
                 run_as_root: false,
@@ -887,37 +904,54 @@ fn init_local_default_instance(
 }
 
 fn set_instance_settings(layout: &Layout, settings: &[String]) -> Result<()> {
-    let mut config = descriptor::load(layout)?;
-    for setting in settings {
-        let (key, value) = setting
-            .split_once('=')
-            .with_context(|| format!("expected KEY=VALUE, got {setting}"))?;
-        match key {
-            "cpus" => {
-                let cpus: u8 = value
-                    .parse()
-                    .with_context(|| format!("parse cpus {value}"))?;
-                if cpus == 0 {
-                    bail!("cpus must be at least 1");
-                }
-                config.cpus = Some(cpus);
-            }
-            "memory-mib" | "memory_mib" => {
-                let memory_mib: u32 = value
-                    .parse()
-                    .with_context(|| format!("parse memory-mib {value}"))?;
-                if memory_mib < 256 {
-                    bail!("memory-mib must be at least 256");
-                }
-                config.memory_mib = Some(memory_mib);
-            }
-            other => bail!("unknown setting {other} (valid: cpus, memory-mib)"),
+    if !layout.instance_dir.exists() {
+        bail!("instance not found: {}", layout.instance);
+    }
+    let lock_path = layout.run_dir.join("bootstrap.lock.d");
+    let config = runner::with_existing_lock_dir_guard(&lock_path, || {
+        let maintenance_pid = runner::recorded_maintenance_pid_from_lock(&lock_path)?;
+        if maintenance_pid.is_some_and(runner::process_alive) {
+            bail!(
+                "cannot change settings while instance {} has a state operation in progress",
+                layout.instance
+            );
         }
-    }
-    if config.name.is_none() {
-        config.name = Some(layout.instance.clone());
-    }
-    descriptor::save(layout, &config)?;
+        if !layout.rootfs.exists() && !descriptor::path(layout).exists() {
+            bail!("instance not found: {}", layout.instance);
+        }
+        let mut config = descriptor::load(layout)?;
+        for setting in settings {
+            let (key, value) = setting
+                .split_once('=')
+                .with_context(|| format!("expected KEY=VALUE, got {setting}"))?;
+            match key {
+                "cpus" => {
+                    let cpus: u8 = value
+                        .parse()
+                        .with_context(|| format!("parse cpus {value}"))?;
+                    if cpus == 0 {
+                        bail!("cpus must be at least 1");
+                    }
+                    config.cpus = Some(cpus);
+                }
+                "memory-mib" | "memory_mib" => {
+                    let memory_mib: u32 = value
+                        .parse()
+                        .with_context(|| format!("parse memory-mib {value}"))?;
+                    if memory_mib < 256 {
+                        bail!("memory-mib must be at least 256");
+                    }
+                    config.memory_mib = Some(memory_mib);
+                }
+                other => bail!("unknown setting {other} (valid: cpus, memory-mib)"),
+            }
+        }
+        if config.name.is_none() {
+            config.name = Some(layout.instance.clone());
+        }
+        descriptor::save(layout, &config)?;
+        Ok(config)
+    })?;
     println!("{}", serde_json::to_string_pretty(&config)?);
     Ok(())
 }
@@ -1296,21 +1330,57 @@ fn list_instances(base: &Path) -> Result<()> {
 fn delete_instance(base: &Path, name: &str) -> Result<()> {
     crate::server::validate_instance_name(name)?;
     let layout = Layout::resolve_in_base(name, base.to_path_buf(), None, None);
-    if !layout.instance_dir.exists() {
+    delete_resolved_instance(base, name, &layout)
+}
+
+fn delete_resolved_instance(base: &Path, name: &str, layout: &Layout) -> Result<()> {
+    let persistent_root = base.join("instances");
+    let run_is_persistent =
+        paths_refer_to_same_existing_entry(&layout.run_dir, &layout.instance_dir);
+    let split_run_root = (!run_is_persistent)
+        .then(|| {
+            layout
+                .run_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .context("split instance run directory has no instances parent")
+        })
+        .transpose()?;
+    let mut stale_trash = find_detached_instance_state(&persistent_root, name)?;
+    if let Some(run_root) = &split_run_root {
+        stale_trash.extend(find_detached_instance_state(run_root, name)?);
+    }
+    if !layout.instance_dir.exists() && !layout.run_dir.exists() && stale_trash.is_empty() {
         bail!("instance not found: {name}");
     }
-
-    let state = instance_state(&layout);
+    let state = instance_state(layout);
     if state == "running" || state == "starting" {
-        terminate_instance_owner(&layout)?;
+        terminate_instance_owner(layout)?;
     }
 
-    remove_contained_instance_dir(&layout.instance_dir, &base.join("instances"), name)?;
-    if layout.run_dir != layout.instance_dir {
-        let run_base = std::env::var_os("LNX_RUN_BASE")
-            .map(PathBuf::from)
-            .context("instance run directory is split from its instance directory but LNX_RUN_BASE is unset")?;
-        remove_contained_instance_dir(&layout.run_dir, &run_base.join("instances"), name)?;
+    let detached = runner::with_exclusive_instance_state(layout, || {
+        let mut planned = Vec::new();
+        if let Some(plan) =
+            plan_contained_instance_detach(&layout.instance_dir, &persistent_root, name)?
+        {
+            planned.push(plan);
+        }
+        if let Some(run_root) = &split_run_root
+            && let Some(plan) = plan_contained_instance_detach(&layout.run_dir, run_root, name)?
+        {
+            planned.push(plan);
+        }
+        detach_planned_instance_dirs(planned)
+    })?;
+    let Some(detached) = detached else {
+        bail!(
+            "instance {name} became busy while deletion was being reserved; stop it or wait for the state copy to finish"
+        );
+    };
+    stale_trash.extend(detached);
+    for path in stale_trash {
+        remove_path_if_exists(&path)
+            .with_context(|| format!("clean up detached instance state at {}", path.display()))?;
     }
 
     println!("deleted {name}");
@@ -1347,10 +1417,7 @@ fn terminate_instance_owner(layout: &Layout) -> Result<()> {
     );
 }
 
-/// Removes `dir`, but only if it is exactly `<instances_root>/<name>`. Never
-/// deletes anything outside that shape, even if callers pass a mismatched
-/// `instances_root`/`name` pair.
-fn remove_contained_instance_dir(dir: &Path, instances_root: &Path, name: &str) -> Result<()> {
+fn validate_contained_instance_dir(dir: &Path, instances_root: &Path, name: &str) -> Result<()> {
     let is_contained = dir.parent() == Some(instances_root)
         && dir.file_name().and_then(|n| n.to_str()) == Some(name);
     if !is_contained {
@@ -1360,6 +1427,103 @@ fn remove_contained_instance_dir(dir: &Path, instances_root: &Path, name: &str) 
             dir.display()
         );
     }
+    Ok(())
+}
+
+fn paths_refer_to_same_existing_entry(left: &Path, right: &Path) -> bool {
+    left == right
+        || fs::canonicalize(left)
+            .ok()
+            .zip(fs::canonicalize(right).ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
+fn find_detached_instance_state(instances_root: &Path, name: &str) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for transaction_root in instance_transaction_roots(instances_root)? {
+        let delete_root = transaction_root.join("delete").join(name);
+        let entries = match fs::read_dir(&delete_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", delete_root.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry.with_context(|| format!("read {}", delete_root.display()))?;
+            if entry.file_type()?.is_dir() {
+                paths.push(entry.path());
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn plan_contained_instance_detach(
+    dir: &Path,
+    instances_root: &Path,
+    name: &str,
+) -> Result<Option<(PathBuf, PathBuf, PathBuf)>> {
+    validate_contained_instance_dir(dir, instances_root, name)?;
+    match fs::symlink_metadata(dir) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("stat {}", dir.display())),
+    }
+    let transaction_root = ensure_instance_transaction_root(instances_root)?;
+    let delete_root = transaction_root.join("delete").join(name);
+    fs::create_dir_all(&delete_root)
+        .with_context(|| format!("create {}", delete_root.display()))?;
+    let mut attempt = 0_u64;
+    let transaction = loop {
+        let candidate = delete_root.join(format!("{}-{attempt}", std::process::id()));
+        match fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("create {}", candidate.display()));
+            }
+        }
+    };
+    let detached_state = transaction.join("state");
+    Ok(Some((dir.to_path_buf(), transaction, detached_state)))
+}
+
+fn detach_planned_instance_dirs(planned: Vec<(PathBuf, PathBuf, PathBuf)>) -> Result<Vec<PathBuf>> {
+    let mut detached = Vec::<(PathBuf, PathBuf, PathBuf)>::new();
+    for (original, transaction, detached_state) in planned {
+        if let Err(error) = fs::rename(&original, &detached_state) {
+            let _ = fs::remove_dir_all(&transaction);
+            for (moved_original, moved_transaction, moved_state) in detached.iter().rev() {
+                if let Err(rollback_error) = fs::rename(moved_state, moved_original) {
+                    bail!(
+                        "detach {} for deletion: {error}; rollback {} to {}: {rollback_error}",
+                        original.display(),
+                        moved_state.display(),
+                        moved_original.display()
+                    );
+                }
+                let _ = fs::remove_dir_all(moved_transaction);
+            }
+            return Err(error)
+                .with_context(|| format!("detach {} for deletion", original.display()));
+        }
+        detached.push((original, transaction, detached_state));
+    }
+    Ok(detached
+        .into_iter()
+        .map(|(_, transaction, _)| transaction)
+        .collect())
+}
+
+/// Removes `dir`, but only if it is exactly `<instances_root>/<name>`. Never
+/// deletes anything outside that shape, even if callers pass a mismatched
+/// `instances_root`/`name` pair.
+#[cfg(test)]
+fn remove_contained_instance_dir(dir: &Path, instances_root: &Path, name: &str) -> Result<()> {
+    validate_contained_instance_dir(dir, instances_root, name)?;
     match fs::remove_dir_all(dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1390,7 +1554,7 @@ fn collect_child_dir_names(parent: &Path, names: &mut BTreeSet<String>) -> Resul
     };
     for entry in entries {
         let entry = entry?;
-        if entry.file_type()?.is_dir() {
+        if entry.file_type()?.is_dir() && !is_instance_transaction_root(&entry.path()) {
             names.insert(entry.file_name().to_string_lossy().into_owned());
         }
     }
@@ -1515,8 +1679,11 @@ fn run_guest(
     let explicit_restore_snapshot = snapshot_path.is_some();
     let restore_snapshot =
         restore_snapshot_for_run(&layout, snapshot_path, explicit_kernel, explicit_rootfs);
-    let restore_snapshot =
-        filter_default_restore_for_version(restore_snapshot, explicit_restore_snapshot)?;
+    let restore_snapshot = require_default_restore_version_compatibility(
+        restore_snapshot,
+        explicit_restore_snapshot,
+        &layout,
+    )?;
 
     let config = runner::RunConfig {
         layout,
@@ -1526,6 +1693,9 @@ fn run_guest(
         memory_mib,
         nested_kvm,
         restore_snapshot,
+        restore_latest_if_available: !explicit_restore_snapshot
+            && !explicit_kernel
+            && !explicit_rootfs,
         forwards,
         run_as_root,
         snapshot_output: None,
@@ -1579,17 +1749,19 @@ fn run_fs_unshare(layout: &Layout, args: FsUnshareArgs) -> Result<()> {
         return Ok(());
     }
 
-    for target in targets {
-        if target.suffix.as_os_str().is_empty() {
-            bail!("refusing to remove all host-share copy-on-write state");
+    let cleared = runner::with_validated_stopped_instance(layout, || {
+        for target in &targets {
+            host_share::remove_path_state(&state, target)?;
         }
-        let upper = state.join(target.tag).join("upper").join(&target.suffix);
-        remove_path_if_exists(&upper)?;
-        let whiteout = state
-            .join(target.tag)
-            .join("whiteouts")
-            .join(&target.suffix);
-        remove_path_if_exists(&whiteout)?;
+        Ok(())
+    })?;
+    if cleared.is_none() {
+        bail!(
+            "cannot remove host-share state while instance {} is running or another state operation is in progress",
+            layout.instance
+        );
+    }
+    for target in targets {
         println!("cleared {}", target.absolute.display());
     }
     Ok(())
@@ -1699,10 +1871,16 @@ fn restore_snapshot_for_run(
     latest.exists().then_some(latest)
 }
 
-fn filter_default_restore_for_version(
+fn require_default_restore_version_compatibility(
     snapshot: Option<PathBuf>,
     explicit_restore_snapshot: bool,
+    layout: &Layout,
 ) -> Result<Option<PathBuf>> {
+    if runner::validate_restore_work_for_command(layout)? {
+        // The command will attach to the running owner, so the on-disk latest
+        // snapshot is not part of this command's startup path.
+        return Ok(snapshot);
+    }
     if explicit_restore_snapshot {
         return Ok(snapshot);
     }
@@ -1712,8 +1890,11 @@ fn filter_default_restore_for_version(
     if runner::default_restore_version_matches(&snapshot)? {
         return Ok(Some(snapshot));
     }
-    eprintln!("latest snapshot was taken by an older lnx; cold-booting without it");
-    Ok(None)
+    bail!(
+        "latest snapshot is incompatible with this lnx version: {}\nrecovery: lnx --instance {} snapshots clear to explicitly cold-boot",
+        snapshot.display(),
+        layout.instance
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1874,6 +2055,7 @@ fn run_nested_deterministic_on_macos(
         memory_mib: memory_mib.max(DEFAULT_MEMORY_MIB),
         nested_kvm: true,
         restore_snapshot: None,
+        restore_latest_if_available: true,
         forwards: Vec::new(),
         snapshot_output: None,
         run_as_root: false,
@@ -2073,6 +2255,7 @@ fn initialize_vm_instance(
         memory_mib,
         nested_kvm,
         restore_snapshot: None,
+        restore_latest_if_available: true,
         forwards: Vec::new(),
         snapshot_output,
         run_as_root: false,
@@ -2366,42 +2549,54 @@ fn create_checkpoint(
     std::fs::create_dir_all(&layout.checkpoint_dir)
         .with_context(|| format!("create {}", layout.checkpoint_dir.display()))?;
     let (checkpoint, path) = checkpoints::new_checkpoint_path(&layout, name)?;
-    let broker_socket = layout.run_dir.join("broker.sock");
-    if broker_socket.exists() {
-        runner::validate_runtime_deterministic_compatibility(&layout, deterministic.as_ref())?;
-        runner::request_checkpoint(&broker_socket, &path).context("checkpoint running VM")?;
-    } else {
-        let cwd = std::env::current_dir().context("current directory")?;
-        let restore_snapshot =
-            restore_snapshot_for_run(&layout, snapshot_path, explicit_kernel, explicit_rootfs);
-        runner::seed_checkpoint_from_base(
-            &layout,
-            &path,
-            restore_snapshot.as_deref(),
-            &layout.snapshot_dir.join("latest"),
-        )?;
-        let status = runner::run(runner::RunConfig {
-            layout: layout.clone(),
-            command: vec!["true".to_string()],
-            cwd,
-            cpus,
-            memory_mib,
-            nested_kvm: false,
-            restore_snapshot,
-            forwards,
-            snapshot_output: Some(path.clone()),
-            run_as_root: false,
-            no_host_shares,
-            vhost_user_fs,
-            reuse_owner: true,
-            deterministic,
-            trace_events,
-        })?;
-        if status != 0 {
-            bail!("checkpoint command exited with status {status}");
+    let creation_result = (|| -> Result<()> {
+        if runner::validate_restore_work_for_command(&layout)? {
+            runner::request_checkpoint_awaiting_owner(
+                &layout,
+                &path,
+                deterministic.as_ref(),
+                Duration::from_secs(120),
+            )
+            .context("checkpoint running VM")?;
+        } else {
+            let cwd = std::env::current_dir().context("current directory")?;
+            let restore_latest_if_available =
+                snapshot_path.is_none() && !explicit_kernel && !explicit_rootfs;
+            let restore_snapshot =
+                restore_snapshot_for_run(&layout, snapshot_path, explicit_kernel, explicit_rootfs);
+            let status = runner::run(runner::RunConfig {
+                layout: layout.clone(),
+                command: vec!["true".to_string()],
+                cwd,
+                cpus,
+                memory_mib,
+                nested_kvm: false,
+                restore_snapshot,
+                restore_latest_if_available,
+                forwards,
+                snapshot_output: Some(path.clone()),
+                run_as_root: false,
+                no_host_shares,
+                vhost_user_fs,
+                reuse_owner: true,
+                deterministic,
+                trace_events,
+            })?;
+            if status != 0 {
+                bail!("checkpoint command exited with status {status}");
+            }
         }
+        checkpoints::write_metadata(&layout, &checkpoint)
+    })();
+    if let Err(error) = creation_result {
+        return match remove_path_if_exists(&path) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(error.context(format!(
+                "also failed to remove incomplete checkpoint {}: {cleanup_error:#}",
+                path.display()
+            ))),
+        };
     }
-    checkpoints::write_metadata(&layout, &checkpoint)?;
     let label = checkpoint.name.as_deref().unwrap_or(&checkpoint.id);
     println!("{label}");
     Ok(())
@@ -2427,9 +2622,18 @@ fn list_checkpoints(layout: &Layout) -> Result<()> {
 }
 
 fn delete_checkpoint(layout: &Layout, identifier: &str) -> Result<()> {
-    let checkpoint = checkpoints::resolve(layout, identifier)?;
-    checkpoints::delete(layout, &checkpoint)?;
-    println!("deleted {}", checkpoint.id);
+    let deleted = runner::with_validated_stopped_instance(layout, || {
+        let checkpoint = checkpoints::resolve(layout, identifier)?;
+        checkpoints::delete(layout, &checkpoint)?;
+        Ok(checkpoint.id)
+    })?;
+    let Some(id) = deleted else {
+        bail!(
+            "cannot delete a checkpoint while instance {} is running or another state operation is in progress",
+            layout.instance
+        );
+    };
+    println!("deleted {id}");
     Ok(())
 }
 
@@ -2440,13 +2644,155 @@ fn run_snapshots_command(layout: &Layout, args: SnapshotsArgs) -> Result<()> {
 }
 
 fn clear_latest_snapshot(layout: &Layout) -> Result<()> {
+    if !layout.instance_dir.exists() && !layout.snapshot_dir.exists() && !layout.run_dir.exists() {
+        bail!("instance does not exist: {}", layout.instance);
+    }
+    fs::create_dir_all(&layout.snapshot_dir)
+        .with_context(|| format!("create {}", layout.snapshot_dir.display()))?;
     let latest = layout.snapshot_dir.join("latest");
-    remove_path_if_exists(&latest)?;
-    remove_path_if_exists(&layout.snapshot_dir.join(".latest.next"))?;
-    remove_path_if_exists(&layout.snapshot_dir.join(".latest.previous"))?;
-    remove_path_if_exists(&layout.snapshot_dir.join(".restore-work"))?;
+    let lock_path = layout.run_dir.join("bootstrap.lock.d");
+    let detached = runner::with_unowned_bootstrap_lock(&lock_path, || {
+        let recorded_pid = runner::recorded_owner_pid_from_lock(&lock_path)
+            .ok()
+            .flatten()
+            .and_then(|pid| u32::try_from(pid).ok());
+        let outcome = runner::read_final_snapshot_outcome(layout).ok().flatten();
+        let acknowledged_pid = recorded_pid.or_else(|| outcome.as_ref().map(|outcome| outcome.pid));
+        let mut targets = vec![
+            latest.clone(),
+            layout.snapshot_dir.join(".latest.next"),
+            layout.snapshot_dir.join(".latest.previous"),
+            layout.snapshot_dir.join(runner::RESTORE_WORK_SNAPSHOT),
+            layout.snapshot_dir.join(runner::RESTORE_WORK_ACTIVE_MARKER),
+        ];
+        if outcome.is_none() {
+            targets.push(layout.snapshot_dir.join(runner::FINAL_SNAPSHOT_OUTCOME));
+        }
+        let mut detached = detach_snapshot_paths(&targets)?;
+        runner::sync_snapshot_directory(layout)?;
+        let acknowledge = || match acknowledged_pid {
+            Some(pid) => runner::acknowledge_final_snapshot_outcome(layout, pid),
+            None => runner::clear_final_snapshot_outcome(layout),
+        };
+        if let Err(initial_error) = acknowledge() {
+            // Snapshot failures frequently coincide with a full filesystem.
+            // In that exceptional path, free the already-detached bulk data
+            // while still holding the guard, then retry the tiny durable ack.
+            let mut remaining = Vec::new();
+            for path in detached {
+                if remove_path_if_exists(&path).is_err() {
+                    remaining.push(path);
+                }
+            }
+            acknowledge().with_context(|| {
+                format!(
+                    "acknowledge snapshot clear after reclaiming detached data (initial error: {initial_error:#})"
+                )
+            })?;
+            detached = remaining;
+        }
+        Ok(detached)
+    })?;
+    let Some(detached) = detached else {
+        bail!(
+            "cannot clear snapshots while instance {} has a running VM owner or state copy; stop it or wait for the copy to finish",
+            layout.instance
+        );
+    };
+    let mut cleanup_errors = Vec::new();
+    for path in detached {
+        if let Err(error) = remove_path_if_exists(&path) {
+            cleanup_errors.push((path, error));
+        }
+    }
+    for (path, error) in cleanup_errors {
+        eprintln!(
+            "warning: snapshot state was detached but deferred cleanup failed for {}: {error:#}; rerun snapshots clear to retry",
+            path.display()
+        );
+    }
     println!("cleared {}", latest.display());
     Ok(())
+}
+
+/// Atomically detaches snapshot state while the owner guard is held. Recursive
+/// deletion happens after the guard is released so a large snapshot cannot
+/// stall unrelated owner lock operations.
+fn detach_snapshot_paths(targets: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut stale_trash = Vec::new();
+    for target in targets {
+        let Some(parent) = target.parent() else {
+            continue;
+        };
+        let Some(name) = target.file_name() else {
+            continue;
+        };
+        let prefix = format!(".{}.clear-", name.to_string_lossy());
+        let entries = match fs::read_dir(parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", parent.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry.with_context(|| format!("read {}", parent.display()))?;
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                stale_trash.push(entry.path());
+            }
+        }
+    }
+
+    let mut planned = Vec::<(PathBuf, PathBuf)>::new();
+    for target in targets {
+        match fs::symlink_metadata(target) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("stat {}", target.display()));
+            }
+        }
+        let parent = target
+            .parent()
+            .with_context(|| format!("snapshot path has no parent: {}", target.display()))?;
+        let name = target
+            .file_name()
+            .with_context(|| format!("snapshot path has no name: {}", target.display()))?
+            .to_string_lossy();
+        let mut attempt = 0_u64;
+        let trash = loop {
+            let candidate = parent.join(format!(".{name}.clear-{}-{attempt}", std::process::id()));
+            match fs::symlink_metadata(&candidate) {
+                Ok(_) => attempt = attempt.saturating_add(1),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break candidate,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("stat {}", candidate.display()));
+                }
+            }
+        };
+        planned.push((target.clone(), trash));
+    }
+
+    let mut detached = Vec::<(PathBuf, PathBuf)>::new();
+    for (target, trash) in planned {
+        if let Err(error) = fs::rename(&target, &trash) {
+            for (original, moved) in detached.iter().rev() {
+                if let Err(rollback_error) = fs::rename(moved, original) {
+                    bail!(
+                        "move {} aside for snapshot clear: {error}; rollback {} to {}: {rollback_error}",
+                        target.display(),
+                        moved.display(),
+                        original.display()
+                    );
+                }
+            }
+            return Err(error)
+                .with_context(|| format!("move {} aside for snapshot clear", target.display()));
+        }
+        detached.push((target, trash));
+    }
+    stale_trash.extend(detached.into_iter().map(|(_, trash)| trash));
+    Ok(stale_trash)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2507,42 +2853,54 @@ fn create_internal_fork_checkpoint(
     std::fs::create_dir_all(&layout.checkpoint_dir)
         .with_context(|| format!("create {}", layout.checkpoint_dir.display()))?;
     let (checkpoint, path) = checkpoints::new_checkpoint_path(layout, None)?;
-    let broker_socket = layout.run_dir.join("broker.sock");
-    if broker_socket.exists() {
-        runner::validate_runtime_deterministic_compatibility(layout, deterministic.as_ref())?;
-        runner::request_checkpoint(&broker_socket, &path).context("checkpoint running VM")?;
-    } else {
-        let cwd = std::env::current_dir().context("current directory")?;
-        let restore_snapshot =
-            restore_snapshot_for_run(layout, snapshot_path, explicit_kernel, explicit_rootfs);
-        runner::seed_checkpoint_from_base(
-            layout,
-            &path,
-            restore_snapshot.as_deref(),
-            &layout.snapshot_dir.join("latest"),
-        )?;
-        let status = runner::run(runner::RunConfig {
-            layout: layout.clone(),
-            command: vec!["true".to_string()],
-            cwd,
-            cpus,
-            memory_mib,
-            nested_kvm: false,
-            restore_snapshot,
-            forwards,
-            snapshot_output: Some(path.clone()),
-            run_as_root: false,
-            no_host_shares,
-            vhost_user_fs,
-            reuse_owner: true,
-            deterministic,
-            trace_events,
-        })?;
-        if status != 0 {
-            bail!("checkpoint command exited with status {status}");
+    let creation_result = (|| -> Result<()> {
+        if runner::validate_restore_work_for_command(layout)? {
+            runner::request_checkpoint_awaiting_owner(
+                layout,
+                &path,
+                deterministic.as_ref(),
+                Duration::from_secs(120),
+            )
+            .context("checkpoint running VM")?;
+        } else {
+            let cwd = std::env::current_dir().context("current directory")?;
+            let restore_latest_if_available =
+                snapshot_path.is_none() && !explicit_kernel && !explicit_rootfs;
+            let restore_snapshot =
+                restore_snapshot_for_run(layout, snapshot_path, explicit_kernel, explicit_rootfs);
+            let status = runner::run(runner::RunConfig {
+                layout: layout.clone(),
+                command: vec!["true".to_string()],
+                cwd,
+                cpus,
+                memory_mib,
+                nested_kvm: false,
+                restore_snapshot,
+                restore_latest_if_available,
+                forwards,
+                snapshot_output: Some(path.clone()),
+                run_as_root: false,
+                no_host_shares,
+                vhost_user_fs,
+                reuse_owner: true,
+                deterministic,
+                trace_events,
+            })?;
+            if status != 0 {
+                bail!("checkpoint command exited with status {status}");
+            }
         }
+        checkpoints::write_metadata(layout, &checkpoint)
+    })();
+    if let Err(error) = creation_result {
+        return match remove_path_if_exists(&path) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(error.context(format!(
+                "also failed to remove incomplete checkpoint {}: {cleanup_error:#}",
+                path.display()
+            ))),
+        };
     }
-    checkpoints::write_metadata(layout, &checkpoint)?;
     Ok(checkpoint)
 }
 
