@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, io::Write, path::PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -48,12 +48,38 @@ pub fn load(layout: &Layout) -> Result<InstanceDescriptor> {
 }
 
 pub fn save(layout: &Layout, descriptor: &InstanceDescriptor) -> Result<()> {
-    let path = path(layout);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
+    save_to_path(&path(layout), descriptor)
+}
+
+pub(crate) fn save_in_instance_dir(
+    instance_dir: &std::path::Path,
+    descriptor: &InstanceDescriptor,
+) -> Result<()> {
+    save_to_path(&instance_dir.join(DESCRIPTOR_FILE), descriptor)
+}
+
+fn save_to_path(path: &std::path::Path, descriptor: &InstanceDescriptor) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("descriptor path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     let json = serde_json::to_string_pretty(descriptor).context("encode descriptor")?;
-    fs::write(&path, json + "\n").with_context(|| format!("write {}", path.display()))
+    let mut temp = tempfile::Builder::new()
+        .prefix(".lnx-descriptor-")
+        .tempfile_in(parent)
+        .with_context(|| format!("create descriptor staging file in {}", parent.display()))?;
+    temp.write_all(format!("{json}\n").as_bytes())
+        .with_context(|| format!("write staged descriptor for {}", path.display()))?;
+    temp.as_file()
+        .sync_all()
+        .with_context(|| format!("sync staged descriptor for {}", path.display()))?;
+    temp.persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publish descriptor {}", path.display()))?;
+    fs::File::open(parent)
+        .with_context(|| format!("open {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("sync {}", parent.display()))
 }
 
 /// Record identity fields the first time an instance image materializes;

@@ -342,6 +342,83 @@ fn restore_snapshot_preserves_explicit_snapshot() {
 }
 
 #[test]
+fn default_restore_version_mismatch_is_a_hard_actionable_error() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+    let snapshot = layout.snapshot_dir.join("latest");
+    fs::create_dir_all(&snapshot).expect("create snapshot");
+    fs::write(
+        snapshot.join("launch.json"),
+        r#"{
+            "version": 1,
+            "owner_args": [],
+            "compatibility": {"host_share_cache": {"dax": true}},
+            "shares": {
+                "no_host_shares": true,
+                "host_home": null,
+                "outside_home_cwd": null
+            }
+        }"#,
+    )
+    .expect("write legacy launch metadata");
+
+    let error =
+        require_default_restore_version_compatibility(Some(snapshot.clone()), false, &layout)
+            .expect_err("reject incompatible default snapshot");
+    let message = error.to_string();
+    assert!(message.contains("incompatible with this lnx version"));
+    assert!(message.contains("lnx --instance dev snapshots clear"));
+    assert!(snapshot.exists(), "rejected snapshot must remain intact");
+}
+
+#[test]
+fn running_owner_skips_unused_default_snapshot_version_check() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+    let snapshot = layout.snapshot_dir.join("latest");
+    fs::create_dir_all(&snapshot).expect("create snapshot");
+    fs::write(snapshot.join("launch.json"), r#"{"version":1}"#)
+        .expect("write legacy launch metadata");
+    let owner = runner::BootstrapLock::try_acquire(&layout.run_dir.join("bootstrap.lock.d"))
+        .expect("acquire owner lock")
+        .expect("owner lock");
+
+    let selected =
+        require_default_restore_version_compatibility(Some(snapshot.clone()), false, &layout)
+            .expect("running owner does not use on-disk snapshot");
+
+    assert_eq!(selected, Some(snapshot));
+    drop(owner);
+}
+
+#[test]
+fn orphaned_restore_work_is_reported_before_snapshot_clear_advice() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+    let snapshot = layout.snapshot_dir.join("latest");
+    fs::create_dir_all(&snapshot).expect("create snapshot");
+    fs::write(snapshot.join("launch.json"), r#"{"version":1}"#)
+        .expect("write legacy launch metadata");
+    fs::create_dir_all(layout.snapshot_dir.join(runner::RESTORE_WORK_SNAPSHOT))
+        .expect("create restore work");
+    fs::write(
+        layout.snapshot_dir.join(runner::RESTORE_WORK_ACTIVE_MARKER),
+        b"generation_id=recovery\n",
+    )
+    .expect("write active marker");
+
+    let error = require_default_restore_version_compatibility(Some(snapshot), false, &layout)
+        .expect_err("orphaned work takes precedence");
+
+    assert!(error.to_string().contains("recoverable state"));
+    assert!(
+        !error
+            .to_string()
+            .contains("incompatible with this lnx version")
+    );
+}
+
+#[test]
 fn clear_latest_snapshot_removes_snapshot_runtime_state() {
     let temp = tempfile::tempdir().expect("tempdir");
     let layout = test_layout(temp.path());
@@ -350,17 +427,128 @@ fn clear_latest_snapshot_removes_snapshot_runtime_state() {
         layout.snapshot_dir.join(".latest.next"),
         layout.snapshot_dir.join(".latest.previous"),
         layout.snapshot_dir.join(".restore-work"),
+        layout.snapshot_dir.join(".restore-work.active"),
     ];
     for path in &paths {
         fs::create_dir_all(path).expect("create snapshot path");
         fs::write(path.join("marker"), b"x").expect("write marker");
     }
+    let stale_clear_trash = layout.snapshot_dir.join(".latest.clear-999999-0");
+    fs::create_dir_all(&stale_clear_trash).expect("create stale clear trash");
+    fs::write(stale_clear_trash.join("large-snapshot-page"), b"x")
+        .expect("write stale clear trash");
+    runner::write_final_snapshot_outcome(&layout, &Err(anyhow::anyhow!("snapshot failed")))
+        .expect("write failed snapshot outcome");
 
     clear_latest_snapshot(&layout).expect("clear latest snapshot");
 
     for path in &paths {
         assert!(!path.exists(), "{} should be removed", path.display());
     }
+    assert!(
+        !stale_clear_trash.exists(),
+        "a retry should clean trash left by an interrupted clear"
+    );
+    let acknowledged = runner::read_final_snapshot_outcome(&layout)
+        .expect("read acknowledged outcome")
+        .expect("acknowledgement remains for concurrent stop verification");
+    assert!(acknowledged.succeeded);
+    assert!(!acknowledged.pending);
+}
+
+#[test]
+fn clear_latest_snapshot_refuses_while_owner_is_live() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+    fs::create_dir_all(&layout.run_dir).expect("create run dir");
+    let latest = layout.snapshot_dir.join("latest");
+    let work = layout.snapshot_dir.join(runner::RESTORE_WORK_SNAPSHOT);
+    fs::create_dir_all(&latest).expect("create latest");
+    fs::create_dir_all(&work).expect("create restore work");
+    fs::write(
+        layout.snapshot_dir.join(runner::RESTORE_WORK_ACTIVE_MARKER),
+        b"generation_id=active\n",
+    )
+    .expect("write restore marker");
+    runner::write_final_snapshot_outcome(&layout, &Err(anyhow::anyhow!("snapshot failed")))
+        .expect("write failed snapshot outcome");
+    let outcome_before = fs::read(layout.snapshot_dir.join(runner::FINAL_SNAPSHOT_OUTCOME))
+        .expect("read outcome before clear");
+    let owner = runner::BootstrapLock::try_acquire(&layout.run_dir.join("bootstrap.lock.d"))
+        .expect("acquire owner lock")
+        .expect("owner lock");
+
+    let error = clear_latest_snapshot(&layout).expect_err("running owner blocks snapshot clear");
+
+    assert!(error.to_string().contains("running VM owner"));
+    assert!(latest.exists());
+    assert!(work.exists());
+    assert!(
+        layout
+            .snapshot_dir
+            .join(runner::RESTORE_WORK_ACTIVE_MARKER)
+            .exists()
+    );
+    assert_eq!(
+        fs::read(layout.snapshot_dir.join(runner::FINAL_SNAPSHOT_OUTCOME))
+            .expect("live-owner outcome remains"),
+        outcome_before
+    );
+    drop(owner);
+}
+
+#[test]
+fn clear_snapshot_recovery_works_after_split_run_directory_loss() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut layout = test_layout(temp.path());
+    layout.run_dir = temp.path().join("ephemeral-run/default");
+    fs::create_dir_all(layout.snapshot_dir.join("latest")).expect("create latest snapshot");
+    runner::write_final_snapshot_outcome(
+        &layout,
+        &Err(anyhow::anyhow!("failed before run dir loss")),
+    )
+    .expect("write persistent failed outcome");
+    assert!(!layout.run_dir.exists());
+
+    clear_latest_snapshot(&layout).expect("clear with missing split run dir");
+
+    assert!(!layout.snapshot_dir.join("latest").exists());
+    assert!(
+        layout.run_dir.exists(),
+        "coordination directory is recreated"
+    );
+    let outcome = runner::read_final_snapshot_outcome(&layout)
+        .expect("read clear acknowledgement")
+        .expect("clear acknowledgement");
+    assert!(outcome.succeeded);
+}
+
+#[test]
+fn clear_nonexistent_instance_does_not_create_phantom_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+
+    let error = clear_latest_snapshot(&layout).expect_err("missing instance is rejected");
+
+    assert!(error.to_string().contains("instance does not exist"));
+    assert!(!layout.instance_dir.exists());
+    assert!(!layout.run_dir.join("bootstrap.lock.d.guard").exists());
+}
+
+#[test]
+fn clear_never_snapshotted_instance_is_idempotent() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+    fs::create_dir_all(&layout.instance_dir).expect("create cold instance");
+    fs::write(&layout.rootfs, b"cold-rootfs").expect("write cold rootfs");
+
+    clear_latest_snapshot(&layout).expect("clear cold instance");
+
+    assert_eq!(
+        fs::read(&layout.rootfs).expect("rootfs remains"),
+        b"cold-rootfs"
+    );
+    assert!(layout.snapshot_dir.exists());
 }
 
 #[test]
@@ -370,6 +558,176 @@ fn delete_instance_missing_instance_reports_not_found() {
     let err = delete_instance(temp.path(), "missing-instance").expect_err("expect not found");
 
     assert_eq!(err.to_string(), "instance not found: missing-instance");
+}
+
+#[test]
+fn delete_instance_refuses_a_concurrent_state_copy() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+    fs::create_dir_all(&layout.instance_dir).expect("create instance");
+    fs::write(&layout.rootfs, b"rootfs").expect("write rootfs");
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder_layout = layout.clone();
+    let holder = std::thread::spawn(move || {
+        runner::with_exclusive_instance_state(&holder_layout, || {
+            held_tx.send(()).expect("signal held lease");
+            release_rx.recv().expect("wait for release");
+            Ok(())
+        })
+        .expect("reserve state")
+        .expect("exclusive state lease");
+    });
+    held_rx.recv().expect("wait for held lease");
+
+    let error = delete_instance(temp.path(), "dev").expect_err("state copy blocks deletion");
+
+    assert!(error.to_string().contains("became busy"));
+    assert!(layout.rootfs.exists());
+    release_tx.send(()).expect("release state lease");
+    holder.join().expect("join state holder");
+}
+
+#[test]
+fn set_settings_refuses_a_concurrent_state_operation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+    fs::create_dir_all(&layout.instance_dir).expect("create instance");
+    descriptor::save(
+        &layout,
+        &descriptor::InstanceDescriptor {
+            name: Some("dev".to_string()),
+            cpus: Some(2),
+            ..Default::default()
+        },
+    )
+    .expect("write descriptor");
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder_layout = layout.clone();
+    let holder = std::thread::spawn(move || {
+        runner::with_exclusive_instance_state(&holder_layout, || {
+            held_tx.send(()).expect("signal held lease");
+            release_rx.recv().expect("wait for release");
+            Ok(())
+        })
+        .expect("reserve state")
+        .expect("exclusive state lease");
+    });
+    held_rx.recv().expect("wait for held lease");
+
+    let error = set_instance_settings(&layout, &["cpus=4".to_string()])
+        .expect_err("state operation blocks settings");
+
+    assert!(error.to_string().contains("state operation in progress"));
+    assert_eq!(descriptor::load(&layout).unwrap().cpus, Some(2));
+    release_tx.send(()).expect("release state lease");
+    holder.join().expect("join state holder");
+}
+
+#[test]
+fn delete_instance_atomically_detaches_and_removes_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+    fs::create_dir_all(layout.instance_dir.join("nested")).expect("create instance");
+    fs::write(&layout.rootfs, b"rootfs").expect("write rootfs");
+    fs::write(layout.instance_dir.join("nested/state"), b"state").expect("write state");
+
+    delete_instance(temp.path(), "dev").expect("delete instance");
+
+    assert!(!layout.instance_dir.exists());
+    assert!(
+        find_detached_instance_state(&temp.path().join("instances"), "dev")
+            .expect("scan detached state")
+            .is_empty()
+    );
+}
+
+#[test]
+fn delete_instance_retries_cleanup_after_a_committed_detach() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let instances = temp.path().join("instances");
+    let transaction_root = crate::paths::ensure_instance_transaction_root(&instances)
+        .expect("create transaction root");
+    let trash = transaction_root
+        .join("delete/dev")
+        .join(format!("{}-0", std::process::id()));
+    fs::create_dir_all(trash.join("state")).expect("create detached state");
+    fs::write(trash.join("state/rootfs.ext4"), b"rootfs").expect("write detached rootfs");
+
+    delete_instance(temp.path(), "dev").expect("retry detached cleanup");
+
+    assert!(!trash.exists());
+}
+
+#[test]
+fn split_delete_recovers_after_only_persistent_state_was_detached() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let persistent_base = temp.path().join("persistent");
+    let run_base = temp.path().join("runtime");
+    let mut layout = test_layout(&persistent_base);
+    layout.run_dir = run_base.join("instances/dev");
+    layout.console_log = layout.run_dir.join("console.log");
+    let persistent_transaction_root =
+        crate::paths::ensure_instance_transaction_root(&persistent_base.join("instances"))
+            .expect("create persistent transaction root");
+    let persistent_trash = persistent_transaction_root
+        .join("delete/dev")
+        .join(format!("{}-0", std::process::id()));
+    fs::create_dir_all(persistent_trash.join("state")).expect("create detached persistent state");
+    fs::write(persistent_trash.join("state/rootfs.ext4"), b"old rootfs")
+        .expect("write detached rootfs");
+    let lock = layout.run_dir.join("bootstrap.lock.d");
+    fs::create_dir_all(&lock).expect("create interrupted maintenance lease");
+    let mut exited = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("spawn short-lived maintenance process");
+    let stale_pid = exited.id();
+    exited.wait().expect("reap maintenance process");
+    fs::write(lock.join("maintenance.pid"), stale_pid.to_string())
+        .expect("write stale maintenance pid");
+
+    delete_resolved_instance(&persistent_base, "dev", &layout)
+        .expect("recover interrupted split deletion");
+
+    assert!(!persistent_trash.exists());
+    assert!(!layout.run_dir.exists());
+    assert!(
+        find_detached_instance_state(&run_base.join("instances"), "dev")
+            .expect("scan runtime trash")
+            .is_empty()
+    );
+}
+
+#[test]
+fn instance_listing_keeps_valid_dot_names_and_hides_transactions() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let instances = temp.path().join("instances");
+    fs::create_dir_all(instances.join(".dev")).expect("create dot instance");
+    fs::create_dir_all(instances.join("@legacy-name")).expect("create legacy invalid name");
+    let transaction_root = crate::paths::ensure_instance_transaction_root(&instances)
+        .expect("create transaction root");
+    fs::create_dir_all(transaction_root.join("delete/dev/1-0")).expect("create delete transaction");
+    let mut names = BTreeSet::new();
+
+    collect_child_dir_names(&instances, &mut names).expect("collect instances");
+
+    assert_eq!(
+        names,
+        BTreeSet::from([".dev".to_string(), "@legacy-name".to_string()])
+    );
+}
+
+#[test]
+fn existing_path_aliases_are_not_treated_as_split_runtime_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let real = temp.path().join("real");
+    let alias = temp.path().join("alias");
+    fs::create_dir_all(&real).expect("create real directory");
+    std::os::unix::fs::symlink(&real, &alias).expect("create alias");
+
+    assert!(paths_refer_to_same_existing_entry(&real, &alias));
 }
 
 #[test]

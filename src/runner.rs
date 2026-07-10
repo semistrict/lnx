@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     fs::{self, OpenOptions},
     io::{ErrorKind, Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
@@ -32,7 +32,7 @@ const CONTROL_PORT: u32 = 10242;
 const FRAME_SNAPSHOT: u8 = b'K';
 
 // Owner exit status meaning "the VM failed to start with a restore
-// configured"; the client retries the spawn with a cold boot.
+// configured"; the client reports a hard restore failure.
 const EXIT_RESTORE_FAILED: i32 = 86;
 
 const DEFAULT_BROKER_IDLE_TTL: Duration = Duration::ZERO;
@@ -45,7 +45,7 @@ const OWNER_BOOT_TIMEOUT: Duration = Duration::from_secs(120);
 const FRESH_OWNER_SLOT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_AGENT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(90);
 const BROKER_HELLO_TIMEOUT: Duration = Duration::from_secs(1);
-const OWNER_REPLACE_GRACE: Duration = Duration::from_secs(5);
+const OWNER_REPLACE_GRACE: Duration = Duration::from_secs(120);
 const ROOTFS_BACKEND_ENV: &str = "LNX_ROOTFS_BACKEND";
 const DETERMINISTIC_EXEC_UID: u32 = 1000;
 const DETERMINISTIC_EXEC_GID: u32 = 1000;
@@ -60,11 +60,17 @@ const DETERMINISTIC_TIMER_JUMPS_CURSOR: &str = "deterministic-timer-jumps.cursor
 const RUN_ID_ENV: &str = "LNX_RUN_ID";
 const LAUNCH_METADATA: &str = "launch.json";
 static SIGNAL_INIT: Once = Once::new();
+static OWNER_SIGNAL_INIT: Once = Once::new();
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static OWNER_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static LIFECYCLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 extern "C" fn handle_sigint(_: libc::c_int) {
     INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+extern "C" fn handle_owner_shutdown(_: libc::c_int) {
+    OWNER_SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +82,7 @@ pub struct RunConfig {
     pub memory_mib: u32,
     pub nested_kvm: bool,
     pub restore_snapshot: Option<PathBuf>,
+    pub restore_latest_if_available: bool,
     pub forwards: Vec<PortForward>,
     pub snapshot_output: Option<PathBuf>,
     pub run_as_root: bool,
@@ -100,8 +107,7 @@ pub struct DeterministicConfig {
 }
 
 /// Marks an owner start failure that happened while restoring a snapshot's
-/// memory, as opposed to an unrelated boot failure. Only these refusals are
-/// worth retrying as a cold boot.
+/// memory, as opposed to an unrelated boot failure.
 #[derive(Debug)]
 struct RestoreRefused;
 
@@ -166,6 +172,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
         .with_context(|| format!("create {}", config.layout.run_dir.display()))?;
     fs::create_dir_all(&config.layout.snapshot_dir)
         .with_context(|| format!("create {}", config.layout.snapshot_dir.display()))?;
+    validate_restore_work_for_command(&config.layout)?;
     let run_log = Arc::new(RunLog::open(&config.layout)?);
     let run_id = current_run_id();
     run_log.line(format!(
@@ -189,7 +196,17 @@ pub fn run(config: RunConfig) -> Result<i32> {
         config.layout.run_dir.join("gvproxy.log").display()
     ));
     preflight_host_share_cwd(&config.layout, &config.cwd, config.no_host_shares)?;
-    let broker_socket = config.layout.run_dir.join("broker.sock");
+    // Foreground snapshot-output owners are intentionally private: attaching
+    // an unrelated command would mutate state captured only into the
+    // checkpoint and make that successful command disappear from `latest`.
+    let broker_socket = config
+        .layout
+        .run_dir
+        .join(if config.snapshot_output.is_some() {
+            "checkpoint-broker.sock"
+        } else {
+            "broker.sock"
+        });
     let no_daemon_reuse = !config.reuse_owner || debug_flag_enabled("nodaemonreuse");
     if no_daemon_reuse {
         run_log.line("debug.nodaemonreuse enabled");
@@ -197,7 +214,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
             "debug[nodaemonreuse]: replacing any existing VM owner for this instance before starting a fresh owner."
         );
     }
-    if config.forwards.is_empty() && !no_daemon_reuse {
+    if config.snapshot_output.is_none() && config.forwards.is_empty() && !no_daemon_reuse {
         if broker_socket.exists() {
             validate_runtime_deterministic_compatibility(
                 &config.layout,
@@ -269,6 +286,106 @@ pub fn run(config: RunConfig) -> Result<i32> {
     Ok(status)
 }
 
+/// Validates recovery state before any path can discard it. A live owner
+/// legitimately owns in-progress state; once no owner is live, missing or
+/// failed final-snapshot state requires explicit acknowledgement.
+pub(crate) fn validate_restore_work_for_command(layout: &Layout) -> Result<bool> {
+    let lock_path = layout.run_dir.join("bootstrap.lock.d");
+    with_lock_dir_guard(&lock_path, || {
+        validate_recovery_state_locked(layout, &lock_path)
+    })
+}
+
+fn validate_recovery_state_locked(layout: &Layout, lock_path: &Path) -> Result<bool> {
+    let recorded_pid = recorded_owner_pid_from_lock(lock_path).with_context(|| {
+        format!(
+            "owner lease is corrupt; recovery: lnx --instance {} snapshots clear to acknowledge and explicitly cold-boot",
+            layout.instance
+        )
+    })?;
+    if recorded_pid.is_some_and(process_alive) {
+        return Ok(true);
+    }
+    let maintenance_pid = recorded_maintenance_pid_from_lock(lock_path).with_context(|| {
+        format!(
+            "maintenance lease is corrupt; recovery: lnx --instance {} snapshots clear to acknowledge and explicitly cold-boot",
+            layout.instance
+        )
+    })?;
+    if maintenance_pid.is_some_and(process_alive) {
+        return Ok(true);
+    }
+    refuse_active_restore_work(layout)?;
+    if lock_path.exists() && recorded_pid.is_none() && maintenance_pid.is_none() {
+        bail!(
+            "instance {} has an incomplete owner lease at {}; run lnx --instance {} snapshots clear to acknowledge and explicitly cold-boot",
+            layout.instance,
+            lock_path.display(),
+            layout.instance
+        );
+    }
+    let expected_pid = recorded_pid
+        .map(u32::try_from)
+        .transpose()
+        .context("owner pid does not fit final snapshot outcome")?;
+    validate_final_snapshot_outcome(layout, expected_pid)?;
+    Ok(false)
+}
+
+fn try_acquire_validated_bootstrap(
+    layout: &Layout,
+    lock_path: &Path,
+) -> Result<Option<BootstrapLock>> {
+    BootstrapLock::try_acquire_validated(lock_path, || {
+        if validate_recovery_state_locked(layout, lock_path)? {
+            bail!(
+                "instance {} acquired a live VM owner while exclusive startup was being validated",
+                layout.instance
+            );
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn with_validated_stopped_instance<T>(
+    layout: &Layout,
+    action: impl FnOnce() -> Result<T>,
+) -> Result<Option<T>> {
+    let lock_path = layout.run_dir.join("bootstrap.lock.d");
+    let Some(state_lock) = InstanceStateLock::try_acquire_validated(&lock_path, || {
+        if validate_recovery_state_locked(layout, &lock_path)? {
+            bail!(
+                "instance {} became busy while stopped-state access was being reserved",
+                layout.instance
+            );
+        }
+        Ok(())
+    })?
+    else {
+        return Ok(None);
+    };
+    let result = action();
+    drop(state_lock);
+    result.map(Some)
+}
+
+/// Reserves an instance's stopped state for an operation that intentionally
+/// destroys it. Unlike `with_validated_stopped_instance`, this does not require
+/// recoverable snapshot state because deleting the instance is itself the
+/// explicit destructive action.
+pub(crate) fn with_exclusive_instance_state<T>(
+    layout: &Layout,
+    action: impl FnOnce() -> Result<T>,
+) -> Result<Option<T>> {
+    let lock_path = layout.run_dir.join("bootstrap.lock.d");
+    let Some(state_lock) = InstanceStateLock::try_acquire_validated(&lock_path, || Ok(()))? else {
+        return Ok(None);
+    };
+    let result = action();
+    drop(state_lock);
+    result.map(Some)
+}
+
 fn validate_runtime_share_compatibility(config: &RunConfig) -> Result<()> {
     let current = launch_metadata_for_config(config)?;
     let path = config.layout.run_dir.join(LAUNCH_METADATA);
@@ -293,6 +410,7 @@ fn prepare_fresh_owner_slot(
 ) -> Result<()> {
     if replace_existing {
         replace_existing_owner(layout, run_log)?;
+        validate_restore_work_for_command(layout)?;
     }
     wait_for_fresh_owner_slot(layout, run_log)
 }
@@ -302,13 +420,13 @@ fn wait_for_fresh_owner_slot(layout: &Layout, run_log: &RunLog) -> Result<()> {
     let start = Instant::now();
     let mut logged_wait = false;
     while lock_path.exists() {
-        if bootstrap_lock_is_stale(&lock_path)? {
+        if owner_pid_from_lock(&lock_path).is_none() {
+            validate_restore_work_for_command(layout)?;
             run_log.line(format!(
-                "fresh_owner.slot.stale_lock.remove lock={}",
+                "fresh_owner.slot.stale_lock.validated lock={}",
                 lock_path.display()
             ));
-            let _ = fs::remove_dir_all(&lock_path);
-            continue;
+            return Ok(());
         }
         if !logged_wait {
             run_log.line(format!(
@@ -331,54 +449,56 @@ fn wait_for_fresh_owner_slot(layout: &Layout, run_log: &RunLog) -> Result<()> {
 
 fn replace_existing_owner(layout: &Layout, run_log: &RunLog) -> Result<()> {
     let lock_path = layout.run_dir.join("bootstrap.lock.d");
-    let broker_socket = layout.run_dir.join("broker.sock");
     let Some(pid) = owner_pid_from_lock(&lock_path) else {
-        if bootstrap_lock_is_stale(&lock_path).unwrap_or(false) {
-            run_log.line(format!(
-                "owner.replace.stale_lock.remove lock={}",
-                lock_path.display()
-            ));
-            let _ = fs::remove_dir_all(&lock_path);
-        }
-        let _ = fs::remove_file(&broker_socket);
+        validate_restore_work_for_command(layout)?;
         return Ok(());
     };
     run_log.line(format!(
         "owner.replace.term pid={pid} instance={}",
         layout.instance
     ));
-    signal_process_group(pid, libc::SIGTERM)?;
+    signal_process(pid, libc::SIGTERM)?;
     let deadline = Instant::now() + OWNER_REPLACE_GRACE;
     while Instant::now() < deadline {
-        if !process_alive(pid) {
-            run_log.line(format!("owner.replace.exited pid={pid}"));
-            let _ = fs::remove_dir_all(&lock_path);
-            let _ = fs::remove_file(&broker_socket);
-            return Ok(());
+        match owner_pid_from_lock(&lock_path) {
+            Some(current_pid) if current_pid == pid => {}
+            Some(current_pid) => {
+                run_log.line(format!(
+                    "owner.replace.changed previous_pid={pid} current_pid={current_pid}"
+                ));
+                return Ok(());
+            }
+            None => {
+                validate_expected_owner_shutdown(layout, pid)?;
+                run_log.line(format!("owner.replace.exited pid={pid}"));
+                return Ok(());
+            }
         }
         thread::sleep(Duration::from_millis(50));
     }
-    run_log.line(format!("owner.replace.kill pid={pid}"));
-    signal_process_group(pid, libc::SIGKILL)?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if !process_alive(pid) {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
+    if owner_pid_from_lock(&lock_path) == Some(pid) {
+        bail!(
+            "owner process {pid} for instance {} did not finish its shutdown snapshot within 120 seconds; it was left running so recoverable state is not discarded",
+            layout.instance
+        );
     }
-    if process_alive(pid) {
-        run_log.line(format!(
-            "owner.replace.kill_delivered pid={pid} still_observable=true"
-        ));
-    }
-    let _ = fs::remove_dir_all(&lock_path);
-    let _ = fs::remove_file(&broker_socket);
+    validate_expected_owner_shutdown(layout, pid)?;
+    run_log.line(format!("owner.replace.exited pid={pid}"));
     Ok(())
 }
 
-fn acquire_bootstrap_for_forward(lock_path: &Path, run_log: &RunLog) -> Result<BootstrapLock> {
-    match BootstrapLock::try_acquire(lock_path)? {
+fn validate_expected_owner_shutdown(layout: &Layout, pid: libc::pid_t) -> Result<()> {
+    refuse_active_restore_work(layout)?;
+    let pid = u32::try_from(pid).context("owner pid does not fit final snapshot outcome")?;
+    validate_or_record_final_snapshot_failure(layout, pid)
+}
+
+fn acquire_bootstrap_for_forward(
+    layout: &Layout,
+    lock_path: &Path,
+    run_log: &RunLog,
+) -> Result<BootstrapLock> {
+    match try_acquire_validated_bootstrap(layout, lock_path)? {
         Some(lock) => {
             run_log.line(format!(
                 "bootstrap.lock.acquired path={} forward=true",
@@ -392,10 +512,12 @@ fn acquire_bootstrap_for_forward(lock_path: &Path, run_log: &RunLog) -> Result<B
     }
 }
 
-pub fn run_owner(config: RunConfig) -> Result<()> {
+pub fn run_owner(mut config: RunConfig) -> Result<()> {
     if config.trace_events && config.deterministic.is_none() {
         bail!("trace events require deterministic mode");
     }
+    OWNER_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    install_owner_signal_handlers();
     fs::create_dir_all(&config.layout.run_dir)
         .with_context(|| format!("create {}", config.layout.run_dir.display()))?;
     fs::create_dir_all(&config.layout.snapshot_dir)
@@ -416,6 +538,7 @@ pub fn run_owner(config: RunConfig) -> Result<()> {
     ));
     let broker_socket = config.layout.run_dir.join("broker.sock");
     let Some(bootstrap_lock) = acquire_bootstrap_for_owner(
+        &config.layout,
         &config.layout.run_dir.join("bootstrap.lock.d"),
         &broker_socket,
         &run_log,
@@ -424,6 +547,7 @@ pub fn run_owner(config: RunConfig) -> Result<()> {
         run_log.line("owner.exit reason=existing_broker");
         return Ok(());
     };
+    refresh_default_restore_snapshot(&mut config)?;
     reset_owner_attempt_logs(&config.layout, &run_log);
     if broker_socket.exists() {
         run_log.line(format!(
@@ -448,7 +572,13 @@ pub fn run_owner(config: RunConfig) -> Result<()> {
         }
         Err(e) => return Err(e),
     };
-    let _ = vm.owner.join();
+    let owner_result = vm
+        .owner
+        .join()
+        .map_err(|_| anyhow!("VM owner thread panicked"))
+        .and_then(|result| result);
+    write_final_snapshot_outcome(&config.layout, &owner_result)?;
+    owner_result?;
     flush_deterministic_trace_events(&config.layout, vm.trace_log.as_deref())?;
     run_log.line(format!("owner.done owner_run_id={owner_run_id}"));
     drop(vm.network);
@@ -457,12 +587,29 @@ pub fn run_owner(config: RunConfig) -> Result<()> {
 }
 
 fn run_foreground(
-    config: RunConfig,
+    mut config: RunConfig,
     run_log: Arc<RunLog>,
     broker_socket: PathBuf,
     owner_run_id: String,
 ) -> Result<i32> {
+    OWNER_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    install_owner_signal_handlers();
     let lock_path = config.layout.run_dir.join("bootstrap.lock.d");
+    let owner_start_lock = match acquire_owner_start_or_run_client(
+        &config.layout.run_dir.join("owner-start.lock.d"),
+        &broker_socket,
+        &config.command,
+        &config.cwd,
+        config.run_as_root,
+        config.no_host_shares,
+        config.deterministic.as_ref(),
+        &config.layout.instance,
+        false,
+        &run_log,
+    )? {
+        OwnerStartOutcome::Lock(lock) => lock,
+        OwnerStartOutcome::Status(_) => unreachable!("foreground startup never attaches"),
+    };
     let no_daemon_reuse = !config.reuse_owner || debug_flag_enabled("nodaemonreuse");
     if no_daemon_reuse {
         preflight_fresh_owner_network(&config, &run_log)?;
@@ -470,6 +617,7 @@ fn run_foreground(
     }
     let bootstrap_lock = if config.forwards.is_empty() {
         match acquire_bootstrap_or_run_client(
+            &config.layout,
             &lock_path,
             &broker_socket,
             &config.command,
@@ -478,30 +626,17 @@ fn run_foreground(
             config.no_host_shares,
             config.deterministic.as_ref(),
             &config.layout.instance,
-            no_daemon_reuse,
+            true,
             &run_log,
         )? {
             BootstrapOutcome::Lock(lock) => lock,
             BootstrapOutcome::Status(status) => return Ok(status),
         }
     } else {
-        acquire_bootstrap_for_forward(&lock_path, &run_log)?
+        acquire_bootstrap_for_forward(&config.layout, &lock_path, &run_log)?
     };
-    if config.forwards.is_empty() && !no_daemon_reuse {
-        if let Some(status) = run_existing_broker_client(
-            &broker_socket,
-            &config.command,
-            &config.cwd,
-            config.run_as_root,
-            config.no_host_shares,
-            config.deterministic.as_ref(),
-            &config.layout.instance,
-            Some(&run_log),
-        )? {
-            drop(bootstrap_lock);
-            return Ok(status);
-        }
-    }
+    drop(owner_start_lock);
+    refresh_default_restore_snapshot(&mut config)?;
     if broker_socket.exists() {
         run_log.line(format!(
             "broker.stale_socket.remove path={}",
@@ -521,7 +656,7 @@ fn run_foreground(
         },
         &owner_run_id,
     )?;
-    let status = match run_broker_client_retry(
+    let client_result = run_broker_client_retry(
         &broker_socket,
         &config.command,
         &config.cwd,
@@ -531,17 +666,27 @@ fn run_foreground(
         &config.layout.instance,
         Duration::from_secs(5),
     )
-    .with_context(|| console_hint(&config.layout.console_log))
-    {
-        Ok(status) => status,
-        Err(e) => {
-            vm.timings.event(&format!("restore.client.error {e:#}"));
-            run_log.line(format!("client.error {e:#}"));
-            log_console_tail(&run_log, &config.layout.console_log);
-            return Err(e);
+    .with_context(|| console_hint(&config.layout.console_log));
+    if let Err(error) = &client_result {
+        vm.timings.event(&format!("restore.client.error {error:#}"));
+        run_log.line(format!("client.error {error:#}"));
+        log_console_tail(&run_log, &config.layout.console_log);
+        OWNER_SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    }
+    let owner_result = vm
+        .owner
+        .join()
+        .map_err(|_| anyhow!("VM owner thread panicked"))
+        .and_then(|result| result);
+    write_final_snapshot_outcome(&config.layout, &owner_result)?;
+    let status = match (client_result, owner_result) {
+        (Ok(status), Ok(())) => status,
+        (Err(client_error), Ok(())) => return Err(client_error),
+        (Ok(_), Err(owner_error)) => return Err(owner_error),
+        (Err(client_error), Err(owner_error)) => {
+            return Err(client_error.context(format!("VM owner also failed: {owner_error:#}")));
         }
     };
-    let _ = vm.owner.join();
     flush_deterministic_trace_events(&config.layout, vm.trace_log.as_deref())?;
     vm.timings.event(&format!("run.done status={status}"));
     run_log.line(format!("run.done run_id={owner_run_id} status={status}"));
@@ -550,8 +695,30 @@ fn run_foreground(
     Ok(status)
 }
 
+fn refresh_default_restore_snapshot(config: &mut RunConfig) -> Result<()> {
+    if !config.restore_latest_if_available {
+        return Ok(());
+    }
+    let latest = config.layout.snapshot_dir.join("latest");
+    if !latest.exists() {
+        // Any earlier value was only a pre-lock observation of the default
+        // snapshot. Under exclusive ownership, absence means cold boot.
+        config.restore_snapshot = None;
+        return Ok(());
+    }
+    if !default_restore_version_matches(&latest)? {
+        bail!(
+            "latest snapshot is incompatible with this lnx version: {}\nrecovery: lnx --instance {} snapshots clear to explicitly cold-boot",
+            latest.display(),
+            config.layout.instance
+        );
+    }
+    config.restore_snapshot = Some(latest);
+    Ok(())
+}
+
 struct VmHandles {
-    owner: thread::JoinHandle<()>,
+    owner: thread::JoinHandle<Result<()>>,
     network: NetworkBacking,
     timings: Arc<TimingLog>,
     trace_log: Option<Arc<TraceLog>>,
@@ -621,6 +788,8 @@ fn start_vm(
     idle: IdlePolicy,
     owner_run_id: &str,
 ) -> Result<VmHandles> {
+    refuse_active_restore_work(&config.layout)?;
+    validate_final_snapshot_outcome(&config.layout, None)?;
     let timings = Arc::new(TimingLog::open(
         &config.layout,
         &config.command,
@@ -740,26 +909,29 @@ fn start_vm(
         }
     }
     let restore_snapshot = if let Some(snapshot) = &config.restore_snapshot {
-        let initramfs_compatible = snapshot_initramfs_is_compatible(snapshot, &initramfs_stamp);
-        if !initramfs_compatible {
+        if let Err(error) =
+            validate_snapshot_initramfs_compatibility(snapshot, &initramfs_stamp, &config.layout)
+        {
             run_log.line(format!(
-                "snapshot.initramfs_stamp_mismatch ignored snapshot={} current={}",
+                "snapshot.initramfs_stamp_mismatch refused snapshot={} current={}",
                 snapshot.join("initramfs.stamp").display(),
                 initramfs_stamp.display()
             ));
+            return Err(error);
         }
         if let Some(reason) = snapshot_launch_incompatibility(snapshot, &launch_metadata) {
             bail!(
-                "snapshot launch metadata is incompatible ({reason}): {}\nrecovery: lnx --instance {} snapshots clear",
+                "snapshot launch metadata is incompatible ({reason}): {}\n{}",
                 snapshot.join(LAUNCH_METADATA).display(),
-                config.layout.instance
+                snapshot_restore_recovery_guidance(&config.layout, snapshot)
             );
         }
         if let Some(reason) = snapshot_deterministic_incompatibility(snapshot, &deterministic_stamp)
         {
             bail!(
-                "snapshot deterministic stamp is incompatible ({reason}): {}",
-                snapshot.join("deterministic.stamp").display()
+                "snapshot deterministic stamp is incompatible ({reason}): {}\n{}",
+                snapshot.join("deterministic.stamp").display(),
+                snapshot_restore_recovery_guidance(&config.layout, snapshot)
             );
         }
         match snapshot_vm_config(snapshot) {
@@ -767,15 +939,15 @@ fn start_vm(
                 if !snapshot_config.matches(config.cpus, config.memory_mib) =>
             {
                 bail!(
-                    "snapshot VM config mismatch: snapshot_cpus={} configured_cpus={} snapshot_memory_mib={} configured_memory_mib={}",
+                    "snapshot VM config mismatch: snapshot_cpus={} configured_cpus={} snapshot_memory_mib={} configured_memory_mib={}\n{}",
                     snapshot_config.vcpu_count,
                     config.cpus,
                     snapshot_config.memory_mib(),
-                    config.memory_mib
+                    config.memory_mib,
+                    snapshot_restore_recovery_guidance(&config.layout, snapshot)
                 );
             }
-            Ok(_) if initramfs_compatible => Some(snapshot.clone()),
-            Ok(_) => None,
+            Ok(_) => Some(snapshot.clone()),
             Err(e) => {
                 return Err(e).with_context(|| {
                     format!(
@@ -993,8 +1165,41 @@ fn start_vm(
     vm_builder.exec("/init", &["--init".to_string()], &init_env);
     timings.event("krun.exec.configured");
 
+    let snapshot_output = config
+        .snapshot_output
+        .clone()
+        .unwrap_or_else(|| config.layout.snapshot_dir.join("latest"));
+    let latest_snapshot = config.layout.snapshot_dir.join("latest");
+    let promote_rootfs_after_snapshot = prepared_restore.is_some()
+        && snapshot_output == latest_snapshot
+        && requested_restore_snapshot
+            .as_deref()
+            .is_some_and(|requested| paths_refer_to_same_snapshot(requested, &latest_snapshot));
+    let clear_restore_marker_after_final_snapshot = prepared_restore.is_some();
+
     let vm = vm_builder.build();
     let ctx = Arc::new(vm.handle());
+    if clear_restore_marker_after_final_snapshot {
+        let generation_id = prepared_restore
+            .as_ref()
+            .map(|restore| restore.generation_id.as_str())
+            .unwrap_or("unknown");
+        mark_restore_work_active(&config.layout, generation_id)?;
+        run_log.line(format!(
+            "snapshot.work.mark_active owner_run_id={owner_run_id} generation_id={generation_id} path={}",
+            config
+                .layout
+                .snapshot_dir
+                .join(RESTORE_WORK_ACTIVE_MARKER)
+                .display()
+        ));
+    }
+    if let Err(error) = write_final_snapshot_pending(&config.layout) {
+        if clear_restore_marker_after_final_snapshot {
+            let _ = clear_restore_work_active(&config.layout);
+        }
+        return Err(error.context("record pending final snapshot outcome"));
+    }
     let console_log = config.layout.console_log.clone();
     let vm_timings = Arc::clone(&timings);
     let vm_run_log = Arc::clone(run_log);
@@ -1016,14 +1221,6 @@ fn start_vm(
     });
     timings.event("krun.thread.spawned");
 
-    let snapshot_output = config
-        .snapshot_output
-        .clone()
-        .unwrap_or_else(|| config.layout.snapshot_dir.join("latest"));
-    let latest_snapshot = config.layout.snapshot_dir.join("latest");
-    let promote_rootfs_after_snapshot = prepared_restore.is_some()
-        && snapshot_output == latest_snapshot
-        && requested_restore_snapshot.as_deref() == Some(latest_snapshot.as_path());
     let owner = run_broker_owner(
         listener,
         config.layout.clone(),
@@ -1033,6 +1230,7 @@ fn start_vm(
         rootfs,
         config.layout.rootfs.clone(),
         promote_rootfs_after_snapshot,
+        clear_restore_marker_after_final_snapshot,
         snapshot_listener,
         control_listener,
         broker_listener,
@@ -1072,18 +1270,21 @@ fn start_vm(
     })
 }
 
-pub fn seed_checkpoint_from_base(
-    layout: &Layout,
+fn request_checkpoint_with_timeout(
+    socket: &Path,
     checkpoint_path: &Path,
-    restore_snapshot: Option<&Path>,
-    latest_snapshot: &Path,
+    timeout: Option<Duration>,
 ) -> Result<()> {
-    let run_log = RunLog::open(layout)?;
-    seed_incremental_snapshot(checkpoint_path, restore_snapshot, latest_snapshot, &run_log)
-}
-
-pub fn request_checkpoint(socket: &Path, checkpoint_path: &Path) -> Result<()> {
     let mut stream = connect_broker(socket)?;
+    if let Some(timeout) = timeout {
+        // Once the owner accepts a checkpoint request it may legitimately
+        // spend longer than the broker-readiness deadline writing a large
+        // snapshot. Do not time out and let the caller delete its output while
+        // that write is still in flight.
+        stream
+            .set_write_timeout(Some(timeout))
+            .context("set checkpoint request timeout")?;
+    }
     let channel_id = new_request_id()?;
     write_message(
         &mut stream,
@@ -1101,6 +1302,85 @@ pub fn request_checkpoint(socket: &Path, checkpoint_path: &Path) -> Result<()> {
             } if id == channel_id => bail!("{message}"),
             _ => {}
         }
+    }
+}
+
+pub fn request_checkpoint_awaiting_owner(
+    layout: &Layout,
+    checkpoint_path: &Path,
+    deterministic: Option<&DeterministicConfig>,
+    timeout: Duration,
+) -> Result<()> {
+    request_checkpoint_from_current_owner(layout, checkpoint_path, deterministic, true, timeout)
+}
+
+pub(crate) fn request_coherent_checkpoint_awaiting_owner(
+    layout: &Layout,
+    checkpoint_path: &Path,
+    timeout: Duration,
+) -> Result<()> {
+    request_checkpoint_from_current_owner(layout, checkpoint_path, None, false, timeout)
+}
+
+fn request_checkpoint_from_current_owner(
+    layout: &Layout,
+    checkpoint_path: &Path,
+    deterministic: Option<&DeterministicConfig>,
+    validate_deterministic: bool,
+    timeout: Duration,
+) -> Result<()> {
+    let lock_path = layout.run_dir.join("bootstrap.lock.d");
+    let broker_socket = layout.run_dir.join("broker.sock");
+    let expected_pid = owner_pid_from_lock(&lock_path)
+        .context("checkpoint requested for an instance without a live VM owner")?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match owner_pid_from_lock(&lock_path) {
+            Some(pid) if pid == expected_pid => {}
+            Some(pid) => bail!(
+                "instance {} changed VM owner from pid {expected_pid} to pid {pid} while waiting to checkpoint",
+                layout.instance
+            ),
+            None => {
+                validate_expected_owner_shutdown(layout, expected_pid)?;
+                bail!(
+                    "instance {} VM owner exited before its broker became ready for checkpointing",
+                    layout.instance
+                );
+            }
+        }
+        if broker_socket.exists() && connect_broker(&broker_socket).is_ok() {
+            if owner_pid_from_lock(&lock_path) != Some(expected_pid) {
+                continue;
+            }
+            if validate_deterministic {
+                validate_runtime_deterministic_compatibility(layout, deterministic)?;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!(
+                    "timed out waiting for instance {} VM owner broker before checkpointing",
+                    layout.instance
+                );
+            }
+            request_checkpoint_with_timeout(&broker_socket, checkpoint_path, Some(remaining))?;
+            if let Some(pid) = owner_pid_from_lock(&lock_path)
+                && pid != expected_pid
+            {
+                bail!(
+                    "instance {} changed VM owner from pid {expected_pid} to pid {pid} while checkpointing",
+                    layout.instance
+                );
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for instance {} VM owner broker before checkpointing",
+                layout.instance
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -1282,11 +1562,52 @@ fn drain_broker_channels(
     active_owned
 }
 
+fn begin_broker_shutdown(
+    stopping: &AtomicBool,
+    clients: &Mutex<HashMap<u64, BrokerChannel>>,
+    active: &AtomicUsize,
+    error_message: String,
+) -> usize {
+    let drained = match clients.lock() {
+        Ok(mut clients) => {
+            stopping.store(true, Ordering::SeqCst);
+            clients.drain().collect::<Vec<_>>()
+        }
+        Err(_) => {
+            stopping.store(true, Ordering::SeqCst);
+            return 0;
+        }
+    };
+    let active_owned = drained
+        .iter()
+        .filter(|(_, channel)| channel.active_owned_by_reader)
+        .count();
+    for (channel_id, channel) in &drained {
+        let _ = channel.tx.send(Message::Error {
+            channel_id: *channel_id,
+            message: error_message.clone(),
+        });
+    }
+    if active_owned > 0 {
+        active.fetch_sub(active_owned, Ordering::SeqCst);
+    }
+    active_owned
+}
+
 fn install_signal_handlers() {
     SIGNAL_INIT.call_once(|| unsafe {
         libc::signal(
             libc::SIGINT,
             handle_sigint as *const () as libc::sighandler_t,
+        );
+    });
+}
+
+fn install_owner_signal_handlers() {
+    OWNER_SIGNAL_INIT.call_once(|| unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            handle_owner_shutdown as *const () as libc::sighandler_t,
         );
     });
 }
@@ -1455,6 +1776,7 @@ fn bind_unix_listener(path: &Path) -> Result<UnixListener> {
 
 #[allow(clippy::too_many_arguments)]
 fn acquire_bootstrap_or_run_client(
+    layout: &Layout,
     lock_path: &Path,
     socket: &Path,
     command: &[String],
@@ -1469,7 +1791,7 @@ fn acquire_bootstrap_or_run_client(
     let start = Instant::now();
     let mut logged_wait = false;
     loop {
-        if let Some(lock) = BootstrapLock::try_acquire(lock_path)? {
+        if let Some(lock) = try_acquire_validated_bootstrap(layout, lock_path)? {
             run_log.line(format!(
                 "bootstrap.lock.acquired path={}",
                 lock_path.display()
@@ -1980,10 +2302,11 @@ fn ensure_auto_forward_port(
     clients: Arc<Mutex<HashMap<u64, BrokerChannel>>>,
     active: Arc<AtomicUsize>,
     seen_active: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
     auto_forward_ports: Arc<Mutex<HashSet<(String, u16)>>>,
     run_log: Arc<RunLog>,
 ) -> Result<bool> {
-    if port <= 1024 {
+    if port <= 1024 || stopping.load(Ordering::SeqCst) {
         return Ok(false);
     }
     let key = (listen_host.to_string(), port);
@@ -2008,6 +2331,7 @@ fn ensure_auto_forward_port(
         clients,
         active,
         seen_active,
+        stopping,
         Arc::clone(&run_log),
     ) {
         if let Ok(mut ports) = auto_forward_ports.lock() {
@@ -2123,6 +2447,7 @@ fn run_broker_owner(
     rootfs: PathBuf,
     canonical_rootfs: PathBuf,
     promote_rootfs_after_snapshot: bool,
+    clear_restore_marker_after_final_snapshot: bool,
     snapshot_listener: UnixListener,
     _control_listener: UnixListener,
     broker_listener: UnixListener,
@@ -2140,7 +2465,7 @@ fn run_broker_owner(
     trace_log: Option<Arc<TraceLog>>,
     vm_error_rx: mpsc::Receiver<KrunError>,
     owner_run_id: String,
-) -> Result<thread::JoinHandle<()>> {
+) -> Result<thread::JoinHandle<Result<()>>> {
     listener
         .set_nonblocking(true)
         .context("set lnx-agent listener nonblocking")?;
@@ -2180,7 +2505,7 @@ fn run_broker_owner(
             log_console_tail(&run_log, &console_log);
             let e = e.context(console_hint(&console_log));
             // A restored guest that never reconnects means the devices
-            // refused the memory image; tag it so the client retries cold.
+            // refused the memory image; tag it as a hard restore failure.
             if restore_snapshot.is_some() {
                 return Err(e.context(RestoreRefused));
             }
@@ -2264,6 +2589,7 @@ fn run_broker_owner(
     let auto_forward_ports = Arc::new(Mutex::new(HashSet::<(String, u16)>::new()));
     let active = Arc::new(AtomicUsize::new(0));
     let seen_active = Arc::new(AtomicBool::new(idle.starts_idle));
+    let stopping = Arc::new(AtomicBool::new(false));
     let agent_failed_before_snapshot = Arc::new(AtomicBool::new(false));
     let snapshot_started = Arc::new(AtomicBool::new(false));
 
@@ -2284,6 +2610,7 @@ fn run_broker_owner(
     let reader_auto_forward_ports = Arc::clone(&auto_forward_ports);
     let reader_active = Arc::clone(&active);
     let reader_seen_active = Arc::clone(&seen_active);
+    let reader_stopping = Arc::clone(&stopping);
     let reader_snapshot_exit_tx = snapshot_exit_tx.clone();
     let reader_agent_failed_before_snapshot = Arc::clone(&agent_failed_before_snapshot);
     let reader_snapshot_started = Arc::clone(&snapshot_started);
@@ -2326,6 +2653,9 @@ fn run_broker_owner(
                 continue;
             }
             if let Message::OpenUrl { channel_id, url } = message {
+                if reader_stopping.load(Ordering::SeqCst) {
+                    continue;
+                }
                 if let Some((host, port)) = localhost_url_forward(&url) {
                     if let Err(e) = ensure_auto_forward_port(
                         host,
@@ -2334,6 +2664,7 @@ fn run_broker_owner(
                         Arc::clone(&reader_clients),
                         Arc::clone(&reader_active),
                         Arc::clone(&reader_seen_active),
+                        Arc::clone(&reader_stopping),
                         Arc::clone(&reader_auto_forward_ports),
                         Arc::clone(&reader_log),
                     ) {
@@ -2361,10 +2692,17 @@ fn run_broker_owner(
                         ],
                     );
                 }
-                let _ = reader_agent_tx.send(Message::OpenUrlResult { channel_id, ok });
+                if let Ok(_clients) = reader_clients.lock()
+                    && !reader_stopping.load(Ordering::SeqCst)
+                {
+                    let _ = reader_agent_tx.send(Message::OpenUrlResult { channel_id, ok });
+                }
                 continue;
             }
             if let Message::PortListeners { ports } = message {
+                if reader_stopping.load(Ordering::SeqCst) {
+                    continue;
+                }
                 for port in ports.into_iter().filter(|port| *port > 1024) {
                     if let Err(e) = ensure_auto_forward_port(
                         "127.0.0.1",
@@ -2373,6 +2711,7 @@ fn run_broker_owner(
                         Arc::clone(&reader_clients),
                         Arc::clone(&reader_active),
                         Arc::clone(&reader_seen_active),
+                        Arc::clone(&reader_stopping),
                         Arc::clone(&reader_auto_forward_ports),
                         Arc::clone(&reader_log),
                     ) {
@@ -2440,6 +2779,7 @@ fn run_broker_owner(
             Arc::clone(&client_senders),
             Arc::clone(&active),
             Arc::clone(&seen_active),
+            Arc::clone(&stopping),
             Arc::clone(&run_log),
         )?;
     }
@@ -2452,6 +2792,25 @@ fn run_broker_owner(
         ));
         let mut idle_deadline: Option<Instant> = None;
         loop {
+            if OWNER_SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+                owner_timings.event("owner.shutdown.requested");
+                let dropped = begin_broker_shutdown(
+                    &stopping,
+                    &client_senders,
+                    &active,
+                    "VM owner is stopping after a final snapshot".to_string(),
+                );
+                while let Ok(request) = checkpoint_rx.try_recv() {
+                    let _ = request.reply.send(Err(
+                        "VM owner is stopping after a final snapshot".to_string()
+                    ));
+                }
+                owner_log.line(format!(
+                    "owner.shutdown.requested owner_run_id={owner_run_id} active_clients={} notified_clients={dropped}",
+                    active.load(Ordering::SeqCst),
+                ));
+                break;
+            }
             match broker_listener.accept() {
                 Ok((client, _)) => {
                     owner_log.line("broker.client.accepted");
@@ -2461,6 +2820,7 @@ fn run_broker_owner(
                     // expire between a client connecting and its first message.
                     let reservation = ActiveReservation::new(Arc::clone(&active));
                     let seen = Arc::clone(&seen_active);
+                    let client_stopping = Arc::clone(&stopping);
                     let checkpoint_tx = checkpoint_tx.clone();
                     let client_log = Arc::clone(&owner_log);
                     let client_ctx = Arc::clone(&ctx);
@@ -2474,6 +2834,7 @@ fn run_broker_owner(
                             clients,
                             reservation,
                             seen,
+                            client_stopping,
                             client_ctx,
                             client_host_home,
                             no_host_shares,
@@ -2644,7 +3005,9 @@ fn run_broker_owner(
                         );
                         let _ = fs::remove_file(&broker_socket);
                         drop(broker_listener);
-                        return;
+                        return Err(anyhow!(
+                            "guest agent disconnected before the final snapshot"
+                        ));
                     }
                     if active.load(Ordering::SeqCst) > 0 {
                         idle_deadline = None;
@@ -2663,12 +3026,32 @@ fn run_broker_owner(
                 Err(_) => break,
             }
         }
+        // Establish the same registration barrier for every loop exit, not
+        // only signal-driven shutdown. This closes the accept/idle race before
+        // the final snapshot begins.
+        let dropped = begin_broker_shutdown(
+            &stopping,
+            &client_senders,
+            &active,
+            "VM owner is stopping after a final snapshot".to_string(),
+        );
+        while let Ok(request) = checkpoint_rx.try_recv() {
+            let _ = request.reply.send(Err(
+                "VM owner is stopping after a final snapshot".to_string()
+            ));
+        }
+        owner_log.line(format!(
+            "broker.shutdown.barrier owner_run_id={owner_run_id} active_clients={} notified_clients={dropped}",
+            active.load(Ordering::SeqCst),
+        ));
         let _ = fs::remove_file(&broker_socket);
         drop(broker_listener);
         if agent_failed_before_snapshot.load(Ordering::SeqCst) {
             owner_timings.event("snapshot.skipped.agent_failed");
             owner_log.line("snapshot.skipped reason=guest_agent_disconnected_before_snapshot");
-            return;
+            return Err(anyhow!(
+                "guest agent disconnected before the final snapshot"
+            ));
         }
         snapshot_started.store(true, Ordering::SeqCst);
         let generation_id = new_lifecycle_id("snapshot");
@@ -2692,7 +3075,7 @@ fn run_broker_owner(
             );
         }
         let _ = agent_tx.send(Message::SnapshotReady);
-        match serve_snapshot(
+        let snapshot_result = serve_snapshot(
             snapshot_listener,
             &ctx,
             &snapshot_path,
@@ -2708,6 +3091,11 @@ fn run_broker_owner(
             &owner_log,
             &owner_run_id,
             &generation_id,
+        );
+        match finish_restore_work_after_final_snapshot(
+            &layout,
+            clear_restore_marker_after_final_snapshot,
+            snapshot_result,
         ) {
             Ok(()) => {
                 owner_log.line(format!(
@@ -2723,11 +3111,24 @@ fn run_broker_owner(
                     );
                 }
                 log_snapshot_summary(&owner_log, "snapshot.latest", &snapshot_path);
+                if clear_restore_marker_after_final_snapshot {
+                    owner_log.line(format!(
+                        "snapshot.work.mark_inactive owner_run_id={owner_run_id} generation_id={generation_id} path={}",
+                        layout
+                            .snapshot_dir
+                            .join(RESTORE_WORK_ACTIVE_MARKER)
+                            .display()
+                    ));
+                }
+                Ok(())
             }
-            Err(e) => owner_log.line(format!(
-                "snapshot.error owner_run_id={} generation_id={} error={e:#}",
-                owner_run_id, generation_id
-            )),
+            Err(e) => {
+                owner_log.line(format!(
+                    "snapshot.error owner_run_id={} generation_id={} error={e:#}",
+                    owner_run_id, generation_id
+                ));
+                Err(e)
+            }
         }
     }))
 }
@@ -2857,6 +3258,9 @@ fn spawn_owner_process(config: &RunConfig, run_log: &RunLog, run_id: &str) -> Re
     if let Some(snapshot) = &config.restore_snapshot {
         command.arg("--restore").arg(snapshot);
     }
+    if config.restore_latest_if_available {
+        command.arg("--restore-latest-if-available");
+    }
     command
         .stdin(Stdio::null())
         .stdout(log.try_clone().context("clone owner log handle")?)
@@ -2947,6 +3351,7 @@ fn run_broker_client_awaiting_owner(
 }
 
 fn acquire_bootstrap_for_owner(
+    layout: &Layout,
     lock_path: &Path,
     broker_socket: &Path,
     run_log: &RunLog,
@@ -2954,7 +3359,7 @@ fn acquire_bootstrap_for_owner(
     let start = Instant::now();
     let mut logged_wait = false;
     loop {
-        if let Some(lock) = BootstrapLock::try_acquire(lock_path)? {
+        if let Some(lock) = try_acquire_validated_bootstrap(layout, lock_path)? {
             run_log.line(format!(
                 "owner.bootstrap.lock.acquired path={}",
                 lock_path.display()
@@ -3033,6 +3438,7 @@ fn handle_broker_client(
     clients: Arc<Mutex<HashMap<u64, BrokerChannel>>>,
     mut active_reservation: ActiveReservation,
     seen_active: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
     ctx: Arc<VmHandle>,
     host_home: PathBuf,
     no_host_shares: bool,
@@ -3060,6 +3466,24 @@ fn handle_broker_client(
         },
     )?;
     let first = read_message(&mut client)?;
+    if stopping.load(Ordering::SeqCst) {
+        let channel_id = match &first {
+            Message::Checkpoint { channel_id, .. }
+            | Message::OpenExec { channel_id, .. }
+            | Message::OpenTcp { channel_id, .. } => Some(*channel_id),
+            _ => None,
+        };
+        if let Some(channel_id) = channel_id {
+            write_message(
+                &mut client,
+                &Message::Error {
+                    channel_id,
+                    message: "VM owner is stopping after a final snapshot".to_string(),
+                },
+            )?;
+        }
+        return Ok(());
+    }
     let first_activity = krun::deterministic_host_activity();
     if let Message::Checkpoint { channel_id, path } = first {
         if let Some(trace) = &trace_log {
@@ -3072,12 +3496,32 @@ fn handle_broker_client(
             );
         }
         let (reply_tx, reply_rx) = mpsc::channel();
-        checkpoint_tx
-            .send(CheckpointRequest {
-                path: PathBuf::from(path),
-                reply: reply_tx,
-            })
-            .context("send checkpoint request to owner")?;
+        let stopping_rejected = {
+            let _clients = clients
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock broker clients"))?;
+            if stopping.load(Ordering::SeqCst) {
+                true
+            } else {
+                checkpoint_tx
+                    .send(CheckpointRequest {
+                        path: PathBuf::from(path),
+                        reply: reply_tx,
+                    })
+                    .context("send checkpoint request to owner")?;
+                false
+            }
+        };
+        if stopping_rejected {
+            write_message(
+                &mut client,
+                &Message::Error {
+                    channel_id,
+                    message: "VM owner is stopping after a final snapshot".to_string(),
+                },
+            )?;
+            return Ok(());
+        }
         match reply_rx.recv().context("receive checkpoint result")? {
             Ok(()) => write_message(&mut client, &Message::CheckpointCreated { channel_id })?,
             Err(message) => write_message(
@@ -3098,44 +3542,49 @@ fn handle_broker_client(
     if let Some(trace) = &trace_log {
         trace_client_open(trace, &first);
     }
-    if !no_host_shares {
-        if let Message::OpenExec { cwd, .. } = &first {
-            replace_home_write_allowlist(ctx.as_ref(), Path::new(cwd), &host_home)?;
-        }
-    }
-    seen_active.store(true, Ordering::SeqCst);
     let (to_client_tx, to_client_rx) = mpsc::channel::<Message>();
-    {
+    let mut first = Some(first);
+    let rejection = {
         let mut clients = clients
             .lock()
             .map_err(|_| anyhow::anyhow!("lock broker clients"))?;
-        if clients.contains_key(&channel_id) {
-            let message = format!(
-                "channel id collision for live channel {channel_id:016x}; deterministic mode cannot run identical commands concurrently"
-            );
+        if stopping.load(Ordering::SeqCst) {
+            Some("VM owner is stopping after a final snapshot".to_string())
+        } else {
+            match clients.entry(channel_id) {
+                Entry::Occupied(_) => Some(format!(
+                    "channel id collision for live channel {channel_id:016x}; deterministic mode cannot run identical commands concurrently"
+                )),
+                Entry::Vacant(entry) => {
+                    if !no_host_shares && let Some(Message::OpenExec { cwd, .. }) = first.as_ref() {
+                        replace_home_write_allowlist(ctx.as_ref(), Path::new(cwd), &host_home)?;
+                    }
+                    seen_active.store(true, Ordering::SeqCst);
+                    entry.insert(BrokerChannel {
+                        tx: to_client_tx,
+                        active_owned_by_reader: true,
+                    });
+                    if let Err(e) = agent_tx.send(first.take().expect("first broker message")) {
+                        clients.remove(&channel_id);
+                        return Err(e).context("send open exec to agent");
+                    }
+                    None
+                }
+            }
+        }
+    };
+    if let Some(message) = rejection {
+        if message.starts_with("channel id collision") {
             run_log.line(format!("broker.client.channel_collision {message}"));
-            write_message(
-                &mut client,
-                &Message::Error {
-                    channel_id,
-                    message,
-                },
-            )?;
-            return Ok(());
         }
-        clients.insert(
-            channel_id,
-            BrokerChannel {
-                tx: to_client_tx,
-                active_owned_by_reader: true,
+        write_message(
+            &mut client,
+            &Message::Error {
+                channel_id,
+                message,
             },
-        );
-    }
-    if let Err(e) = agent_tx.send(first) {
-        if let Ok(mut clients) = clients.lock() {
-            clients.remove(&channel_id);
-        }
-        return Err(e).context("send open exec to agent");
+        )?;
+        return Ok(());
     }
     drop(first_activity);
     active_reservation.disarm();
@@ -3168,7 +3617,16 @@ fn handle_broker_client(
                 if let Some(trace) = &trace_log {
                     trace_client_message(trace, &message);
                 }
-                if let Err(e) = agent_tx.send(message) {
+                let send_result = {
+                    let _clients = clients
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("lock broker clients"))?;
+                    if stopping.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    agent_tx.send(message)
+                };
+                if let Err(e) = send_result {
                     // The agent writer is gone; this channel can never
                     // complete, so release its idle-accounting slot.
                     let owned = clients
@@ -3186,7 +3644,11 @@ fn handle_broker_client(
             Err(_) => {
                 let _activity = krun::deterministic_host_activity();
                 run_log.line(format!("broker.client.read_eof channel={channel_id:016x}"));
-                let _ = agent_tx.send(Message::Eof { channel_id });
+                if let Ok(_clients) = clients.lock() {
+                    if !stopping.load(Ordering::SeqCst) {
+                        let _ = agent_tx.send(Message::Eof { channel_id });
+                    }
+                }
                 return Ok(());
             }
         }
@@ -3373,6 +3835,7 @@ fn start_forward_listener(
     clients: Arc<Mutex<HashMap<u64, BrokerChannel>>>,
     active: Arc<AtomicUsize>,
     seen_active: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
     run_log: Arc<RunLog>,
 ) -> Result<()> {
     let listener = TcpListener::bind((forward.listen_host.as_str(), forward.listen_port))
@@ -3389,6 +3852,9 @@ fn start_forward_listener(
     ));
     thread::spawn(move || {
         loop {
+            if stopping.load(Ordering::SeqCst) {
+                break;
+            }
             match listener.accept() {
                 Ok((stream, peer)) => {
                     let _ = stream.set_nonblocking(false);
@@ -3401,6 +3867,7 @@ fn start_forward_listener(
                     let connection_clients = Arc::clone(&clients);
                     let connection_active = Arc::clone(&active);
                     let connection_seen = Arc::clone(&seen_active);
+                    let connection_stopping = Arc::clone(&stopping);
                     let connection_log = Arc::clone(&run_log);
                     thread::spawn(move || {
                         if let Err(e) = handle_forward_connection(
@@ -3410,6 +3877,7 @@ fn start_forward_listener(
                             connection_clients,
                             connection_active,
                             connection_seen,
+                            connection_stopping,
                             Arc::clone(&connection_log),
                         ) {
                             connection_log.line(format!("forward.connection.error {e:#}"));
@@ -3429,6 +3897,7 @@ fn start_forward_listener(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_forward_connection(
     mut local: TcpStream,
     forward: PortForward,
@@ -3436,51 +3905,75 @@ fn handle_forward_connection(
     clients: Arc<Mutex<HashMap<u64, BrokerChannel>>>,
     active: Arc<AtomicUsize>,
     seen_active: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
     run_log: Arc<RunLog>,
 ) -> Result<()> {
+    if stopping.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     let reservation = ActiveReservation::new(active);
     seen_active.store(true, Ordering::SeqCst);
     let channel_id = new_request_id()?;
     let (to_forward_tx, to_forward_rx) = mpsc::channel::<Message>();
-    clients
-        .lock()
-        .map_err(|_| anyhow::anyhow!("lock broker clients"))?
-        .insert(
+    {
+        let mut clients = clients
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lock broker clients"))?;
+        if stopping.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        clients.insert(
             channel_id,
             BrokerChannel {
                 tx: to_forward_tx,
                 active_owned_by_reader: false,
             },
         );
-    if let Err(e) = agent_tx.send(Message::OpenTcp {
-        channel_id,
-        host: forward.guest_host,
-        port: forward.guest_port,
-    }) {
-        if let Ok(mut clients) = clients.lock() {
+        if let Err(e) = agent_tx.send(Message::OpenTcp {
+            channel_id,
+            host: forward.guest_host,
+            port: forward.guest_port,
+        }) {
             clients.remove(&channel_id);
+            return Err(e).context("send open tcp to agent");
         }
-        return Err(e).context("send open tcp to agent");
     }
 
     let mut local_reader = local.try_clone().context("clone local forward stream")?;
     let input_tx = agent_tx.clone();
+    let input_stopping = Arc::clone(&stopping);
+    let input_clients = Arc::clone(&clients);
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
         loop {
+            if input_stopping.load(Ordering::SeqCst) {
+                break;
+            }
             match local_reader.read(&mut buf) {
                 Ok(0) => {
-                    let _ = input_tx.send(Message::Eof { channel_id });
+                    if let Ok(clients) = input_clients.lock() {
+                        if !input_stopping.load(Ordering::SeqCst)
+                            && clients.contains_key(&channel_id)
+                        {
+                            let _ = input_tx.send(Message::Eof { channel_id });
+                        }
+                    }
                     break;
                 }
                 Ok(n) => {
-                    if input_tx
-                        .send(Message::Data {
-                            channel_id,
-                            bytes: buf[..n].to_vec(),
-                        })
-                        .is_err()
-                    {
+                    let sent = if let Ok(clients) = input_clients.lock() {
+                        !input_stopping.load(Ordering::SeqCst)
+                            && clients.contains_key(&channel_id)
+                            && input_tx
+                                .send(Message::Data {
+                                    channel_id,
+                                    bytes: buf[..n].to_vec(),
+                                })
+                                .is_ok()
+                    } else {
+                        false
+                    };
+                    if !sent {
                         break;
                     }
                 }
@@ -3489,7 +3982,13 @@ fn handle_forward_connection(
                     thread::sleep(Duration::from_millis(1));
                 }
                 Err(_) => {
-                    let _ = input_tx.send(Message::Close { channel_id });
+                    if let Ok(clients) = input_clients.lock() {
+                        if !input_stopping.load(Ordering::SeqCst)
+                            && clients.contains_key(&channel_id)
+                        {
+                            let _ = input_tx.send(Message::Close { channel_id });
+                        }
+                    }
                     break;
                 }
             }
@@ -3522,8 +4021,10 @@ fn handle_forward_connection(
     }
     if let Ok(mut clients) = clients.lock() {
         clients.remove(&channel_id);
+        if !stopping.load(Ordering::SeqCst) {
+            let _ = agent_tx.send(Message::Close { channel_id });
+        }
     }
-    let _ = agent_tx.send(Message::Close { channel_id });
     thread::sleep(Duration::from_secs(60));
     drop(reservation);
     Ok(())
@@ -4111,15 +4612,7 @@ fn seed_incremental_snapshot(
     remove_path_if_exists(snapshot_path)?;
     fs::create_dir_all(snapshot_path)
         .with_context(|| format!("create {}", snapshot_path.display()))?;
-    for name in [
-        "pages.img",
-        "vmstate.bin",
-        "rootfs.ext4",
-        "initramfs.stamp",
-        LAUNCH_METADATA,
-        "deterministic.stamp",
-        DETERMINISTIC_CLOCK_STATE,
-    ] {
+    for name in SNAPSHOT_RESTORE_FILES {
         let src = base.join(name);
         if src.exists() {
             clone_or_copy_file(&src, &snapshot_path.join(name))?;

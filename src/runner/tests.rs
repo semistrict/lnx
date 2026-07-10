@@ -234,6 +234,159 @@ fn snapshot_runtime_cleanup_removes_only_fixed_work_and_publish_dirs() {
 }
 
 #[test]
+fn snapshot_runtime_cleanup_preserves_active_restore_work() {
+    let temp = TempDir::new("snapshot-active-restore-work");
+    let layout = temp_layout(&temp, "default");
+    let work = layout.snapshot_dir.join(RESTORE_WORK_SNAPSHOT);
+    fs::create_dir_all(&work).expect("create restore work");
+    fs::write(work.join("rootfs.ext4"), b"recoverable state").expect("write recovery rootfs");
+    mark_restore_work_active(&layout, "snapshot-recovery").expect("mark restore work active");
+    let run_log = RunLog::open(&layout).expect("run log");
+
+    let error = cleanup_snapshot_runtime_state(&layout, &run_log)
+        .expect_err("active restore work must not be removed");
+
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to delete recoverable state")
+    );
+    assert!(error.to_string().contains("snapshots clear"));
+    assert_eq!(
+        fs::read(work.join("rootfs.ext4")).expect("read preserved recovery rootfs"),
+        b"recoverable state"
+    );
+    assert!(
+        layout
+            .snapshot_dir
+            .join(RESTORE_WORK_ACTIVE_MARKER)
+            .exists()
+    );
+}
+
+#[test]
+fn clearing_active_marker_allows_restore_work_cleanup() {
+    let temp = TempDir::new("snapshot-cleared-restore-work");
+    let layout = temp_layout(&temp, "default");
+    let work = layout.snapshot_dir.join(RESTORE_WORK_SNAPSHOT);
+    fs::create_dir_all(&work).expect("create restore work");
+    mark_restore_work_active(&layout, "snapshot-recovery").expect("mark restore work active");
+    clear_restore_work_active(&layout).expect("clear restore work marker");
+    let run_log = RunLog::open(&layout).expect("run log");
+
+    cleanup_snapshot_runtime_state(&layout, &run_log).expect("clean inactive restore work");
+
+    assert!(!work.exists());
+}
+
+#[test]
+fn failed_final_snapshot_keeps_restore_work_marked_active() {
+    let temp = TempDir::new("snapshot-failed-final-marker");
+    let layout = temp_layout(&temp, "default");
+    let work = layout.snapshot_dir.join(RESTORE_WORK_SNAPSHOT);
+    fs::create_dir_all(&work).expect("create restore work");
+    mark_restore_work_active(&layout, "snapshot-recovery").expect("mark restore work active");
+
+    let error =
+        finish_restore_work_after_final_snapshot(&layout, true, Err(anyhow!("snapshot failed")))
+            .expect_err("failed snapshot must remain recoverable");
+
+    assert!(error.to_string().contains("snapshot failed"));
+    assert!(restore_work_is_active(&layout));
+}
+
+#[test]
+fn successful_final_snapshot_clears_restore_work_marker() {
+    let temp = TempDir::new("snapshot-successful-final-marker");
+    let layout = temp_layout(&temp, "default");
+    let work = layout.snapshot_dir.join(RESTORE_WORK_SNAPSHOT);
+    fs::create_dir_all(&work).expect("create restore work");
+    mark_restore_work_active(&layout, "snapshot-recovery").expect("mark restore work active");
+
+    finish_restore_work_after_final_snapshot(&layout, true, Ok(()))
+        .expect("successful snapshot clears marker");
+
+    assert!(!restore_work_is_active(&layout));
+    assert!(work.exists(), "work cleanup remains a later bounded step");
+}
+
+#[test]
+fn final_snapshot_outcome_round_trips_success_and_failure() {
+    let temp = TempDir::new("final-snapshot-outcome");
+    let layout = temp_layout(&temp, "default");
+    fs::create_dir_all(&layout.run_dir).expect("create run dir");
+
+    write_final_snapshot_outcome(&layout, &Ok(())).expect("write successful outcome");
+    let success = read_final_snapshot_outcome(&layout)
+        .expect("read successful outcome")
+        .expect("successful outcome");
+    assert_eq!(success.pid, std::process::id());
+    assert!(!success.pending);
+    assert!(success.succeeded);
+    assert_eq!(success.error, None);
+
+    write_final_snapshot_pending(&layout).expect("write pending outcome");
+    let pending = read_final_snapshot_outcome(&layout)
+        .expect("read pending outcome")
+        .expect("pending outcome");
+    assert!(pending.pending);
+    assert!(!pending.succeeded);
+
+    write_final_snapshot_outcome(&layout, &Err(anyhow!("snapshot exploded")))
+        .expect("write failed outcome");
+    let failure = read_final_snapshot_outcome(&layout)
+        .expect("read failed outcome")
+        .expect("failed outcome");
+    assert!(!failure.pending);
+    assert!(!failure.succeeded);
+    assert_eq!(failure.error.as_deref(), Some("snapshot_exploded"));
+
+    clear_final_snapshot_outcome(&layout).expect("clear outcome");
+    assert_eq!(
+        read_final_snapshot_outcome(&layout).expect("read cleared outcome"),
+        None
+    );
+}
+
+#[test]
+fn failed_or_pending_final_snapshot_outcome_blocks_the_next_start() {
+    let temp = TempDir::new("final-snapshot-outcome-blocks-start");
+    let layout = temp_layout(&temp, "default");
+    fs::create_dir_all(&layout.run_dir).expect("create run dir");
+
+    write_final_snapshot_outcome(&layout, &Err(anyhow!("snapshot failed")))
+        .expect("write failed outcome");
+    let failed = validate_restore_work_for_command(&layout)
+        .expect_err("failed outcome must block the next start");
+    assert!(failed.to_string().contains("final snapshot failed"));
+    assert!(failed.to_string().contains("snapshots clear"));
+
+    write_final_snapshot_pending(&layout).expect("write pending outcome");
+    let pending = validate_restore_work_for_command(&layout)
+        .expect_err("pending outcome must block the next start");
+    assert!(pending.to_string().contains("did not finish reporting"));
+    assert!(pending.to_string().contains("snapshots clear"));
+}
+
+#[test]
+fn final_snapshot_failure_survives_split_run_directory_recreation() {
+    let temp = TempDir::new("final-snapshot-outcome-split-run-dir");
+    let mut layout = temp_layout(&temp, "default");
+    layout.run_dir = temp.path().join("ephemeral-run/default");
+    fs::create_dir_all(&layout.run_dir).expect("create split run dir");
+
+    write_final_snapshot_outcome(&layout, &Err(anyhow!("snapshot failed")))
+        .expect("write persistent failed outcome");
+    fs::remove_dir_all(&layout.run_dir).expect("clear ephemeral run dir");
+    fs::create_dir_all(&layout.run_dir).expect("recreate split run dir");
+
+    let error = validate_restore_work_for_command(&layout)
+        .expect_err("persistent failed outcome blocks after run-dir loss");
+    assert!(error.to_string().contains("final snapshot failed"));
+    assert!(layout.snapshot_dir.join(FINAL_SNAPSHOT_OUTCOME).exists());
+}
+
+#[test]
 fn restore_snapshot_rootfs_newer_than_memory_is_rejected() {
     let temp = TempDir::new("restore-rootfs-stale");
     let layout = temp_layout(&temp, "default");
@@ -364,18 +517,88 @@ fn agent_reader_failure_notifies_waiting_clients() {
 }
 
 #[test]
+fn broker_shutdown_closes_registration_gate_before_draining_clients() {
+    let clients = Mutex::new(HashMap::new());
+    let active = AtomicUsize::new(1);
+    let stopping = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel();
+    let channel_id = 0x1234_u64;
+    clients.lock().unwrap().insert(
+        channel_id,
+        BrokerChannel {
+            tx,
+            active_owned_by_reader: true,
+        },
+    );
+
+    let dropped = begin_broker_shutdown(
+        &stopping,
+        &clients,
+        &active,
+        "VM owner is stopping after a final snapshot".to_string(),
+    );
+
+    assert!(stopping.load(Ordering::SeqCst));
+    assert_eq!(dropped, 1);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert!(clients.lock().unwrap().is_empty());
+    assert!(matches!(
+        rx.recv().expect("shutdown error"),
+        Message::Error { channel_id: id, .. } if id == channel_id
+    ));
+}
+
+#[test]
 fn fresh_owner_slot_removes_stale_bootstrap_lock() {
     let temp = TempDir::new("fresh-owner-stale-lock");
     let layout = temp_layout(&temp, "vm");
     fs::create_dir_all(&layout.run_dir).expect("create run dir");
     let lock = layout.run_dir.join("bootstrap.lock.d");
     fs::create_dir(&lock).expect("create lock");
-    fs::write(lock.join("owner.pid"), "999999").expect("write stale pid");
+    let mut exited = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("spawn short-lived owner");
+    let stale_pid = exited.id();
+    exited.wait().expect("reap short-lived owner");
+    fs::write(lock.join("owner.pid"), stale_pid.to_string()).expect("write stale pid");
+    acknowledge_final_snapshot_outcome(&layout, stale_pid)
+        .expect("acknowledge stale owner outcome");
     let run_log = RunLog::open(&layout).expect("open run log");
 
-    wait_for_fresh_owner_slot(&layout, &run_log).expect("stale lock should be removed");
+    wait_for_fresh_owner_slot(&layout, &run_log).expect("stale lock should be validated");
 
-    assert!(!lock.exists());
+    assert!(lock.exists(), "validation does not create an unowned gap");
+    let replacement = try_acquire_validated_bootstrap(&layout, &lock)
+        .expect("replace stale lock atomically")
+        .expect("replacement lock");
+    assert_eq!(owner_pid_from_lock(&lock), Some(std::process::id() as i32));
+    drop(replacement);
+}
+
+#[test]
+fn validated_bootstrap_reclaims_a_dead_maintenance_lease() {
+    let temp = TempDir::new("fresh-owner-stale-maintenance");
+    let layout = temp_layout(&temp, "vm");
+    fs::create_dir_all(&layout.run_dir).expect("create run dir");
+    let lock = layout.run_dir.join("bootstrap.lock.d");
+    fs::create_dir(&lock).expect("create lock");
+    let mut exited = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("spawn short-lived maintenance process");
+    let stale_pid = exited.id();
+    exited.wait().expect("reap maintenance process");
+    fs::write(lock.join("maintenance.pid"), stale_pid.to_string())
+        .expect("write stale maintenance pid");
+
+    let replacement = try_acquire_validated_bootstrap(&layout, &lock)
+        .expect("reclaim dead maintenance lease")
+        .expect("replacement owner lease");
+
+    assert_eq!(owner_pid_from_lock(&lock), Some(std::process::id() as i32));
+    assert!(!lock.join("maintenance.pid").exists());
+    drop(replacement);
 }
 
 #[test]
@@ -383,22 +606,47 @@ fn fresh_owner_slot_replace_stops_recorded_owner() {
     let temp = TempDir::new("fresh-owner-replace");
     let layout = temp_layout(&temp, "vm");
     fs::create_dir_all(&layout.run_dir).expect("create run dir");
+    fs::create_dir_all(&layout.snapshot_dir).expect("create snapshot dir");
     let lock = layout.run_dir.join("bootstrap.lock.d");
+    let ready = layout.run_dir.join("owner-ready");
     fs::create_dir(&lock).expect("create lock");
     let mut child = Command::new("/bin/sh")
         .arg("-c")
-        .arg("trap 'exit 0' TERM; while :; do sleep 1; done")
+        .arg(
+            "trap 'printf \"version=1\\npid=%s\\nstatus=success\\n\" \"$$\" > \"$OUTCOME\"; rm -rf \"$LOCK\"; rm -f \"$BROKER\"; exit 0' TERM; : > \"$READY\"; while :; do sleep 1; done",
+        )
+        .env(
+            "OUTCOME",
+            layout.snapshot_dir.join(FINAL_SNAPSHOT_OUTCOME),
+        )
+        .env("LOCK", &lock)
+        .env("BROKER", layout.run_dir.join("broker.sock"))
+        .env("READY", &ready)
         .process_group(0)
         .spawn()
         .expect("spawn child owner");
-    fs::write(lock.join("owner.pid"), child.id().to_string()).expect("write owner pid");
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() && Instant::now() < ready_deadline {
+        if let Some(status) = child.try_wait().expect("poll child owner readiness") {
+            panic!("child owner exited before becoming ready: {status}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !ready.exists() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("child owner did not install its signal handler within 5 seconds");
+    }
+    let child_pid = child.id();
+    fs::write(lock.join("owner.pid"), child_pid.to_string()).expect("write owner pid");
     fs::write(layout.run_dir.join("broker.sock"), "").expect("write broker socket placeholder");
     let run_log = RunLog::open(&layout).expect("open run log");
+    let reaper = thread::spawn(move || child.wait().expect("wait for child owner"));
 
     prepare_fresh_owner_slot(&layout, true, &run_log).expect("replace owner");
 
-    let _ = child.wait();
-    assert!(!process_alive(child.id() as libc::pid_t));
+    let _ = reaper.join().expect("join owner reaper");
+    assert!(!process_alive(child_pid as libc::pid_t));
     assert!(!lock.exists());
     assert!(!layout.run_dir.join("broker.sock").exists());
 }
@@ -431,6 +679,41 @@ fn bootstrap_lock_live_lock_is_not_reclaimed() {
     assert!(lock.is_none());
     let owner_pid = fs::read_to_string(lock_path.join("owner.pid")).expect("read owner pid");
     assert_eq!(owner_pid, live_pid);
+}
+
+#[test]
+fn stale_lock_removal_rechecks_after_lease_replacement() {
+    let temp = TempDir::new("bootstrap-lock-stale-removal-aba");
+    let lock_path = temp.path().join("bootstrap.lock.d");
+    fs::create_dir(&lock_path).expect("create lock dir");
+    fs::write(lock_path.join("owner.pid"), "0").expect("write stale owner pid");
+
+    let guard_path = temp.path().join("bootstrap.lock.d.guard");
+    let guard = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&guard_path)
+        .expect("open stale-lock guard");
+    lock_file(&guard).expect("lock stale-lock guard");
+
+    let remover_path = lock_path.clone();
+    let remover = thread::spawn(move || {
+        remove_stale_lock_dir(&remover_path, bootstrap_lock_is_stale)
+            .expect("guarded stale removal")
+    });
+
+    fs::remove_dir_all(&lock_path).expect("remove observed stale lease");
+    fs::create_dir(&lock_path).expect("create replacement lease");
+    fs::write(lock_path.join("owner.pid"), std::process::id().to_string())
+        .expect("write fresh owner pid");
+    unlock_file(&guard).expect("unlock stale-lock guard");
+
+    assert!(!remover.join().expect("join stale remover"));
+    assert_eq!(
+        fs::read_to_string(lock_path.join("owner.pid")).expect("read replacement owner pid"),
+        std::process::id().to_string()
+    );
 }
 
 #[test]
@@ -751,13 +1034,48 @@ fn default_restore_version_matching_reads_launch_metadata() {
     assert!(default_restore_version_matches(temp.path()).expect("current version matches"));
 
     // A version-1 snapshot may carry the nix package-store virtiofs device
-    // and must cold-boot instead of restoring.
+    // and must be rejected instead of restoring implicitly.
     let legacy = serde_json::to_string(&current)
         .expect("encode launch metadata")
         .replace("\"version\":2", "\"version\":1");
     assert!(legacy.contains("\"version\":1"));
     fs::write(temp.path().join(LAUNCH_METADATA), legacy).expect("write legacy launch metadata");
     assert!(!default_restore_version_matches(temp.path()).expect("legacy version mismatches"));
+}
+
+#[test]
+fn default_restore_refresh_replaces_a_pre_lock_snapshot_observation() {
+    let temp = TempDir::new("default-restore-refresh");
+    let layout = temp_layout(&temp, "vm");
+    let stale = layout.checkpoint_dir.join("stale");
+    let latest = layout.snapshot_dir.join("latest");
+    write_snapshot_state_files(&stale);
+    write_snapshot_state_files(&latest);
+    let mut config = RunConfig {
+        layout: layout.clone(),
+        command: vec!["true".to_string()],
+        cwd: temp.path().to_path_buf(),
+        cpus: 2,
+        memory_mib: 4096,
+        nested_kvm: false,
+        restore_snapshot: Some(stale),
+        restore_latest_if_available: true,
+        forwards: Vec::new(),
+        snapshot_output: Some(layout.checkpoint_dir.join("output")),
+        run_as_root: false,
+        no_host_shares: true,
+        vhost_user_fs: Vec::new(),
+        reuse_owner: true,
+        deterministic: None,
+        trace_events: false,
+    };
+
+    refresh_default_restore_snapshot(&mut config).expect("refresh latest snapshot");
+    assert_eq!(config.restore_snapshot.as_deref(), Some(latest.as_path()));
+
+    fs::remove_dir_all(&latest).expect("remove latest snapshot");
+    refresh_default_restore_snapshot(&mut config).expect("refresh missing latest snapshot");
+    assert!(config.restore_snapshot.is_none());
 }
 
 #[test]
@@ -1196,18 +1514,61 @@ fn initramfs_stamp_key_prefers_source_but_keeps_sha256_compatibility() {
 }
 
 #[test]
-fn snapshot_initramfs_compatibility_requires_matching_source_stamp() {
+fn snapshot_initramfs_mismatch_is_a_hard_actionable_error() {
     let temp = TempDir::new("snapshot-initramfs-compatibility");
-    let snapshot = temp.path().join("snapshot");
-    fs::create_dir(&snapshot).expect("create snapshot");
+    let layout = temp_layout(&temp, "initramfs-test");
+    let snapshot = layout.snapshot_dir.join("latest");
+    fs::create_dir_all(&snapshot).expect("create snapshot");
     let current = temp.path().join("initramfs.stamp");
 
     fs::write(snapshot.join("initramfs.stamp"), "source=old\n").expect("write snapshot stamp");
     fs::write(&current, "source=new\n").expect("write current stamp");
     assert!(!snapshot_initramfs_is_compatible(&snapshot, &current));
+    let error = validate_snapshot_initramfs_compatibility(&snapshot, &current, &layout)
+        .expect_err("reject incompatible initramfs");
+    let message = error.to_string();
+    assert!(message.contains("snapshot initramfs is incompatible"));
+    assert!(message.contains("lnx --instance initramfs-test snapshots clear"));
+    assert!(snapshot.exists(), "rejected snapshot must remain intact");
 
     fs::write(&current, "source=old\n").expect("write matching current stamp");
     assert!(snapshot_initramfs_is_compatible(&snapshot, &current));
+    validate_snapshot_initramfs_compatibility(&snapshot, &current, &layout)
+        .expect("accept compatible initramfs");
+}
+
+#[test]
+fn explicit_snapshot_mismatch_does_not_advise_clearing_latest() {
+    let temp = TempDir::new("explicit-snapshot-initramfs-compatibility");
+    let layout = temp_layout(&temp, "initramfs-test");
+    let snapshot = temp.path().join("explicit-snapshot");
+    fs::create_dir(&snapshot).expect("create snapshot");
+    let current = temp.path().join("initramfs.stamp");
+    fs::write(snapshot.join("initramfs.stamp"), "source=old\n").expect("write snapshot stamp");
+    fs::write(&current, "source=new\n").expect("write current stamp");
+
+    let error = validate_snapshot_initramfs_compatibility(&snapshot, &current, &layout)
+        .expect_err("reject incompatible explicit snapshot");
+
+    assert!(error.to_string().contains("provide a compatible snapshot"));
+    assert!(error.to_string().contains("snapshots clear"));
+    assert!(error.to_string().contains("retry without --snapshot"));
+}
+
+#[test]
+fn snapshot_recovery_guidance_recognizes_symlink_to_latest() {
+    let temp = TempDir::new("snapshot-guidance-symlink");
+    let layout = temp_layout(&temp, "guidance-test");
+    let latest = layout.snapshot_dir.join("latest");
+    fs::create_dir_all(&latest).expect("create latest");
+    let alias = temp.path().join("latest-alias");
+    std::os::unix::fs::symlink(&latest, &alias).expect("symlink latest");
+
+    let guidance = snapshot_restore_recovery_guidance(&layout, &alias);
+
+    assert!(paths_refer_to_same_snapshot(&alias, &latest));
+    assert!(guidance.contains("lnx --instance guidance-test snapshots clear"));
+    assert!(!guidance.contains("retry without --snapshot"));
 }
 
 #[test]

@@ -42,7 +42,7 @@ pub(crate) struct LaunchHostShareCache {
 // A restored snapshot keeps its snapshot-time virtiofs devices and guest
 // mounts, so the device topology is part of snapshot compatibility. Version 2
 // dropped the nix package-store mount; version-1 snapshots carry its virtiofs
-// device and must cold-boot.
+// device and must not be restored implicitly.
 pub(crate) const LAUNCH_METADATA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

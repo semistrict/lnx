@@ -49,6 +49,7 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
                 .with_context(|| format!("clonefile {} to {}", src.display(), dst.display()));
         }
         if cloned_destination_is_sparse_safe(dst, len)? {
+            preserve_file_metadata(&metadata, dst)?;
             return Ok(());
         }
         fs::remove_file(dst).with_context(|| format!("remove dense clone {}", dst.display()))?;
@@ -76,9 +77,12 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
                 .with_context(|| format!("remove partial clone {}", dst.display()))?;
             copy_without_dense_large_image(src, dst, len)
                 .with_context(|| format!("sparse-copy {} to {}", src.display(), dst.display()))?;
+            preserve_file_metadata(&metadata, dst)?;
             return Ok(());
         }
         if cloned_file_is_sparse_safe(&dst_file, len)? {
+            drop(dst_file);
+            preserve_file_metadata(&metadata, dst)?;
             return Ok(());
         }
         drop(dst_file);
@@ -88,6 +92,25 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     anyhow::bail!("file clone is unsupported on this platform")
+}
+
+fn preserve_file_metadata(metadata: &fs::Metadata, dst: &Path) -> Result<()> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .open(dst)
+        .with_context(|| format!("open cloned file {} for timestamp restore", dst.display()))?;
+    let mut times = fs::FileTimes::new();
+    if let Ok(accessed) = metadata.accessed() {
+        times = times.set_accessed(accessed);
+    }
+    if let Ok(modified) = metadata.modified() {
+        times = times.set_modified(modified);
+    }
+    file.set_times(times)
+        .with_context(|| format!("restore timestamps on {}", dst.display()))?;
+    drop(file);
+    fs::set_permissions(dst, metadata.permissions())
+        .with_context(|| format!("restore permissions on {}", dst.display()))
 }
 
 #[cfg(target_os = "linux")]
