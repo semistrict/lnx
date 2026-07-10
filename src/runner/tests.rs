@@ -608,11 +608,12 @@ fn fresh_owner_slot_replace_stops_recorded_owner() {
     fs::create_dir_all(&layout.run_dir).expect("create run dir");
     fs::create_dir_all(&layout.snapshot_dir).expect("create snapshot dir");
     let lock = layout.run_dir.join("bootstrap.lock.d");
+    let ready = layout.run_dir.join("owner-ready");
     fs::create_dir(&lock).expect("create lock");
     let mut child = Command::new("/bin/sh")
         .arg("-c")
         .arg(
-            "trap 'printf \"version=1\\npid=%s\\nstatus=success\\n\" \"$$\" > \"$OUTCOME\"; rm -rf \"$LOCK\"; rm -f \"$BROKER\"; exit 0' TERM; while :; do sleep 1; done",
+            "trap 'printf \"version=1\\npid=%s\\nstatus=success\\n\" \"$$\" > \"$OUTCOME\"; rm -rf \"$LOCK\"; rm -f \"$BROKER\"; exit 0' TERM; : > \"$READY\"; while :; do sleep 1; done",
         )
         .env(
             "OUTCOME",
@@ -620,9 +621,22 @@ fn fresh_owner_slot_replace_stops_recorded_owner() {
         )
         .env("LOCK", &lock)
         .env("BROKER", layout.run_dir.join("broker.sock"))
+        .env("READY", &ready)
         .process_group(0)
         .spawn()
         .expect("spawn child owner");
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() && Instant::now() < ready_deadline {
+        if let Some(status) = child.try_wait().expect("poll child owner readiness") {
+            panic!("child owner exited before becoming ready: {status}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !ready.exists() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("child owner did not install its signal handler within 5 seconds");
+    }
     let child_pid = child.id();
     fs::write(lock.join("owner.pid"), child_pid.to_string()).expect("write owner pid");
     fs::write(layout.run_dir.join("broker.sock"), "").expect("write broker socket placeholder");
