@@ -14,6 +14,7 @@ mod runner;
 mod server;
 mod sparse_copy;
 mod status;
+mod store;
 
 use anyhow::Result;
 use clap::Parser;
