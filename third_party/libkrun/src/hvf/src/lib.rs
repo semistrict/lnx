@@ -166,7 +166,9 @@ pub enum Error {
     VcpuReadSystemRegister,
     VcpuRequestExit,
     VcpuRun,
-    VcpuSetPendingIrq,
+    VcpuSetPendingIrq(hv_return_t),
+    VcpuUnexpectedExit(u32),
+    VtimerExitWithInKernelGic,
     VcpuSetRegister,
     VcpuSetSystemRegister(u16, u64),
     VcpuSetVtimerMask,
@@ -194,7 +196,19 @@ impl Display for Error {
             VcpuReadSystemRegister => write!(f, "Error reading HVF vCPU system register"),
             VcpuRequestExit => write!(f, "Error requesting HVF vCPU exit"),
             VcpuRun => write!(f, "Error running HVF vCPU"),
-            VcpuSetPendingIrq => write!(f, "Error setting HVF vCPU pending irq"),
+            VcpuSetPendingIrq(ret) => {
+                write!(
+                    f,
+                    "Error setting HVF vCPU pending irq (hv_return_t {ret:#x})"
+                )
+            }
+            VcpuUnexpectedExit(reason) => {
+                write!(f, "HVF vCPU returned unexpected exit reason {reason:#x}")
+            }
+            VtimerExitWithInKernelGic => write!(
+                f,
+                "HVF reported a vtimer exit although its in-kernel GIC owns vtimer delivery"
+            ),
             VcpuSetRegister => write!(f, "Error setting HVF vCPU register"),
             VcpuSetSystemRegister(reg, val) => write!(
                 f,
@@ -209,6 +223,21 @@ impl Display for Error {
 pub enum InterruptType {
     Irq,
     Fiq,
+}
+
+/// Which interrupt controller delivers interrupts to a vCPU. Fixed when the VM
+/// is built, so every vCPU of a VM agrees on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterruptController {
+    /// libkrun's userspace GICv3 emulation. The VMM queues IRQs in its
+    /// [`Vcpus`] list and injects them with `hv_vcpu_set_pending_interrupt`
+    /// before each run; vtimer expiry and WFI/WFE exit to the VMM.
+    Userspace,
+    /// Hypervisor.framework's in-kernel GIC (`hv_gic_create`). HVF delivers
+    /// the vtimer and device interrupts itself, and
+    /// `hv_vcpu_set_pending_interrupt` is unsupported (macOS 27 returns
+    /// `HV_UNSUPPORTED`). The VMM must never queue or inject IRQs.
+    InKernel,
 }
 
 pub trait Vcpus: Send + Sync {
@@ -245,7 +274,7 @@ pub fn vcpu_set_pending_irq(
     let ret = unsafe { hv_vcpu_set_pending_interrupt(vcpuid, _type, pending) };
 
     if ret != HV_SUCCESS {
-        Err(Error::VcpuSetPendingIrq)
+        Err(Error::VcpuSetPendingIrq(ret))
     } else {
         Ok(())
     }
@@ -651,6 +680,8 @@ pub enum VcpuExit<'a> {
     SystemRegister,
     VtimerActivated,
     WaitForEvent,
+    /// WFI/WFE trapped under the in-kernel GIC and completed immediately.
+    WaitForEventCompleted,
     WaitForEventExpired,
     WaitForEventTimeout(Duration),
 }
@@ -742,10 +773,15 @@ pub struct HvfVcpu<'a> {
     pending_advance_pc: bool,
     vtimer_masked: bool,
     nested_enabled: bool,
+    interrupt_controller: InterruptController,
 }
 
 impl HvfVcpu<'_> {
-    pub fn new(mpidr: u64, nested_enabled: bool) -> Result<Self, Error> {
+    pub fn new(
+        mpidr: u64,
+        nested_enabled: bool,
+        interrupt_controller: InterruptController,
+    ) -> Result<Self, Error> {
         let mut vcpuid: hv_vcpu_t = 0;
         let mut vcpu_exit_ptr: *mut hv_vcpu_exit_t = std::ptr::null_mut();
 
@@ -789,6 +825,7 @@ impl HvfVcpu<'_> {
             pending_advance_pc: false,
             vtimer_masked: false,
             nested_enabled,
+            interrupt_controller,
         })
     }
 
@@ -1001,23 +1038,6 @@ impl HvfVcpu<'_> {
         }
     }
 
-    pub fn vtimer_wait_duration(&self) -> Option<Duration> {
-        let ctl = self
-            .read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0)
-            .ok()?;
-        if (ctl & TMR_CTL_ENABLE) == 0 || (ctl & TMR_CTL_IMASK) != 0 {
-            return None;
-        }
-
-        let cval = self
-            .read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0)
-            .ok()?;
-        let mut offset: u64 = 0;
-        unsafe { hv_vcpu_get_vtimer_offset(self.vcpuid, &mut offset as *mut _) };
-        let guest_now = cntvct_el0().wrapping_sub(offset);
-        Some(vtimer_duration(cval, guest_now, self.cntfrq))
-    }
-
     fn jump_vtimer_to_guest_counter(&self, guest_counter: u64) -> Result<(), Error> {
         let offset = vtimer_offset_for_guest_counter(cntvct_el0(), guest_counter);
         let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, offset) };
@@ -1156,7 +1176,10 @@ impl HvfVcpu<'_> {
     }
 
     pub fn run(&mut self, vcpu_list: Arc<dyn Vcpus>) -> Result<VcpuExit<'_>, Error> {
-        let pending_irq = vcpu_list.has_pending_irq(self.vcpuid);
+        let pending_irq = match self.interrupt_controller {
+            InterruptController::Userspace => vcpu_list.has_pending_irq(self.vcpuid),
+            InterruptController::InKernel => false,
+        };
 
         self.complete_pending_emulation()?;
 
@@ -1173,18 +1196,22 @@ impl HvfVcpu<'_> {
         match self.vcpu_exit.reason {
             HV_EXIT_REASON_EXCEPTION => { /* This is the main one, handle below. */ }
             HV_EXIT_REASON_VTIMER_ACTIVATED => {
+                // The in-kernel GIC delivers the vtimer itself; queueing it
+                // for userspace injection would fail on the next run.
+                if self.interrupt_controller == InterruptController::InKernel {
+                    return Err(Error::VtimerExitWithInKernelGic);
+                }
                 self.vtimer_masked = true;
                 return Ok(VcpuExit::VtimerActivated);
             }
             HV_EXIT_REASON_CANCELED => return Ok(VcpuExit::Canceled),
-            _ => {
-                let pc = self.read_reg(hv_reg_t_HV_REG_PC)?;
-                panic!(
-                    "unexpected exit reason: vcpuid={} 0x{:x} at pc=0x{:x}",
-                    self.id(),
-                    self.vcpu_exit.reason,
-                    pc
+            reason => {
+                let pc = self.read_reg(hv_reg_t_HV_REG_PC).unwrap_or(0);
+                error!(
+                    "unexpected exit reason: vcpuid={} 0x{reason:x} at pc=0x{pc:x}",
+                    self.id()
                 );
+                return Err(Error::VcpuUnexpectedExit(reason));
             }
         }
 
@@ -1294,9 +1321,15 @@ impl HvfVcpu<'_> {
                 }
             }
             EC_WFX_TRAP => {
-                let ctl = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0)?;
-
                 self.pending_advance_pc = true;
+                if self.interrupt_controller == InterruptController::InKernel {
+                    // Wake-ups belong to HVF's GIC, so libkrun cannot park
+                    // this vCPU or queue a vtimer IRQ for it. Completing the
+                    // WFI/WFE immediately is architecturally permitted.
+                    return Ok(VcpuExit::WaitForEventCompleted);
+                }
+
+                let ctl = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0)?;
                 if ((ctl & 1) == 0) || (ctl & 2) != 0 {
                     return Ok(VcpuExit::WaitForEvent);
                 }

@@ -1047,18 +1047,22 @@ pub fn build_microvm(
 
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     {
-        intc = {
-            // If the system supports the in-kernel GIC, use it. Otherwise, fall back to the
-            // userspace implementation.
-            let gic = match HvfGicV3::new(
-                vm_resources.vm_config().vcpu_count.unwrap() as u64,
-                vcpu_list.clone(),
-            ) {
-                Ok(hvfgic) => IrqChipDevice::new(Box::new(hvfgic)),
-                Err(_) => IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone()))),
-            };
-            Arc::new(Mutex::new(gic))
+        // If the system supports the in-kernel GIC, use it. Otherwise, fall back to the
+        // userspace implementation.
+        let (gic, interrupt_controller) = match HvfGicV3::new(
+            vm_resources.vm_config().vcpu_count.unwrap() as u64,
+            vcpu_list.clone(),
+        ) {
+            Ok(hvfgic) => (
+                IrqChipDevice::new(Box::new(hvfgic)),
+                hvf::InterruptController::InKernel,
+            ),
+            Err(_) => (
+                IrqChipDevice::new(Box::new(GicV3::new(vcpu_list.clone()))),
+                hvf::InterruptController::Userspace,
+            ),
         };
+        intc = Arc::new(Mutex::new(gic));
 
         vcpus = create_vcpus_aarch64(
             &vm,
@@ -1068,6 +1072,7 @@ pub fn build_microvm(
             &exit_evt,
             vcpu_list.clone(),
             vm_resources.nested_enabled,
+            interrupt_controller,
         )
         .map_err(StartMicrovmError::Internal)?;
         crate::timing_event("build_microvm.vcpus.created");
@@ -2396,6 +2401,7 @@ fn create_vcpus_aarch64(
     exit_evt: &EventFd,
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+    interrupt_controller: hvf::InterruptController,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
     let mut boot_senders: HashMap<u64, Sender<u64>> = HashMap::new();
@@ -2415,6 +2421,7 @@ fn create_vcpus_aarch64(
             exit_evt.try_clone().map_err(Error::EventFd)?,
             vcpu_list.clone(),
             nested_enabled,
+            interrupt_controller,
         )
         .map_err(Error::Vcpu)?;
 

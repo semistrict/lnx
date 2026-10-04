@@ -21,7 +21,7 @@ use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 use arch::ArchMemoryInfo;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use devices::legacy::VcpuList;
-use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
+use hvf::{HvfVcpu, HvfVm, InterruptController, VcpuExit, Vcpus};
 use serde::Deserialize;
 use utils::eventfd::EventFd;
 use vm_memory::{
@@ -220,6 +220,7 @@ pub struct Vcpu {
 
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+    interrupt_controller: InterruptController,
     initial_pause: bool,
 }
 
@@ -288,6 +289,7 @@ impl Vcpu {
     /// * `id` - Represents the CPU number between [0, max vcpus).
     /// * `vm_fd` - The kvm `VmFd` for the virtual machine this vcpu will get attached to.
     /// * `exit_evt` - An `EventFd` that will be written into when this vcpu exits.
+    /// * `interrupt_controller` - The GIC the VM was built with.
     pub fn new_aarch64(
         id: u8,
         boot_entry_addr: GuestAddress,
@@ -295,6 +297,7 @@ impl Vcpu {
         exit_evt: EventFd,
         vcpu_list: Arc<VcpuList>,
         nested_enabled: bool,
+        interrupt_controller: InterruptController,
     ) -> Result<Self> {
         let (event_sender, event_receiver) = unbounded();
         let (response_sender, response_receiver) = unbounded();
@@ -314,6 +317,7 @@ impl Vcpu {
             response_sender,
             vcpu_list,
             nested_enabled,
+            interrupt_controller,
             initial_pause: false,
         })
     }
@@ -469,6 +473,10 @@ impl Vcpu {
                     debug!("vCPU {vcpuid} WaitForEvent");
                     Ok(VcpuEmulation::WaitForEvent)
                 }
+                VcpuExit::WaitForEventCompleted => {
+                    debug_log_vcpu_exit(vcpuid, "wait_for_event_completed".to_string());
+                    Ok(VcpuEmulation::Handled)
+                }
                 VcpuExit::WaitForEventExpired => {
                     debug!("vCPU {vcpuid} WaitForEventExpired");
                     Ok(VcpuEmulation::WaitForEventExpired)
@@ -478,19 +486,31 @@ impl Vcpu {
                     Ok(VcpuEmulation::WaitForEventTimeout(duration))
                 }
             },
-            Err(e) => panic!("Error running HVF vCPU: {e:?}"),
+            Err(e) => {
+                error!("vCPU {vcpuid} stopped: {e}");
+                crate::timing_event(&format!("vcpu.run.error vcpu={vcpuid} error={e}"));
+                Err(Error::VcpuRun)
+            }
         }
     }
 
     /// Main loop of the vCPU thread.
     pub fn run(&mut self, init_tls_sender: Sender<bool>) {
-        let mut hvf_vcpu =
-            HvfVcpu::new(self.mpidr, self.nested_enabled).expect("Can't create HVF vCPU");
-        let hvf_vcpuid = hvf_vcpu.id();
+        let hvf_vcpu = HvfVcpu::new(self.mpidr, self.nested_enabled, self.interrupt_controller);
 
         init_tls_sender
             .send(true)
             .expect("Cannot notify vcpu TLS initialization.");
+
+        let mut hvf_vcpu = match hvf_vcpu {
+            Ok(hvf_vcpu) => hvf_vcpu,
+            Err(e) => {
+                error!("vCPU {} could not be created: {e}", self.id);
+                self.exit(FC_EXIT_CODE_GENERIC_ERROR);
+                return;
+            }
+        };
+        let hvf_vcpuid = hvf_vcpu.id();
 
         let (wfe_sender, wfe_receiver) = unbounded();
         self.vcpu_list.register(hvf_vcpuid, wfe_sender);
@@ -621,31 +641,15 @@ impl Vcpu {
                                 let _ = self.response_sender.send(resp);
                             }
                             Ok(VcpuEvent::RebaseTimer(delta)) => {
+                                // Rebasing on this, the owning, thread is all
+                                // restore needs. The in-kernel GIC delivers the
+                                // vtimer itself. With the userspace GIC,
+                                // rebase_timer leaves the vtimer unmasked, so
+                                // hv_vcpu_run reports VTIMER_ACTIVATED once it
+                                // fires and a guest WFI derives its own wait
+                                // deadline from CNTV_CVAL_EL0.
                                 let resp = match hvf_vcpu.rebase_timer(delta) {
-                                    Ok(()) => {
-                                        if let Some(timeout) = hvf_vcpu.vtimer_wait_duration() {
-                                            let vcpu_list = self.vcpu_list.clone();
-                                            let vcpuid = hvf_vcpu.id();
-                                            std::thread::spawn(move || {
-                                                if !timeout.is_zero() {
-                                                    std::thread::sleep(timeout);
-                                                }
-                                                let _ = hvf::vcpu_set_vtimer_mask(vcpuid, true);
-                                                let _ = hvf::vcpu_set_pending_irq(
-                                                    vcpuid,
-                                                    hvf::InterruptType::Irq,
-                                                    false,
-                                                );
-                                                let _ = hvf::vcpu_set_pending_irq(
-                                                    vcpuid,
-                                                    hvf::InterruptType::Irq,
-                                                    true,
-                                                );
-                                                vcpu_list.set_vtimer_irq(vcpuid);
-                                            });
-                                        }
-                                        VcpuResponse::TimerRebased
-                                    }
+                                    Ok(()) => VcpuResponse::TimerRebased,
                                     Err(e) => VcpuResponse::Error(format!("rebase: {e}")),
                                 };
                                 let _ = self.response_sender.send(resp);
@@ -1337,7 +1341,16 @@ mod tests {
         let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size)]).unwrap();
         let exit_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
         let vcpu_list = Arc::new(VcpuList::new(1));
-        let vcpu = Vcpu::new_aarch64(1, GuestAddress(0), None, exit_evt, vcpu_list, false).unwrap();
+        let vcpu = Vcpu::new_aarch64(
+            1,
+            GuestAddress(0),
+            None,
+            exit_evt,
+            vcpu_list,
+            false,
+            InterruptController::Userspace,
+        )
+        .unwrap();
         (vcpu, gm)
     }
 
@@ -1367,13 +1380,42 @@ mod tests {
         ret == 0 && value == 1
     }
 
+    /// Hypervisor.framework allows one VM per process and libkrun never
+    /// destroys it, so every test that needs a real VM shares this one.
+    struct SharedTestVm {
+        vm: Vm,
+        vcpu_list: Arc<VcpuList>,
+        /// `None` when the host has no in-kernel GIC (macOS before 15).
+        in_kernel_gic: Option<devices::legacy::HvfGicV3>,
+        /// Host memory backing guest mappings; it must outlive the VM.
+        guest_memory: Vec<GuestMemoryMmap>,
+    }
+
+    fn shared_test_vm() -> std::sync::MutexGuard<'static, SharedTestVm> {
+        static VM: std::sync::OnceLock<std::sync::Mutex<SharedTestVm>> = std::sync::OnceLock::new();
+        VM.get_or_init(|| {
+            let vm = Vm::new(false).expect("Cannot create new vm");
+            let vcpu_list = Arc::new(VcpuList::new(1));
+            // The in-kernel GIC has to exist before any vCPU is created.
+            let in_kernel_gic = devices::legacy::HvfGicV3::new(1, vcpu_list.clone()).ok();
+            std::sync::Mutex::new(SharedTestVm {
+                vm,
+                vcpu_list,
+                in_kernel_gic,
+                guest_memory: Vec::new(),
+            })
+        })
+        .lock()
+        .unwrap()
+    }
+
     #[test]
     fn test_vm_memory_init() {
         if !hvf_available() {
             eprintln!("skipping test_vm_memory_init: host has no Hypervisor.framework support");
             return;
         }
-        let mut vm = Vm::new(false).expect("Cannot create new vm");
+        let mut shared = shared_test_vm();
 
         // Use a realistic guest physical address; hv_vm_map rejects GPA 0.
         let gm = GuestMemoryMmap::from_ranges(&[(
@@ -1381,7 +1423,109 @@ mod tests {
             0x20_0000, // 2 MB
         )])
         .unwrap();
-        vm.memory_init(&gm, &[]).expect("memory_init failed");
+        shared.vm.memory_init(&gm, &[]).expect("memory_init failed");
+        shared.guest_memory.push(gm);
+    }
+
+    fn set_sysreg(sysregs: &mut [(u16, u64)], reg: u16, value: u64) {
+        let entry = sysregs
+            .iter_mut()
+            .find(|(id, _)| *id == reg)
+            .unwrap_or_else(|| panic!("vCPU state has no sysreg {reg:#x}"));
+        entry.1 = value;
+    }
+
+    fn next_response(handle: &VcpuHandle) -> VcpuResponse {
+        handle
+            .response_receiver()
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("vCPU thread did not respond")
+    }
+
+    /// Snapshot restore re-arms the vtimer with RebaseTimer. Under the
+    /// in-kernel GIC, HVF owns vtimer delivery: nothing may be queued for
+    /// userspace injection, which macOS 27 rejects with HV_UNSUPPORTED.
+    #[test]
+    fn rebase_timer_with_in_kernel_gic_queues_no_userspace_irq() {
+        if !hvf_available() {
+            eprintln!("skipping: host has no Hypervisor.framework support");
+            return;
+        }
+        let mut shared = shared_test_vm();
+        if shared.in_kernel_gic.is_none() {
+            eprintln!("skipping: host has no in-kernel HVF GIC");
+            return;
+        }
+
+        // Spin long enough for any out-of-band vtimer injection to land while
+        // the guest runs, then power off through PSCI SYSTEM_OFF.
+        const GUEST_CODE: [u32; 7] = [
+            0xd2a0_4001, // movz x1, #0x200, lsl #16
+            0xf100_0421, // subs x1, x1, #1
+            0x54ff_ffe1, // b.ne .-4
+            0xd280_0100, // movz x0, #0x8
+            0xf2b0_8000, // movk x0, #0x8400, lsl #16
+            0xd400_0002, // hvc #0
+            0x1400_0000, // b .
+        ];
+        let code_addr = GuestAddress(DRAM_MEM_START_EFI + 0x100_0000);
+        let gm = GuestMemoryMmap::from_ranges(&[(code_addr, 0x20_0000)]).unwrap();
+        let code: Vec<u8> = GUEST_CODE.iter().flat_map(|i| i.to_le_bytes()).collect();
+        vm_memory::Bytes::write_slice(&gm, &code, code_addr).unwrap();
+        shared.vm.memory_init(&gm, &[]).expect("memory_init failed");
+        shared.guest_memory.push(gm);
+
+        let mut vcpu = Vcpu::new_aarch64(
+            0,
+            code_addr,
+            None,
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            shared.vcpu_list.clone(),
+            false,
+            InterruptController::InKernel,
+        )
+        .unwrap();
+        vcpu.queue_initial_pause();
+        let handle = vcpu.start_threaded().unwrap();
+
+        // Restore a vCPU whose vtimer is enabled and already expired.
+        let VcpuResponse::Paused(payload) = next_response(&handle) else {
+            panic!("expected the initial pause");
+        };
+        let mut state: hvf::state::HvfVcpuState = bincode::deserialize(&payload).unwrap();
+        set_sysreg(
+            &mut state.sysregs,
+            hvf::bindings::hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0,
+            0,
+        );
+        set_sysreg(
+            &mut state.sysregs,
+            hvf::bindings::hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0,
+            1,
+        );
+        handle
+            .send_event(VcpuEvent::RestoreState(bincode::serialize(&state).unwrap()))
+            .unwrap();
+        let response = next_response(&handle);
+        assert!(matches!(response, VcpuResponse::Restored), "{response:?}");
+
+        handle.send_event(VcpuEvent::RebaseTimer(0)).unwrap();
+        let response = next_response(&handle);
+        assert!(
+            matches!(response, VcpuResponse::TimerRebased),
+            "{response:?}"
+        );
+
+        handle.send_event(VcpuEvent::Resume).unwrap();
+        let response = next_response(&handle);
+        assert!(matches!(response, VcpuResponse::Resumed), "{response:?}");
+
+        let response = next_response(&handle);
+        assert!(
+            matches!(response, VcpuResponse::Exited(FC_EXIT_CODE_OK)),
+            "{response:?}"
+        );
+        assert!(!shared.vcpu_list.has_pending_irq(0));
     }
 
     #[test]
@@ -1398,6 +1542,7 @@ mod tests {
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
             vcpu_list,
             false,
+            InterruptController::Userspace,
         )
         .unwrap();
         assert!(vcpu.configure_aarch64(&mem_info).is_ok());
@@ -1411,6 +1556,7 @@ mod tests {
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
             vcpu_list,
             false,
+            InterruptController::Userspace,
         )
         .unwrap();
         assert!(vcpu.configure_aarch64(&mem_info).is_ok());
