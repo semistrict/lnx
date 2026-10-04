@@ -290,7 +290,8 @@ fn relay_after(message: &str) -> anyhow::Error {
         },
     )
     .expect("write error");
-    relay_channel_output(&mut client, 7, None).expect_err("relay fails")
+    let writer = SharedStream::new(&client).expect("writer");
+    relay_channel_output(&mut client, &writer, 7, None).expect_err("relay fails")
 }
 
 #[test]

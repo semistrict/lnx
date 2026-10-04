@@ -210,7 +210,15 @@ struct HeldLock {
 
 impl HeldLock {
     fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        let mut retry = false;
         loop {
+            // A retry follows a lock file that was moved away with its
+            // directory; if the directory is gone, so is the instance, and
+            // reopening the path would bring an empty one back.
+            if retry && path.parent().is_some_and(|parent| !parent.exists()) {
+                bail!("{} was removed while its lock was being taken", path.display());
+            }
+            retry = true;
             let file = open_lock_file(path)?;
             if !flock(&file, libc::LOCK_EX | libc::LOCK_NB)? {
                 return Ok(None);

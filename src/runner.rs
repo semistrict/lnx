@@ -1626,13 +1626,14 @@ fn run_broker_session(mut stream: UnixStream, config: &RunConfig) -> Result<i32>
         },
     )?;
 
+    let writer = SharedStream::new(&stream)?;
     if deterministic.is_some() && !is_tty(std::io::stdin().as_raw_fd()) {
         // A deterministic run must see the same input chunks every time.
         send_all_stdin(&mut stream, channel_id)?;
     } else {
-        spawn_stdin_pump(&stream, channel_id)?;
+        spawn_stdin_pump(&writer, channel_id);
     }
-    let status = relay_channel_output(&mut stream, channel_id, exec.timeout);
+    let status = relay_channel_output(&mut stream, &writer, channel_id, exec.timeout);
     drop(raw_mode);
     status
 }
@@ -1650,17 +1651,15 @@ fn send_all_stdin(stream: &mut UnixStream, channel_id: u64) -> Result<()> {
 }
 
 /// Forwards stdin to the guest as it arrives, then its end.
-fn spawn_stdin_pump(stream: &UnixStream, channel_id: u64) -> Result<()> {
-    let mut input_stream = stream
-        .try_clone()
-        .context("clone broker stream for stdin")?;
+fn spawn_stdin_pump(writer: &FrameWriter, channel_id: u64) {
+    let writer = Arc::clone(writer);
     thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
         let mut input = [0u8; 8192];
         loop {
             match stdin.read(&mut input) {
                 Ok(0) => {
-                    let _ = write_message(&mut input_stream, &Message::Eof { channel_id });
+                    let _ = writer.send(&Message::Eof { channel_id });
                     break;
                 }
                 Ok(n) => {
@@ -1668,7 +1667,7 @@ fn spawn_stdin_pump(stream: &UnixStream, channel_id: u64) -> Result<()> {
                         channel_id,
                         bytes: input[..n].to_vec(),
                     };
-                    if write_message(&mut input_stream, &data).is_err() {
+                    if writer.send(&data).is_err() {
                         break;
                     }
                 }
@@ -1677,7 +1676,28 @@ fn spawn_stdin_pump(stream: &UnixStream, channel_id: u64) -> Result<()> {
             }
         }
     });
-    Ok(())
+}
+
+/// Writes whole frames to the broker from more than one thread.
+type FrameWriter = Arc<SharedStream>;
+
+pub(crate) struct SharedStream(Mutex<UnixStream>);
+
+impl SharedStream {
+    fn new(stream: &UnixStream) -> Result<FrameWriter> {
+        let stream = stream
+            .try_clone()
+            .context("clone broker stream for writing")?;
+        Ok(Arc::new(Self(Mutex::new(stream))))
+    }
+
+    fn send(&self, message: &Message) -> Result<()> {
+        let mut stream = self
+            .0
+            .lock()
+            .map_err(|_| anyhow!("broker writer lock poisoned"))?;
+        write_message(&mut stream, message)
+    }
 }
 
 /// Copies the guest command's output to stdout and stderr until it exits.
@@ -1685,6 +1705,7 @@ fn spawn_stdin_pump(stream: &UnixStream, channel_id: u64) -> Result<()> {
 /// closes the channel, which ends the command.
 fn relay_channel_output(
     stream: &mut UnixStream,
+    writer: &FrameWriter,
     channel_id: u64,
     timeout: Option<Duration>,
 ) -> Result<i32> {
@@ -1693,8 +1714,8 @@ fn relay_channel_output(
         let message = match read_message_interruptible(stream, deadline)? {
             Interruptible::Message(message) => message,
             stopped => {
-                let _ = write_message(stream, &Message::Eof { channel_id });
-                let _ = write_message(stream, &Message::Close { channel_id });
+                let _ = writer.send(&Message::Eof { channel_id });
+                let _ = writer.send(&Message::Close { channel_id });
                 if matches!(stopped, Interruptible::DeadlinePassed) {
                     eprintln!(
                         "lnx: the command ran longer than {} and was stopped",
