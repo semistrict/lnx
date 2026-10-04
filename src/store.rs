@@ -225,6 +225,8 @@ pub(crate) enum Origin {
     Image,
     /// The final snapshot of a VM run.
     Snapshot { run: RunId },
+    /// A snapshot the guest asked for while its run went on.
+    SnapshotExit { run: RunId },
     /// A checkpoint taken while a VM run was live.
     Checkpoint { run: RunId },
     /// The disk of a run that crashed after serving commands.
@@ -627,8 +629,10 @@ impl Store {
     }
 
     /// Makes `id` the latest generation while `run` keeps running, as after
-    /// a guest-requested snapshot. The run counts as not having served a
-    /// command since, so a crash from here keeps `id`.
+    /// a guest-requested snapshot. A run that has served commands stays
+    /// dirty: commands may still be running (the one that asked for the
+    /// snapshot, at least), so writes acknowledged after `id` may exist, and
+    /// a crash from here must still be resolved with `recover`.
     pub(crate) fn advance_latest(
         &self,
         lock: &InstanceLock,
@@ -637,25 +641,15 @@ impl Store {
     ) -> Result<()> {
         self.generation(id)?;
         let record = self.require_record()?;
-        let owner = match &record.phase {
-            Phase::Running {
-                run: current,
-                owner,
+        let phase = match &record.phase {
+            Phase::Running { run: current, .. } | Phase::Dirty { run: current, .. }
+                if current == run =>
+            {
+                record.phase.clone()
             }
-            | Phase::Dirty {
-                run: current,
-                owner,
-            } if current == run => *owner,
             phase => bail!("cannot advance run {run}: instance is {phase:?}"),
         };
-        self.commit_record(
-            lock,
-            Some(id.clone()),
-            Phase::Running {
-                run: run.clone(),
-                owner,
-            },
-        )
+        self.commit_record(lock, Some(id.clone()), phase)
     }
 
     /// Copies a snapshot directory produced elsewhere (another host, an

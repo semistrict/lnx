@@ -158,15 +158,14 @@ impl RunSession {
     }
 
     /// Makes `id` the latest generation while the run continues, as after a
-    /// guest-requested snapshot.
+    /// guest-requested snapshot. A dirty run stays dirty; holding the flag's
+    /// lock keeps `mark_dirty` from committing in between.
     pub(crate) fn advance(&self, id: &GenerationId) -> Result<()> {
-        let mut dirty = self
+        let _dirty = self
             .dirty
             .lock()
             .map_err(|_| anyhow!("run dirty flag lock poisoned"))?;
-        self.store.advance_latest(&self.lock, &self.run.id, id)?;
-        *dirty = false;
-        Ok(())
+        self.store.advance_latest(&self.lock, &self.run.id, id)
     }
 
     pub(crate) fn add_checkpoint(&self, checkpoint: &CheckpointRef) -> Result<()> {

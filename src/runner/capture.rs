@@ -148,7 +148,7 @@ impl Captures for Capturer {
         ));
         let result = self
             .context()
-            .capture(Origin::Snapshot { run: self.run_id() })
+            .capture(Origin::SnapshotExit { run: self.run_id() })
             .and_then(|id| {
                 self.session.advance(&id)?;
                 Ok(id)

@@ -251,6 +251,74 @@ fn a_snapshot_published_before_a_crash_is_rolled_forward() {
     assert_eq!(fixture.latest_disk(), b"final disk");
 }
 
+/// Publishes a snapshot the guest asked for mid-run and makes it latest.
+fn snapshot_exit(fixture: &Fixture, lock: &InstanceLock, run: &Run) -> GenerationId {
+    let staging = fixture.store.stage(lock).expect("stage snapshot-exit");
+    clone_or_copy_file(&run.rootfs(), &staging.dir().join(ROOTFS)).expect("clone disk");
+    let id = fixture
+        .store
+        .publish(
+            lock,
+            staging,
+            None,
+            Origin::SnapshotExit {
+                run: run.id.clone(),
+            },
+        )
+        .expect("publish snapshot-exit");
+    fixture
+        .store
+        .advance_latest(lock, &run.id, &id)
+        .expect("advance");
+    id
+}
+
+#[test]
+fn writes_after_a_mid_run_snapshot_are_not_dropped_by_recovery() {
+    let (fixture, _image) = Fixture::initialized(b"image disk");
+    let (run, exit) = {
+        let lock = fixture.lock();
+        let run = fixture.store.begin_run(&lock, None).expect("begin run");
+        fixture.store.mark_dirty(&lock, &run.id).expect("mark dirty");
+        fs::write(run.rootfs(), b"before snapshot-exit").expect("guest writes");
+        let exit = snapshot_exit(&fixture, &lock, &run);
+        fs::write(run.rootfs(), b"acknowledged after").expect("guest writes on");
+        (run, exit)
+        // The owner dies.
+    };
+
+    let lock = fixture.lock();
+    let error = fixture
+        .store
+        .recover(&lock)
+        .expect_err("not rolled forward to the mid-run snapshot");
+    assert_eq!(
+        error.downcast_ref::<CrashedWithUnsavedState>().map(|crash| &crash.run),
+        Some(&run.id)
+    );
+    fixture.store.salvage(&lock).expect("keep the disk");
+    assert_eq!(fixture.latest_disk(), b"acknowledged after");
+    assert_ne!(fixture.store.latest().unwrap().unwrap().id(), &exit);
+}
+
+#[test]
+fn an_idle_run_that_crashes_after_a_mid_run_snapshot_keeps_it() {
+    let (fixture, _image) = Fixture::initialized(b"image disk");
+    let exit = {
+        let lock = fixture.lock();
+        let run = fixture.store.begin_run(&lock, None).expect("begin run");
+        fs::write(run.rootfs(), b"snapshot-exit disk").expect("guest writes");
+        snapshot_exit(&fixture, &lock, &run)
+    };
+
+    let lock = fixture.lock();
+    let recovery = fixture.store.recover(&lock).expect("recover");
+
+    assert!(matches!(recovery, Recovery::DiscardedIdleRun(_)));
+    assert_eq!(fixture.store.latest().unwrap().unwrap().id(), &exit);
+    assert_eq!(fixture.latest_disk(), b"snapshot-exit disk");
+}
+
 #[test]
 fn a_half_written_generation_is_never_latest_and_is_collected() {
     let (fixture, image) = Fixture::initialized(b"image disk");
