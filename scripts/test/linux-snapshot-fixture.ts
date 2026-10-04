@@ -27,18 +27,18 @@ const ctx = defaultContext("linux-snapshot-fixture");
 const output =
   Bun.env.LNX_LINUX_SNAPSHOT_FIXTURE_OUT ??
   join(ctx.repoRoot, "target", "linux-macos-snapshot-fixture");
-const hostHome = Bun.env.HOME ?? "";
-const cwd = join(hostHome, ".lnx", "test-work", `linux-snapshot-fixture-${process.pid}`);
+// ctx.base honors LNX_BASE, so isolated runs never touch the real ~/.lnx.
+const cwd = join(ctx.base, "test-work", `linux-snapshot-fixture-${process.pid}`);
 const linuxTarget = "aarch64-unknown-linux-musl";
 const linuxLnx = join(ctx.repoRoot, "target", linuxTarget, "debug", "lnx");
 const linuxLinker =
   Bun.env.CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER ??
   Bun.env.CC_LINUX ??
   "/opt/homebrew/bin/aarch64-linux-musl-gcc";
-const kernel = Bun.env.LNX_NESTED_INNER_KERNEL ?? join(hostHome, ".lnx", "vmlinuz");
-const outerKernel = Bun.env.LNX_NESTED_OUTER_KERNEL ?? join(hostHome, ".lnx", "vmlinuz");
+const kernel = Bun.env.LNX_NESTED_INNER_KERNEL ?? join(ctx.base, "vmlinuz");
+const outerKernel = Bun.env.LNX_NESTED_OUTER_KERNEL ?? join(ctx.base, "vmlinuz");
 const rootfs =
-  Bun.env.LNX_NESTED_ROOTFS ?? join(hostHome, ".lnx", "instances", "default", "rootfs.ext4");
+  Bun.env.LNX_NESTED_ROOTFS ?? join(ctx.base, "instances", "default", "rootfs.ext4");
 const innerBase = join(cwd, "inner-base");
 const innerRunBase = `/tmp/lnx-run-linux-fixture-${process.pid}`;
 const innerInstance = `linux-fixture-${process.pid}`;

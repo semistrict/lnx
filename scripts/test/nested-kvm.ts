@@ -27,10 +27,10 @@ import {
 } from "./lib";
 
 const ctx = defaultContext("nested-kvm");
-const hostHome = Bun.env.HOME ?? "";
+// ctx.base honors LNX_BASE, so isolated runs never touch the real ~/.lnx.
 const cwd =
   Bun.env.LNX_NESTED_KVM_WORKDIR ??
-  join(hostHome, ".lnx", "test-work", `nested-kvm-${process.pid}`);
+  join(ctx.base, "test-work", `nested-kvm-${process.pid}`);
 const linuxTarget = "aarch64-unknown-linux-musl";
 const linuxLnx = join(ctx.repoRoot, "target", linuxTarget, "debug", "lnx");
 const bunVersion = "1.3.14";
@@ -41,7 +41,7 @@ const linuxLinker =
   Bun.env.CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER ??
   Bun.env.CC_LINUX ??
   "/opt/homebrew/bin/aarch64-linux-musl-gcc";
-const kernel = join(hostHome, ".lnx", "vmlinuz");
+const kernel = join(ctx.base, "vmlinuz");
 const fixtureKernel = Bun.env.LNX_MACOS_SNAPSHOT_FIXTURE
   ? join(Bun.env.LNX_MACOS_SNAPSHOT_FIXTURE, "vmlinuz")
   : undefined;
@@ -56,7 +56,7 @@ const innerKernel =
   (fixtureKernel && existsSync(fixtureKernel) ? fixtureKernel : kernel);
 const rootfs =
   Bun.env.LNX_NESTED_ROOTFS ??
-  join(hostHome, ".lnx", "instances", "default", "rootfs.ext4");
+  join(ctx.base, "instances", "default", "rootfs.ext4");
 const outerRootfs = join(cwd, "outer-rootfs.ext4");
 const snapshotInnerRootfs = join(cwd, "snapshot-inner-rootfs.ext4");
 const outerRootfsBytes = Number(
