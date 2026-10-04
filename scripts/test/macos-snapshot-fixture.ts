@@ -1,14 +1,13 @@
 import {
   existsSync } from "node:fs";
 import { mkdir,
-  readdir,
-  readFile,
   rm } from "node:fs/promises";
 import { dirname,
   join } from "node:path";
 import {
   assertContains,
   assertEq,
+  checkpointGenerationDir,
   cloneSparseImage,
   cleanupContext,
   defaultContext,
@@ -61,21 +60,6 @@ function collectOutput(stream: ReadableStream<Uint8Array>) {
       throw new Error(`timeout waiting for ${label}; saw:\n${text}`);
     },
   };
-}
-
-async function checkpointPathByName(imageDir: string, name: string): Promise<string> {
-  const checkpointDir = join(imageDir, "checkpoints");
-  for (const entry of await readdir(checkpointDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-    const path = join(checkpointDir, entry.name);
-    const meta = await readFile(join(path, "checkpoint.meta"), "utf8");
-    if (meta.split("\n").includes(`name=${name}`)) {
-      return path;
-    }
-  }
-  throw new Error(`checkpoint not found: ${name}`);
 }
 
 try {
@@ -188,7 +172,7 @@ print("mac-source-after", flush=True)
     await stderr.finished.catch(() => "");
   }
 
-  const snapshot = await checkpointPathByName(ctx.imageDir, checkpointName);
+  const snapshot = checkpointGenerationDir(ctx.imageDir, checkpointName);
   for (const file of ["vmstate.bin", "pages.img", "rootfs.ext4", "launch.json", "initramfs.stamp"]) {
     const path = join(snapshot, file);
     if (!existsSync(path)) {

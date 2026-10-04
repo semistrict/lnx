@@ -16,6 +16,7 @@ import {
   run,
   sleep,
   spawn,
+  latestSnapshotDir,
 } from "./lib";
 
 if (process.platform !== "darwin") {
@@ -143,7 +144,7 @@ print("snapshot-exit-ready", flush=True)
     await stderr.finished.catch(() => "");
   }
 
-  const snapshot = join(ctx.snapshotDir, "latest");
+  const snapshot = latestSnapshotDir(ctx);
   for (const file of ["vmstate.bin", "pages.img", "rootfs.ext4", "launch.json", "initramfs.stamp"]) {
     const path = join(snapshot, file);
     if (!existsSync(path)) {

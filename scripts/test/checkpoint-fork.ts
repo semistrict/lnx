@@ -99,7 +99,7 @@ try {
       check: false,
     });
     assertEq(failed.status === 0, false, "duplicate fork rejected");
-    assertContains(failed.stderr, "destination rootfs already exists", "duplicate fork error");
+    assertContains(failed.stderr, "destination instance already exists", "duplicate fork error");
   });
 } finally {
   await cleanupContext(ctx);

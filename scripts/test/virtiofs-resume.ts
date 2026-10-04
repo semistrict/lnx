@@ -15,6 +15,8 @@ import {
   testStep,
   waitForVmSuspend,
   write,
+  latestSnapshotDir,
+  dropSavedMemory,
 } from "./lib";
 
 const ctx = defaultContext("virtiofs-resume");
@@ -28,7 +30,7 @@ async function cleanupDirs() {
 }
 
 async function discardLatestSnapshot() {
-  await rm(join(ctx.snapshotDir, "latest"), { recursive: true, force: true });
+  await dropSavedMemory(ctx);
 }
 
 async function waitForSourceReady(): Promise<void> {

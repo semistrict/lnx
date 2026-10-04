@@ -11,6 +11,7 @@ import { assertContains,
   run,
   testStep,
   waitForVmSuspend,
+  latestSnapshotDir,
 } from "./lib";
 
 Bun.env.LNX_BROKER_IDLE_TTL_MS ??= "500";
@@ -41,7 +42,7 @@ try {
 
   await testStep("mismatched snapshot header rejects memory restore clearly", async () => {
     await waitForVmSuspend(ctx);
-    await cp(join(ctx.snapshotDir, "latest"), badSnapshot, { recursive: true });
+    await cp(latestSnapshotDir(ctx), badSnapshot, { recursive: true });
     const vmstatePath = join(badSnapshot, "vmstate.bin");
     const header = Buffer.from(await readFile(vmstatePath));
     header.writeUInt32LE(99, 32);
@@ -59,12 +60,12 @@ try {
     if (failure.status === 0) {
       throw new Error("config-mismatched snapshot restore succeeded unexpectedly");
     }
-    assertContains(failure.stderr, "snapshot VM config mismatch", "config mismatch rejected");
+    assertContains(failure.stderr, "the saved memory snapshot cannot be resumed: it has 99 CPUs", "config mismatch rejected");
   });
 
   await testStep("snapshot without launch metadata rejects memory restore clearly", async () => {
     await waitForVmSuspend(ctx);
-    await cp(join(ctx.snapshotDir, "latest"), missingLaunchSnapshot, { recursive: true });
+    await cp(latestSnapshotDir(ctx), missingLaunchSnapshot, { recursive: true });
     await Bun.file(join(missingLaunchSnapshot, "launch.json")).delete();
 
     const failure = await ctx.vm.cli([
@@ -82,7 +83,7 @@ try {
     }
     assertContains(
       failure.stderr,
-      "snapshot launch metadata is incompatible (launch_metadata: snapshot has no launch.json",
+      "the saved memory snapshot cannot be resumed: its host shares differ (launch_metadata: snapshot has no launch.json",
       "missing launch metadata rejected",
     );
   });
@@ -92,7 +93,7 @@ try {
     // pre-flight accepts the snapshot, but the section hash check refuses it
     // at restore time.
     await waitForVmSuspend(ctx);
-    await cp(join(ctx.snapshotDir, "latest"), corruptSectionSnapshot, { recursive: true });
+    await cp(latestSnapshotDir(ctx), corruptSectionSnapshot, { recursive: true });
     const vmstatePath = join(corruptSectionSnapshot, "vmstate.bin");
     const vmstate = Buffer.from(await readFile(vmstatePath));
     vmstate[vmstate.length - 1] ^= 0xff;
@@ -113,7 +114,7 @@ try {
     }
     assertContains(
       failure.stderr,
-      "VM memory snapshot restore was refused before the broker came up",
+      "the saved memory snapshot could not be resumed",
       "restore refusal fails hard",
     );
     const log = await run(["bash", "-lc", `cat ${join(ctx.runDir, "lnx.log")}`]);
@@ -126,7 +127,7 @@ try {
 
   await testStep("share root drift rejects restore", async () => {
     await waitForVmSuspend(ctx);
-    await cp(join(ctx.snapshotDir, "latest"), shareMismatchSnapshot, { recursive: true });
+    await cp(latestSnapshotDir(ctx), shareMismatchSnapshot, { recursive: true });
     const metadataPath = join(shareMismatchSnapshot, "launch.json");
     const launchMetadata = JSON.parse(await readFile(metadataPath, "utf8"));
     launchMetadata.shares.host_home = "/Users/lnx-share-drift";
@@ -147,7 +148,7 @@ try {
     }
     assertContains(
       drifted.stderr,
-      "snapshot launch metadata is incompatible (share_mismatch:",
+      "the saved memory snapshot cannot be resumed: its host shares differ (share_mismatch:",
       "share root drift rejects the restore",
     );
   });

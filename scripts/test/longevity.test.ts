@@ -20,6 +20,7 @@ import {
   run,
   sleep,
   type LnxCliOptions,
+  latestSnapshotDir,
 } from "./lib";
 
 const ctx = defaultContext("longevity");
@@ -108,7 +109,7 @@ test("repeated restore loop tracks latency and snapshot size drift", async () =>
       const result = await lnxExpect(["echo", String(i)]);
       latencies.push(performance.now() - start);
       expect(result.stdout).toBe(String(i));
-      sizes.push(await diskUsageBytes(join(ctx.snapshotDir, "latest")));
+      sizes.push(await diskUsageBytes(latestSnapshotDir(ctx)));
     }
     const max = Math.max(...latencies);
     const avg = latencies.reduce((sum, value) => sum + value, 0) / latencies.length;
@@ -317,12 +318,12 @@ test("host kill during snapshot recovers or fails cleanly", async () => {
 
 test("snapshot size and sparse regression", async () => {
   await maybe("snapshot size and sparse regression", async () => {
-    const before = await diskUsageBytes(join(ctx.snapshotDir, "latest"));
+    const before = await diskUsageBytes(latestSnapshotDir(ctx));
     for (let i = 0; i < Math.min(restoreIterations, 100); i++) {
       await lnxExpect(["bash", "-lc", "dd if=/dev/zero of=/root/sparse-probe bs=1M count=64 status=none; rm -f /root/sparse-probe"]);
     }
-    const after = await diskUsageBytes(join(ctx.snapshotDir, "latest"));
-    const logical = await fileSize(join(ctx.snapshotDir, "latest", "pages.img"));
+    const after = await diskUsageBytes(latestSnapshotDir(ctx));
+    const logical = await fileSize(join(latestSnapshotDir(ctx), "pages.img"));
     console.log(`sparse-regression before=${before} after=${after} drift=${after - before} pages_logical=${logical}`);
     expect(after - before).toBeLessThan(2 * 1024 * 1024 * 1024);
   });

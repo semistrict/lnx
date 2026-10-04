@@ -1,11 +1,11 @@
-import {
-  existsSync,
-  statSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   assertEq,
   cleanupContext,
   defaultContext,
+  latestGenerationDir,
+  latestSnapshotDir,
   prepareContext,
   testStep,
   waitForVmSuspend,
@@ -16,7 +16,6 @@ import {
 delete Bun.env.LNX_BROKER_IDLE_TTL_MS;
 
 const ctx = defaultContext("rapid-fire");
-const latestVmstate = join(ctx.snapshotDir, "latest", "vmstate.bin");
 
 try {
   await prepareContext(ctx);
@@ -24,14 +23,13 @@ try {
   await testStep("initialize VM instance", async () => {
     assertEq((await ctx.vm.cli(["true"], { env: { LNX_BROKER_IDLE_TTL_MS: "0" } })).status, 0, "vm init status");
     await waitForVmSuspend(ctx, 120_000);
-    assertEq(existsSync(latestVmstate), true, "initial snapshot exists");
+    assertEq(existsSync(join(latestSnapshotDir(ctx), "vmstate.bin")), true, "initial snapshot exists");
   });
 
   await testStep("client exits before the post-command snapshot", async () => {
-    const beforeMtime = statSync(latestVmstate).mtimeMs;
+    const before = latestGenerationDir(ctx.imageDir);
     assertEq((await ctx.vm.cli(["echo", "cold"])).stdout, "cold", "cold exec");
-    const afterMtime = statSync(latestVmstate).mtimeMs;
-    assertEq(afterMtime, beforeMtime, "snapshot deferred past client exit");
+    assertEq(latestGenerationDir(ctx.imageDir), before, "snapshot deferred past client exit");
     assertEq(existsSync(join(ctx.runDir, "broker.sock")), true, "broker stays up for the grace period");
   });
 
@@ -53,7 +51,7 @@ try {
   await testStep("idle VM suspends after the grace period", async () => {
     await waitForVmSuspend(ctx, 120_000);
     assertEq(existsSync(join(ctx.runDir, "broker.sock")), false, "broker exits after the grace period");
-    assertEq(existsSync(join(ctx.snapshotDir, "latest", "vmstate.bin")), true, "suspend wrote the snapshot");
+    assertEq(existsSync(join(latestSnapshotDir(ctx), "vmstate.bin")), true, "suspend wrote the snapshot");
     assertEq((await ctx.vm.cli(["cat", "/tmp/rapid-fire"])).stdout, "marker", "snapshot captured pre-suspend state");
     assertEq((await ctx.vm.cli(["cat", "/run/lnx-vmstate-reseed"])).stdout, "ok", "ordinary restore reseeded guest rng");
     await waitForVmSuspend(ctx, 120_000);

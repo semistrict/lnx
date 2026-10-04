@@ -1,5 +1,3 @@
-import {
-  existsSync } from "node:fs";
 import { link,
   mkdir,
   readFile,
@@ -9,6 +7,7 @@ import { join } from "node:path";
 import { homedir,
   tmpdir } from "node:os";
 import { assertEq,
+  latestGenerationDir,
   repoRoot,
   run,
   sleep,
@@ -25,6 +24,13 @@ const sourceInstance = "server-source";
 const targetInstance = "server-target";
 const port = await freePort();
 const url = `http://127.0.0.1:${port}`;
+// A vmstate.bin header for a 2-vCPU, 4 GiB VM; the body is not needed to
+// transfer the snapshot.
+const vmstate = Buffer.alloc(40);
+vmstate.write("LKRNSS01", 0, "ascii");
+vmstate.writeUInt32LE(4, 8);
+vmstate.writeBigUInt64LE(4n << 30n, 16);
+vmstate.writeUInt32LE(2, 32);
 const launchMetadata = JSON.stringify({
   version: 2,
   owner_args: [],
@@ -50,7 +56,7 @@ try {
     join(sourceBase, "instances", sourceInstance, "memory-snapshots", "latest", "rootfs.ext4"),
   );
   await writeFile(join(sourceBase, "instances", sourceInstance, "memory-snapshots", "latest", "pages.img"), "pages");
-  await writeFile(join(sourceBase, "instances", sourceInstance, "memory-snapshots", "latest", "vmstate.bin"), "vmstate");
+  await writeFile(join(sourceBase, "instances", sourceInstance, "memory-snapshots", "latest", "vmstate.bin"), vmstate);
   await writeFile(join(sourceBase, "instances", sourceInstance, "memory-snapshots", "latest", "launch.json"), launchMetadata);
   await writeFile(join(sourceBase, "instances", sourceInstance, "memory-snapshots", "latest", "initramfs.stamp"), "stamp");
 
@@ -80,13 +86,12 @@ try {
 
     await testStep("imported sandbox is usable on destination", async () => {
       assertEq(await readFile(join(destBase, "vmlinuz"), "utf8"), "kernel", "kernel import");
-      assertEq(await readFile(join(destBase, "instances", targetInstance, "rootfs.ext4"), "utf8"), "rootfs", "rootfs import");
-      assertEq(
-        await readFile(join(destBase, "instances", targetInstance, "memory-snapshots", "latest", "vmstate.bin"), "utf8"),
-        "vmstate",
-        "snapshot import",
-      );
-      assertEq(existsSync(join(destBase, "instances", targetInstance, "vm-initialized")), true, "vm-initialized import");
+      const target = join(destBase, "instances", targetInstance);
+      const latest = latestGenerationDir(target);
+      if (latest === null) throw new Error(`pushed instance has no saved state: ${target}`);
+      assertEq(await readFile(join(latest, "rootfs.ext4"), "utf8"), "rootfs", "rootfs import");
+      assertEq(Buffer.compare(await readFile(join(latest, "vmstate.bin")), vmstate), 0, "snapshot import");
+      assertEq(JSON.parse(await readFile(join(target, "state.json"), "utf8")).phase, "stopped", "pushed instance is stopped");
       const descriptor = JSON.parse(await readFile(join(destBase, "instances", targetInstance, "lnx.json"), "utf8"));
       assertEq(descriptor.name, targetInstance, "descriptor renamed");
     });

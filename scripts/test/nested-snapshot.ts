@@ -13,6 +13,7 @@ import {
   waitForOwnerExit,
   waitForVmSuspend,
   type LnxCliOptions,
+  latestSnapshotDir,
 } from "./lib";
 
 const ctx = defaultContext("nested-snapshot");
@@ -65,7 +66,7 @@ try {
     // pre-flight accepts the snapshot, but the section hash check refuses it
     // at restore time.
     await waitForVmSuspend(ctx, 120_000);
-    await cp(join(ctx.snapshotDir, "latest"), corruptSectionSnapshot, { recursive: true });
+    await cp(latestSnapshotDir(ctx), corruptSectionSnapshot, { recursive: true });
     const vmstatePath = join(corruptSectionSnapshot, "vmstate.bin");
     const vmstate = Buffer.from(await readFile(vmstatePath));
     vmstate[vmstate.length - 1] ^= 0xff;

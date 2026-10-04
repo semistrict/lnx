@@ -15,6 +15,8 @@ import {
   testStep,
   waitForOwnerExit,
   waitForVmSuspend,
+  latestSnapshotDir,
+  dropSavedMemory,
 } from "./lib";
 
 const ctx = defaultContext("instance-config");
@@ -44,7 +46,7 @@ try {
       "nproc honors persisted cpus",
     );
     await waitForVmSuspend(ctx);
-    const vmstate = await readFile(join(ctx.snapshotDir, "latest", "vmstate.bin"));
+    const vmstate = await readFile(join(latestSnapshotDir(ctx), "vmstate.bin"));
     const view = new DataView(vmstate.buffer, vmstate.byteOffset, vmstate.byteLength);
     assertEq(
       Number(view.getBigUint64(16, true)),
@@ -57,8 +59,8 @@ try {
   await testStep("explicit flags override persisted settings", async () => {
     const mismatch = await ctx.vm.cli(["--cpus", "2", "nproc"], { check: false });
     assertEq(mismatch.status === 0, false, "incompatible snapshot rejects restore");
-    assertContains(mismatch.stderr, "snapshot VM config mismatch", "snapshot mismatch is explicit");
-    await rm(join(ctx.snapshotDir, "latest"), { recursive: true, force: true });
+    assertContains(mismatch.stderr, "the saved memory snapshot cannot be resumed: it has 1 CPUs", "snapshot mismatch is explicit");
+    await dropSavedMemory(ctx);
     assertEq(
       (await ctx.vm.cli(["--cpus", "2", "nproc"])).stdout,
       "2",
@@ -93,7 +95,7 @@ try {
     assertEq(inspect.settings.memory_mib, 2048, "inspect persisted memory");
     assertEq(inspect.image, "release:images-v0.6.0", "inspect image source");
     assertEq(inspect.checkpoints, 0, "inspect checkpoint count");
-    assertEq(inspect.rootfs, ctx.imageDir + "/rootfs.ext4", "inspect rootfs path");
+    assertEq(inspect.rootfs, join(latestSnapshotDir(ctx), "rootfs.ext4"), "inspect rootfs path");
     assertEq(typeof inspect.created, "string", "inspect created timestamp");
     assertEq(typeof inspect.snapshot.pages_allocated_bytes, "number", "inspect snapshot pages size");
   });

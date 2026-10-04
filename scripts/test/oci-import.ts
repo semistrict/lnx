@@ -17,6 +17,7 @@ import {
   run,
   testStep,
   waitForVmSuspend,
+  latestSnapshotDir,
 } from "./lib";
 
 const ctx = defaultContext("oci-import");
@@ -46,7 +47,7 @@ try {
     await run([ctx.lnxBin, "--instance", ctx.instance, "init", "-g", "--image", image], {
       timeoutMs: 600_000,
     });
-    assertFile(join(ctx.imageDir, "rootfs.ext4"), "imported rootfs");
+    assertFile(join(latestSnapshotDir(ctx), "rootfs.ext4"), "imported rootfs");
     const descriptor = JSON.parse(await readFile(join(ctx.imageDir, "lnx.json"), "utf8"));
     assertEq(descriptor.image, `oci:${image}`, "descriptor records image source");
   });

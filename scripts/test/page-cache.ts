@@ -10,6 +10,7 @@ import { assertEq,
   prepareContext,
   testStep,
   waitForVmSuspend,
+  latestSnapshotDir,
 } from "./lib";
 
 Bun.env.LNX_BROKER_IDLE_TTL_MS ??= "500";
@@ -111,7 +112,7 @@ PY
     const log = await Bun.file(join(ctx.runDir, "lnx.log")).text();
     assertEq(log.includes("snapshot.error"), false, "exit snapshot succeeded");
     assertEq(log.includes("snapshot.done"), true, "exit snapshot completed");
-    assertEq(existsSync(join(ctx.snapshotDir, "latest", "vmstate.bin")), true, "snapshot vmstate exists");
+    assertEq(existsSync(join(latestSnapshotDir(ctx), "vmstate.bin")), true, "snapshot vmstate exists");
   });
 } finally {
   await cleanupContext(ctx);

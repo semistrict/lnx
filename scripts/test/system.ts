@@ -12,6 +12,8 @@ import {
   testStep,
   waitForVmSuspend,
   write,
+  latestSnapshotDir,
+  latestGenerationDir,
 } from "./lib";
 
 // Shorten the detached owner's idle grace period so suspend-dependent
@@ -30,8 +32,8 @@ try {
   await testStep("paths and init", async () => {
     const paths = await run([ctx.lnxBin, "--instance", ctx.instance, "paths"]);
     assertContains(paths.stdout, `name: ${ctx.instance}`, "paths prints instance name");
-    assertContains(paths.stdout, `rootfs: ${ctx.imageDir}/rootfs.ext4`, "paths prints rootfs");
-    assertContains(paths.stdout, `snapshots: ${ctx.snapshotDir}`, "paths prints snapshots");
+    assertContains(paths.stdout, "rootfs: none", "paths prints no rootfs before the instance exists");
+    assertContains(paths.stdout, `generations: ${join(ctx.imageDir, "generations")}`, "paths prints generations");
 
     const envPaths = await run([ctx.lnxBin, "paths"], { env: { LNX_INSTANCE: ctx.instance } });
     assertContains(envPaths.stdout, `name: ${ctx.instance}`, "paths honors LNX_INSTANCE");
@@ -44,8 +46,6 @@ try {
       copyInstance,
       "--kernel",
       join(ctx.tmpdir, "copied-kernel"),
-      "--rootfs",
-      join(ctx.tmpdir, "copied-rootfs.ext4"),
       "init",
       "-g",
       "--kernel",
@@ -54,21 +54,26 @@ try {
       join(ctx.tmpdir, "rootfs.ext4"),
     ]);
     assertEq(await read(join(ctx.tmpdir, "copied-kernel")), "kernel-copy-test", "explicit init copied kernel");
-    assertEq(await read(join(ctx.tmpdir, "copied-rootfs.ext4")), "rootfs-copy-test", "explicit init copied rootfs");
+    const copiedInstance = latestGenerationDir(join(ctx.base, "instances", copyInstance));
+    assertEq(
+      await read(join(copiedInstance ?? "", "rootfs.ext4")),
+      "rootfs-copy-test",
+      "explicit init creates the instance from the rootfs",
+    );
   });
 
   await testStep("basic exec and snapshots", async () => {
     assertEq((await ctx.vm.cli(["echo", "cold"])).stdout, "cold", "cold exec");
     assertFile(join(ctx.base, "vmlinuz"), "auto-init kernel");
-    assertFile(join(ctx.imageDir, "rootfs.ext4"), "auto-init rootfs");
+    assertFile(join(ctx.imageDir, "state.json"), "auto-init instance state");
     await waitForVmSuspend(ctx);
-    assertFile(join(ctx.snapshotDir, "latest", "vmstate.bin"), "full snapshot vmstate");
-    assertFile(join(ctx.snapshotDir, "latest", "pages.img"), "full snapshot pages");
-    assertFile(join(ctx.snapshotDir, "latest", "rootfs.ext4"), "full snapshot rootfs");
+    assertFile(join(latestSnapshotDir(ctx), "vmstate.bin"), "full snapshot vmstate");
+    assertFile(join(latestSnapshotDir(ctx), "pages.img"), "full snapshot pages");
+    assertFile(join(latestSnapshotDir(ctx), "rootfs.ext4"), "full snapshot rootfs");
     assertEq((await ctx.vm.cli(["echo", "restored"])).stdout, "restored", "restored exec");
     assertEq((await ctx.vm.cli(["run", "echo", "run-subcommand"])).stdout, "run-subcommand", "run subcommand exec");
     await waitForVmSuspend(ctx);
-    assertEq((await ctx.vm.cli(["--snapshot", join(ctx.snapshotDir, "latest"), "echo", "explicit-snapshot"])).stdout, "explicit-snapshot", "explicit snapshot restore");
+    assertEq((await ctx.vm.cli(["--snapshot", latestSnapshotDir(ctx), "echo", "explicit-snapshot"])).stdout, "explicit-snapshot", "explicit snapshot restore");
   });
 
   await testStep("stdio and status", async () => {

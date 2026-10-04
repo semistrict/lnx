@@ -2,8 +2,10 @@ import {
   existsSync } from "node:fs";
 import { join } from "node:path";
 import { assertEq,
+  checkpointGenerationDir,
   cleanupContext,
   defaultContext,
+  latestGenerationDir,
   prepareContext,
   run,
   skip,
@@ -35,14 +37,14 @@ try {
   });
 
   await testStep("offline repair fsck of checkpoint and fork rootfs clones", async () => {
-    for (const rootfs of [
-      join(ctx.imageDir, "checkpoints"),
-      join(ctx.base, "instances", forkName, "rootfs.ext4"),
+    const fork = latestGenerationDir(join(ctx.base, "instances", forkName));
+    if (fork === null) throw new Error(`fork ${forkName} has no saved state`);
+    for (const [label, generation] of [
+      ["checkpoint", checkpointGenerationDir(ctx.imageDir, "dirty")],
+      ["fork", fork],
     ]) {
-      const target = rootfs.endsWith("checkpoints")
-        ? (await run(["bash", "-lc", `find ${rootfs} -name rootfs.ext4 | head -n1`])).stdout
-        : rootfs;
-      const clone = join(ctx.tmpdir, `fsck-${target.split("/").at(-3) ?? "rootfs"}.ext4`);
+      const target = join(generation, "rootfs.ext4");
+      const clone = join(ctx.tmpdir, `fsck-${label}.ext4`);
       await run(["cp", "-c", target, clone], { timeoutMs: 120_000 });
       const fsck = await run([e2fsck, "-fy", clone], { check: false, timeoutMs: 120_000 });
       const output = fsck.stdout + fsck.stderr;

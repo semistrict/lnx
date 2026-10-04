@@ -1,5 +1,5 @@
 import { mkdir, rm, writeFile, readFile } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { createLnxClient, type LnxClient, type LnxInstance } from "../../ts/index";
@@ -22,7 +22,6 @@ export type TestContext = {
   tmpdir: string;
   imageDir: string;
   runDir: string;
-  snapshotDir: string;
 };
 
 export function repoRoot(): string {
@@ -61,7 +60,6 @@ export function defaultContext(name: string): TestContext {
     tmpdir: join(tmpdir(), `lnx-${name}-${process.pid}`),
     imageDir,
     runDir,
-    snapshotDir: join(imageDir, "memory-snapshots"),
   };
 }
 
@@ -103,17 +101,58 @@ export async function waitForOwnerExit(ctx: TestContext, timeoutMs = 30_000): Pr
   throw new Error(`timeout waiting for VM owner exit (broker.sock or instance.lock lease remains)`);
 }
 
+/**
+ * The directory of an instance's latest saved generation (its memory
+ * snapshot and disk), as named by the instance's committed state record.
+ */
+export function latestGenerationDir(instanceDir: string): string | null {
+  const state = join(instanceDir, "state.json");
+  if (!existsSync(state)) {
+    return null;
+  }
+  const latest = JSON.parse(readFileSync(state, "utf8")).latest;
+  return typeof latest === "string" ? join(instanceDir, "generations", latest) : null;
+}
+
+/** The latest saved generation of the test instance; throws if there is none. */
+export function latestSnapshotDir(ctx: TestContext): string {
+  const dir = latestGenerationDir(ctx.imageDir);
+  if (dir === null) {
+    throw new Error(`instance ${ctx.instance} has no saved state`);
+  }
+  return dir;
+}
+
+/** The generation a named checkpoint of an instance refers to. */
+export function checkpointGenerationDir(instanceDir: string, name: string): string {
+  const dir = join(instanceDir, "checkpoints");
+  for (const entry of readdirSync(dir)) {
+    if (!entry.endsWith(".ref")) continue;
+    const ref = JSON.parse(readFileSync(join(dir, entry), "utf8"));
+    if (ref.name === name || ref.id === name) {
+      return join(instanceDir, "generations", ref.generation);
+    }
+  }
+  throw new Error(`checkpoint not found: ${name}`);
+}
+
+/** Waits until the VM has idled out and saved a memory snapshot. */
 export async function waitForVmSuspend(ctx: TestContext, timeoutMs = 60_000): Promise<void> {
-  const vmstate = join(ctx.snapshotDir, "latest", "vmstate.bin");
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (existsSync(vmstate)) {
+    const latest = latestGenerationDir(ctx.imageDir);
+    if (latest !== null && existsSync(join(latest, "vmstate.bin")) && instanceLeasePid(ctx.imageDir) === null) {
       await waitForOwnerExit(ctx, deadline - Date.now());
       return;
     }
     await sleep(100);
   }
-  throw new Error(`timeout waiting for VM suspend (missing ${vmstate})`);
+  throw new Error(`timeout waiting for VM suspend of ${ctx.instance}`);
+}
+
+/** Drops the saved memory so the next run boots from the saved disk. */
+export async function dropSavedMemory(ctx: TestContext): Promise<void> {
+  await run([ctx.lnxBin, "--instance", ctx.instance, "snapshots", "clear"]);
 }
 
 export async function cleanupInstance(ctx: TestContext, instance: string): Promise<void> {
@@ -125,7 +164,6 @@ export async function cleanupInstance(ctx: TestContext, instance: string): Promi
     instance,
     imageDir,
     runDir,
-    snapshotDir: join(imageDir, "memory-snapshots"),
   }).catch(() => {});
   await rm(imageDir, { recursive: true, force: true });
   if (runDir !== imageDir) {

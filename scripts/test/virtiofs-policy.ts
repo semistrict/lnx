@@ -1,12 +1,11 @@
 import {
   mkdir,
-  readdir,
-  readFile,
   rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertContains,
   assertEq,
+  checkpointGenerationDir,
   cleanupContext,
   cleanupInstance,
   defaultContext,
@@ -24,17 +23,6 @@ const cwdB = join(ctx.repoRoot, ".lnx-virtiofs-policy-b");
 async function cleanupDirs() {
   await rm(cwdA, { recursive: true, force: true });
   await rm(cwdB, { recursive: true, force: true });
-}
-
-async function checkpointPathByName(name: string): Promise<string> {
-  const checkpointDir = join(ctx.imageDir, "checkpoints");
-  for (const entry of await readdir(checkpointDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    const path = join(checkpointDir, entry.name);
-    const meta = await readFile(join(path, "checkpoint.meta"), "utf8");
-    if (meta.split("\n").includes(`name=${name}`)) return path;
-  }
-  throw new Error(`checkpoint not found: ${name}`);
 }
 
 try {
@@ -77,7 +65,7 @@ try {
       checkpointName,
       "checkpoint name",
     );
-    const snapshot = await checkpointPathByName(checkpointName);
+    const snapshot = checkpointGenerationDir(ctx.imageDir, checkpointName);
     const restored = await ctx.vm.cli([
         "--snapshot",
         snapshot,

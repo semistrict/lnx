@@ -1,15 +1,12 @@
-import {
-  cp,
-  mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { platform } from "node:process";
 import {
   assertEq,
-  cloneSparseImage,
   cleanupContext,
   cleanupInstance,
   defaultContext,
   prepareContext,
+  run,
   testStep,
 } from "./lib";
 
@@ -20,7 +17,6 @@ const secondCtx = {
   instance: secondInstance,
   imageDir: join(ctx.base, "instances", secondInstance),
   runDir: join(Bun.env.LNX_RUN_BASE ?? ctx.base, "instances", secondInstance),
-  snapshotDir: join(ctx.base, "instances", secondInstance, "memory-snapshots"),
 };
 const vmArgs = [
   ...(Bun.env.LNX_TEST_CPUS ? ["--cpus", Bun.env.LNX_TEST_CPUS] : []),
@@ -77,38 +73,7 @@ async function deterministicProbe(instance: string) {
 }
 
 async function clonePreparedCheckpoint() {
-  await mkdir(secondCtx.imageDir, { recursive: true });
-  await cloneSparseImage(
-    join(ctx.imageDir, "rootfs.ext4"),
-    join(secondCtx.imageDir, "rootfs.ext4"),
-  );
-  for (const name of [
-    "lnx.json",
-    "launch.json",
-    "deterministic.stamp",
-    "initramfs.cpio",
-    "initramfs.stamp",
-  ]) {
-    await cp(join(ctx.imageDir, name), join(secondCtx.imageDir, name), {
-      preserveTimestamps: true,
-    });
-  }
-  const sourceSnapshot = join(ctx.imageDir, "memory-snapshots", "latest");
-  const destSnapshot = join(secondCtx.imageDir, "memory-snapshots", "latest");
-  await mkdir(destSnapshot, { recursive: true });
-  for (const name of [
-    "launch.json",
-    "deterministic.stamp",
-    "initramfs.stamp",
-    "deterministic-clock.state",
-  ]) {
-    await cp(join(sourceSnapshot, name), join(destSnapshot, name), {
-      preserveTimestamps: true,
-    });
-  }
-  for (const name of ["rootfs.ext4", "pages.img", "vmstate.bin"]) {
-    await cloneSparseImage(join(sourceSnapshot, name), join(destSnapshot, name));
-  }
+  await run([ctx.lnxBin, "--instance", ctx.instance, "fork", secondInstance]);
 }
 
 function parseDeltaSeconds(stdout: string): number {

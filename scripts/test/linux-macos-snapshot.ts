@@ -16,6 +16,7 @@ import {
   startHostHttpProbe,
   testStep,
   waitForVmSuspend,
+  latestSnapshotDir,
 } from "./lib";
 
 if (process.platform !== "darwin") {
@@ -87,7 +88,7 @@ try {
 
       if (exportMacosSnapshot) {
         await waitForVmSuspend(ctx, 120_000);
-        const latest = join(ctx.snapshotDir, "latest");
+        const latest = latestSnapshotDir(ctx);
         for (const file of ["vmstate.bin", "pages.img", "rootfs.ext4", "launch.json", "initramfs.stamp"]) {
           const path = join(latest, file);
           if (!existsSync(path)) {
