@@ -16,7 +16,8 @@ things the others don't do:
   processes still running. Prepare one instance (checkout, deps installed,
   server running), then fork it per experiment or per agent.
 - **Checkpoints.** Capture the whole machine — RAM, devices, disk — at a
-  known-good point and roll back to it, or fork new instances from it.
+  known-good point and roll back to it (`lnx restore`), or fork new
+  instances from it.
 
 If you want a always-on Docker replacement, OrbStack is great. If you want
 disposable-but-stateful Linux environments that appear on demand, that's
@@ -59,6 +60,7 @@ forwarding with `--forward` works without it.
 
 ## Where does my data live?
 
-Everything is under `~/.lnx`: instance rootfs images, memory snapshots,
-checkpoints, logs, and ingress state. Delete an instance directory (or all of
-`~/.lnx`) and it is gone.
+Everything is under `~/.lnx`: each instance's saved states (disk images and
+memory snapshots, kept as immutable generations), its checkpoints and logs,
+and ingress state. `lnx instances delete NAME` removes an instance; deleting
+`~/.lnx` removes everything.
