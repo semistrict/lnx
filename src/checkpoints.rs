@@ -335,6 +335,10 @@ impl StagedInstance {
                 dest.display()
             )
         })?;
+        // A fork reported done must survive a power loss.
+        if let Some(parent) = dest.parent() {
+            crate::store::sync_dir(parent)?;
+        }
         if let Err(error) = fs::remove_file(dest.join(".lnx-fork-lease")) {
             eprintln!(
                 "warning: fork was published but its internal lease file could not be removed from {}: {error}",

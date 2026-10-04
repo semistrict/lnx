@@ -315,12 +315,23 @@ fn a_new_owner_waits_for_its_first_client_before_it_may_stop() {
     assert!(status.pending, "the starting client is still on its way");
 
     drop(state.pending_connection());
+    assert!(
+        state.idle_status().pending,
+        "a status probe is not the client that started the owner"
+    );
+
+    let channel_id = 0x77;
+    open_exec(&state, channel_id);
+    state.deliver_to_client(channel_id, Message::Close { channel_id });
     assert!(!state.idle_status().pending, "the first client has arrived");
 }
 
 #[test]
 fn pending_connections_delay_stopping_without_restarting_the_idle_timer() {
     let (state, _agent_rx, _temp) = test_broker();
+    // The client that started the owner has come and gone.
+    open_exec(&state, 0x1);
+    state.deliver_to_client(0x1, Message::Close { channel_id: 0x1 });
 
     let probe = state.pending_connection();
     let status = state.idle_status();
@@ -333,7 +344,7 @@ fn pending_connections_delay_stopping_without_restarting_the_idle_timer() {
         IdleStatus {
             busy: false,
             pending: false,
-            seen_active: false,
+            seen_active: true,
         }
     );
 }

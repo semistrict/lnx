@@ -980,14 +980,21 @@ fn install_imported_sandbox(
     index_layout_into_cas(dest)
 }
 
+/// Moves a fully written import into place, durably: the import responds
+/// only once the instance would survive a power loss.
 fn move_into_place(imported: &Path, instance_dir: &Path) -> Result<()> {
+    store::sync_tree(imported)?;
     fs::rename(imported, instance_dir).with_context(|| {
         format!(
             "move imported sandbox {} to {}",
             imported.display(),
             instance_dir.display()
         )
-    })
+    })?;
+    match instance_dir.parent() {
+        Some(parent) => store::sync_dir(parent),
+        None => Ok(()),
+    }
 }
 
 /// Swaps an imported sandbox in for an existing instance while holding that

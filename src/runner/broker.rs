@@ -64,8 +64,9 @@ pub(crate) struct BrokerState {
     pending: AtomicUsize,
     seen_active: AtomicBool,
     awake_until: Mutex<Option<Instant>>,
-    /// Until the first client connects (or this passes), the owner may not
-    /// stop: the client that started it is still on its way.
+    /// Until the first channel opens (or this passes), the owner may not
+    /// stop: the client that started it is still on its way. Status probes
+    /// and other connections that open nothing do not count.
     first_client_deadline: Mutex<Option<Instant>>,
     auto_forward_ports: Mutex<HashSet<(String, u16)>>,
     agent_tx: mpsc::Sender<Message>,
@@ -163,6 +164,9 @@ impl BrokerState {
             self.active.fetch_add(1, Ordering::SeqCst);
         }
         self.seen_active.store(true, Ordering::SeqCst);
+        if let Ok(mut deadline) = self.first_client_deadline.lock() {
+            *deadline = None;
+        }
         entry.insert(channel);
         if let Err(error) = self.agent_tx.send(open) {
             channels.remove(&channel_id);
@@ -268,9 +272,6 @@ impl BrokerState {
     /// as long as the guard lives.
     pub(crate) fn pending_connection(self: &Arc<Self>) -> PendingConnection {
         self.pending.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut deadline) = self.first_client_deadline.lock() {
-            *deadline = None;
-        }
         PendingConnection {
             state: Arc::clone(self),
         }

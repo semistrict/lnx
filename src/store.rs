@@ -1062,7 +1062,7 @@ impl Store {
 }
 
 /// Syncs every regular file under `dir`, then each directory bottom-up.
-fn sync_tree(dir: &Path) -> Result<()> {
+pub(crate) fn sync_tree(dir: &Path) -> Result<()> {
     for entry in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
         let entry = entry?;
         let file_type = entry.file_type()?;
