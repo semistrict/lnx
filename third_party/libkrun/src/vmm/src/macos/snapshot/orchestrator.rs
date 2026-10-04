@@ -17,10 +17,10 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use log::info;
 
-use crossbeam_channel::RecvTimeoutError;
 use devices::legacy::{
     GicV3, GicV3State, IrqChip, LinuxGicDistReg, LinuxGicDistRestorePhase, VcpuList, VcpuListState,
     gic::GICDevice,
@@ -34,7 +34,7 @@ use crate::snapshot_metadata::{
     self, GUEST_ARCH_AARCH64, GicTopology, PAUTH_POLICY_NOPAUTH, SOURCE_BACKEND_HVF,
     SnapshotFormat, TOPOLOGY_HASH_VERSION, VirtioTopology,
 };
-use crate::vstate::KvmGicVcpuState;
+use crate::vstate::{KvmGicVcpuState, VcpuEvent, VcpuHandle, VcpuResponse, VcpuTicket};
 
 use super::container::{SectionId, SnapshotWriter};
 use super::ram::{clone_and_patch_dirty_pages_img, write_full_pages_img};
@@ -179,7 +179,7 @@ impl RestoredVirtioMmioSection {
 pub struct CaptureInputs<'a> {
     pub guest_memory: &'a GuestMemoryMmap,
     pub ram_ranges: &'a [(u64, u64)],
-    pub vcpu_handles: &'a [crate::vstate::VcpuHandle],
+    pub vcpu_handles: &'a [VcpuHandle],
     pub vcpu_ids: &'a [u64],
     pub vcpu_list: &'a Arc<VcpuList>,
     pub irqchip: Option<&'a IrqChip>,
@@ -773,70 +773,83 @@ fn publish_snapshot_dir(stage_dir: &Path, dir: &Path) -> Result<()> {
 
 /// Sends Pause to every vCPU, forces them out of hv_vcpu_run, and collects
 /// their serialized state.
-fn pause_vcpus(handles: &[crate::vstate::VcpuHandle], vcpu_ids: &[u64]) -> Result<Vec<Vec<u8>>> {
-    use crate::vstate::{VcpuEvent, VcpuResponse};
-
-    for h in handles {
-        h.send_event(VcpuEvent::Pause)
-            .map_err(|e| SnapshotError::Io(std::io::Error::other(format!("send Pause: {e:?}"))))?;
-    }
+fn pause_vcpus(handles: &[VcpuHandle], vcpu_ids: &[u64]) -> Result<Vec<Vec<u8>>> {
+    let tickets = send_to_all_vcpus(handles, || VcpuEvent::Pause)?;
     // Kick each vCPU so it returns from hv_vcpu_run and picks up the event.
     for &id in vcpu_ids {
         let _ = hvf::vcpu_request_exit(id);
     }
-
-    let mut out = Vec::with_capacity(handles.len());
-    for (i, h) in handles.iter().enumerate() {
-        match h
-            .response_receiver()
-            .recv_timeout(std::time::Duration::from_millis(VCPU_PAUSE_TIMEOUT_MS))
-        {
-            Ok(VcpuResponse::Paused(bytes)) => out.push(bytes),
-            Ok(other) => {
-                return Err(SnapshotError::Io(std::io::Error::other(format!(
-                    "vcpu {i}: unexpected response {other:?}"
-                ))));
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                return Err(SnapshotError::Io(std::io::Error::other(format!(
-                    "vcpu {i}: pause timeout"
-                ))));
-            }
-            Err(e) => {
-                return Err(SnapshotError::Io(std::io::Error::other(format!(
-                    "vcpu {i}: {e}"
-                ))));
-            }
+    let mut states = Vec::with_capacity(handles.len());
+    for (i, (h, ticket)) in handles.iter().zip(tickets).enumerate() {
+        match vcpu_reply(h, i, ticket, "pause")? {
+            VcpuResponse::Paused(bytes) => states.push(bytes),
+            other => return Err(unexpected_vcpu_reply(i, "pause", other)),
         }
     }
-    Ok(out)
+    Ok(states)
 }
 
-pub fn resume_vcpus(handles: &[crate::vstate::VcpuHandle]) -> Result<()> {
-    use crate::vstate::{VcpuEvent, VcpuResponse};
-    for h in handles {
-        h.send_event(VcpuEvent::Resume)
-            .map_err(|e| SnapshotError::Io(std::io::Error::other(format!("send Resume: {e:?}"))))?;
-    }
-    for (i, h) in handles.iter().enumerate() {
-        match h
-            .response_receiver()
-            .recv_timeout(std::time::Duration::from_millis(VCPU_PAUSE_TIMEOUT_MS))
-        {
-            Ok(VcpuResponse::Resumed) => {}
-            Ok(other) => {
-                return Err(SnapshotError::Io(std::io::Error::other(format!(
-                    "vcpu {i}: unexpected resume response {other:?}"
-                ))));
-            }
-            Err(e) => {
-                return Err(SnapshotError::Io(std::io::Error::other(format!(
-                    "vcpu {i}: resume recv: {e}"
-                ))));
-            }
+pub fn resume_vcpus(handles: &[VcpuHandle]) -> Result<()> {
+    let tickets = send_to_all_vcpus(handles, || VcpuEvent::Resume)?;
+    for (i, (h, ticket)) in handles.iter().zip(tickets).enumerate() {
+        match vcpu_reply(h, i, ticket, "resume")? {
+            VcpuResponse::Resumed => {}
+            other => return Err(unexpected_vcpu_reply(i, "resume", other)),
         }
     }
     Ok(())
+}
+
+fn send_to_all_vcpus(
+    handles: &[VcpuHandle],
+    event: impl Fn() -> VcpuEvent,
+) -> Result<Vec<VcpuTicket>> {
+    handles
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            h.send_event(event())
+                .map_err(|e| vcpu_error(i, "send", format!("{e:?}")))
+        })
+        .collect()
+}
+
+/// Sends `event` to one paused vCPU and waits for the reply.
+fn vcpu_call(
+    handle: &VcpuHandle,
+    index: usize,
+    event: VcpuEvent,
+    what: &str,
+) -> Result<VcpuResponse> {
+    let ticket = handle
+        .send_event(event)
+        .map_err(|e| vcpu_error(index, what, format!("send: {e:?}")))?;
+    vcpu_reply(handle, index, ticket, what)
+}
+
+/// Waits for the reply to `ticket`. Replies left over from earlier requests
+/// that timed out are skipped, so they can never be mistaken for this one.
+fn vcpu_reply(
+    handle: &VcpuHandle,
+    index: usize,
+    ticket: VcpuTicket,
+    what: &str,
+) -> Result<VcpuResponse> {
+    match handle.wait_reply(ticket, Duration::from_millis(VCPU_PAUSE_TIMEOUT_MS)) {
+        Ok(VcpuResponse::Error(e)) => Err(vcpu_error(index, what, e)),
+        Ok(response) => Ok(response),
+        Err(e) => Err(vcpu_error(index, what, e)),
+    }
+}
+
+fn unexpected_vcpu_reply(index: usize, what: &str, response: VcpuResponse) -> SnapshotError {
+    vcpu_error(index, what, format!("unexpected response {response:?}"))
+}
+
+fn vcpu_error(index: usize, what: &str, detail: impl std::fmt::Display) -> SnapshotError {
+    SnapshotError::Io(std::io::Error::other(format!(
+        "vcpu {index}: {what}: {detail}"
+    )))
 }
 
 /// Restore-side: given a fully-built (post-activate but pre-vCPU-run) VMM and
@@ -844,8 +857,6 @@ pub fn resume_vcpus(handles: &[crate::vstate::VcpuHandle]) -> Result<()> {
 /// then re-arm the virtual timer. Caller has already constructed memory from
 /// `pages.img`, so guest RAM is in place.
 pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Result<()> {
-    use crate::vstate::{VcpuEvent, VcpuResponse};
-
     info!("snapshot restore: starting");
     crate::timing_event("snapshot.restore.begin");
     let meta: MetaSection = reader.get_bincode(SectionId::Meta, 0)?;
@@ -869,26 +880,9 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
     // already blocked at the top of their first loop iteration. Drain their
     // initial Paused responses before sending RestoreState.
     for (i, h) in inputs.vcpu_handles.iter().enumerate() {
-        match h
-            .response_receiver()
-            .recv_timeout(std::time::Duration::from_millis(VCPU_PAUSE_TIMEOUT_MS))
-        {
-            Ok(VcpuResponse::Paused(_)) => {}
-            Ok(other) => {
-                return Err(SnapshotError::Io(std::io::Error::other(format!(
-                    "vcpu {i}: expected initial Paused, got {other:?}"
-                ))));
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                return Err(SnapshotError::Io(std::io::Error::other(format!(
-                    "vcpu {i}: initial-pause timeout"
-                ))));
-            }
-            Err(e) => {
-                return Err(SnapshotError::Io(std::io::Error::other(format!(
-                    "vcpu {i}: {e}"
-                ))));
-            }
+        match vcpu_reply(h, i, h.initial_pause_ticket(), "initial pause")? {
+            VcpuResponse::Paused(_) => {}
+            other => return Err(unexpected_vcpu_reply(i, "initial pause", other)),
         }
         crate::timing_event(&format!("snapshot.restore.vcpu.initial_paused index={i}"));
     }
@@ -935,27 +929,10 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
                 .get(i)
                 .map(|state| state.redist_regs.clone())
                 .unwrap_or_default();
-            h.send_event(VcpuEvent::RestoreGicRedist(redist_regs))
-                .map_err(|e| {
-                    SnapshotError::Io(std::io::Error::other(format!(
-                        "send RestoreGicRedist: {e:?}"
-                    )))
-                })?;
-            match h
-                .response_receiver()
-                .recv_timeout(std::time::Duration::from_millis(VCPU_PAUSE_TIMEOUT_MS))
-            {
-                Ok(VcpuResponse::Restored) => {}
-                Ok(VcpuResponse::Error(s)) => {
-                    return Err(SnapshotError::Io(std::io::Error::other(format!(
-                        "vcpu {i}: redist restore: {s}"
-                    ))));
-                }
-                other => {
-                    return Err(SnapshotError::Io(std::io::Error::other(format!(
-                        "vcpu {i}: unexpected redist restore response {other:?}"
-                    ))));
-                }
+            let what = "redist restore";
+            match vcpu_call(h, i, VcpuEvent::RestoreGicRedist(redist_regs), what)? {
+                VcpuResponse::Restored => {}
+                other => return Err(unexpected_vcpu_reply(i, what, other)),
             }
             crate::timing_event(&format!("snapshot.restore.linux_gic.redist.done index={i}"));
         }
@@ -981,24 +958,9 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
                 }),
             },
         };
-        h.send_event(event).map_err(|e| {
-            SnapshotError::Io(std::io::Error::other(format!("send RestoreState: {e:?}")))
-        })?;
-        match h
-            .response_receiver()
-            .recv_timeout(std::time::Duration::from_millis(VCPU_PAUSE_TIMEOUT_MS))
-        {
-            Ok(VcpuResponse::Restored) => {}
-            Ok(VcpuResponse::Error(s)) => {
-                return Err(SnapshotError::Io(std::io::Error::other(format!(
-                    "vcpu {i}: restore: {s}"
-                ))));
-            }
-            other => {
-                return Err(SnapshotError::Io(std::io::Error::other(format!(
-                    "vcpu {i}: unexpected {other:?}"
-                ))));
-            }
+        match vcpu_call(h, i, event, "restore")? {
+            VcpuResponse::Restored => {}
+            other => return Err(unexpected_vcpu_reply(i, "restore", other)),
         }
         crate::timing_event(&format!("snapshot.restore.vcpu.state.done index={i}"));
     }
@@ -1030,25 +992,9 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
     let timer_delta = restore_timer_delta(source_format, meta.capture_timer_counter);
     for (i, h) in inputs.vcpu_handles.iter().enumerate() {
         crate::timing_event(&format!("snapshot.restore.vcpu.timer.begin index={i}"));
-        h.send_event(VcpuEvent::RebaseTimer(timer_delta))
-            .map_err(|e| {
-                SnapshotError::Io(std::io::Error::other(format!("send RebaseTimer: {e:?}")))
-            })?;
-        match h
-            .response_receiver()
-            .recv_timeout(std::time::Duration::from_millis(VCPU_PAUSE_TIMEOUT_MS))
-        {
-            Ok(VcpuResponse::TimerRebased) => {}
-            Ok(VcpuResponse::Error(s)) => {
-                return Err(SnapshotError::Io(std::io::Error::other(format!(
-                    "vcpu {i}: timer rebase: {s}"
-                ))));
-            }
-            other => {
-                return Err(SnapshotError::Io(std::io::Error::other(format!(
-                    "vcpu {i}: unexpected timer rebase response {other:?}"
-                ))));
-            }
+        match vcpu_call(h, i, VcpuEvent::RebaseTimer(timer_delta), "timer rebase")? {
+            VcpuResponse::TimerRebased => {}
+            other => return Err(unexpected_vcpu_reply(i, "timer rebase", other)),
         }
         crate::timing_event(&format!("snapshot.restore.vcpu.timer.done index={i}"));
     }

@@ -55,9 +55,9 @@ use std::time::Duration;
 #[cfg(target_arch = "x86_64")]
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
+use crate::vstate::{Vcpu, VcpuHandle, Vm};
 #[cfg(target_os = "linux")]
-use crate::vstate::VcpuEvent;
-use crate::vstate::{Vcpu, VcpuHandle, VcpuResponse, Vm};
+use crate::vstate::{VcpuEvent, VcpuResponse};
 
 use arch::{ArchMemoryInfo, InitrdConfig};
 #[cfg(target_os = "macos")]
@@ -870,10 +870,7 @@ impl Subscriber for Vmm {
             let vcpu_exit_code = self
                 .vcpus_handles
                 .iter()
-                .find_map(|handle| match handle.response_receiver().try_recv() {
-                    Ok(VcpuResponse::Exited(exit_code)) => Some(exit_code),
-                    _ => None,
-                })
+                .find_map(VcpuHandle::exit_code)
                 .unwrap_or(FC_EXIT_CODE_OK);
             let vmm_exit_code = self.exit_code.load(Ordering::SeqCst);
             let exit_code = if vmm_exit_code != i32::MAX {

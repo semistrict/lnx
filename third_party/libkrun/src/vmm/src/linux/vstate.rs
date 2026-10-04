@@ -3222,6 +3222,14 @@ impl VcpuHandle {
     pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
         &self.response_receiver
     }
+
+    /// The code the vCPU exited with, if that is the next queued response.
+    pub fn exit_code(&self) -> Option<u8> {
+        match self.response_receiver.try_recv() {
+            Ok(VcpuResponse::Exited(exit_code)) => Some(exit_code),
+            _ => None,
+        }
+    }
 }
 
 enum VcpuEmulation {

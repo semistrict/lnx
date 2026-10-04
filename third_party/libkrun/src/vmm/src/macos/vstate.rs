@@ -10,16 +10,16 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::io;
 use std::result;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 
 use arch::ArchMemoryInfo;
-use crossbeam_channel::{Receiver, Select, Sender, TryRecvError, unbounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Select, Sender, TryRecvError, unbounded};
 use devices::legacy::VcpuList;
 use hvf::{HvfVcpu, HvfVm, InterruptController, VcpuExit, Vcpus};
 use serde::Deserialize;
@@ -209,13 +209,13 @@ pub struct Vcpu {
     #[cfg(target_arch = "aarch64")]
     mpidr: u64,
 
-    event_receiver: Receiver<VcpuEvent>,
+    event_receiver: Receiver<VcpuRequest>,
     // The transmitting end of the events channel which will be given to the handler.
-    event_sender: Option<Sender<VcpuEvent>>,
+    event_sender: Option<Sender<VcpuRequest>>,
     // The receiving end of the responses channel which will be given to the handler.
-    response_receiver: Option<Receiver<VcpuResponse>>,
+    response_receiver: Option<Receiver<VcpuReport>>,
     // The transmitting end of the responses channel owned by the vcpu side.
-    response_sender: Sender<VcpuResponse>,
+    response_sender: Sender<VcpuReport>,
 
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
@@ -347,7 +347,10 @@ impl Vcpu {
     pub fn queue_initial_pause(&mut self) {
         self.initial_pause = true;
         if let Some(sender) = &self.event_sender {
-            let _ = sender.send(VcpuEvent::Pause);
+            let _ = sender.send(VcpuRequest {
+                seq: INITIAL_PAUSE_SEQ,
+                event: VcpuEvent::Pause,
+            });
         }
     }
 
@@ -568,112 +571,96 @@ impl Vcpu {
         }
     }
 
-    /// Drain pending control events. If a Pause was requested, block until a
-    /// matching Resume (servicing RestoreState/RebaseTimer in between).
-    /// Returns false if the channel was closed (vmm dropped), in which case
-    /// the caller should exit the run loop.
+    /// Drain pending control events. If a Pause was requested, park until
+    /// the matching Resume. Returns false if the channel was closed (vmm
+    /// dropped), in which case the caller should exit the run loop.
     fn process_control_events(&mut self, hvf_vcpu: &mut HvfVcpu) -> bool {
         loop {
-            match self.event_receiver.try_recv() {
-                Ok(VcpuEvent::Pause) => {
-                    let response = match hvf_vcpu.save_state().and_then(|s| {
-                        bincode::serialize(&s).map_err(|_| hvf::Error::VcpuReadRegister)
-                    }) {
-                        Ok(payload) => VcpuResponse::Paused(payload),
-                        Err(e) => VcpuResponse::Error(format!("save_state: {e}")),
-                    };
-                    if self.response_sender.send(response).is_err() {
-                        return false;
-                    }
-                    // Block until we get Resume. While paused, also accept
-                    // RestoreState and RebaseTimer.
-                    loop {
-                        match self.event_receiver.recv() {
-                            Ok(VcpuEvent::Resume) => {
-                                debug!("vcpu.debug paused.resume_ack vcpu={}", hvf_vcpu.id());
-                                let _ = self.response_sender.send(VcpuResponse::Resumed);
-                                break;
-                            }
-                            Ok(VcpuEvent::Pause) => {
-                                // Already paused — re-acknowledge with current state.
-                                let resp = match hvf_vcpu.save_state().and_then(|s| {
-                                    bincode::serialize(&s).map_err(|_| hvf::Error::VcpuReadRegister)
-                                }) {
-                                    Ok(p) => VcpuResponse::Paused(p),
-                                    Err(e) => VcpuResponse::Error(format!("save_state: {e}")),
-                                };
-                                let _ = self.response_sender.send(resp);
-                            }
-                            Ok(VcpuEvent::RestoreState(bytes)) => {
-                                let resp = match bincode::deserialize::<hvf::state::HvfVcpuState>(
-                                    &bytes,
-                                ) {
-                                    Ok(st) => match hvf_vcpu.restore_state(&st) {
-                                        Ok(()) => VcpuResponse::Restored,
-                                        Err(e) => VcpuResponse::Error(format!("restore: {e}")),
-                                    },
-                                    Err(e) => VcpuResponse::Error(format!("decode: {e}")),
-                                };
-                                let _ = self.response_sender.send(resp);
-                            }
-                            Ok(VcpuEvent::RestoreKvmState {
-                                state,
-                                restore_counter,
-                                gic,
-                            }) => {
-                                let resp = match restore_kvm_state(
-                                    hvf_vcpu,
-                                    &state,
-                                    restore_counter,
-                                    gic.as_ref(),
-                                ) {
-                                    Ok(()) => VcpuResponse::Restored,
-                                    Err(e) => VcpuResponse::Error(format!("restore kvm: {e}")),
-                                };
-                                let _ = self.response_sender.send(resp);
-                            }
-                            Ok(VcpuEvent::RestoreGicRedist(regs)) => {
-                                let resp = match hvf_vcpu.restore_gic_redist_regs(&regs) {
-                                    Ok(()) => VcpuResponse::Restored,
-                                    Err(e) => VcpuResponse::Error(format!("restore redist: {e}")),
-                                };
-                                let _ = self.response_sender.send(resp);
-                            }
-                            Ok(VcpuEvent::RebaseTimer(delta)) => {
-                                // Rebasing on this, the owning, thread is all
-                                // restore needs. The in-kernel GIC delivers the
-                                // vtimer itself. With the userspace GIC,
-                                // rebase_timer leaves the vtimer unmasked, so
-                                // hv_vcpu_run reports VTIMER_ACTIVATED once it
-                                // fires and a guest WFI derives its own wait
-                                // deadline from CNTV_CVAL_EL0.
-                                let resp = match hvf_vcpu.rebase_timer(delta) {
-                                    Ok(()) => VcpuResponse::TimerRebased,
-                                    Err(e) => VcpuResponse::Error(format!("rebase: {e}")),
-                                };
-                                let _ = self.response_sender.send(resp);
-                            }
-                            Err(_) => return false,
-                        }
-                    }
-                }
-                Ok(VcpuEvent::Resume) => {
-                    // Spurious resume — ack and continue.
-                    debug!("vcpu.debug running.resume_ack vcpu={}", hvf_vcpu.id());
-                    let _ = self.response_sender.send(VcpuResponse::Resumed);
-                }
-                Ok(VcpuEvent::RestoreState(_))
-                | Ok(VcpuEvent::RestoreKvmState { .. })
-                | Ok(VcpuEvent::RestoreGicRedist(_))
-                | Ok(VcpuEvent::RebaseTimer(_)) => {
-                    let _ = self
-                        .response_sender
-                        .send(VcpuResponse::Error("not paused".into()));
-                }
+            let VcpuRequest { seq, event } = match self.event_receiver.try_recv() {
+                Ok(request) => request,
                 Err(TryRecvError::Empty) => return true,
                 Err(TryRecvError::Disconnected) => return false,
+            };
+            match event {
+                VcpuEvent::Pause => {
+                    self.reply(seq, paused_response(hvf_vcpu));
+                    if !self.park(hvf_vcpu) {
+                        return false;
+                    }
+                }
+                VcpuEvent::Resume => {
+                    // Spurious resume — ack and continue.
+                    debug!("vcpu.debug running.resume_ack vcpu={}", hvf_vcpu.id());
+                    self.reply(seq, VcpuResponse::Resumed);
+                }
+                VcpuEvent::RestoreState(_)
+                | VcpuEvent::RestoreKvmState { .. }
+                | VcpuEvent::RestoreGicRedist(_)
+                | VcpuEvent::RebaseTimer(_) => {
+                    self.reply(seq, VcpuResponse::Error("not paused".into()));
+                }
             }
         }
+    }
+
+    /// Blocks a paused vCPU until Resume, serving state requests meanwhile.
+    /// Returns false if the channel was closed.
+    fn park(&mut self, hvf_vcpu: &mut HvfVcpu) -> bool {
+        loop {
+            let Ok(VcpuRequest { seq, event }) = self.event_receiver.recv() else {
+                return false;
+            };
+            let response = match event {
+                VcpuEvent::Resume => {
+                    debug!("vcpu.debug paused.resume_ack vcpu={}", hvf_vcpu.id());
+                    self.reply(seq, VcpuResponse::Resumed);
+                    return true;
+                }
+                // Already paused — re-acknowledge with current state.
+                VcpuEvent::Pause => paused_response(hvf_vcpu),
+                VcpuEvent::RestoreState(bytes) => {
+                    match bincode::deserialize::<hvf::state::HvfVcpuState>(&bytes) {
+                        Ok(st) => match hvf_vcpu.restore_state(&st) {
+                            Ok(()) => VcpuResponse::Restored,
+                            Err(e) => VcpuResponse::Error(format!("restore: {e}")),
+                        },
+                        Err(e) => VcpuResponse::Error(format!("decode: {e}")),
+                    }
+                }
+                VcpuEvent::RestoreKvmState {
+                    state,
+                    restore_counter,
+                    gic,
+                } => match restore_kvm_state(hvf_vcpu, &state, restore_counter, gic.as_ref()) {
+                    Ok(()) => VcpuResponse::Restored,
+                    Err(e) => VcpuResponse::Error(format!("restore kvm: {e}")),
+                },
+                VcpuEvent::RestoreGicRedist(regs) => {
+                    match hvf_vcpu.restore_gic_redist_regs(&regs) {
+                        Ok(()) => VcpuResponse::Restored,
+                        Err(e) => VcpuResponse::Error(format!("restore redist: {e}")),
+                    }
+                }
+                // Rebasing on this, the owning, thread is all restore needs.
+                // The in-kernel GIC delivers the vtimer itself. With the
+                // userspace GIC, rebase_timer leaves the vtimer unmasked, so
+                // hv_vcpu_run reports VTIMER_ACTIVATED once it fires and a
+                // guest WFI derives its own wait deadline from CNTV_CVAL_EL0.
+                VcpuEvent::RebaseTimer(delta) => match hvf_vcpu.rebase_timer(delta) {
+                    Ok(()) => VcpuResponse::TimerRebased,
+                    Err(e) => VcpuResponse::Error(format!("rebase: {e}")),
+                },
+            };
+            self.reply(seq, response);
+        }
+    }
+
+    /// A closed channel means the handle is gone; the next receive on the
+    /// request channel observes that, so a failed send needs no handling.
+    fn reply(&self, seq: u64, response: VcpuResponse) {
+        let _ = self
+            .response_sender
+            .send(VcpuReport::Reply { seq, response });
     }
 
     /// Parks this vCPU until a device IRQ arrives on `receiver`, the optional
@@ -715,7 +702,7 @@ impl Vcpu {
 
     fn exit(&mut self, exit_code: u8) {
         self.response_sender
-            .send(VcpuResponse::Exited(exit_code))
+            .send(VcpuReport::Exited(exit_code))
             .expect("failed to send Exited status");
 
         if let Err(e) = self.exit_evt.write(1) {
@@ -727,6 +714,16 @@ impl Vcpu {
 impl Drop for Vcpu {
     fn drop(&mut self) {
         let _ = self.reset_thread_local_data();
+    }
+}
+
+fn paused_response(hvf_vcpu: &HvfVcpu) -> VcpuResponse {
+    match hvf_vcpu
+        .save_state()
+        .and_then(|s| bincode::serialize(&s).map_err(|_| hvf::Error::VcpuReadRegister))
+    {
+        Ok(payload) => VcpuResponse::Paused(payload),
+        Err(e) => VcpuResponse::Error(format!("save_state: {e}")),
     }
 }
 
@@ -763,49 +760,132 @@ pub enum VcpuResponse {
     Restored,
     /// RebaseTimer applied.
     TimerRebased,
-    /// Vcpu is stopped.
-    Exited(u8),
     /// A control event failed.
     Error(String),
 }
 
+/// Sequence number of the Pause that `Vcpu::queue_initial_pause` queues
+/// before the handle exists. Requests sent through the handle start after it.
+const INITIAL_PAUSE_SEQ: u64 = 0;
+
+/// A control event tagged with the sequence number its reply will carry.
+#[derive(Debug)]
+pub struct VcpuRequest {
+    seq: u64,
+    event: VcpuEvent,
+}
+
+/// What a vCPU thread sends back to its handle.
+#[derive(Debug)]
+pub enum VcpuReport {
+    /// Reply to the request with sequence number `seq`.
+    Reply { seq: u64, response: VcpuResponse },
+    /// The vCPU stopped running the guest. Unsolicited.
+    Exited(u8),
+}
+
+/// Identifies one sent request so its reply can be told apart from replies
+/// to earlier requests that were abandoned (e.g. after a timeout).
+#[must_use]
+#[derive(Debug)]
+pub struct VcpuTicket(u64);
+
+#[derive(Debug)]
+pub enum ReplyError {
+    /// No reply arrived in time. A later reply to this request is discarded
+    /// by whichever wait comes next.
+    Timeout,
+    /// The vCPU exited before replying.
+    Exited(u8),
+    /// The vCPU thread is gone.
+    Disconnected,
+}
+
+impl Display for ReplyError {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        match self {
+            ReplyError::Timeout => write!(f, "timed out waiting for reply"),
+            ReplyError::Exited(code) => write!(f, "vCPU exited with code {code}"),
+            ReplyError::Disconnected => write!(f, "vCPU thread is gone"),
+        }
+    }
+}
+
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
 pub struct VcpuHandle {
-    event_sender: Sender<VcpuEvent>,
-    response_receiver: Receiver<VcpuResponse>,
+    event_sender: Sender<VcpuRequest>,
+    response_receiver: Receiver<VcpuReport>,
+    next_seq: AtomicU64,
+    exit_code: OnceLock<u8>,
 }
 
 impl VcpuHandle {
     pub fn new(
-        event_sender: Sender<VcpuEvent>,
-        response_receiver: Receiver<VcpuResponse>,
+        event_sender: Sender<VcpuRequest>,
+        response_receiver: Receiver<VcpuReport>,
         _vcpu_thread: thread::JoinHandle<()>,
     ) -> Self {
         Self {
             event_sender,
             response_receiver,
+            next_seq: AtomicU64::new(INITIAL_PAUSE_SEQ + 1),
+            exit_code: OnceLock::new(),
         }
     }
 
-    pub fn send_event(&self, event: VcpuEvent) -> Result<()> {
+    /// Queues `event` for the vCPU thread. The vCPU only notices it between
+    /// guest runs or while idle; callers kick a running vCPU out of the guest.
+    pub fn send_event(&self, event: VcpuEvent) -> Result<VcpuTicket> {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         // Use expect() to crash if the other thread closed this channel.
         self.event_sender
-            .send(event)
+            .send(VcpuRequest { seq, event })
             .expect("event sender channel closed on vcpu end.");
-        // Kick the vcpu so it picks up the message.
-        /*
-        self.vcpu_thread
-            .as_ref()
-            // Safe to unwrap since constructor make this 'Some'.
-            .unwrap()
-            .kill(sigrtmin() + VCPU_RTSIG_OFFSET)
-            .map_err(Error::SignalVcpu)?;
-        */
-        Ok(())
+        Ok(VcpuTicket(seq))
     }
 
-    pub fn response_receiver(&self) -> &Receiver<VcpuResponse> {
-        &self.response_receiver
+    /// Waits for the reply to the request identified by `ticket`, discarding
+    /// replies to earlier requests that were abandoned.
+    pub fn wait_reply(
+        &self,
+        ticket: VcpuTicket,
+        timeout: Duration,
+    ) -> result::Result<VcpuResponse, ReplyError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.response_receiver.recv_deadline(deadline) {
+                Ok(VcpuReport::Reply { seq, response }) if seq == ticket.0 => return Ok(response),
+                Ok(VcpuReport::Reply { seq, response }) => {
+                    debug!(
+                        "vcpu.debug stale_reply seq={seq} waiting={} {response:?}",
+                        ticket.0
+                    );
+                }
+                Ok(VcpuReport::Exited(code)) => {
+                    let _ = self.exit_code.set(code);
+                    return Err(ReplyError::Exited(code));
+                }
+                Err(RecvTimeoutError::Timeout) => return Err(ReplyError::Timeout),
+                Err(RecvTimeoutError::Disconnected) => return Err(ReplyError::Disconnected),
+            }
+        }
+    }
+
+    /// Ticket for the Pause that `Vcpu::queue_initial_pause` queued before
+    /// this handle existed.
+    pub fn initial_pause_ticket(&self) -> VcpuTicket {
+        VcpuTicket(INITIAL_PAUSE_SEQ)
+    }
+
+    /// The code the vCPU exited with, if it has exited. Replies still queued
+    /// are discarded: once a vCPU has exited nobody waits for them.
+    pub fn exit_code(&self) -> Option<u8> {
+        while let Ok(report) = self.response_receiver.try_recv() {
+            if let VcpuReport::Exited(code) = report {
+                let _ = self.exit_code.set(code);
+            }
+        }
+        self.exit_code.get().copied()
     }
 }
 
@@ -1224,11 +1304,7 @@ fn debug_log_vcpu_exit(vcpuid: u64, kind: String) {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_arch = "x86_64")]
-    use crossbeam_channel::RecvTimeoutError;
     use std::sync::Arc;
-    #[cfg(target_arch = "x86_64")]
-    use std::time::Duration;
 
     use std::ffi::CString;
 
@@ -1444,11 +1520,14 @@ mod tests {
         entry.1 = value;
     }
 
-    fn next_response(handle: &VcpuHandle) -> VcpuResponse {
+    fn reply(handle: &VcpuHandle, ticket: VcpuTicket) -> VcpuResponse {
         handle
-            .response_receiver()
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("vCPU thread did not respond")
+            .wait_reply(ticket, Duration::from_secs(10))
+            .expect("vCPU thread did not reply")
+    }
+
+    fn call(handle: &VcpuHandle, event: VcpuEvent) -> VcpuResponse {
+        reply(handle, handle.send_event(event).unwrap())
     }
 
     /// Snapshot restore re-arms the vtimer with RebaseTimer. Under the
@@ -1498,7 +1577,7 @@ mod tests {
         let handle = vcpu.start_threaded().unwrap();
 
         // Restore a vCPU whose vtimer is enabled and already expired.
-        let VcpuResponse::Paused(payload) = next_response(&handle) else {
+        let VcpuResponse::Paused(payload) = reply(&handle, handle.initial_pause_ticket()) else {
             panic!("expected the initial pause");
         };
         let mut state: hvf::state::HvfVcpuState = bincode::deserialize(&payload).unwrap();
@@ -1512,27 +1591,28 @@ mod tests {
             hvf::bindings::hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0,
             1,
         );
-        handle
-            .send_event(VcpuEvent::RestoreState(bincode::serialize(&state).unwrap()))
-            .unwrap();
-        let response = next_response(&handle);
+        let response = call(
+            &handle,
+            VcpuEvent::RestoreState(bincode::serialize(&state).unwrap()),
+        );
         assert!(matches!(response, VcpuResponse::Restored), "{response:?}");
 
-        handle.send_event(VcpuEvent::RebaseTimer(0)).unwrap();
-        let response = next_response(&handle);
+        let response = call(&handle, VcpuEvent::RebaseTimer(0));
         assert!(
             matches!(response, VcpuResponse::TimerRebased),
             "{response:?}"
         );
 
-        handle.send_event(VcpuEvent::Resume).unwrap();
-        let response = next_response(&handle);
+        let response = call(&handle, VcpuEvent::Resume);
         assert!(matches!(response, VcpuResponse::Resumed), "{response:?}");
 
-        let response = next_response(&handle);
+        let report = handle
+            .response_receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("vCPU thread did not exit");
         assert!(
-            matches!(response, VcpuResponse::Exited(FC_EXIT_CODE_OK)),
-            "{response:?}"
+            matches!(report, VcpuReport::Exited(FC_EXIT_CODE_OK)),
+            "{report:?}"
         );
         assert!(!shared.vcpu_list.has_pending_irq(0));
     }
@@ -1625,12 +1705,20 @@ mod tests {
         let (_wfe_sender, wfe) = unbounded();
 
         let woken = spawn_wait_for_event(vcpu, wfe, None);
-        events.send(VcpuEvent::Pause).unwrap();
+        events
+            .send(VcpuRequest {
+                seq: 1,
+                event: VcpuEvent::Pause,
+            })
+            .unwrap();
         let vcpu = expect_woken(&woken);
 
         assert!(matches!(
             vcpu.event_receiver.try_recv(),
-            Ok(VcpuEvent::Pause)
+            Ok(VcpuRequest {
+                seq: 1,
+                event: VcpuEvent::Pause
+            })
         ));
     }
 
@@ -1664,32 +1752,104 @@ mod tests {
         expect_woken(&woken);
     }
 
-    #[cfg(target_arch = "x86_64")]
-    // Sends an event to a vcpu and expects a particular response.
-    fn queue_event_expect_response(handle: &VcpuHandle, event: VcpuEvent, response: VcpuResponse) {
-        handle
-            .send_event(event)
-            .expect("failed to send event to vcpu");
-        assert_eq!(
-            handle
-                .response_receiver()
-                .recv_timeout(Duration::from_millis(100))
-                .expect("did not receive event response from vcpu"),
-            response
-        );
+    /// A handle wired to channels the test drives in place of a vCPU thread.
+    struct FakeVcpu {
+        handle: VcpuHandle,
+        requests: Receiver<VcpuRequest>,
+        reports: Sender<VcpuReport>,
     }
 
-    #[cfg(target_arch = "x86_64")]
-    // Sends an event to a vcpu and expects no response.
-    fn queue_event_expect_timeout(handle: &VcpuHandle, event: VcpuEvent) {
-        handle
-            .send_event(event)
-            .expect("failed to send event to vcpu");
-        assert_eq!(
-            handle
-                .response_receiver()
-                .recv_timeout(Duration::from_millis(100)),
-            Err(RecvTimeoutError::Timeout)
+    impl FakeVcpu {
+        fn new() -> Self {
+            let (event_sender, requests) = unbounded();
+            let (reports, report_receiver) = unbounded();
+            Self {
+                handle: VcpuHandle::new(event_sender, report_receiver, thread::spawn(|| {})),
+                requests,
+                reports,
+            }
+        }
+
+        fn reply_to_next_request(&self, response: VcpuResponse) {
+            let request = self.requests.try_recv().expect("queued request");
+            self.reports
+                .send(VcpuReport::Reply {
+                    seq: request.seq,
+                    response,
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn wait_reply_skips_late_reply_to_abandoned_request() {
+        let vcpu = FakeVcpu::new();
+        let pause = vcpu.handle.send_event(VcpuEvent::Pause).unwrap();
+        assert!(matches!(
+            vcpu.handle.wait_reply(pause, Duration::ZERO),
+            Err(ReplyError::Timeout)
+        ));
+
+        vcpu.reply_to_next_request(VcpuResponse::Paused(vec![1]));
+        let resume = vcpu.handle.send_event(VcpuEvent::Resume).unwrap();
+        vcpu.reply_to_next_request(VcpuResponse::Resumed);
+
+        assert!(matches!(
+            vcpu.handle.wait_reply(resume, Duration::from_secs(10)),
+            Ok(VcpuResponse::Resumed)
+        ));
+        assert!(matches!(
+            vcpu.handle.response_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn wait_reply_reports_exit_and_keeps_exit_code() {
+        let vcpu = FakeVcpu::new();
+        let pause = vcpu.handle.send_event(VcpuEvent::Pause).unwrap();
+        vcpu.reports.send(VcpuReport::Exited(3)).unwrap();
+
+        assert!(matches!(
+            vcpu.handle.wait_reply(pause, Duration::from_secs(10)),
+            Err(ReplyError::Exited(3))
+        ));
+        assert_eq!(vcpu.handle.exit_code(), Some(3));
+    }
+
+    #[test]
+    fn exit_code_is_found_behind_stale_replies() {
+        let vcpu = FakeVcpu::new();
+        let _abandoned = vcpu.handle.send_event(VcpuEvent::Pause).unwrap();
+        vcpu.reply_to_next_request(VcpuResponse::Paused(vec![1]));
+        vcpu.reports.send(VcpuReport::Exited(4)).unwrap();
+
+        assert_eq!(vcpu.handle.exit_code(), Some(4));
+    }
+
+    #[test]
+    fn initial_pause_reply_is_matched_by_its_ticket() {
+        let (mut vcpu, _) = setup_vcpu(0x1000);
+        vcpu.queue_initial_pause();
+        let request = vcpu.event_receiver.try_recv().expect("initial pause");
+        let reports = vcpu.response_sender.clone();
+        let handle = VcpuHandle::new(
+            vcpu.event_sender.take().unwrap(),
+            vcpu.response_receiver.take().unwrap(),
+            thread::spawn(|| {}),
         );
+        let first = handle.send_event(VcpuEvent::Resume).unwrap();
+        assert_ne!(first.0, request.seq);
+
+        reports
+            .send(VcpuReport::Reply {
+                seq: request.seq,
+                response: VcpuResponse::Paused(vec![]),
+            })
+            .unwrap();
+        assert!(matches!(
+            handle.wait_reply(handle.initial_pause_ticket(), Duration::from_secs(10)),
+            Ok(VcpuResponse::Paused(_))
+        ));
     }
 }
