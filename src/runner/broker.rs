@@ -455,9 +455,14 @@ pub(crate) fn handle_broker_client(
         let message = match read_message(&mut client) {
             Ok(message) => message,
             Err(_) => {
+                // The client is gone. A command still running has no one to
+                // report to, so end it (its whole process group) rather than
+                // leave it running and keeping the VM awake.
                 let _activity = krun::deterministic_host_activity();
                 run_log.line(format!("broker.client.read_eof channel={channel_id:016x}"));
-                let _ = context.state.send_to_agent(Message::Eof { channel_id });
+                context
+                    .state
+                    .send_to_agent_on(channel_id, Message::Close { channel_id });
                 return Ok(());
             }
         };

@@ -45,6 +45,7 @@ const O_NONBLOCK: c_int = 0o4000;
 const STDIN_FILENO: c_int = 0;
 const STDOUT_FILENO: c_int = 1;
 const STDERR_FILENO: c_int = 2;
+const SIGHUP: c_int = 1;
 const SIGTERM: c_int = 15;
 const WNOHANG: c_int = 1;
 const POLLIN: i16 = 0x0001;
@@ -2133,6 +2134,16 @@ fn log_child_probe(channel_id: u64, pid: c_int) {
     );
 }
 
+/// Ends an exec whose client went away: hangs up its session (the command
+/// is a session leader, so its pid is also its process group) the way
+/// closing a terminal does.
+fn hang_up_session(pid: c_int) {
+    unsafe {
+        kill(-pid, SIGHUP);
+        kill(-pid, SIGTERM);
+    }
+}
+
 fn send_status(agent_fd: &Arc<Mutex<c_int>>, channel_id: u64, status: c_int) {
     log!(
         "channel.status.send channel={channel_id:016x} status={}",
@@ -2366,9 +2377,7 @@ fn run_channel_pty(
                     }
                 }
                 ChannelInput::Close => {
-                    unsafe {
-                        kill(pid, SIGTERM);
-                    }
+                    hang_up_session(pid);
                     status = 130 << 8;
                     break;
                 }
@@ -2450,6 +2459,9 @@ fn run_channel_pipe(
     }
     if pid == 0 {
         unsafe {
+            // Its own session, so closing the channel can end everything
+            // the command started, as a terminal hangup would.
+            setsid();
             close(stdin_pipe[1]);
             close(stdout_pipe[0]);
             close(stderr_pipe[0]);
@@ -2571,9 +2583,7 @@ fn run_channel_pipe(
                     stdin_write = -1;
                 }
                 ChannelInput::Close => {
-                    unsafe {
-                        kill(pid, SIGTERM);
-                    }
+                    hang_up_session(pid);
                     status = 130 << 8;
                     break;
                 }

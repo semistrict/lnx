@@ -1,13 +1,12 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 pub(crate) use lnx_protocol::MAX_MESSAGE_SIZE;
 use lnx_protocol::Message;
 
-use super::INTERRUPTED;
+use super::client_interrupted;
 
 const INTERRUPT_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -38,7 +37,7 @@ pub(crate) fn read_message_interruptible(stream: &mut UnixStream) -> Result<Opti
         .set_read_timeout(Some(INTERRUPT_POLL_TIMEOUT))
         .context("set interruptible read timeout")?;
     loop {
-        if INTERRUPTED.load(Ordering::SeqCst) {
+        if client_interrupted() {
             let _ = stream.set_read_timeout(None);
             return Ok(None);
         }

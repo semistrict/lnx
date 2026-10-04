@@ -9,7 +9,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex, Once,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -69,12 +69,22 @@ const RUN_ID_ENV: &str = "LNX_RUN_ID";
 const LAUNCH_METADATA: &str = "launch.json";
 static SIGNAL_INIT: Once = Once::new();
 static OWNER_SIGNAL_INIT: Once = Once::new();
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+/// The signal (SIGINT, SIGTERM or SIGHUP) that asked the client to stop, or 0.
+static INTERRUPT_SIGNAL: AtomicI32 = AtomicI32::new(0);
 static OWNER_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static LIFECYCLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-extern "C" fn handle_sigint(_: libc::c_int) {
-    INTERRUPTED.store(true, Ordering::SeqCst);
+extern "C" fn handle_client_interrupt(signal: libc::c_int) {
+    INTERRUPT_SIGNAL.store(signal, Ordering::SeqCst);
+}
+
+pub(crate) fn client_interrupted() -> bool {
+    INTERRUPT_SIGNAL.load(Ordering::SeqCst) != 0
+}
+
+/// The exit status of a client stopped by a signal, as a shell reports it.
+fn interrupted_status() -> i32 {
+    128 + INTERRUPT_SIGNAL.load(Ordering::SeqCst)
 }
 
 extern "C" fn handle_owner_shutdown(_: libc::c_int) {
@@ -173,7 +183,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
         bail!("vhost-user fs mounts are read-only only");
     }
     install_signal_handlers();
-    INTERRUPTED.store(false, Ordering::SeqCst);
+    INTERRUPT_SIGNAL.store(0, Ordering::SeqCst);
     config.layout.create_runtime_dirs()?;
     refuse_crashed_run(&config.layout)?;
     let run_log = Arc::new(RunLog::open(&config.layout)?);
@@ -1156,12 +1166,19 @@ pub fn proxy_stream_to_guest(
     }
 }
 
+/// The client stops on SIGINT, SIGTERM and SIGHUP by closing its channel,
+/// which ends the guest command's process group, instead of dying and
+/// leaving the command running.
 fn install_signal_handlers() {
-    SIGNAL_INIT.call_once(|| unsafe {
-        libc::signal(
-            libc::SIGINT,
-            handle_sigint as *const () as libc::sighandler_t,
-        );
+    SIGNAL_INIT.call_once(|| {
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            unsafe {
+                libc::signal(
+                    signal,
+                    handle_client_interrupt as *const () as libc::sighandler_t,
+                );
+            }
+        }
     });
 }
 
@@ -1508,7 +1525,7 @@ fn run_broker_session(
     deterministic: Option<&DeterministicConfig>,
     instance: &str,
 ) -> Result<i32> {
-    INTERRUPTED.store(false, Ordering::SeqCst);
+    INTERRUPT_SIGNAL.store(0, Ordering::SeqCst);
     // Validate the cwd resolves to a host home directory even when
     // no_host_shares is set, matching the eager-validation pattern used
     // elsewhere (e.g. snapshot_shares_incompatibility_for_import).
@@ -1578,65 +1595,36 @@ fn run_broker_session(
         },
     )?;
 
-    if !is_tty(std::io::stdin().as_raw_fd()) {
-        let mut bytes = Vec::new();
-        let mut input = [0u8; 8192];
-        loop {
-            match std::io::stdin().read(&mut input) {
-                Ok(0) => break,
-                Ok(n) => bytes.extend_from_slice(&input[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e).context("read stdin"),
-            }
-        }
-        if !bytes.is_empty() {
-            write_message(&mut stream, &Message::Data { channel_id, bytes })?;
-        }
-        write_message(&mut stream, &Message::Eof { channel_id })?;
-        loop {
-            let Some(message) = read_message_interruptible(&mut stream)? else {
-                let _ = write_message(&mut stream, &Message::Eof { channel_id });
-                let _ = write_message(&mut stream, &Message::Close { channel_id });
-                return Ok(130);
-            };
-            match message {
-                Message::Data {
-                    channel_id: id,
-                    bytes,
-                } if id == channel_id => {
-                    std::io::stdout().write_all(&bytes)?;
-                    std::io::stdout().flush()?;
-                }
-                Message::Stderr {
-                    channel_id: id,
-                    bytes,
-                } if id == channel_id => {
-                    std::io::stderr().write_all(&bytes)?;
-                    std::io::stderr().flush()?;
-                }
-                Message::ExitStatus {
-                    channel_id: id,
-                    status,
-                } if id == channel_id => {
-                    return Ok(status);
-                }
-                Message::Error {
-                    channel_id: id,
-                    message,
-                } if id == channel_id => {
-                    bail!("{message}");
-                }
-                _ => {}
-            }
-        }
+    if deterministic.is_some() && !is_tty(std::io::stdin().as_raw_fd()) {
+        // A deterministic run must see the same input chunks every time.
+        send_all_stdin(&mut stream, channel_id)?;
+    } else {
+        spawn_stdin_pump(&stream, channel_id)?;
     }
+    let status = relay_channel_output(&mut stream, channel_id);
+    drop(raw_mode);
+    status
+}
 
+fn send_all_stdin(stream: &mut UnixStream, channel_id: u64) -> Result<()> {
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .lock()
+        .read_to_end(&mut bytes)
+        .context("read stdin")?;
+    if !bytes.is_empty() {
+        write_message(stream, &Message::Data { channel_id, bytes })?;
+    }
+    write_message(stream, &Message::Eof { channel_id })
+}
+
+/// Forwards stdin to the guest as it arrives, then its end.
+fn spawn_stdin_pump(stream: &UnixStream, channel_id: u64) -> Result<()> {
     let mut input_stream = stream
         .try_clone()
         .context("clone broker stream for stdin")?;
     thread::spawn(move || {
-        let stdin_handle = std::io::stdin();
-        let mut stdin = stdin_handle.lock();
+        let mut stdin = std::io::stdin().lock();
         let mut input = [0u8; 8192];
         loop {
             match stdin.read(&mut input) {
@@ -1645,14 +1633,11 @@ fn run_broker_session(
                     break;
                 }
                 Ok(n) => {
-                    let result = write_message(
-                        &mut input_stream,
-                        &Message::Data {
-                            channel_id,
-                            bytes: input[..n].to_vec(),
-                        },
-                    );
-                    if result.is_err() {
+                    let data = Message::Data {
+                        channel_id,
+                        bytes: input[..n].to_vec(),
+                    };
+                    if write_message(&mut input_stream, &data).is_err() {
                         break;
                     }
                 }
@@ -1661,13 +1646,17 @@ fn run_broker_session(
             }
         }
     });
+    Ok(())
+}
 
+/// Copies the guest command's output to stdout and stderr until it exits.
+/// A client stopped by a signal closes the channel, which ends the command.
+fn relay_channel_output(stream: &mut UnixStream, channel_id: u64) -> Result<i32> {
     loop {
-        let Some(message) = read_message_interruptible(&mut stream)? else {
-            let _ = write_message(&mut stream, &Message::Eof { channel_id });
-            let _ = write_message(&mut stream, &Message::Close { channel_id });
-            drop(raw_mode);
-            return Ok(130);
+        let Some(message) = read_message_interruptible(stream)? else {
+            let _ = write_message(stream, &Message::Eof { channel_id });
+            let _ = write_message(stream, &Message::Close { channel_id });
+            return Ok(interrupted_status());
         };
         match message {
             Message::Data {
@@ -1687,16 +1676,11 @@ fn run_broker_session(
             Message::ExitStatus {
                 channel_id: id,
                 status,
-            } if id == channel_id => {
-                drop(raw_mode);
-                return Ok(status);
-            }
+            } if id == channel_id => return Ok(status),
             Message::Error {
                 channel_id: id,
                 message,
-            } if id == channel_id => {
-                bail!("{message}");
-            }
+            } if id == channel_id => bail!("{message}"),
             _ => {}
         }
     }
@@ -2368,8 +2352,8 @@ fn run_broker_client_awaiting_owner(
     let deadline = Instant::now() + OWNER_BOOT_TIMEOUT;
     let mut last = None;
     while Instant::now() < deadline {
-        if INTERRUPTED.load(Ordering::SeqCst) {
-            return Ok(130);
+        if client_interrupted() {
+            return Ok(interrupted_status());
         }
         match connect_broker(socket) {
             Ok(stream) => {
