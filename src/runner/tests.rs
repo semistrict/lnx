@@ -1977,3 +1977,35 @@ fn home_write_allowlist_is_empty_outside_home() {
 fn cwd_write_allowlist_allows_entire_outside_home_cwd_share() {
     assert_eq!(cwd_write_allowlist(), vec![".".to_string()]);
 }
+
+#[test]
+fn concurrent_run_log_writers_never_interleave_within_a_line() {
+    let temp = TempDir::new("run-log-interleave");
+    let layout = temp_layout(&temp, "vm");
+    fs::create_dir_all(&layout.run_dir).expect("create run dir");
+    // Separate handles stand in for the client and owner processes, which
+    // each open the log themselves.
+    let writers: Vec<_> = (0..4)
+        .map(|writer| {
+            let log = RunLog::open(&layout).expect("open run log");
+            thread::spawn(move || {
+                for line in 0..500 {
+                    log.line(format!("writer={writer} line={line} {}", "x".repeat(64)));
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().expect("join writer");
+    }
+
+    let content = fs::read_to_string(layout.run_dir.join("lnx.log")).expect("read log");
+    let lines: Vec<_> = content.lines().collect();
+    assert_eq!(lines.len(), 2000);
+    for line in lines {
+        let (timestamp, rest) = line.split_once(' ').expect("timestamp");
+        assert!(timestamp.split_once('.').is_some(), "malformed line: {line}");
+        assert!(rest.starts_with("writer="), "malformed line: {line}");
+        assert!(rest.ends_with(&"x".repeat(64)), "malformed line: {line}");
+    }
+}

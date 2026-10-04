@@ -101,13 +101,11 @@ impl RunLog {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         let message = message.as_ref().replace('\r', "").replace('\n', " | ");
-        let _ = writeln!(
-            file,
-            "{}.{:09} {}",
-            now.as_secs(),
-            now.subsec_nanos(),
-            message
-        );
+        // One write per line: the client and the owner append to the same
+        // file, and an O_APPEND write is placed atomically, whereas
+        // `writeln!` issues a write per formatted piece and lines interleave.
+        let line = format!("{}.{:09} {message}\n", now.as_secs(), now.subsec_nanos());
+        let _ = file.write_all(line.as_bytes());
     }
 }
 
@@ -312,9 +310,8 @@ impl TimingLog {
             .unwrap_or_default();
         let base_unix_nanos = now.as_nanos();
         write!(state_file, "{base_unix_nanos}")?;
-        writeln!(
-            file,
-            "\nrun pid={} unix={} instance={} restore={} cmd={:?}",
+        let header = format!(
+            "\nrun pid={} unix={} instance={} restore={} cmd={:?}\n",
             std::process::id(),
             now.as_secs(),
             layout.instance,
@@ -322,7 +319,8 @@ impl TimingLog {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "false".to_string()),
             command
-        )?;
+        );
+        file.write_all(header.as_bytes())?;
         Ok(Self {
             path,
             state_path,
@@ -358,13 +356,12 @@ impl TimingLog {
         let elapsed_nanos = now.saturating_sub(self.base_unix_nanos);
 
         let line = format!(
-            "{:>10.3}ms +{:>9.3}ms {}",
+            "{:>10.3}ms +{:>9.3}ms {}\n",
             elapsed_nanos as f64 / 1_000_000.0,
             delta_nanos as f64 / 1_000_000.0,
             label
         );
         let _ = state.file.write_all(line.as_bytes());
-        let _ = state.file.write_all(b"\n");
         let _ = unlock_file(&state.state_file);
     }
 }
