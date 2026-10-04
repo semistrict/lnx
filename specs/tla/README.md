@@ -18,7 +18,7 @@ TLA_KEEP_LOGS=/tmp/tlc bun run tla:check   # keep counterexample traces
 
 The script downloads tla2tools.jar v1.7.4 (MIT, latest stable release) into
 `${XDG_CACHE_HOME:-~/.cache}/lnx/`, checks its pinned sha256, and runs TLC on
-every `.cfg` under `specs/tla/`. The full suite (42 configs) takes about one
+every `.cfg` under `specs/tla/`. The full suite (45 configs) takes about one
 minute.
 
 ## Implementation status
@@ -67,8 +67,11 @@ parse. Three kinds of configs use `violation`:
 | `OwnerLifecycleTarget.TwoCrashes.cfg` (2 crashes, 3 spawns per client) | 1,362,826 | pass |
 | `SnapshotCommit.cfg` (3 runs, 2 faults, power loss) | 18,783 | pass: NoSilentAckLoss, LatestCoherent |
 | `SnapshotCommit.*.cfg` (4 configs) | n/a | violated (expected) |
-| `SnapshotCommitTarget.cfg` (3 runs, 2 faults incl. power loss) | 8,073 | pass: all 9 invariants |
-| `SnapshotCommitTarget.Mut_*.cfg` (4 configs) | n/a | each removed rule breaks an invariant |
+| `SnapshotCommitTarget.cfg` (3 runs, 2 faults incl. power loss, 1 snapshot-exit) | 52,822 | pass: all 9 invariants |
+| `SnapshotCommitTarget.Mut_*.cfg` (6 configs) | n/a | each removed rule breaks an invariant |
+| `SnapshotCommitTarget.Mut_exitLooksFinal.cfg` | n/a | violates NoSilentAckLoss (recovery rolls forward to the snapshot-exit generation) |
+| `SnapshotCommitTarget.Mut_advanceClears.cfg` | n/a | violates NoSilentAckLoss (snapshot-exit commit resets dirty to running) |
+| `SnapshotCommitTarget.Witness*.cfg` (4 configs) | n/a | each interesting state reachable, incl. snapshot-exit then final commit |
 | `CheckpointForkDelete.*.cfg` (5 configs) | n/a | violated (expected) |
 | `CheckpointForkDeleteTarget.cfg` (1 crash, 2 generations) | 2,564 | pass: all 5 invariants |
 | `CheckpointForkDeleteTarget.Mut_*.cfg` (2 configs) | n/a | each removed rule breaks ForkIsComplete |
@@ -263,7 +266,8 @@ checking (timeouts are not modeled).
   "infer state from artifacts" check.
 - **O3 Recovery** (lock holder, before spawning; and `lnx recover`):
   - `stopped`: GC (S6), continue.
-  - `running` or `dirty` and `generations/<gen of run_id>` exists with a valid
+  - `running` or `dirty` and the run's final snapshot (origin
+    `Snapshot{run_id}`, never a `SnapshotExit`, S8) exists with a valid
     manifest: roll forward (commit `{latest: that gen, phase: stopped}`), GC,
     continue.
   - `running` (nothing was dispatched): commit `stopped`, GC (deletes
@@ -332,6 +336,16 @@ checking (timeouts are not modeled).
 - **S7** `lnx snapshots clear` becomes "drop memory": commit a disk-only
   generation cloned from the latest rootfs (the same mechanism as
   `recover --salvage`, which the model checks). It never discards disk state.
+- **S8 Snapshot-exit.** A guest snapshot (`lnxctl snapshot-exit`) does not end
+  the run: it is captured like S4 into a generation with its own origin
+  (`SnapshotExit{run}`), recovery never rolls forward to it (O3 rolls forward
+  only to the run's final `Snapshot{run}`), and committing it as latest
+  (`Store::advance_latest`) keeps the phase, so a dirty run stays dirty.
+  Writes acknowledged after it must survive a crash. `Mut_exitLooksFinal`:
+  recovery treating it as the final snapshot rolls forward past those writes.
+  `Mut_advanceClears`: resetting the phase to running makes a later crash look
+  idle and restores the snapshot-exit generation without them. Both violate
+  `NoSilentAckLoss`.
 
 ### Checkpoint rules (CheckpointForkDeleteTarget.tla)
 
