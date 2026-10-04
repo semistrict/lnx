@@ -21,6 +21,20 @@ The script downloads tla2tools.jar v1.7.4 (MIT, latest stable release) into
 every `.cfg` under `specs/tla/`. The full suite (42 configs) takes about one
 minute.
 
+## Implementation status
+
+The current-design models describe `main` @ 077f0b09. Since then:
+
+- pid-file lock directories were replaced by `flock` on
+  `instance_dir/instance.lock` with leases that record the process start time
+  (bc60faa6). This covers the crash-release and pid-reuse halves of O1 and O8,
+  but the separate `owner-start.lock` remains and the client does not yet hand
+  its locked descriptor to the owner.
+- status probes no longer keep an owner awake, and checkpoints run off the
+  accept loop (5caf445f), part of O6.
+
+The remaining owner, snapshot and checkpoint rules are not implemented yet.
+
 ## Config convention
 
 `<Dir>/<Module>.cfg` and `<Dir>/<Module>.<Variant>.cfg` are TLC configs for
