@@ -73,3 +73,14 @@ fn preserves_read_only_permissions_and_timestamps() {
     assert_eq!(destination.modified().expect("destination mtime"), modified);
     assert_eq!(destination.modified().unwrap(), source.modified().unwrap());
 }
+
+#[test]
+fn a_well_used_large_image_may_be_cloned_but_a_densified_copy_may_not() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    // A 16 GiB disk holding 9.4 GiB of data, cloned as-is.
+    assert!(kept_sparseness(16 * GIB, 9 * GIB + GIB / 2, 9 * GIB + GIB / 2));
+    // The same disk copied with its holes filled in.
+    assert!(!kept_sparseness(16 * GIB, 9 * GIB, 16 * GIB));
+    // Small files are never judged.
+    assert!(kept_sparseness(GIB, 0, GIB));
+}

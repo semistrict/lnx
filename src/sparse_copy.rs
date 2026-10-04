@@ -57,12 +57,6 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let allocated = len;
 
-    if !clone_is_sparse_safe(len, allocated) {
-        anyhow::bail!(
-            "source is not sparse-safe to clone: {} len={len} allocated={allocated}",
-            src.display()
-        );
-    }
 
     #[cfg(target_os = "macos")]
     {
@@ -73,7 +67,7 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("clonefile {} to {}", src.display(), dst.display()));
         }
-        if cloned_destination_is_sparse_safe(dst, len)? {
+        if cloned_destination_is_sparse_safe(dst, len, allocated)? {
             preserve_file_metadata(&metadata, dst)?;
             return Ok(());
         }
@@ -100,12 +94,12 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
             drop(dst_file);
             fs::remove_file(dst)
                 .with_context(|| format!("remove partial clone {}", dst.display()))?;
-            copy_without_dense_large_image(src, dst, len)
+            copy_without_dense_large_image(src, dst, len, allocated)
                 .with_context(|| format!("sparse-copy {} to {}", src.display(), dst.display()))?;
             preserve_file_metadata(&metadata, dst)?;
             return Ok(());
         }
-        if cloned_file_is_sparse_safe(&dst_file, len)? {
+        if cloned_file_is_sparse_safe(&dst_file, len, allocated)? {
             drop(dst_file);
             preserve_file_metadata(&metadata, dst)?;
             return Ok(());
@@ -147,15 +141,15 @@ fn ficlone_can_fall_back(error: &std::io::Error) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn copy_without_dense_large_image(src: &Path, dst: &Path, len: u64) -> Result<()> {
+fn copy_without_dense_large_image(src: &Path, dst: &Path, len: u64, allocated: u64) -> Result<()> {
     if len < LARGE_SPARSE_IMAGE_BYTES {
         fs::copy(src, dst)
             .with_context(|| format!("copy {} to {}", src.display(), dst.display()))?;
-        return ensure_copied_file_is_sparse_safe(dst, len);
+        return ensure_copied_file_is_sparse_safe(dst, len, allocated);
     }
 
     copy_sparse_extents(src, dst, len)?;
-    ensure_copied_file_is_sparse_safe(dst, len)
+    ensure_copied_file_is_sparse_safe(dst, len, allocated)
 }
 
 #[cfg(target_os = "linux")]
@@ -221,35 +215,43 @@ fn copy_range(
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_copied_file_is_sparse_safe(path: &Path, len: u64) -> Result<()> {
+fn ensure_copied_file_is_sparse_safe(path: &Path, len: u64, source_allocated: u64) -> Result<()> {
     let allocated = fs::metadata(path)
         .with_context(|| format!("stat {}", path.display()))?
         .blocks()
         * 512;
-    if clone_is_sparse_safe(len, allocated) {
+    if kept_sparseness(len, source_allocated, allocated) {
         return Ok(());
     }
     fs::remove_file(path).with_context(|| format!("remove dense copy {}", path.display()))?;
     anyhow::bail!("copy produced dense VM image {}", path.display())
 }
 
-fn clone_is_sparse_safe(len: u64, allocated: u64) -> bool {
-    len < LARGE_SPARSE_IMAGE_BYTES || allocated <= len / 2
+/// Allocation a copy may add over its source (filesystem rounding and
+/// metadata) and still count as having kept the source's holes.
+const SPARSENESS_SLACK_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Whether a copy of a `len`-byte file kept its source's sparseness: a large
+/// VM image must not come out denser than it went in. How full the source
+/// is does not matter; a well-used disk is not a broken one.
+fn kept_sparseness(len: u64, source_allocated: u64, copy_allocated: u64) -> bool {
+    len < LARGE_SPARSE_IMAGE_BYTES
+        || copy_allocated <= source_allocated.saturating_add(SPARSENESS_SLACK_BYTES)
 }
 
 #[cfg(target_os = "macos")]
-fn cloned_destination_is_sparse_safe(path: &Path, len: u64) -> Result<bool> {
+fn cloned_destination_is_sparse_safe(path: &Path, len: u64, source_allocated: u64) -> Result<bool> {
     let allocated = fs::metadata(path)
         .with_context(|| format!("stat {}", path.display()))?
         .blocks()
         * 512;
-    Ok(clone_is_sparse_safe(len, allocated))
+    Ok(kept_sparseness(len, source_allocated, allocated))
 }
 
 #[cfg(target_os = "linux")]
-fn cloned_file_is_sparse_safe(file: &fs::File, len: u64) -> Result<bool> {
+fn cloned_file_is_sparse_safe(file: &fs::File, len: u64, source_allocated: u64) -> Result<bool> {
     let allocated = file.metadata()?.blocks() * 512;
-    Ok(clone_is_sparse_safe(len, allocated))
+    Ok(kept_sparseness(len, source_allocated, allocated))
 }
 
 #[cfg(test)]
