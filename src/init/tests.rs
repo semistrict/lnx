@@ -88,3 +88,66 @@ fn ext4_error_state_is_rejected() {
         "unexpected error: {error:#}"
     );
 }
+
+#[test]
+fn release_cache_is_current_only_with_a_matching_stamp() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cached = temp.path().join("rootfs.ext4");
+    fs::write(&cached, b"rootfs").expect("write cached rootfs");
+
+    assert_eq!(recorded_release(&cached), None);
+
+    record_release(&cached, "images-v0.6.0/rootfs.ext4.zst").expect("record release");
+    assert_eq!(
+        recorded_release(&cached).as_deref(),
+        Some("images-v0.6.0/rootfs.ext4.zst")
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("rootfs.ext4.release")).expect("read stamp"),
+        "images-v0.6.0/rootfs.ext4.zst\n"
+    );
+}
+
+#[test]
+fn matching_release_cache_is_reused_without_downloading() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cached = temp.path().join("rootfs.ext4");
+    fs::write(&cached, b"rootfs").expect("write cached rootfs");
+    record_release(&cached, "images-v9.9.9/rootfs.ext4.zst").expect("record release");
+
+    ensure_release_asset(
+        &cached,
+        "rootfs.ext4.zst",
+        "images-v9.9.9",
+        CachePolicy::MatchRelease,
+    )
+    .expect("current cache needs no download");
+
+    assert_eq!(fs::read(&cached).expect("read cache"), b"rootfs");
+}
+
+#[test]
+fn kept_assets_are_reused_regardless_of_release() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let kernel = temp.path().join("vmlinuz");
+    fs::write(&kernel, b"kernel").expect("write kernel");
+
+    ensure_release_asset(
+        &kernel,
+        "vmlinuz.gz",
+        "images-v9.9.9",
+        CachePolicy::KeepExisting,
+    )
+    .expect("kept kernel needs no download");
+
+    assert_eq!(fs::read(&kernel).expect("read kernel"), b"kernel");
+}
+
+#[test]
+fn unique_siblings_differ_between_calls() {
+    let path = Path::new("/base/cache/rootfs.ext4");
+    let first = unique_sibling(path, "download");
+    let second = unique_sibling(path, "download");
+    assert_ne!(first, second);
+    assert_eq!(first.parent(), path.parent());
+}

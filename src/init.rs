@@ -43,7 +43,12 @@ pub fn run(layout: &Layout, kernel: Option<&Path>, rootfs: Option<&Path>) -> Res
         copy_if_needed(rootfs, &layout.rootfs, "rootfs")?;
         &layout.rootfs
     } else {
-        download_release(&default_rootfs, "rootfs.ext4.zst")?;
+        ensure_release_asset(
+            &default_rootfs,
+            "rootfs.ext4.zst",
+            DEFAULT_IMAGE_VERSION,
+            CachePolicy::MatchRelease,
+        )?;
         &default_rootfs
     };
 
@@ -103,7 +108,13 @@ pub fn ensure_kernel(layout: &Layout) -> Result<()> {
 }
 
 pub fn ensure_nested_linux_lnx(dest: &Path) -> Result<()> {
-    download_executable_release(dest, "lnx-linux-aarch64", NESTED_HELPER_IMAGE_VERSION)
+    ensure_release_asset(
+        dest,
+        "lnx-linux-aarch64",
+        NESTED_HELPER_IMAGE_VERSION,
+        CachePolicy::MatchRelease,
+    )?;
+    make_executable(dest)
 }
 
 /// Installs a caller-supplied kernel image instead of downloading one.
@@ -145,110 +156,165 @@ fn clone_or_copy(src: &Path, dest: &Path) -> Result<()> {
 }
 
 fn download_kernel(dest: &Path) -> Result<()> {
-    if dest.exists() {
-        eprintln!("init: kernel exists, skipping {}", dest.display());
-        return Ok(());
-    }
-
-    download_release(dest, "vmlinuz.gz")
+    ensure_release_asset(
+        dest,
+        "vmlinuz.gz",
+        DEFAULT_IMAGE_VERSION,
+        CachePolicy::KeepExisting,
+    )
 }
 
-fn download_release(dest: &Path, asset: &str) -> Result<()> {
-    download_release_version(dest, asset, DEFAULT_IMAGE_VERSION)
+/// What to do with a cached release artifact that already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachePolicy {
+    /// Keep it. The shared kernel stays put because instances were booted,
+    /// and memory snapshots taken, against it.
+    KeepExisting,
+    /// Replace it unless it came from the release this lnx expects, so a
+    /// cache filled by an older lnx is not silently reused for new instances.
+    /// Instances already cloned from it keep their own copy.
+    MatchRelease,
 }
 
-fn download_release_version(dest: &Path, asset: &str, version: &str) -> Result<()> {
+fn ensure_release_asset(
+    dest: &Path,
+    asset: &str,
+    version: &str,
+    policy: CachePolicy,
+) -> Result<()> {
+    let release = format!("{version}/{asset}");
     if dest.exists() {
-        eprintln!("init: {asset} exists, skipping {}", dest.display());
-        return Ok(());
+        match policy {
+            CachePolicy::KeepExisting => {
+                eprintln!("init: {asset} exists, skipping {}", dest.display());
+                return Ok(());
+            }
+            CachePolicy::MatchRelease => match recorded_release(dest) {
+                Some(recorded) if recorded == release => {
+                    eprintln!(
+                        "init: {asset} from {version} exists, skipping {}",
+                        dest.display()
+                    );
+                    return Ok(());
+                }
+                recorded => eprintln!(
+                    "init: {} is from {}, replacing it with {release}",
+                    dest.display(),
+                    recorded.as_deref().unwrap_or("an unrecorded release")
+                ),
+            },
+        }
     }
+    fetch_release_asset(dest, asset, version)?;
+    if policy == CachePolicy::MatchRelease {
+        record_release(dest, &release)?;
+    }
+    Ok(())
+}
 
+fn release_stamp_path(dest: &Path) -> PathBuf {
+    let mut path = dest.as_os_str().to_owned();
+    path.push(".release");
+    PathBuf::from(path)
+}
+
+fn recorded_release(dest: &Path) -> Option<String> {
+    let recorded = fs::read_to_string(release_stamp_path(dest)).ok()?;
+    Some(recorded.trim().to_string()).filter(|recorded| !recorded.is_empty())
+}
+
+/// Written after the artifact is in place: a crash in between leaves the old
+/// (or no) stamp, which only causes another download.
+fn record_release(dest: &Path, release: &str) -> Result<()> {
+    let stamp = release_stamp_path(dest);
+    let temp = unique_sibling(&stamp, "tmp");
+    fs::write(&temp, format!("{release}\n"))
+        .with_context(|| format!("write {}", temp.display()))?;
+    fs::rename(&temp, &stamp)
+        .with_context(|| format!("rename {} to {}", temp.display(), stamp.display()))
+}
+
+/// A sibling of `path` no other process will pick, so concurrent first runs
+/// never write through each other's temporary files.
+fn unique_sibling(path: &Path, suffix: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".{}-{nanos}.{suffix}", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Downloads `asset` from `version` and atomically installs it at `dest`.
+fn fetch_release_asset(dest: &Path, asset: &str, version: &str) -> Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-
     let url = format!("{RELEASE_BASE}/{version}/{asset}");
-    let download_tmp = dest.with_extension(format!(
-        "{}download",
-        dest.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| format!("{ext}."))
-            .unwrap_or_default()
-    ));
-    let output_tmp = dest.with_extension(format!(
-        "{}tmp",
-        dest.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| format!("{ext}."))
-            .unwrap_or_default()
-    ));
-    let _ = fs::remove_file(&download_tmp);
-    let _ = fs::remove_file(&output_tmp);
-
-    eprintln!("init: download {url}");
-    run_status(
-        Command::new("curl")
-            .arg("--fail")
-            .arg("--location")
-            .arg("--progress-bar")
-            .arg("--output")
-            .arg(&download_tmp)
-            .arg(&url),
-        "curl",
-    )?;
-
-    match Path::new(asset).extension().and_then(|ext| ext.to_str()) {
-        Some("zst") => {
-            eprintln!("init: decompress {asset}");
-            run_status(
-                Command::new("zstd")
-                    .arg("-d")
-                    .arg("--force")
-                    .arg("--sparse")
-                    .arg("--progress")
-                    .arg("-o")
-                    .arg(&output_tmp)
-                    .arg(&download_tmp)
-                    .stdout(Stdio::inherit()),
-                "zstd",
-            )?;
-            eprintln!("init: sparsify {}", output_tmp.display());
-            punch_holes(&output_tmp, ZERO_SCAN_BLOCK)?;
-        }
-        Some("gz") => {
-            eprintln!("init: decompress {asset}");
-            run_status(
-                Command::new("gzip")
-                    .arg("-dc")
-                    .arg(&download_tmp)
-                    .stdout(Stdio::from(
-                        fs::File::create(&output_tmp)
-                            .with_context(|| format!("create {}", output_tmp.display()))?,
-                    )),
-                "gzip",
-            )?;
-        }
-        _ => {
-            fs::rename(&download_tmp, &output_tmp).with_context(|| {
+    let download_tmp = unique_sibling(dest, "download");
+    let output_tmp = unique_sibling(dest, "tmp");
+    let result = (|| -> Result<()> {
+        eprintln!("init: download {url}");
+        run_status(
+            Command::new("curl")
+                .arg("--fail")
+                .arg("--location")
+                .arg("--progress-bar")
+                .arg("--output")
+                .arg(&download_tmp)
+                .arg(&url),
+            "curl",
+        )?;
+        match Path::new(asset).extension().and_then(|ext| ext.to_str()) {
+            Some("zst") => {
+                eprintln!("init: decompress {asset}");
+                run_status(
+                    Command::new("zstd")
+                        .arg("-d")
+                        .arg("--force")
+                        .arg("--sparse")
+                        .arg("--progress")
+                        .arg("-o")
+                        .arg(&output_tmp)
+                        .arg(&download_tmp)
+                        .stdout(Stdio::inherit()),
+                    "zstd",
+                )?;
+                eprintln!("init: sparsify {}", output_tmp.display());
+                punch_holes(&output_tmp, ZERO_SCAN_BLOCK)?;
+            }
+            Some("gz") => {
+                eprintln!("init: decompress {asset}");
+                run_status(
+                    Command::new("gzip")
+                        .arg("-dc")
+                        .arg(&download_tmp)
+                        .stdout(Stdio::from(
+                            fs::File::create(&output_tmp)
+                                .with_context(|| format!("create {}", output_tmp.display()))?,
+                        )),
+                    "gzip",
+                )?;
+            }
+            _ => fs::rename(&download_tmp, &output_tmp).with_context(|| {
                 format!(
                     "rename {} to {}",
                     download_tmp.display(),
                     output_tmp.display()
                 )
-            })?;
+            })?,
         }
-    }
-
-    fs::rename(&output_tmp, dest)
-        .with_context(|| format!("rename {} to {}", output_tmp.display(), dest.display()))?;
+        fs::rename(&output_tmp, dest)
+            .with_context(|| format!("rename {} to {}", output_tmp.display(), dest.display()))
+    })();
     let _ = fs::remove_file(&download_tmp);
+    if result.is_err() {
+        let _ = fs::remove_file(&output_tmp);
+    }
+    result?;
     eprintln!("init: installed {asset} -> {}", dest.display());
     Ok(())
-}
-
-fn download_executable_release(dest: &Path, asset: &str, version: &str) -> Result<()> {
-    download_release_version(dest, asset, version)?;
-    make_executable(dest)
 }
 
 #[cfg(unix)]
