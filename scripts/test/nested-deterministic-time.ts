@@ -2,8 +2,7 @@ import {
   existsSync } from "node:fs";
 import { chmod,
   mkdir,
-  rm,
-  writeFile } from "node:fs/promises";
+  rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertContains,
@@ -198,7 +197,6 @@ async function prepareInnerBase() {
   await cloneShrunkRootfs(rootfs, suiteCache);
   await growRootfs(suiteCache, suiteRootfsBytes);
   await cloneSparseImage(suiteCache, suiteDefault);
-  await writeFile(join(suiteBase, "instances", "default", "vm-initialized"), "1\n");
   await assertSparseVmImage(suiteCache, "nested deterministic cache rootfs");
   await assertSparseVmImage(suiteDefault, "nested deterministic default rootfs");
 }
@@ -223,7 +221,6 @@ function stageInnerBaseScript(): string[] {
     `mkdir -p ${quoteShell(`${outerLocalSuiteBase}/instances/default`)}`,
     `cp ${quoteShell(join(suiteBase, "vmlinuz"))} ${quoteShell(`${outerLocalSuiteBase}/vmlinuz`)}`,
     `"$LNX_BIN" _sparse-copy ${quoteShell(suiteDefault)} ${quoteShell(localDefault)}`,
-    `cp ${quoteShell(join(suiteBase, "instances/default/vm-initialized"))} ${quoteShell(`${outerLocalSuiteBase}/instances/default/vm-initialized`)}`,
   ];
 }
 
@@ -234,12 +231,6 @@ async function waitForOuterExit() {
       instance: outerInstance,
       imageDir: join(ctx.base, "instances", outerInstance),
       runDir: join(ctx.base, "instances", outerInstance),
-      snapshotDir: join(
-        ctx.base,
-        "instances",
-        outerInstance,
-        "memory-snapshots",
-      ),
     },
     120_000,
   );

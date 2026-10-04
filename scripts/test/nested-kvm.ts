@@ -2,13 +2,12 @@ import {
   existsSync } from "node:fs";
 import { chmod,
   mkdir,
-  readdir,
-  readFile,
   rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertContains,
   assertEq,
+  checkpointGenerationDir,
   cloneSparseImage,
   cleanupInstance,
   cleanupContext,
@@ -55,8 +54,7 @@ const innerKernel =
   Bun.env.LNX_NESTED_INNER_KERNEL ??
   (fixtureKernel && existsSync(fixtureKernel) ? fixtureKernel : kernel);
 const rootfs =
-  Bun.env.LNX_NESTED_ROOTFS ??
-  join(ctx.base, "instances", "default", "rootfs.ext4");
+  Bun.env.LNX_NESTED_ROOTFS ?? join(ctx.base, "cache", "rootfs.ext4");
 const outerRootfs = join(cwd, "outer-rootfs.ext4");
 const snapshotInnerRootfs = join(cwd, "snapshot-inner-rootfs.ext4");
 const outerRootfsBytes = Number(
@@ -330,26 +328,7 @@ function instanceContext(instance: string) {
     instance,
     imageDir,
     runDir: imageDir,
-    snapshotDir: join(imageDir, "memory-snapshots"),
   };
-}
-
-async function checkpointPathByName(
-  imageDir: string,
-  name: string,
-): Promise<string> {
-  const checkpointDir = join(imageDir, "checkpoints");
-  for (const entry of await readdir(checkpointDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-    const path = join(checkpointDir, entry.name);
-    const meta = await readFile(join(path, "checkpoint.meta"), "utf8");
-    if (meta.split("\n").includes(`name=${name}`)) {
-      return path;
-    }
-  }
-  throw new Error(`checkpoint not found: ${name}`);
 }
 
 async function waitForHostPath(
@@ -416,23 +395,19 @@ function outerLnx(
   });
 }
 
+/** Creates the outer instance and drops its saved memory, so its next run boots cold. */
 async function prepareColdOuter(instance: string) {
-  await run([ctx.lnxBin, "--instance", instance, ...outerVmArgs, "_vm-init"], {
+  const env = {
+    LNX_BROKER_IDLE_TTL_MS: "250",
+    LNX_INGRESS_STATE_DIR: join(cwd, "disabled-ingress"),
+  };
+  await run([ctx.lnxBin, "--instance", instance, ...outerVmArgs, "true"], {
     cwd,
     timeoutMs: 180_000,
-    env: {
-      LNX_BROKER_IDLE_TTL_MS: "250",
-      LNX_INGRESS_STATE_DIR: join(cwd, "disabled-ingress"),
-    },
+    env,
   });
-  await waitForOuterExit(instance);
-  await rm(
-    join(ctx.base, "instances", instance, "memory-snapshots", "latest"),
-    {
-      recursive: true,
-      force: true,
-    },
-  );
+  await run([ctx.lnxBin, "--instance", instance, "stop"], { cwd, timeoutMs: 180_000, env });
+  await run([ctx.lnxBin, "--instance", instance, "snapshots", "clear"], { cwd, timeoutMs: 60_000, env });
 }
 
 function stageNestedToolsScript(extraTools: string[] = []): string[] {
@@ -508,7 +483,6 @@ async function waitForOuterExit(instance: string) {
       instance,
       imageDir: join(ctx.base, "instances", instance),
       runDir: join(ctx.base, "instances", instance),
-      snapshotDir: join(ctx.base, "instances", instance, "memory-snapshots"),
     },
     120_000,
   );
@@ -1110,10 +1084,7 @@ print("mac-source-after", flush=True)
           await waitForOwnerExit(sourceCtx, 120_000);
         }
 
-        snapshot = await checkpointPathByName(
-          sourceCtx.imageDir,
-          checkpointName,
-        );
+        snapshot = checkpointGenerationDir(sourceCtx.imageDir, checkpointName);
       }
       for (const file of [
         "vmstate.bin",
@@ -1219,8 +1190,8 @@ print("mac-source-after", flush=True)
       const outerLocalInnerBase = `/root/lnx-macos-linux-inner-${process.pid}`;
       const outerLocalSnapshot = `/root/lnx-macos-linux-snapshot-${process.pid}`;
       const sharedInnerDir = join(innerBase, "instances", innerInstance);
-      const exportedLatest = join(sharedInnerDir, "memory-snapshots", "latest");
-      const outerLocalLatest = `${outerLocalInnerBase}/instances/${innerInstance}/memory-snapshots/latest`;
+      const exportedLatest = join(sharedInnerDir, "exported-snapshot");
+      const outerLocalInstance = `${outerLocalInnerBase}/instances/${innerInstance}`;
       const outerLocalSetup = [
         `rm -rf ${quoteShell(outerLocalInnerBase)} ${quoteShell(outerLocalSnapshot)}`,
         `mkdir -p ${quoteShell(`${outerLocalInnerBase}/instances/${innerInstance}`)} ${quoteShell(outerLocalSnapshot)}`,
@@ -1235,11 +1206,12 @@ print("mac-source-after", flush=True)
         ? [
             `rm -rf ${quoteShell(exportedLatest)}`,
             `mkdir -p ${quoteShell(exportedLatest)}`,
-            `"$LNX_BIN" _sparse-copy ${quoteShell(`${outerLocalLatest}/rootfs.ext4`)} ${quoteShell(join(exportedLatest, "rootfs.ext4"))}`,
-            `"$LNX_BIN" _sparse-copy ${quoteShell(`${outerLocalLatest}/pages.img`)} ${quoteShell(join(exportedLatest, "pages.img"))}`,
-            `cp ${quoteShell(`${outerLocalLatest}/vmstate.bin`)} ${quoteShell(join(exportedLatest, "vmstate.bin"))}`,
-            `cp ${quoteShell(`${outerLocalLatest}/launch.json`)} ${quoteShell(join(exportedLatest, "launch.json"))}`,
-            `cp ${quoteShell(`${outerLocalLatest}/initramfs.stamp`)} ${quoteShell(join(exportedLatest, "initramfs.stamp"))}`,
+            `latest_generation=${quoteShell(`${outerLocalInstance}/generations/`)}"$(sed -n 's/.*"latest": *"\\([^"]*\\)".*/\\1/p' ${quoteShell(`${outerLocalInstance}/state.json`)})"`,
+            `"$LNX_BIN" _sparse-copy "$latest_generation"/rootfs.ext4 ${quoteShell(join(exportedLatest, "rootfs.ext4"))}`,
+            `"$LNX_BIN" _sparse-copy "$latest_generation"/pages.img ${quoteShell(join(exportedLatest, "pages.img"))}`,
+            `cp "$latest_generation"/vmstate.bin ${quoteShell(join(exportedLatest, "vmstate.bin"))}`,
+            `cp "$latest_generation"/launch.json ${quoteShell(join(exportedLatest, "launch.json"))}`,
+            `cp "$latest_generation"/initramfs.stamp ${quoteShell(join(exportedLatest, "initramfs.stamp"))}`,
           ]
         : [];
       const restoredProbeCommands = [
@@ -1300,13 +1272,7 @@ print("mac-source-after", flush=True)
         hostProbe.stop();
       }
       if (exportSnapshot) {
-        const latest = join(
-          innerBase,
-          "instances",
-          innerInstance,
-          "memory-snapshots",
-          "latest",
-        );
+        const latest = exportedLatest;
         for (const file of [
           "vmstate.bin",
           "pages.img",

@@ -1,6 +1,3 @@
-import {
-  readdir,
-  readFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   assertEq,
@@ -11,6 +8,7 @@ import {
   testStep,
   waitForOwnerExit,
   type LnxCliOptions,
+  checkpointGenerationDir,
 } from "./lib";
 
 const ctx = defaultContext("nested-checkpoint");
@@ -29,17 +27,7 @@ function lnxCommand(instance: string, args: string[], options: Parameters<typeof
 }
 
 async function checkpointPathByName(name: string): Promise<string> {
-  for (const entry of await readdir(join(ctx.imageDir, "checkpoints"), { withFileTypes: true })) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-    const path = join(ctx.imageDir, "checkpoints", entry.name);
-    const meta = await readFile(join(path, "checkpoint.meta"), "utf8");
-    if (meta.split("\n").includes(`name=${name}`)) {
-      return path;
-    }
-  }
-  throw new Error(`checkpoint not found: ${name}`);
+  return checkpointGenerationDir(ctx.imageDir, name);
 }
 
 try {

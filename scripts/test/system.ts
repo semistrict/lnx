@@ -123,6 +123,18 @@ try {
     await ctx.vm.cli(["kill", String(pid)]);
   });
 
+  await testStep("create makes an instance with saved settings", async () => {
+    const created = `${ctx.instance}-created`;
+    try {
+      assertEq((await run([ctx.lnxBin, "--cpus", "1", "create", created])).stdout, created, "create prints the name");
+      assertEq((await run([ctx.lnxBin, "--instance", created, "nproc"])).stdout, "1", "created instance uses its settings");
+      const again = await run([ctx.lnxBin, "create", created], { check: false });
+      assertEq(again.status, 125, "creating an existing instance fails");
+    } finally {
+      await run([ctx.lnxBin, "instances", "delete", created], { check: false });
+    }
+  });
+
   await testStep("guest shape", async () => {
     assertEq((await ctx.vm.cli(["id", "-un"])).stdout, "lnxuser", "exec runs as lnxuser");
     assertEq((await ctx.vm.cli(["bash", "-lc", 'printf "%s:%s:%s" "$USER" "$LOGNAME" "$HOME"'])).stdout, "lnxuser:lnxuser:/home/lnxuser", "exec user environment");

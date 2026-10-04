@@ -178,6 +178,10 @@ enum Command {
     Ingress(IngressArgs),
     #[command(about = "List instances")]
     Instances(InstancesArgs),
+    #[command(
+        about = "Create an instance from the base image, or from another instance or checkpoint with --from"
+    )]
+    Create(CreateArgs),
     #[command(about = "Persist per-instance settings, like: set cpus=4 memory-mib=8192")]
     Set(SetArgs),
     #[command(about = "Print instance state and configuration as JSON")]
@@ -371,6 +375,18 @@ struct ServerPushArgs {
 
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct CreateArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+    #[arg(
+        long,
+        value_name = "INSTANCE[:CHECKPOINT]",
+        help = "Copy another instance's current state, or one of its checkpoints"
+    )]
+    from: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -573,13 +589,17 @@ impl Cli {
         let persisted = descriptor::load(&layout)?;
         // An instance still in the layout of an older lnx keeps its snapshot
         // shape there; move it into the store first so the shape is found.
-        if matches!(command, None | Some(Command::Run(_)) | Some(Command::Checkpoint(_))) {
+        if matches!(
+            command,
+            None | Some(Command::Run(_)) | Some(Command::Checkpoint(_)) | Some(Command::Paths)
+        ) {
             runner::ensure_store(&layout)?;
         }
         // Saved memory can only resume in the shape it was taken with, so
         // that shape wins over saved settings, which apply at cold boot. Only
         // an explicit flag can ask for something else (and then fails with
         // the remedy rather than silently dropping memory).
+        let requested_shape = (cpus, memory_mib);
         let snapshot_shape = latest_snapshot_shape(&layout);
         let cpus = cpus
             .or(snapshot_shape.map(|shape| shape.cpus))
@@ -718,6 +738,7 @@ impl Cli {
                 InstancesCommand::Delete { name } => delete_instance(&layout.base, &name),
             },
             Some(Command::Set(args)) => set_instance_settings(&layout, &args.settings),
+            Some(Command::Create(args)) => create_instance(&layout, &args, requested_shape),
             Some(Command::Inspect) => inspect_instance(&layout, cpus, memory_mib),
             Some(Command::Logs(args)) => print_instance_logs(&layout, args.console, args.owner),
             Some(Command::HiddenIngress(args)) => {
@@ -876,6 +897,46 @@ fn init_local_default_instance(
     }
 
     crate::oci::import_image(dest, default_instance, kernel)
+}
+
+/// Creates an instance explicitly: from the base image (or `--rootfs`), or
+/// as a fork of another instance or checkpoint. `--cpus` and `--memory-mib`
+/// become its saved settings.
+fn create_instance(
+    current: &Layout,
+    args: &CreateArgs,
+    (cpus, memory_mib): (Option<u8>, Option<u32>),
+) -> Result<()> {
+    crate::paths::validate_instance_name(&args.name)?;
+    let dest = Layout::resolve_in_base(
+        &args.name,
+        current.base.clone(),
+        None,
+        current.rootfs.clone(),
+    );
+    if init::instance_has_state(&dest) {
+        bail!("instance {} already exists", args.name);
+    }
+    match &args.from {
+        Some(from) => {
+            let (source, checkpoint) = match from.split_once(':') {
+                Some((source, checkpoint)) => (source, Some(checkpoint)),
+                None => (from.as_str(), None),
+            };
+            crate::paths::validate_instance_name(source)?;
+            let source = Layout::resolve_in_base(source, current.base.clone(), None, None);
+            fork_into(&source, checkpoint, &dest)?;
+        }
+        None => init::run(&dest, None, dest.rootfs.as_deref())?,
+    }
+    if cpus.is_some() || memory_mib.is_some() {
+        let mut config = descriptor::load(&dest)?;
+        config.cpus = cpus.or(config.cpus);
+        config.memory_mib = memory_mib.or(config.memory_mib);
+        descriptor::save(&dest, &config)?;
+    }
+    println!("{}", args.name);
+    Ok(())
 }
 
 /// Changes an instance's persisted settings. Settings of an instance that
@@ -2432,19 +2493,23 @@ fn require_instance(layout: &Layout) -> Result<()> {
 /// instance named `instance` in the same base.
 fn fork_checkpoint(source: Layout, checkpoint: Option<&str>, instance: &str) -> Result<()> {
     crate::paths::validate_instance_name(instance)?;
-    require_instance(&source)?;
+    let dest = Layout::resolve_in_base(instance, source.base.clone(), None, None);
+    fork_into(&source, checkpoint, &dest)?;
+    println!("{instance}");
+    Ok(())
+}
+
+fn fork_into(source: &Layout, checkpoint: Option<&str>, dest: &Layout) -> Result<()> {
+    require_instance(source)?;
     let checkpoint = checkpoint
-        .map(|checkpoint| checkpoints::resolve(&source, checkpoint))
+        .map(|checkpoint| checkpoints::resolve(source, checkpoint))
         .transpose()?;
     let from = match &checkpoint {
         Some(checkpoint) => checkpoints::ForkSource::Checkpoint(checkpoint),
         None => checkpoints::ForkSource::Current,
     };
-    let dest = Layout::resolve_in_base(instance, source.base.clone(), None, None);
     init::ensure_base_ignored(&dest.base)?;
-    checkpoints::fork(&source, from, &dest)?;
-    println!("{instance}");
-    Ok(())
+    checkpoints::fork(source, from, dest)
 }
 
 fn parse_port_forward(value: &str) -> Result<runner::PortForward, String> {

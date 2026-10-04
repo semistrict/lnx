@@ -513,6 +513,46 @@ fn forking_a_missing_instance_creates_neither() {
     assert!(!temp.path().join("instances/copy").exists());
 }
 
+fn create_args(name: &str, from: Option<&str>) -> CreateArgs {
+    CreateArgs {
+        name: name.to_string(),
+        from: from.map(str::to_string),
+    }
+}
+
+#[test]
+fn create_from_another_instance_copies_its_state_and_saves_settings() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = test_layout(temp.path());
+    store_instance(&source, b"source disk", false);
+
+    create_instance(&source, &create_args("copy", Some("dev")), (Some(3), None))
+        .expect("create from dev");
+
+    let copy = Layout::resolve_in_base("copy", temp.path().to_path_buf(), None, None);
+    assert_eq!(latest_disk(&copy), b"source disk");
+    assert_eq!(descriptor::load(&copy).expect("descriptor").cpus, Some(3));
+}
+
+#[test]
+fn create_refuses_an_existing_instance_and_a_missing_source() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+    store_instance(&layout, b"disk", false);
+
+    let error = create_instance(&layout, &create_args("dev", None), (None, None))
+        .expect_err("exists");
+    assert_eq!(error.to_string(), "instance dev already exists");
+
+    let error = create_instance(&layout, &create_args("copy", Some("ghost:v1")), (None, None))
+        .expect_err("missing source");
+    assert_eq!(
+        error.to_string(),
+        "no instance named ghost; running a command in it creates it"
+    );
+    assert!(!temp.path().join("instances/copy").exists());
+}
+
 #[test]
 fn forking_into_an_invalid_name_is_refused() {
     let temp = tempfile::tempdir().expect("tempdir");

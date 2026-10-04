@@ -47,7 +47,7 @@ try {
 
     const explicit = await lnxVm([
       "--snapshot",
-      `${ctx.snapshotDir}/latest`,
+      latestSnapshotDir(ctx),
       "bash",
       "-lc",
       'printf "%s/%s" "$(sudo cat /root/lnx-nested-snapshot-disk)" "$(sudo cat /run/lnx-nested-snapshot-memory)"',

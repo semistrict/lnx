@@ -76,6 +76,7 @@ rootfs images are downloaded on first run.
 ```sh
 lnx bash                          # interactive shell in the default instance
 lnx --instance dev bash           # named instances are isolated machines
+lnx --cpus 4 create dev2          # create one explicitly, with saved settings
 lnx --forward 8080:80 nginx       # forward Mac localhost:8080 to guest :80
 lnx checkpoint -m "deps installed"
 lnx fork dev2                     # clone the instance, memory and disk

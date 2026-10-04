@@ -25,7 +25,7 @@ try {
   await testStep("paths and init commands work on a Linux host", async () => {
     const paths = await run([ctx.lnxBin, "--instance", ctx.instance, "paths"]);
     assertContains(paths.stdout, `name: ${ctx.instance}`, "paths prints instance name");
-    assertContains(paths.stdout, `rootfs: ${ctx.imageDir}/rootfs.ext4`, "paths prints rootfs");
+    assertContains(paths.stdout, `rootfs: ${ctx.imageDir}/generations/`, "paths prints the latest rootfs");
     assertContains(paths.stdout, `generations: ${join(ctx.imageDir, "generations")}`, "paths prints generations");
 
     const envPaths = await run([ctx.lnxBin, "paths"], { env: { LNX_INSTANCE: ctx.instance } });

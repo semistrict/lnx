@@ -1,10 +1,7 @@
 import {
   existsSync } from "node:fs";
 import { mkdir,
-  readdir,
-  readFile,
-  rm,
-  writeFile } from "node:fs/promises";
+  rm } from "node:fs/promises";
 import { dirname,
   join } from "node:path";
 import {
@@ -16,7 +13,7 @@ import {
   prepareContext,
   quoteShell,
   run,
-  waitForOwnerExit,
+  checkpointGenerationDir,
 } from "./lib";
 
 if (process.platform !== "darwin") {
@@ -38,7 +35,7 @@ const linuxLinker =
 const kernel = Bun.env.LNX_NESTED_INNER_KERNEL ?? join(ctx.base, "vmlinuz");
 const outerKernel = Bun.env.LNX_NESTED_OUTER_KERNEL ?? join(ctx.base, "vmlinuz");
 const rootfs =
-  Bun.env.LNX_NESTED_ROOTFS ?? join(ctx.base, "instances", "default", "rootfs.ext4");
+  Bun.env.LNX_NESTED_ROOTFS ?? join(ctx.base, "cache", "rootfs.ext4");
 const innerBase = join(cwd, "inner-base");
 const innerRunBase = `/tmp/lnx-run-linux-fixture-${process.pid}`;
 const innerInstance = `linux-fixture-${process.pid}`;
@@ -99,20 +96,6 @@ async function growRootfs(path: string, sizeBytes: number) {
   await alignRootfsForPmem(path);
 }
 
-async function checkpointPathByName(imageDir: string, name: string): Promise<string> {
-  const checkpointDir = join(imageDir, "checkpoints");
-  for (const entry of await readdir(checkpointDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-    const path = join(checkpointDir, entry.name);
-    const meta = await readFile(join(path, "checkpoint.meta"), "utf8");
-    if (meta.split("\n").includes(`name=${name}`)) {
-      return path;
-    }
-  }
-  throw new Error(`checkpoint not found: ${name}`);
-}
 
 async function ensureLinuxTools() {
   if (!existsSync(linuxLinker)) {
@@ -166,7 +149,6 @@ print("linux-source-after", flush=True)
     "mkdir -p \"$local_base/instances/$inner_instance\"",
     "cp \"$host_base/vmlinuz\" \"$local_base/vmlinuz\"",
     "cp --sparse=always \"$host_base/instances/$inner_instance/rootfs.ext4\" \"$local_base/instances/$inner_instance/rootfs.ext4\"",
-    "cp \"$host_base/instances/$inner_instance/vm-initialized\" \"$local_base/instances/$inner_instance/vm-initialized\"",
     "export LNX_BASE=\"$local_base\"",
     `export LNX_RUN_BASE=${quoteShell(innerRunBase)}`,
     "rm -rf \"$LNX_RUN_BASE\"",
@@ -214,7 +196,8 @@ print("linux-source-after", flush=True)
     "  grep -q '\"pid\"' \"$lockfile\" 2>/dev/null || break",
     "  sleep 0.1",
     "done",
-    "cp -R --sparse=always \"$local_base/instances/$inner_instance/checkpoints\" \"$host_base/instances/$inner_instance/\"",
+    // Checkpoints are references to generations; bring both back.
+    "cp -R --sparse=always \"$local_base/instances/$inner_instance/checkpoints\" \"$local_base/instances/$inner_instance/generations\" \"$host_base/instances/$inner_instance/\"",
   ].join("\n");
 }
 
@@ -238,7 +221,6 @@ try {
   const innerRootfs = join(innerBase, "instances", innerInstance, "rootfs.ext4");
   await cloneSparseImage(rootfs, innerRootfs);
   await shrinkRootfsToMinimum(innerRootfs);
-  await writeFile(join(innerBase, "instances", innerInstance, "vm-initialized"), "1\n");
 
   await run(
     [
@@ -254,7 +236,7 @@ try {
       "2",
       "--memory-mib",
       "4096",
-      "_vm-init",
+      "true",
     ],
     {
       cwd,
@@ -264,11 +246,9 @@ try {
       },
     },
   );
-  await waitForOwnerExit(ctx, 120_000);
-  await rm(join(ctx.imageDir, "memory-snapshots", "latest"), {
-    recursive: true,
-    force: true,
-  });
+  // The outer VM must boot cold for the run below, with nested KVM ready.
+  await run([ctx.lnxBin, "--instance", ctx.instance, "stop"], { timeoutMs: 180_000 });
+  await run([ctx.lnxBin, "--instance", ctx.instance, "snapshots", "clear"], { timeoutMs: 60_000 });
 
   await run(
     [
@@ -298,7 +278,7 @@ try {
     },
   );
 
-  const snapshot = await checkpointPathByName(join(innerBase, "instances", innerInstance), checkpointName);
+  const snapshot = checkpointGenerationDir(join(innerBase, "instances", innerInstance), checkpointName);
   for (const file of ["vmstate.bin", "pages.img", "rootfs.ext4", "launch.json", "initramfs.stamp"]) {
     const path = join(snapshot, file);
     if (!existsSync(path)) {

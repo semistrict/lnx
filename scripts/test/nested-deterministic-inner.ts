@@ -1,7 +1,6 @@
 import {
   existsSync } from "node:fs";
-import { readdir,
-  readFile,
+import { readFile,
   rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -11,6 +10,7 @@ import {
   run,
   sleep,
   testStep,
+  checkpointGenerationDir,
 } from "./lib";
 
 const ctx = defaultContext("nested-deterministic-inner");
@@ -79,18 +79,7 @@ async function stopOwner(instance: string) {
 }
 
 async function checkpointPathByName(name: string): Promise<string> {
-  const checkpointDir = join(instanceDir(sourceInstance), "checkpoints");
-  for (const entry of await readdir(checkpointDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-    const path = join(checkpointDir, entry.name);
-    const meta = await readFile(join(path, "checkpoint.meta"), "utf8");
-    if (meta.split("\n").includes(`name=${name}`)) {
-      return path;
-    }
-  }
-  throw new Error(`checkpoint not found: ${name}`);
+  return checkpointGenerationDir(instanceDir(sourceInstance), name);
 }
 
 function parseDeltaSeconds(stdout: string): number {
