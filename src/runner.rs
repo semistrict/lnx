@@ -2869,7 +2869,7 @@ fn run_broker_owner(
                                 rootfs.display(),
                                 restore_generation.as_deref().unwrap_or("none")
                             ));
-                            ctx.snapshot_with_file_copy(&request.path, &rootfs, "rootfs.ext4")?;
+                            capture_vm_state(&ctx, &request.path, &rootfs, &layout)?;
                             validate_snapshot_rootfs(&request.path)?;
                             align_snapshot_rootfs_mtime_with_memory(&request.path)?;
                             owner_log.line(format!(
@@ -2884,7 +2884,6 @@ fn run_broker_owner(
                                 trace_log.as_deref(),
                                 deterministic_clock_state.as_ref(),
                             )?;
-                            copy_host_share_state_to_snapshot(&layout, &request.path)?;
                             write_snapshot_lifecycle_manifest(
                                 &request.path,
                                 &generation_id,
@@ -4561,14 +4560,13 @@ fn capture_snapshot_for_publish(
         seed_incremental_snapshot(&temp, base_snapshot, snapshot_path, run_log)?;
     }
     ensure_deterministic_clock_state_file(initramfs_stamp, deterministic_clock_state)?;
-    ctx.snapshot_with_file_copy(&temp, rootfs, "rootfs.ext4")?;
+    capture_vm_state(ctx, &temp, rootfs, layout)?;
     if let Err(e) = validate_snapshot_rootfs(&temp) {
         let _ = remove_path_if_exists(&temp);
         return Err(e);
     }
     align_snapshot_rootfs_mtime_with_memory(&temp)?;
     copy_snapshot_stamp(&temp, initramfs_stamp, trace_log, deterministic_clock_state)?;
-    copy_host_share_state_to_snapshot(layout, &temp)?;
     write_snapshot_lifecycle_manifest(&temp, generation_id, owner_run_id, rootfs)?;
     publish_snapshot_dir(snapshot_path, &temp, run_log, owner_run_id, generation_id)?;
     Ok(())
@@ -4703,14 +4701,25 @@ fn copy_snapshot_metadata_file(src: &Path, dst: &Path) -> Result<()> {
         .with_context(|| format!("sync {}", dst.display()))
 }
 
-fn copy_host_share_state_to_snapshot(layout: &Layout, snapshot_path: &Path) -> Result<()> {
-    let source = host_share_state_root(layout);
-    if !source.exists() {
-        return Ok(());
-    }
-    let target = snapshot_path.join("host-share-state");
-    remove_path_if_exists(&target)?;
-    crate::sparse_copy::clone_or_copy_tree(&source, &target)
+/// Captures VM memory into `dir` together with the rootfs and the host-share
+/// copy-on-write state as they were at the same paused instant. Copying either
+/// after the vCPUs resume would pair the memory image with later disk state.
+fn capture_vm_state(ctx: &VmHandle, dir: &Path, rootfs: &Path, layout: &Layout) -> Result<()> {
+    let share_state = host_share_state_root(layout);
+    ctx.snapshot_while_paused(dir, |stage| {
+        let copy = || -> Result<()> {
+            clone_or_copy_file(rootfs, &stage.join("rootfs.ext4"))?;
+            if share_state.exists() {
+                crate::sparse_copy::clone_or_copy_tree(
+                    &share_state,
+                    &stage.join("host-share-state"),
+                )?;
+            }
+            Ok(())
+        };
+        copy().map_err(|error| std::io::Error::other(format!("{error:#}")))
+    })?;
+    Ok(())
 }
 
 fn cleanup_runtime_sockets(run_log: &RunLog, paths: &[&Path]) {

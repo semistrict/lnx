@@ -544,14 +544,16 @@ impl Vmm {
         crate::macos::snapshot::capture(inputs, path).map_err(|e| e.to_string())
     }
 
-    /// Capture a snapshot and copy one host file into the snapshot directory
-    /// while vCPUs and devices are still paused.
+    /// Capture a snapshot and run `paused_hook` with the staging directory
+    /// while vCPUs and devices are still paused, so whatever the hook copies
+    /// there is coherent with the captured memory. Every virtio device is
+    /// paused first; pmem's `pause()` msync(MS_SYNC)s and fsyncs its DAX
+    /// mapping, so host files backing guest disks hold all guest-synced data.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn snapshot_with_file_copy(
+    pub fn snapshot_while_paused(
         &mut self,
         path: &std::path::Path,
-        copy_src: &std::path::Path,
-        copy_dst_name: &std::path::Path,
+        paused_hook: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
     ) -> std::result::Result<(), String> {
         let ctx = self
             .snapshot_ctx
@@ -569,13 +571,7 @@ impl Vmm {
             nested_enabled: ctx.nested_enabled,
         };
         crate::macos::snapshot::capture_with_paused_hook(inputs, path, |stage_dir| {
-            // `capture_with_paused_hook` pauses every virtio device before
-            // running this hook; pmem's `pause()` msync(MS_SYNC)s + fsyncs its
-            // DAX mapping, so `copy_src` already holds all guest-synced data by
-            // the time we clone it here.
-            let dst = stage_dir.join(copy_dst_name);
-            clone_or_copy_file(copy_src, &dst)?;
-            Ok(())
+            paused_hook(stage_dir).map_err(crate::macos::snapshot::SnapshotError::Io)
         })
         .map_err(|e| e.to_string())
     }
@@ -660,12 +656,12 @@ impl Vmm {
         crate::linux::snapshot::capture(inputs, path).map_err(|e| e.to_string())
     }
 
+    /// See the macOS `snapshot_while_paused`.
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    pub fn snapshot_with_file_copy(
+    pub fn snapshot_while_paused(
         &mut self,
         path: &std::path::Path,
-        copy_src: &std::path::Path,
-        copy_dst_name: &std::path::Path,
+        paused_hook: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
     ) -> std::result::Result<(), String> {
         let inputs = crate::linux::snapshot::CaptureInputs {
             guest_memory: &self.guest_memory,
@@ -676,12 +672,7 @@ impl Vmm {
             nested_enabled: self.snapshot_nested_enabled,
         };
         crate::linux::snapshot::capture_with_paused_hook(inputs, path, |stage_dir| {
-            // `capture_with_paused_hook` pauses every virtio device before
-            // running this hook; pmem's `pause()` msync(MS_SYNC)s + fsyncs its
-            // DAX mapping, so `copy_src` already holds all guest-synced data by
-            // the time we clone it here.
-            let dst = stage_dir.join(copy_dst_name);
-            clone_or_copy_file(copy_src, &dst).map_err(crate::linux::snapshot::SnapshotError::Io)
+            paused_hook(stage_dir).map_err(crate::linux::snapshot::SnapshotError::Io)
         })
         .map_err(|e| e.to_string())
     }
@@ -754,251 +745,6 @@ fn maybe_start_restore_debug_kicks(handles: &[VcpuHandle]) {
             }
         })
         .ok();
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn clone_or_copy_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let _ = std::fs::remove_file(dst);
-    let c_src = CString::new(src.as_os_str().as_bytes())?;
-    let c_dst = CString::new(dst.as_os_str().as_bytes())?;
-    let rc = unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) };
-    if rc == 0 {
-        return Ok(());
-    }
-    sparse_copy_extents_macos(src, dst)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn sparse_copy_extents_macos(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom, Write};
-    use std::os::fd::AsRawFd;
-
-    const LARGE_SPARSE_IMAGE_BYTES: u64 = 1024 * 1024 * 1024;
-
-    let mut src_file = std::fs::File::open(src)?;
-    let mut dst_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(dst)?;
-    let len = src_file.metadata()?.len();
-    dst_file.set_len(len)?;
-
-    let mut offset = 0u64;
-    let mut buf = vec![0u8; 8 * 1024 * 1024];
-    while offset < len {
-        let data =
-            unsafe { libc::lseek(src_file.as_raw_fd(), offset as libc::off_t, libc::SEEK_DATA) };
-        if data < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ENXIO) {
-                return Ok(());
-            }
-            if len >= LARGE_SPARSE_IMAGE_BYTES {
-                return Err(err);
-            }
-            src_file.seek(SeekFrom::Start(offset))?;
-            while offset < len {
-                let want = std::cmp::min(buf.len() as u64, len - offset) as usize;
-                src_file.read_exact(&mut buf[..want])?;
-                if buf[..want].iter().any(|byte| *byte != 0) {
-                    dst_file.seek(SeekFrom::Start(offset))?;
-                    dst_file.write_all(&buf[..want])?;
-                }
-                offset += want as u64;
-            }
-            return Ok(());
-        }
-
-        let data = data as u64;
-        let hole =
-            unsafe { libc::lseek(src_file.as_raw_fd(), data as libc::off_t, libc::SEEK_HOLE) };
-        if hole < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        let end = std::cmp::min(hole as u64, len);
-        let mut copied = data;
-        while copied < end {
-            let want = std::cmp::min(buf.len() as u64, end - copied) as usize;
-            src_file.seek(SeekFrom::Start(copied))?;
-            src_file.read_exact(&mut buf[..want])?;
-            if buf[..want].iter().any(|byte| *byte != 0) {
-                dst_file.seek(SeekFrom::Start(copied))?;
-                dst_file.write_all(&buf[..want])?;
-            }
-            copied += want as u64;
-        }
-        offset = end;
-    }
-    Ok(())
-}
-
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-fn clone_or_copy_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom, Write};
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::MetadataExt;
-
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let mut src_file = std::fs::File::open(src)?;
-    let src_metadata = src_file.metadata()?;
-    let len = src_metadata.len();
-    let src_allocated = src_metadata.blocks() * 512;
-    let mut dst_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(dst)?;
-
-    const FICLONE: libc::Ioctl = 0x4004_9409;
-    if clone_is_sparse_safe(len, src_allocated)
-        && unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) } == 0
-    {
-        let dst_allocated = dst_file.metadata()?.blocks() * 512;
-        if clone_is_sparse_safe(len, dst_allocated) {
-            return Ok(());
-        }
-        drop(dst_file);
-        std::fs::remove_file(dst)?;
-        dst_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(dst)?;
-    }
-
-    dst_file.set_len(len)?;
-
-    // A whole-file copy_file_range is deliberately avoided: on filesystems
-    // without reflink support it materializes source holes as allocated
-    // zeros. Instead walk SEEK_DATA/SEEK_HOLE extents and copy_file_range
-    // each data extent — on virtiofs the whole file is one extent but
-    // FUSE_COPY_FILE_RANGE is serviced server-side instead of streaming
-    // bytes through the guest.
-    if sparse_copy_extents(
-        &mut src_file,
-        &mut dst_file,
-        len,
-        is_large_sparse_image(len, src_allocated),
-    )
-    .is_ok()
-        && clone_is_sparse_safe(len, dst_file.metadata()?.blocks() * 512)
-    {
-        return Ok(());
-    }
-
-    // SEEK_DATA may be unsupported; restart with a dense scan.
-    dst_file.set_len(0)?;
-    dst_file.set_len(len)?;
-    src_file.seek(SeekFrom::Start(0))?;
-    let mut buf = vec![0u8; 8 * 1024 * 1024];
-    let mut offset = 0u64;
-    while offset < len {
-        let want = std::cmp::min(buf.len() as u64, len - offset) as usize;
-        src_file.read_exact(&mut buf[..want])?;
-        if buf[..want].iter().any(|byte| *byte != 0) {
-            dst_file.seek(SeekFrom::Start(offset))?;
-            dst_file.write_all(&buf[..want])?;
-        }
-        offset += want as u64;
-    }
-    Ok(())
-}
-
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const LARGE_SPARSE_IMAGE_BYTES: u64 = 1024 * 1024 * 1024;
-
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-fn clone_is_sparse_safe(len: u64, allocated: u64) -> bool {
-    len < LARGE_SPARSE_IMAGE_BYTES || allocated <= len / 2
-}
-
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-fn is_large_sparse_image(len: u64, allocated: u64) -> bool {
-    len >= LARGE_SPARSE_IMAGE_BYTES && allocated <= len / 2
-}
-
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-fn sparse_copy_extents(
-    src_file: &mut std::fs::File,
-    dst_file: &mut std::fs::File,
-    len: u64,
-    source_is_large_sparse: bool,
-) -> std::io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom, Write};
-    use std::os::fd::AsRawFd;
-
-    let mut offset = 0u64;
-    let mut buf = vec![0u8; 8 * 1024 * 1024];
-    while offset < len {
-        let data =
-            unsafe { libc::lseek(src_file.as_raw_fd(), offset as libc::off_t, libc::SEEK_DATA) };
-        if data < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ENXIO) {
-                return Ok(());
-            }
-            return Err(err);
-        }
-
-        let data = data as u64;
-        let hole =
-            unsafe { libc::lseek(src_file.as_raw_fd(), data as libc::off_t, libc::SEEK_HOLE) };
-        if hole < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        let mut copied = data;
-        let end = std::cmp::min(hole as u64, len);
-        if source_is_large_sparse && data == 0 && end == len {
-            return Err(std::io::Error::other(
-                "filesystem reports one full-file data extent for sparse source",
-            ));
-        }
-        while copied < end {
-            let want = std::cmp::min(end - copied, 128 * 1024 * 1024) as libc::size_t;
-            let mut off_in = copied as libc::loff_t;
-            let mut off_out = copied as libc::loff_t;
-            let n = unsafe {
-                libc::copy_file_range(
-                    src_file.as_raw_fd(),
-                    &mut off_in,
-                    dst_file.as_raw_fd(),
-                    &mut off_out,
-                    want,
-                    0,
-                )
-            };
-            if n > 0 {
-                copied += n as u64;
-                continue;
-            }
-            // copy_file_range unsupported here; stream the rest of this
-            // extent through userspace, skipping all-zero chunks.
-            while copied < end {
-                let want = std::cmp::min(buf.len() as u64, end - copied) as usize;
-                src_file.seek(SeekFrom::Start(copied))?;
-                src_file.read_exact(&mut buf[..want])?;
-                if buf[..want].iter().any(|byte| *byte != 0) {
-                    dst_file.seek(SeekFrom::Start(copied))?;
-                    dst_file.write_all(&buf[..want])?;
-                }
-                copied += want as u64;
-            }
-        }
-        offset = end;
-    }
-    Ok(())
 }
 
 #[cfg(all(any(target_os = "linux", target_os = "macos"), target_arch = "aarch64"))]

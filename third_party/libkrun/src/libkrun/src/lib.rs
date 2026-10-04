@@ -612,27 +612,25 @@ impl VmHandle {
         Err(Error::from_errno(libc::ENOSYS))
     }
 
+    /// Captures a snapshot into `path`, running `paused_hook` with the
+    /// snapshot's staging directory while the VM is paused. Files the hook
+    /// copies into that directory are coherent with the captured memory, and
+    /// are published with the rest of the snapshot.
     #[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
-    pub fn snapshot_with_file_copy(
+    pub fn snapshot_while_paused(
         &self,
         path: impl AsRef<Path>,
-        copy_src: impl AsRef<Path>,
-        copy_dst_name: impl AsRef<Path>,
+        paused_hook: impl FnOnce(&Path) -> std::io::Result<()>,
     ) -> KrunResult {
-        let copy_dst_name = copy_dst_name.as_ref();
-        if copy_dst_name.is_absolute() || copy_dst_name.components().count() != 1 {
-            return Err(Error::from_errno(libc::EINVAL));
-        }
-
         match self
             .require_running_vmm()?
             .lock()
             .unwrap()
-            .snapshot_with_file_copy(path.as_ref(), copy_src.as_ref(), copy_dst_name)
+            .snapshot_while_paused(path.as_ref(), paused_hook)
         {
             Ok(()) => Ok(()),
             Err(e) => {
-                error!("krun_snapshot_with_file_copy failed: {e}");
+                error!("krun_snapshot_while_paused failed: {e}");
                 if e.contains("device refused") || e.contains("connections") {
                     Err(Error::from_errno(libc::EPERM))
                 } else {
@@ -643,11 +641,10 @@ impl VmHandle {
     }
 
     #[cfg(not(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64")))]
-    pub fn snapshot_with_file_copy(
+    pub fn snapshot_while_paused(
         &self,
         _path: impl AsRef<Path>,
-        _copy_src: impl AsRef<Path>,
-        _copy_dst_name: impl AsRef<Path>,
+        _paused_hook: impl FnOnce(&Path) -> std::io::Result<()>,
     ) -> KrunResult {
         Err(Error::from_errno(libc::ENOSYS))
     }
