@@ -61,6 +61,8 @@ struct DirtyRegion {
 struct DirtyTracker {
     enabled: bool,
     regions: Vec<DirtyRegion>,
+    /// Whether the dirty bits record every write since the last reset.
+    complete: bool,
 }
 
 static DIRTY_TRACKER: LazyLock<Mutex<DirtyTracker>> =
@@ -407,33 +409,128 @@ impl HvfVm {
     }
 }
 
-pub fn enable_dirty_tracking(ranges: &[(u64, u64)]) -> Result<(), Error> {
-    let mut regions = Vec::new();
-    for &(guest_addr, size) in ranges {
-        if size == 0 {
-            continue;
-        }
-        let block_count = size.div_ceil(DIRTY_BLOCK_SIZE) as usize;
-        let ret = unsafe {
-            hv_vm_protect(
+const DIRTY_TRACKED_PROTECTION: u64 = (HV_MEMORY_READ | HV_MEMORY_EXEC) as u64;
+const DIRTY_WRITABLE_PROTECTION: u64 = (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC) as u64;
+
+/// Dirty RAM blocks handed out by [`take_dirty_blocks_and_reprotect`].
+#[derive(Debug)]
+pub struct DirtySet {
+    pub blocks: Vec<DirtyBlock>,
+    /// True when `blocks` is every block written since the tracker was last
+    /// reset. A capture may only patch an existing RAM image with a complete
+    /// set; otherwise it must write all of RAM.
+    pub complete: bool,
+}
+
+impl DirtyTracker {
+    fn reset(
+        &mut self,
+        ranges: &[(u64, u64)],
+        mut protect: impl FnMut(u64, u64, u64) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let mut regions = Vec::new();
+        for &(guest_addr, size) in ranges {
+            if size == 0 {
+                continue;
+            }
+            protect(guest_addr, size, DIRTY_TRACKED_PROTECTION)?;
+            regions.push(DirtyRegion {
                 guest_addr,
-                size as usize,
-                (HV_MEMORY_READ | HV_MEMORY_EXEC).into(),
-            )
-        };
-        if ret != HV_SUCCESS {
-            return Err(Error::MemoryMap);
+                size,
+                blocks: vec![false; size.div_ceil(DIRTY_BLOCK_SIZE) as usize],
+            });
         }
-        regions.push(DirtyRegion {
-            guest_addr,
-            size,
-            blocks: vec![false; block_count],
-        });
+        self.enabled = true;
+        self.regions = regions;
+        self.complete = true;
+        Ok(())
     }
-    let mut tracker = DIRTY_TRACKER.lock().unwrap();
-    tracker.enabled = true;
-    tracker.regions = regions;
+
+    fn mark(&mut self, ranges: &[(u64, u64)]) {
+        if self.enabled {
+            mark_dirty_ranges_in_regions(&mut self.regions, ranges);
+        }
+    }
+
+    /// Hands the dirty set to the caller and write-protects those blocks
+    /// again. Taking consumes completeness: until the caller resets the
+    /// tracker after durably storing RAM, later takes report an incomplete
+    /// set, so a capture that fails after taking can never be followed by an
+    /// incremental capture that silently misses the blocks it took.
+    fn take(
+        &mut self,
+        mut protect: impl FnMut(u64, u64, u64) -> Result<(), Error>,
+    ) -> Result<DirtySet, Error> {
+        let complete = std::mem::replace(&mut self.complete, false);
+        let blocks = self.dirty_blocks();
+        for block in &blocks {
+            protect(block.guest_addr, block.size, DIRTY_TRACKED_PROTECTION)?;
+        }
+        for region in &mut self.regions {
+            region.blocks.fill(false);
+        }
+        Ok(DirtySet { blocks, complete })
+    }
+
+    fn dirty_blocks(&self) -> Vec<DirtyBlock> {
+        let mut dirty = Vec::new();
+        for region in &self.regions {
+            for (index, _) in region.blocks.iter().enumerate().filter(|(_, d)| **d) {
+                let offset = index as u64 * DIRTY_BLOCK_SIZE;
+                dirty.push(DirtyBlock {
+                    guest_addr: region.guest_addr + offset,
+                    size: DIRTY_BLOCK_SIZE.min(region.size - offset),
+                });
+            }
+        }
+        dirty
+    }
+
+    fn handle_write_fault(
+        &mut self,
+        pa: u64,
+        mut protect: impl FnMut(u64, u64, u64) -> Result<(), Error>,
+    ) -> Result<bool, Error> {
+        if !self.enabled {
+            return Ok(false);
+        }
+        let Some(region) = self
+            .regions
+            .iter_mut()
+            .find(|region| pa >= region.guest_addr && pa < region.guest_addr + region.size)
+        else {
+            return Ok(false);
+        };
+        let block_index = ((pa - region.guest_addr) / DIRTY_BLOCK_SIZE) as usize;
+        let block_offset = block_index as u64 * DIRTY_BLOCK_SIZE;
+        let block_addr = region.guest_addr + block_offset;
+        let block_size = DIRTY_BLOCK_SIZE.min(region.size - block_offset);
+        region.blocks[block_index] = true;
+        let result = protect(block_addr, block_size, DIRTY_WRITABLE_PROTECTION);
+        if DIRTY_FAULT_DEBUG_LOGS.fetch_add(1, Ordering::Relaxed) < 200 {
+            debug!(
+                "dirty.debug write_fault pa=0x{pa:x} region=0x{:x}+0x{:x} block_index={block_index} block=0x{block_addr:x}+0x{block_size:x} ok={}",
+                region.guest_addr,
+                region.size,
+                result.is_ok()
+            );
+        }
+        result.map(|()| true)
+    }
+}
+
+fn hv_protect(guest_addr: u64, size: u64, protection: u64) -> Result<(), Error> {
+    let ret = unsafe { hv_vm_protect(guest_addr, size as usize, protection) };
+    if ret != HV_SUCCESS {
+        return Err(Error::MemoryMap);
+    }
     Ok(())
+}
+
+/// Write-protects `ranges` and starts recording writes to them from a clean,
+/// complete state.
+pub fn enable_dirty_tracking(ranges: &[(u64, u64)]) -> Result<(), Error> {
+    DIRTY_TRACKER.lock().unwrap().reset(ranges, hv_protect)
 }
 
 fn mark_dirty_ranges_in_regions(regions: &mut [DirtyRegion], ranges: &[(u64, u64)]) {
@@ -461,81 +558,19 @@ fn mark_dirty_ranges_in_regions(regions: &mut [DirtyRegion], ranges: &[(u64, u64
 }
 
 pub fn mark_dirty_ranges(ranges: &[(u64, u64)]) -> Result<(), Error> {
-    let mut tracker = DIRTY_TRACKER.lock().unwrap();
-    if !tracker.enabled {
-        return Ok(());
-    }
-    mark_dirty_ranges_in_regions(&mut tracker.regions, ranges);
+    DIRTY_TRACKER.lock().unwrap().mark(ranges);
     Ok(())
 }
 
-pub fn take_dirty_blocks_and_reprotect() -> Result<Vec<DirtyBlock>, Error> {
-    let mut tracker = DIRTY_TRACKER.lock().unwrap();
-    if !tracker.enabled {
-        return Ok(Vec::new());
-    }
-
-    let mut dirty = Vec::new();
-    for region in &mut tracker.regions {
-        for (index, is_dirty) in region.blocks.iter_mut().enumerate() {
-            if !*is_dirty {
-                continue;
-            }
-            *is_dirty = false;
-            let offset = index as u64 * DIRTY_BLOCK_SIZE;
-            let guest_addr = region.guest_addr + offset;
-            let size = DIRTY_BLOCK_SIZE.min(region.size - offset);
-            let ret = unsafe {
-                hv_vm_protect(
-                    guest_addr,
-                    size as usize,
-                    (HV_MEMORY_READ | HV_MEMORY_EXEC).into(),
-                )
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::MemoryMap);
-            }
-            dirty.push(DirtyBlock { guest_addr, size });
-        }
-    }
-    Ok(dirty)
+pub fn take_dirty_blocks_and_reprotect() -> Result<DirtySet, Error> {
+    DIRTY_TRACKER.lock().unwrap().take(hv_protect)
 }
 
 fn dirty_tracking_handle_write_fault(pa: u64) -> Result<bool, Error> {
-    let mut tracker = DIRTY_TRACKER.lock().unwrap();
-    if !tracker.enabled {
-        return Ok(false);
-    }
-
-    for region in &mut tracker.regions {
-        if pa < region.guest_addr || pa >= region.guest_addr + region.size {
-            continue;
-        }
-        let offset = pa - region.guest_addr;
-        let block_index = (offset / DIRTY_BLOCK_SIZE) as usize;
-        let block_offset = block_index as u64 * DIRTY_BLOCK_SIZE;
-        let block_addr = region.guest_addr + block_offset;
-        let block_size = DIRTY_BLOCK_SIZE.min(region.size - block_offset);
-        region.blocks[block_index] = true;
-        let ret = unsafe {
-            hv_vm_protect(
-                block_addr,
-                block_size as usize,
-                (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
-            )
-        };
-        if DIRTY_FAULT_DEBUG_LOGS.fetch_add(1, Ordering::Relaxed) < 200 {
-            debug!(
-                "dirty.debug write_fault pa=0x{pa:x} region=0x{:x}+0x{:x} block_index={} block=0x{block_addr:x}+0x{block_size:x} ret={ret}",
-                region.guest_addr, region.size, block_index
-            );
-        }
-        if ret != HV_SUCCESS {
-            return Err(Error::MemoryMap);
-        }
-        return Ok(true);
-    }
-    Ok(false)
+    DIRTY_TRACKER
+        .lock()
+        .unwrap()
+        .handle_write_fault(pa, hv_protect)
 }
 
 #[cfg(test)]
@@ -603,6 +638,84 @@ mod tests {
         assert_eq!(regions[0].blocks.iter().filter(|block| **block).count(), 2);
         assert!(regions[0].blocks[0]);
         assert!(regions[0].blocks[block_count - 1]);
+    }
+
+    fn allow_protect(_: u64, _: u64, _: u64) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn tracker_with_four_blocks() -> DirtyTracker {
+        let mut tracker = DirtyTracker::default();
+        tracker
+            .reset(&[(0x1000_0000, DIRTY_BLOCK_SIZE * 4)], allow_protect)
+            .expect("reset");
+        tracker
+    }
+
+    fn block_addrs(set: &DirtySet) -> Vec<u64> {
+        set.blocks.iter().map(|block| block.guest_addr).collect()
+    }
+
+    #[test]
+    fn dirty_set_is_complete_only_for_first_take_after_reset() {
+        let mut tracker = tracker_with_four_blocks();
+        tracker.mark(&[(0x1000_0000 + DIRTY_BLOCK_SIZE, 0x1000)]);
+
+        let first = tracker.take(allow_protect).expect("first take");
+        assert!(first.complete);
+        assert_eq!(block_addrs(&first), vec![0x1000_0000 + DIRTY_BLOCK_SIZE]);
+
+        tracker.mark(&[(0x1000_0000, 0x1000)]);
+        let second = tracker.take(allow_protect).expect("second take");
+        assert!(!second.complete);
+        assert_eq!(block_addrs(&second), vec![0x1000_0000]);
+
+        tracker
+            .reset(&[(0x1000_0000, DIRTY_BLOCK_SIZE * 4)], allow_protect)
+            .expect("reset");
+        let after_reset = tracker.take(allow_protect).expect("take after reset");
+        assert!(after_reset.complete);
+        assert_eq!(block_addrs(&after_reset), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn failed_reprotect_keeps_blocks_dirty_and_set_incomplete() {
+        let mut tracker = tracker_with_four_blocks();
+        tracker.mark(&[(0x1000_0000, DIRTY_BLOCK_SIZE * 3)]);
+
+        let mut calls = 0;
+        let error = tracker
+            .take(|_, _, _| {
+                calls += 1;
+                if calls == 2 {
+                    Err(Error::MemoryMap)
+                } else {
+                    Ok(())
+                }
+            })
+            .expect_err("reprotect failure");
+        assert!(matches!(error, Error::MemoryMap));
+
+        let retry = tracker.take(allow_protect).expect("retry take");
+        assert!(!retry.complete);
+        assert_eq!(
+            block_addrs(&retry),
+            vec![
+                0x1000_0000,
+                0x1000_0000 + DIRTY_BLOCK_SIZE,
+                0x1000_0000 + DIRTY_BLOCK_SIZE * 2
+            ]
+        );
+    }
+
+    #[test]
+    fn untracked_ram_never_reports_a_complete_set() {
+        let mut tracker = DirtyTracker::default();
+        tracker.mark(&[(0x1000_0000, 0x1000)]);
+
+        let set = tracker.take(allow_protect).expect("take");
+        assert!(!set.complete);
+        assert_eq!(block_addrs(&set), Vec::<u64>::new());
     }
 
     #[test]

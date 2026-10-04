@@ -359,13 +359,7 @@ where
     crate::timing_event("snapshot.capture.vcpus.paused");
     let capture_mach_time = cntvct_el0();
 
-    let result = capture_paused(
-        &inputs,
-        dir,
-        &vcpu_states,
-        capture_mach_time,
-        paused_hook,
-    );
+    let result = capture_paused(&inputs, dir, &vcpu_states, capture_mach_time, paused_hook);
     crate::timing_event("snapshot.capture.paused_work.done");
 
     // Always attempt to resume every device and vCPU before returning. A failed
@@ -494,8 +488,12 @@ where
 
     let result = (|| {
         crate::timing_event("snapshot.capture_paused.dirty_blocks.begin");
-        let mut dirty_blocks = hvf::take_dirty_blocks_and_reprotect()
+        // Taking the dirty set marks it incomplete until the reset below, so
+        // if anything between here and that reset fails, the next capture
+        // writes all of RAM instead of patching with blocks this one consumed.
+        let dirty = hvf::take_dirty_blocks_and_reprotect()
             .map_err(|e| SnapshotError::Io(std::io::Error::other(format!("dirty RAM: {e}"))))?;
+        let mut dirty_blocks = dirty.blocks;
         add_virtio_dma_dirty_blocks(
             inputs.guest_memory,
             inputs.ram_ranges,
@@ -503,11 +501,12 @@ where
             &mut dirty_blocks,
         );
         crate::timing_event(&format!(
-            "snapshot.capture_paused.dirty_blocks.done count={}",
-            dirty_blocks.len()
+            "snapshot.capture_paused.dirty_blocks.done count={} complete={}",
+            dirty_blocks.len(),
+            dirty.complete
         ));
         crate::timing_event("snapshot.capture_paused.ram.begin");
-        let ram = if dir.join(super::PAGES_IMG).exists() {
+        let ram = if dirty.complete && dir.join(super::PAGES_IMG).exists() {
             clone_and_patch_dirty_pages_img(
                 inputs.guest_memory,
                 inputs.ram_ranges,
