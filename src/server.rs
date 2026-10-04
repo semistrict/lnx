@@ -959,6 +959,12 @@ fn install_imported_sandbox(
         bail!("sandbox bundle has no saved state for instances/{source_instance}");
     }
     validate_imported_snapshot(&imported, state)?;
+    // Name it for its new place while nothing can see it yet.
+    rewrite_descriptor_name(&Layout {
+        instance_dir: imported.clone(),
+        run_dir: imported.clone(),
+        ..dest.clone()
+    })?;
 
     let parent = dest
         .instance_dir
@@ -971,7 +977,6 @@ fn install_imported_sandbox(
         move_into_place(&imported, &dest.instance_dir)?;
     }
     install_kernel_if_present(scratch, dest)?;
-    rewrite_descriptor_name(dest)?;
     index_layout_into_cas(dest)
 }
 
@@ -1011,6 +1016,11 @@ fn replace_instance_dir(dest: &Layout, imported: &Path) -> Result<()> {
             })?;
             return Err(error);
         }
+        // The replaced instance's runtime files, kept apart under
+        // LNX_RUN_BASE, go before any owner of the new one can create its own.
+        if dest.run_dir != dest.instance_dir {
+            remove_path_if_exists(&dest.run_dir)?;
+        }
         Ok(())
     })?;
     if swapped.is_none() {
@@ -1018,9 +1028,6 @@ fn replace_instance_dir(dest: &Layout, imported: &Path) -> Result<()> {
             "target instance {} is busy; stop it and retry",
             dest.instance
         );
-    }
-    if dest.run_dir != dest.instance_dir {
-        remove_path_if_exists(&dest.run_dir)?;
     }
     remove_path_if_exists(trash.path())
 }

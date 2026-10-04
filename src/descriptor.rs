@@ -28,11 +28,7 @@ pub struct InstanceDescriptor {
 }
 
 pub fn path(layout: &Layout) -> PathBuf {
-    layout
-        .base
-        .join("instances")
-        .join(&layout.instance)
-        .join(DESCRIPTOR_FILE)
+    layout.instance_dir.join(DESCRIPTOR_FILE)
 }
 
 pub fn load(layout: &Layout) -> Result<InstanceDescriptor> {
