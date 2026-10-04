@@ -1463,6 +1463,7 @@ print("mac-source-after", flush=True)
 
           const script = [
             "set -euo pipefail",
+            `trap 'echo "nested suite script failed at line $LINENO: $BASH_COMMAND" >&2' ERR`,
             "test -c /dev/kvm",
             "test -r /dev/kvm",
             ...stageNestedToolsScript([
