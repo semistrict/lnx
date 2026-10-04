@@ -3,11 +3,17 @@
 // Captures the architectural state the guest is allowed to observe so the same
 // guest can be resumed on the same host: GP regs, FP/SIMD regs, the set of
 // system regs HVF lets us read, and a few flags from the HvfVcpu wrapper.
+//
+// Which registers apply is decided up front from the VM configuration (EL2
+// registers only with nested virtualization, GIC registers only with HVF's
+// in-kernel GIC). Every register that applies must save and restore, so a
+// failing HVF call aborts the snapshot or restore instead of silently
+// producing or applying partial state.
 
 use serde::{Deserialize, Serialize};
 
 use crate::bindings::*;
-use crate::{Error, HvfVcpu, vcpu_set_vtimer_mask};
+use crate::{Error, HvfVcpu, InterruptController, RegisterBank, vcpu_set_vtimer_mask};
 
 const TMR_CTL_ENABLE: u64 = 1 << 0;
 const TMR_CTL_ISTATUS: u64 = 1 << 2;
@@ -108,7 +114,9 @@ pub const SYS_REGS_EL1: &[u16] = &[
     hv_sys_reg_t_HV_SYS_REG_SP_EL1 as u16,
 ];
 
-/// Additional sysregs only valid when EL2/nested is enabled.
+/// Additional sysregs only valid when EL2/nested is enabled. MDCR_EL2 is in
+/// `hv_sys_reg_t` but HVF rejects reading it (HV_BAD_ARGUMENT, seen on M5 /
+/// macOS 27) because it keeps debug trapping for itself, so it is left out.
 pub const SYS_REGS_EL2: &[u16] = &[
     hv_sys_reg_t_HV_SYS_REG_CNTHCTL_EL2 as u16,
     hv_sys_reg_t_HV_SYS_REG_CNTHP_CTL_EL2 as u16,
@@ -121,7 +129,6 @@ pub const SYS_REGS_EL2: &[u16] = &[
     hv_sys_reg_t_HV_SYS_REG_HCR_EL2 as u16,
     hv_sys_reg_t_HV_SYS_REG_HPFAR_EL2 as u16,
     hv_sys_reg_t_HV_SYS_REG_MAIR_EL2 as u16,
-    hv_sys_reg_t_HV_SYS_REG_MDCR_EL2 as u16,
     hv_sys_reg_t_HV_SYS_REG_SCTLR_EL2 as u16,
     hv_sys_reg_t_HV_SYS_REG_SPSR_EL2 as u16,
     hv_sys_reg_t_HV_SYS_REG_SP_EL2 as u16,
@@ -136,7 +143,9 @@ pub const SYS_REGS_EL2: &[u16] = &[
     hv_sys_reg_t_HV_SYS_REG_VTTBR_EL2 as u16,
 ];
 
-const GIC_ICC_REGS: &[u16] = &[
+/// GIC CPU-interface registers saved with the in-kernel GIC. HVF exposes a
+/// single active-priority register per group (AP0R0/AP1R0).
+pub const GIC_ICC_REGS: &[u16] = &[
     hv_gic_icc_reg_t_HV_GIC_ICC_REG_SRE_EL1 as u16,
     hv_gic_icc_reg_t_HV_GIC_ICC_REG_CTLR_EL1 as u16,
     hv_gic_icc_reg_t_HV_GIC_ICC_REG_IGRPEN0_EL1 as u16,
@@ -145,16 +154,10 @@ const GIC_ICC_REGS: &[u16] = &[
     hv_gic_icc_reg_t_HV_GIC_ICC_REG_BPR0_EL1 as u16,
     hv_gic_icc_reg_t_HV_GIC_ICC_REG_BPR1_EL1 as u16,
     hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP0R0_EL1 as u16,
-    hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP0R0_EL1 as u16 + 1,
-    hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP0R0_EL1 as u16 + 2,
-    hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP0R0_EL1 as u16 + 3,
     hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP1R0_EL1 as u16,
-    hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP1R0_EL1 as u16 + 1,
-    hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP1R0_EL1 as u16 + 2,
-    hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP1R0_EL1 as u16 + 3,
 ];
 
-const GIC_REDIST_REGS: &[u32] = &[
+pub const GIC_REDIST_REGS: &[u32] = &[
     hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_IGROUPR0 as u32,
     hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISENABLER0 as u32,
     hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ICFGR0 as u32,
@@ -171,9 +174,23 @@ const GIC_REDIST_REGS: &[u32] = &[
     hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_IPRIORITYR7 as u32,
 ];
 
-const GIC_ICH_REGS: &[u16] = &[
+/// GIC virtualization-control registers saved with the in-kernel GIC when
+/// EL2 is enabled, in restore order: these, the implemented list registers,
+/// then the active-priority registers. As for ICC, HVF exposes AP0R0/AP1R0
+/// only.
+const GIC_ICH_CONTROL_REGS: &[u16] = &[
     hv_gic_ich_reg_t_HV_GIC_ICH_REG_VMCR_EL2 as u16,
     hv_gic_ich_reg_t_HV_GIC_ICH_REG_HCR_EL2 as u16,
+];
+
+const GIC_ICH_APR_REGS: &[u16] = &[
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_AP0R0_EL2 as u16,
+    hv_gic_ich_reg_t_HV_GIC_ICH_REG_AP1R0_EL2 as u16,
+];
+
+/// ICH_LR<n>_EL2. Only the first ICH_VTR_EL2.ListRegs + 1 exist; HVF answers
+/// HV_UNSUPPORTED for the rest (M5 implements 8).
+const GIC_ICH_LIST_REGS: &[u16] = &[
     hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR0_EL2 as u16,
     hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR1_EL2 as u16,
     hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR2_EL2 as u16,
@@ -190,15 +207,19 @@ const GIC_ICH_REGS: &[u16] = &[
     hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR13_EL2 as u16,
     hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR14_EL2 as u16,
     hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR15_EL2 as u16,
-    hv_gic_ich_reg_t_HV_GIC_ICH_REG_AP0R0_EL2 as u16,
-    hv_gic_ich_reg_t_HV_GIC_ICH_REG_AP0R0_EL2 as u16 + 1,
-    hv_gic_ich_reg_t_HV_GIC_ICH_REG_AP0R0_EL2 as u16 + 2,
-    hv_gic_ich_reg_t_HV_GIC_ICH_REG_AP0R0_EL2 as u16 + 3,
-    hv_gic_ich_reg_t_HV_GIC_ICH_REG_AP1R0_EL2 as u16,
-    hv_gic_ich_reg_t_HV_GIC_ICH_REG_AP1R0_EL2 as u16 + 1,
-    hv_gic_ich_reg_t_HV_GIC_ICH_REG_AP1R0_EL2 as u16 + 2,
-    hv_gic_ich_reg_t_HV_GIC_ICH_REG_AP1R0_EL2 as u16 + 3,
 ];
+
+/// Whether `reg` is a GIC ICH register HVF snapshots can carry.
+pub fn is_snapshot_gic_ich_reg(reg: u16) -> bool {
+    GIC_ICH_CONTROL_REGS.contains(&reg)
+        || GIC_ICH_LIST_REGS.contains(&reg)
+        || GIC_ICH_APR_REGS.contains(&reg)
+}
+
+/// Number of list registers the GIC implements, from ICH_VTR_EL2.ListRegs.
+fn implemented_ich_list_regs(vtr: u64) -> usize {
+    ((vtr & 0x1f) as usize + 1).min(GIC_ICH_LIST_REGS.len())
+}
 
 /// Read-only ID/identification regs we capture for verification but do not write back
 /// on restore (HVF rejects writes outside the nested-init window). Mac→Mac same-host
@@ -231,9 +252,48 @@ fn is_blocked_timer_reg(reg: u16) -> bool {
     )
 }
 
-fn restore_sys_reg(vcpuid: hv_vcpu_t, reg: u16, val: u64) {
+/// Whether `reg` is a system register HVF snapshots carry.
+pub fn is_snapshot_sys_reg(reg: u16) -> bool {
+    SYS_REGS_EL1.contains(&reg) || SYS_REGS_EL2.contains(&reg)
+}
+
+fn saved(ret: hv_return_t, value: u64, bank: RegisterBank, reg: u32) -> Result<u64, Error> {
+    if ret == HV_SUCCESS {
+        Ok(value)
+    } else {
+        Err(Error::VcpuSaveRegister(bank, reg, ret))
+    }
+}
+
+fn restored(ret: hv_return_t, bank: RegisterBank, reg: u32) -> Result<(), Error> {
+    if ret == HV_SUCCESS {
+        Ok(())
+    } else {
+        Err(Error::VcpuRestoreRegister(bank, reg, ret))
+    }
+}
+
+fn save_regs<R: Copy>(
+    regs: &[R],
+    read: impl Fn(R) -> Result<u64, Error>,
+) -> Result<Vec<(R, u64)>, Error> {
+    regs.iter().map(|&reg| Ok((reg, read(reg)?))).collect()
+}
+
+fn get_sys_reg(vcpuid: hv_vcpu_t, reg: u16) -> (hv_return_t, u64) {
+    let mut val: u64 = 0;
+    let ret = unsafe { hv_vcpu_get_sys_reg(vcpuid, reg as hv_sys_reg_t, &mut val) };
+    (ret, val)
+}
+
+fn set_sys_reg(vcpuid: hv_vcpu_t, reg: u16, val: u64) -> Result<(), Error> {
+    let ret = unsafe { hv_vcpu_set_sys_reg(vcpuid, reg as hv_sys_reg_t, val) };
+    restored(ret, RegisterBank::System, reg.into())
+}
+
+fn restore_sys_reg(vcpuid: hv_vcpu_t, reg: u16, val: u64) -> Result<(), Error> {
     if is_ro(reg) || is_blocked_timer_reg(reg) {
-        return;
+        return Ok(());
     }
     let val = if matches!(
         reg,
@@ -245,9 +305,7 @@ fn restore_sys_reg(vcpuid: hv_vcpu_t, reg: u16, val: u64) {
     } else {
         val
     };
-    if let Err(e) = HvfVcpu::raw_set_sys_reg(vcpuid, reg, val) {
-        debug!("snapshot restore: skipping sysreg 0x{reg:x}: {e}");
-    }
+    set_sys_reg(vcpuid, reg, val)
 }
 
 fn is_el2_control_reg(reg: u16) -> bool {
@@ -296,81 +354,86 @@ impl HvfVcpu<'_> {
         }
     }
 
-    fn raw_get_gic_icc_reg(vcpuid: hv_vcpu_t, reg: u16) -> Option<u64> {
+    fn save_gic_icc_reg(vcpuid: hv_vcpu_t, reg: u16) -> Result<u64, Error> {
         let mut val: u64 = 0;
         let ret = unsafe { hv_gic_get_icc_reg(vcpuid, reg as hv_gic_icc_reg_t, &mut val) };
-        (ret == HV_SUCCESS).then_some(val)
+        saved(ret, val, RegisterBank::GicIcc, reg.into())
     }
 
-    fn raw_set_gic_icc_reg(vcpuid: hv_vcpu_t, reg: u16, value: u64) -> bool {
+    fn restore_gic_icc_reg(vcpuid: hv_vcpu_t, reg: u16, value: u64) -> Result<(), Error> {
         let ret = unsafe { hv_gic_set_icc_reg(vcpuid, reg as hv_gic_icc_reg_t, value) };
-        ret == HV_SUCCESS
+        restored(ret, RegisterBank::GicIcc, reg.into())
     }
 
-    fn raw_get_gic_redist_reg(vcpuid: hv_vcpu_t, reg: u32) -> Option<u64> {
+    fn save_gic_redist_reg(vcpuid: hv_vcpu_t, reg: u32) -> Result<u64, Error> {
         let mut val: u64 = 0;
         let ret = unsafe {
             hv_gic_get_redistributor_reg(vcpuid, reg as hv_gic_redistributor_reg_t, &mut val)
         };
-        (ret == HV_SUCCESS).then_some(val)
+        saved(ret, val, RegisterBank::GicRedistributor, reg)
     }
 
-    fn raw_set_gic_redist_reg(vcpuid: hv_vcpu_t, reg: u32, value: u64) -> bool {
+    fn set_gic_redist_reg(vcpuid: hv_vcpu_t, reg: u32, value: u64) -> Result<(), Error> {
         let ret = unsafe {
             hv_gic_set_redistributor_reg(vcpuid, reg as hv_gic_redistributor_reg_t, value)
         };
-        ret == HV_SUCCESS
+        restored(ret, RegisterBank::GicRedistributor, reg)
     }
 
-    fn raw_get_gic_ich_reg(vcpuid: hv_vcpu_t, reg: u16) -> Option<u64> {
+    fn save_gic_ich_reg(vcpuid: hv_vcpu_t, reg: u16) -> Result<u64, Error> {
         let mut val: u64 = 0;
         let ret = unsafe { hv_gic_get_ich_reg(vcpuid, reg as hv_gic_ich_reg_t, &mut val) };
-        (ret == HV_SUCCESS).then_some(val)
+        saved(ret, val, RegisterBank::GicIch, reg.into())
     }
 
-    fn raw_set_gic_ich_reg(vcpuid: hv_vcpu_t, reg: u16, value: u64) -> bool {
+    fn restore_gic_ich_reg(vcpuid: hv_vcpu_t, reg: u16, value: u64) -> Result<(), Error> {
         let ret = unsafe { hv_gic_set_ich_reg(vcpuid, reg as hv_gic_ich_reg_t, value) };
-        ret == HV_SUCCESS
+        restored(ret, RegisterBank::GicIch, reg.into())
     }
 
-    fn restore_gic_redist_reg(vcpuid: hv_vcpu_t, reg: u32, value: u64) {
-        if reg == hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISENABLER0 as u32 {
-            let _ = Self::raw_set_gic_redist_reg(
-                vcpuid,
-                hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ICENABLER0 as u32,
-                u32::MAX as u64,
-            );
-        } else if reg == hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0 as u32 {
-            let _ = Self::raw_set_gic_redist_reg(
-                vcpuid,
-                hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ICPENDR0 as u32,
-                u32::MAX as u64,
-            );
-        } else if reg == hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISACTIVER0 as u32
-        {
-            let _ = Self::raw_set_gic_redist_reg(
-                vcpuid,
-                hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ICACTIVER0 as u32,
-                u32::MAX as u64,
-            );
+    /// Set-type registers (ISENABLER, ISPENDR, ISACTIVER) only set bits, so
+    /// clear the whole register through its clear-type twin first.
+    fn restore_gic_redist_reg(vcpuid: hv_vcpu_t, reg: u32, value: u64) -> Result<(), Error> {
+        const ISENABLER0: u32 = hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISENABLER0;
+        const ISPENDR0: u32 = hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0;
+        const ISACTIVER0: u32 = hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISACTIVER0;
+        let clear_twin = match reg {
+            ISENABLER0 => Some(hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ICENABLER0),
+            ISPENDR0 => Some(hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ICPENDR0),
+            ISACTIVER0 => Some(hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ICACTIVER0),
+            _ => None,
+        };
+        if let Some(clear) = clear_twin {
+            Self::set_gic_redist_reg(vcpuid, clear, u32::MAX as u64)?;
         }
-        let _ = Self::raw_set_gic_redist_reg(vcpuid, reg, value);
+        Self::set_gic_redist_reg(vcpuid, reg, value)
     }
 
-    fn restore_gic_redist_exact(vcpuid: hv_vcpu_t, regs: &[(u32, u64)], wanted: u32) {
+    fn restore_gic_redist_exact(
+        vcpuid: hv_vcpu_t,
+        regs: &[(u32, u64)],
+        wanted: u32,
+    ) -> Result<(), Error> {
         for &(reg, val) in regs {
             if reg == wanted {
-                Self::restore_gic_redist_reg(vcpuid, reg, val);
+                Self::restore_gic_redist_reg(vcpuid, reg, val)?;
             }
         }
+        Ok(())
     }
 
-    fn restore_gic_redist_range(vcpuid: hv_vcpu_t, regs: &[(u32, u64)], base: u32, len: u32) {
+    fn restore_gic_redist_range(
+        vcpuid: hv_vcpu_t,
+        regs: &[(u32, u64)],
+        base: u32,
+        len: u32,
+    ) -> Result<(), Error> {
         for &(reg, val) in regs {
             if (base..base + len).contains(&reg) {
-                Self::restore_gic_redist_reg(vcpuid, reg, val);
+                Self::restore_gic_redist_reg(vcpuid, reg, val)?;
             }
         }
+        Ok(())
     }
 
     fn is_ordered_gic_redist_reg(reg: u32) -> bool {
@@ -388,21 +451,7 @@ impl HvfVcpu<'_> {
         )
     }
 
-    fn restore_gic_icc_reg(vcpuid: hv_vcpu_t, reg: u16, value: u64) {
-        if !Self::raw_set_gic_icc_reg(vcpuid, reg, value) {
-            debug!("snapshot restore: skipping GIC ICC reg 0x{reg:x}");
-        }
-    }
-
-    fn restore_gic_icc_exact(vcpuid: hv_vcpu_t, regs: &[(u16, u64)], wanted: u16) {
-        for &(reg, val) in regs {
-            if reg == wanted {
-                Self::restore_gic_icc_reg(vcpuid, reg, val);
-            }
-        }
-    }
-
-    fn restore_gic_icc_regs(vcpuid: hv_vcpu_t, regs: &[(u16, u64)]) {
+    fn restore_gic_icc_regs(vcpuid: hv_vcpu_t, regs: &[(u16, u64)]) -> Result<(), Error> {
         let ordered = [
             hv_gic_icc_reg_t_HV_GIC_ICC_REG_SRE_EL1 as u16,
             hv_gic_icc_reg_t_HV_GIC_ICC_REG_CTLR_EL1 as u16,
@@ -411,23 +460,22 @@ impl HvfVcpu<'_> {
             hv_gic_icc_reg_t_HV_GIC_ICC_REG_PMR_EL1 as u16,
             hv_gic_icc_reg_t_HV_GIC_ICC_REG_BPR0_EL1 as u16,
             hv_gic_icc_reg_t_HV_GIC_ICC_REG_BPR1_EL1 as u16,
-            hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP0R0_EL1 as u16 + 3,
-            hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP0R0_EL1 as u16 + 2,
-            hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP0R0_EL1 as u16 + 1,
             hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP0R0_EL1 as u16,
-            hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP1R0_EL1 as u16 + 3,
-            hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP1R0_EL1 as u16 + 2,
-            hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP1R0_EL1 as u16 + 1,
             hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP1R0_EL1 as u16,
         ];
         for wanted in ordered {
-            Self::restore_gic_icc_exact(vcpuid, regs, wanted);
+            for &(reg, val) in regs {
+                if reg == wanted {
+                    Self::restore_gic_icc_reg(vcpuid, reg, val)?;
+                }
+            }
         }
         for &(reg, val) in regs {
             if !ordered.contains(&reg) {
-                Self::restore_gic_icc_reg(vcpuid, reg, val);
+                Self::restore_gic_icc_reg(vcpuid, reg, val)?;
             }
         }
+        Ok(())
     }
 
     fn raw_set_sys_reg(vcpuid: hv_vcpu_t, reg: u16, value: u64) -> Result<(), Error> {
@@ -481,41 +529,41 @@ impl HvfVcpu<'_> {
             *slot = Self::raw_get_fp(id, i as hv_simd_fp_reg_t)?;
         }
 
-        let mut sysregs = Vec::with_capacity(SYS_REGS_EL1.len() + SYS_REGS_EL2.len());
-        for &r in SYS_REGS_EL1 {
-            match Self::raw_get_sys_reg(id, r) {
-                Ok(v) => sysregs.push((r, v)),
-                Err(e) => debug!("snapshot save: skipping sysreg 0x{r:x}: {e}"),
-            }
-        }
+        let save_sys = |reg| {
+            let (ret, val) = get_sys_reg(id, reg);
+            saved(ret, val, RegisterBank::System, reg.into())
+        };
+        let mut sysregs = save_regs(SYS_REGS_EL1, save_sys)?;
         if self.nested_enabled {
-            for &r in SYS_REGS_EL2 {
-                match Self::raw_get_sys_reg(id, r) {
-                    Ok(v) => sysregs.push((r, v)),
-                    Err(e) => debug!("snapshot save: skipping EL2 sysreg 0x{r:x}: {e}"),
-                }
-            }
+            sysregs.extend(save_regs(SYS_REGS_EL2, save_sys)?);
         }
-        let gic_icc_regs = GIC_ICC_REGS
-            .iter()
-            .filter_map(|&r| Self::raw_get_gic_icc_reg(id, r).map(|v| (r, v)))
-            .collect::<Vec<_>>();
-        let gic_redist_regs = GIC_REDIST_REGS
-            .iter()
-            .filter_map(|&r| Self::raw_get_gic_redist_reg(id, r).map(|v| (r, v)))
-            .collect::<Vec<_>>();
-        let gic_ich_regs = if self.nested_enabled {
-            GIC_ICH_REGS
+        let in_kernel_gic = self.interrupt_controller == InterruptController::InKernel;
+        let (gic_icc_regs, gic_redist_regs) = if in_kernel_gic {
+            (
+                save_regs(GIC_ICC_REGS, |reg| Self::save_gic_icc_reg(id, reg))?,
+                save_regs(GIC_REDIST_REGS, |reg| Self::save_gic_redist_reg(id, reg))?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let gic_ich_regs = if in_kernel_gic && self.nested_enabled {
+            let vtr = hv_gic_ich_reg_t_HV_GIC_ICH_REG_VTR_EL2 as u16;
+            let list_regs = implemented_ich_list_regs(Self::save_gic_ich_reg(id, vtr)?);
+            let regs = GIC_ICH_CONTROL_REGS
                 .iter()
-                .filter_map(|&r| Self::raw_get_gic_ich_reg(id, r).map(|v| (r, v)))
-                .collect::<Vec<_>>()
+                .chain(&GIC_ICH_LIST_REGS[..list_regs])
+                .chain(GIC_ICH_APR_REGS)
+                .copied()
+                .collect::<Vec<_>>();
+            save_regs(&regs, |reg| Self::save_gic_ich_reg(id, reg))?
         } else {
             Vec::new()
         };
 
         let mut vtimer_offset: u64 = 0;
         // SAFETY: FFI call.
-        let _ = unsafe { hv_vcpu_get_vtimer_offset(id, &mut vtimer_offset as *mut _) };
+        let ret = unsafe { hv_vcpu_get_vtimer_offset(id, &mut vtimer_offset as *mut _) };
+        let vtimer_offset = saved(ret, vtimer_offset, RegisterBank::VtimerOffset, 0)?;
         Ok(HvfVcpuState {
             gp,
             pc,
@@ -542,12 +590,12 @@ impl HvfVcpu<'_> {
 
         for &(reg, val) in &st.sysregs {
             if is_el2_control_reg(reg) {
-                restore_sys_reg(id, reg, val);
+                restore_sys_reg(id, reg, val)?;
             }
         }
         for &(reg, val) in &st.sysregs {
             if !is_el2_control_reg(reg) {
-                restore_sys_reg(id, reg, val);
+                restore_sys_reg(id, reg, val)?;
             }
         }
 
@@ -560,80 +608,84 @@ impl HvfVcpu<'_> {
         }
 
         self.restore_gic_redist_regs(&st.gic_redist_regs)?;
-        Self::restore_gic_icc_regs(id, &st.gic_icc_regs);
-        for &(reg, val) in &st.gic_ich_regs {
-            if !Self::raw_set_gic_ich_reg(id, reg, val) {
-                debug!("snapshot restore: skipping GIC ICH reg 0x{reg:x}");
-            }
-        }
+        Self::restore_gic_icc_regs(id, &st.gic_icc_regs)?;
+        self.restore_gic_ich_regs(&st.gic_ich_regs)?;
 
         // Restore the captured offset as the baseline. The snapshot
         // orchestrator later re-arms pending timer state before resuming.
-        unsafe {
-            let _ = hv_vcpu_set_vtimer_offset(id, st.vtimer_offset);
-        }
-        if let (Ok(cval), Ok(ctl)) = (
-            Self::raw_get_sys_reg(id, hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0 as u16),
-            Self::raw_get_sys_reg(id, hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0 as u16),
-        ) {
-            let _ = Self::raw_set_sys_reg(id, hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0 as u16, cval);
-            let ctl = if (ctl & TMR_CTL_ENABLE) == 0 {
-                ctl & !TMR_CTL_ISTATUS
-            } else {
-                ctl
-            };
-            let _ = Self::raw_set_sys_reg(id, hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0 as u16, ctl);
-        }
+        let ret = unsafe { hv_vcpu_set_vtimer_offset(id, st.vtimer_offset) };
+        restored(ret, RegisterBank::VtimerOffset, 0)?;
+        let cval_reg = hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0 as u16;
+        let ctl_reg = hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0 as u16;
+        let restore_read = |reg: u16| {
+            let (ret, val) = get_sys_reg(id, reg);
+            restored(ret, RegisterBank::System, reg.into()).map(|()| val)
+        };
+        let cval = restore_read(cval_reg)?;
+        let ctl = restore_read(ctl_reg)?;
+        set_sys_reg(id, cval_reg, cval)?;
+        let ctl = if (ctl & TMR_CTL_ENABLE) == 0 {
+            ctl & !TMR_CTL_ISTATUS
+        } else {
+            ctl
+        };
+        set_sys_reg(id, ctl_reg, ctl)?;
 
-        let _ = vcpu_set_vtimer_mask(id, false);
+        vcpu_set_vtimer_mask(id, false)?;
         self.vtimer_masked = false;
 
         Ok(())
     }
 
+    fn restore_gic_ich_regs(&self, regs: &[(u16, u64)]) -> Result<(), Error> {
+        if regs.is_empty() {
+            return Ok(());
+        }
+        let id = self.vcpuid;
+        let vtr_reg = hv_gic_ich_reg_t_HV_GIC_ICH_REG_VTR_EL2 as u16;
+        let mut vtr: u64 = 0;
+        let ret = unsafe { hv_gic_get_ich_reg(id, vtr_reg as hv_gic_ich_reg_t, &mut vtr) };
+        restored(ret, RegisterBank::GicIch, vtr_reg.into())?;
+        let list_regs = implemented_ich_list_regs(vtr);
+        for &(reg, val) in regs {
+            // A snapshot from a GIC with more list registers may carry ones
+            // this GIC lacks. Empty ones hold no interrupt and can be dropped;
+            // a live one cannot be restored, so it stays an error below.
+            let unimplemented = GIC_ICH_LIST_REGS
+                .iter()
+                .position(|&lr| lr == reg)
+                .is_some_and(|index| index >= list_regs);
+            if unimplemented && val == 0 {
+                continue;
+            }
+            Self::restore_gic_ich_reg(id, reg, val)?;
+        }
+        Ok(())
+    }
+
     pub fn restore_gic_redist_regs(&mut self, regs: &[(u32, u64)]) -> Result<(), Error> {
         let id = self.vcpuid;
-        Self::restore_gic_redist_exact(
-            id,
-            regs,
-            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_IGROUPR0 as u32,
-        );
-        Self::restore_gic_redist_exact(
-            id,
-            regs,
-            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISENABLER0 as u32,
-        );
         // Configuration must be restored before pending bits so level/edge
         // state is interpreted the same way as it was at capture.
-        Self::restore_gic_redist_exact(
-            id,
-            regs,
-            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ICFGR0 as u32,
-        );
-        Self::restore_gic_redist_exact(
-            id,
-            regs,
-            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ICFGR1 as u32,
-        );
-        Self::restore_gic_redist_exact(
-            id,
-            regs,
-            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0 as u32,
-        );
-        Self::restore_gic_redist_exact(
-            id,
-            regs,
-            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISACTIVER0 as u32,
-        );
+        for wanted in [
+            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_IGROUPR0,
+            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISENABLER0,
+            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ICFGR0,
+            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ICFGR1,
+            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0,
+            hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_ISACTIVER0,
+        ] {
+            Self::restore_gic_redist_exact(id, regs, wanted as u32)?;
+        }
         Self::restore_gic_redist_range(
             id,
             regs,
             hv_gic_redistributor_reg_t_HV_GIC_REDISTRIBUTOR_REG_GICR_IPRIORITYR0 as u32,
             32,
-        );
+        )?;
         for &(reg, val) in regs {
             if !Self::is_ordered_gic_redist_reg(reg) {
-                Self::restore_gic_redist_reg(id, reg, val);
+                Self::restore_gic_redist_reg(id, reg, val)?;
             }
         }
         Ok(())
@@ -695,5 +747,38 @@ impl HvfVcpu<'_> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ich_list_register_count_comes_from_vtr() {
+        assert_eq!(implemented_ich_list_regs(0x9000_0007), 8);
+        assert_eq!(implemented_ich_list_regs(0x9000_000f), 16);
+        assert_eq!(implemented_ich_list_regs(0x9000_001f), 16);
+    }
+
+    #[test]
+    fn snapshot_ich_registers_exclude_active_priorities_hvf_lacks() {
+        let ap0r0 = hv_gic_ich_reg_t_HV_GIC_ICH_REG_AP0R0_EL2 as u16;
+        assert!(is_snapshot_gic_ich_reg(ap0r0));
+        assert!(!is_snapshot_gic_ich_reg(ap0r0 + 1));
+        assert!(is_snapshot_gic_ich_reg(
+            hv_gic_ich_reg_t_HV_GIC_ICH_REG_LR15_EL2 as u16
+        ));
+        assert!(!is_snapshot_gic_ich_reg(
+            hv_gic_ich_reg_t_HV_GIC_ICH_REG_VTR_EL2 as u16
+        ));
+    }
+
+    #[test]
+    fn snapshot_sys_registers_exclude_mdcr_el2() {
+        assert!(is_snapshot_sys_reg(hv_sys_reg_t_HV_SYS_REG_HCR_EL2 as u16));
+        assert!(!is_snapshot_sys_reg(
+            hv_sys_reg_t_HV_SYS_REG_MDCR_EL2 as u16
+        ));
     }
 }

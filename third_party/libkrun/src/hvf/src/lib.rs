@@ -175,7 +175,22 @@ pub enum Error {
     VcpuSetRegister,
     VcpuSetSystemRegister(u16, u64),
     VcpuSetVtimerMask,
+    /// Snapshot capture could not read this vCPU register.
+    VcpuSaveRegister(RegisterBank, u32, hv_return_t),
+    /// Snapshot restore could not write this vCPU register.
+    VcpuRestoreRegister(RegisterBank, u32, hv_return_t),
     VmCreate,
+}
+
+/// The HVF API family a vCPU register is accessed through.
+#[derive(Clone, Copy, Debug)]
+pub enum RegisterBank {
+    System,
+    GicIcc,
+    GicRedistributor,
+    GicIch,
+    VtimerOffset,
+    VtimerMask,
 }
 
 impl Display for Error {
@@ -218,6 +233,14 @@ impl Display for Error {
                 "Error setting HVF vCPU system register 0x{reg:#x} to 0x{val:#x}"
             ),
             VcpuSetVtimerMask => write!(f, "Error setting HVF vCPU vtimer mask"),
+            VcpuSaveRegister(bank, reg, ret) => write!(
+                f,
+                "Error saving HVF vCPU {bank:?} register 0x{reg:x}: hv_return_t 0x{ret:x}"
+            ),
+            VcpuRestoreRegister(bank, reg, ret) => write!(
+                f,
+                "Error restoring HVF vCPU {bank:?} register 0x{reg:x}: hv_return_t 0x{ret:x}"
+            ),
             VmCreate => write!(f, "Error creating HVF VM instance"),
         }
     }

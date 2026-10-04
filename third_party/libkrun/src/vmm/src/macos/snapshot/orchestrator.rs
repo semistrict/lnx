@@ -1184,9 +1184,15 @@ fn restore_linux_gic_state(
         let vcpu = kvm_gic_attr_mpidr(reg.attr) as usize;
         if let Some(state) = restored.vcpus.get_mut(vcpu) {
             let offset = kvm_gic_attr_offset(reg.attr);
+            // KVM saves four active-priority registers per group; HVF has
+            // one, so keep only the registers HVF snapshots carry.
             if let Some(hvf_reg) = kvm_cpu_sysreg_to_hvf_ich_reg(offset) {
-                state.ich_regs.push((hvf_reg, reg.value));
-            } else if !kvm_cpu_sysreg_is_icc_apr(offset) {
+                if hvf::state::is_snapshot_gic_ich_reg(hvf_reg) {
+                    state.ich_regs.push((hvf_reg, reg.value));
+                }
+            } else if !kvm_cpu_sysreg_is_icc_apr(offset)
+                && hvf::state::GIC_ICC_REGS.contains(&(offset as u16))
+            {
                 state.icc_regs.push((offset as u16, reg.value));
             }
         }
@@ -1540,6 +1546,66 @@ mod tests {
 
         vm.capture(&snapshot, |_| Ok(())).expect("capture");
         assert_eq!(read_pages(&snapshot), b"");
+    }
+
+    #[derive(Serialize)]
+    struct KvmGicSnapshotFixture {
+        vcpu_count: u64,
+        regs32: Vec<KvmReg32Fixture>,
+        regs64: Vec<KvmReg64Fixture>,
+    }
+
+    #[derive(Serialize)]
+    struct KvmReg32Fixture {
+        group: u32,
+        attr: u64,
+        value: u32,
+    }
+
+    #[derive(Serialize)]
+    struct KvmReg64Fixture {
+        group: u32,
+        attr: u64,
+        value: u64,
+    }
+
+    #[test]
+    fn linux_gic_state_keeps_only_cpu_registers_hvf_snapshots_carry() {
+        let icc_pmr_el1 = kvm_vgic_sysreg(3, 0, 4, 6, 0);
+        let icc_rpr_el1 = kvm_vgic_sysreg(3, 0, 12, 11, 3);
+        let cpu_reg = |attr: u64, value: u64| KvmReg64Fixture {
+            group: KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS,
+            attr,
+            value,
+        };
+        let snapshot = KvmGicSnapshotFixture {
+            vcpu_count: 1,
+            regs32: Vec::new(),
+            regs64: vec![
+                cpu_reg(ICH_VMCR_EL2, 1),
+                cpu_reg(ICH_AP0R_EL2[0], 2),
+                cpu_reg(ICH_AP0R_EL2[1], 3),
+                cpu_reg(icc_pmr_el1, 4),
+                cpu_reg(icc_rpr_el1, 5),
+            ],
+        };
+        let scratch = ScratchDir::new("linux-gic");
+        let mut writer = SnapshotWriter::new(0, 0, 1);
+        writer
+            .add_bincode(SectionId::HvfGic, 0, &snapshot)
+            .expect("add gic");
+        writer.write_to_dir(&scratch.0).expect("write vmstate");
+        let reader = super::super::SnapshotReader::open(&scratch.0).expect("open");
+
+        let restored = restore_linux_gic_state(&reader, 1)
+            .expect("decode")
+            .expect("gic state");
+
+        assert_eq!(
+            restored.vcpus[0].ich_regs,
+            vec![(ICH_VMCR_EL2 as u16, 1), (ICH_AP0R_EL2[0] as u16, 2)]
+        );
+        assert_eq!(restored.vcpus[0].icc_regs, vec![(icc_pmr_el1 as u16, 4)]);
     }
 
     #[test]

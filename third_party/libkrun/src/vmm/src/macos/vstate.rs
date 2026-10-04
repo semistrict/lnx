@@ -1014,7 +1014,13 @@ fn kvm_state_to_hvf_state(
             sysregs.push((hvf_sys_reg(3, 3, 14, 3, 2), value));
             continue;
         }
-        sysregs.push((kvm_sysreg_to_hvf_sysreg(reg.id), value));
+        // KVM lists registers HVF does not have (PMU, debug, AArch32 ID
+        // registers, ...). Carry over exactly what an HVF snapshot would hold,
+        // so restore can treat every remaining register as required.
+        let hvf_reg = kvm_sysreg_to_hvf_sysreg(reg.id);
+        if hvf::state::is_snapshot_sys_reg(hvf_reg) {
+            sysregs.push((hvf_reg, value));
+        }
     }
 
     let vtimer_offset = saved_counter
@@ -1354,6 +1360,7 @@ mod tests {
     #[test]
     fn kvm_state_translation_maps_core_fp_sysregs_and_timer() {
         let writable_sysreg = arm64_sys_reg_id(3, 0, 1, 0, 0);
+        let pmcr_el0 = arm64_sys_reg_id(3, 3, 9, 12, 0);
         let mut regs = Vec::new();
         for index in 0..31 {
             regs.push(one_reg_u64(core_user_reg_id(index), 0x1000 + index as u64));
@@ -1372,6 +1379,7 @@ mod tests {
                 0x1111_2222_3333_4444_5555_6666_7777_8888,
             ),
             one_reg_u64(writable_sysreg, 0x9000),
+            one_reg_u64(pmcr_el0, 0x41),
             one_reg_u64(kvm_timer_cval_id(), 0xa000),
             one_reg_u64(kvm_timer_counter_id(), 0xb000),
         ]);
@@ -1409,6 +1417,12 @@ mod tests {
         assert_eq!(hvf.gic_icc_regs, gic.icc_regs);
         assert_eq!(hvf.gic_redist_regs, gic.redist_regs);
         assert_eq!(hvf.gic_ich_regs, gic.ich_regs);
+        assert!(
+            !hvf.sysregs
+                .iter()
+                .any(|&(reg, _)| reg == hvf_sys_reg(3, 3, 9, 12, 0)),
+            "PMCR_EL0 is not an HVF snapshot register"
+        );
     }
 
     #[cfg(target_arch = "aarch64")]
