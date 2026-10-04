@@ -355,9 +355,15 @@ pub(crate) fn handle_broker_client(
     client
         .set_nonblocking(false)
         .context("set broker client blocking")?;
-    client
-        .set_read_timeout(Some(CLIENT_HANDSHAKE_TIMEOUT))
-        .context("set broker client handshake timeout")?;
+    if let Err(error) = client.set_read_timeout(Some(CLIENT_HANDSHAKE_TIMEOUT)) {
+        // macOS refuses socket options on a connection whose peer has
+        // already closed it; such a client has nothing left to ask.
+        if error.raw_os_error() == Some(libc::EINVAL) {
+            run_log.line("broker.client.gone before_handshake=true");
+            return Ok(());
+        }
+        return Err(error).context("set broker client handshake timeout");
+    }
     match read_message(&mut client)? {
         Message::Hello { version } if version == PROTOCOL_VERSION => {}
         Message::Hello { version } => {
