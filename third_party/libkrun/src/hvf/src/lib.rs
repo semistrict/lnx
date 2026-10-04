@@ -61,8 +61,9 @@ struct DirtyRegion {
 struct DirtyTracker {
     enabled: bool,
     regions: Vec<DirtyRegion>,
-    /// Whether the dirty bits record every write since the last reset.
-    complete: bool,
+    /// Image guest RAM matched at the last reset, while the dirty bits are
+    /// still a complete record of every write since then.
+    baseline: Option<DirtyBaseline>,
 }
 
 static DIRTY_TRACKER: LazyLock<Mutex<DirtyTracker>> =
@@ -412,20 +413,25 @@ impl HvfVm {
 const DIRTY_TRACKED_PROTECTION: u64 = (HV_MEMORY_READ | HV_MEMORY_EXEC) as u64;
 const DIRTY_WRITABLE_PROTECTION: u64 = (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC) as u64;
 
+/// Caller-chosen identity of a stored RAM image (e.g. a snapshot's
+/// pages.img). The tracker only carries it; it never interprets it.
+pub type DirtyBaseline = u128;
+
 /// Dirty RAM blocks handed out by [`take_dirty_blocks_and_reprotect`].
 #[derive(Debug)]
 pub struct DirtySet {
     pub blocks: Vec<DirtyBlock>,
-    /// True when `blocks` is every block written since the tracker was last
-    /// reset. A capture may only patch an existing RAM image with a complete
-    /// set; otherwise it must write all of RAM.
-    pub complete: bool,
+    /// The image `blocks` are relative to: patching exactly these blocks into
+    /// that image reproduces current guest RAM. `None` when no image is known
+    /// to match, in which case a capture must write all of RAM.
+    pub baseline: Option<DirtyBaseline>,
 }
 
 impl DirtyTracker {
     fn reset(
         &mut self,
         ranges: &[(u64, u64)],
+        baseline: Option<DirtyBaseline>,
         mut protect: impl FnMut(u64, u64, u64) -> Result<(), Error>,
     ) -> Result<(), Error> {
         let mut regions = Vec::new();
@@ -442,7 +448,7 @@ impl DirtyTracker {
         }
         self.enabled = true;
         self.regions = regions;
-        self.complete = true;
+        self.baseline = baseline;
         Ok(())
     }
 
@@ -453,15 +459,15 @@ impl DirtyTracker {
     }
 
     /// Hands the dirty set to the caller and write-protects those blocks
-    /// again. Taking consumes completeness: until the caller resets the
-    /// tracker after durably storing RAM, later takes report an incomplete
-    /// set, so a capture that fails after taking can never be followed by an
+    /// again. Taking consumes the baseline: until the caller resets the
+    /// tracker after durably storing RAM, later takes report no baseline, so
+    /// a capture that fails after taking can never be followed by an
     /// incremental capture that silently misses the blocks it took.
     fn take(
         &mut self,
         mut protect: impl FnMut(u64, u64, u64) -> Result<(), Error>,
     ) -> Result<DirtySet, Error> {
-        let complete = std::mem::replace(&mut self.complete, false);
+        let baseline = self.baseline.take();
         let blocks = self.dirty_blocks();
         for block in &blocks {
             protect(block.guest_addr, block.size, DIRTY_TRACKED_PROTECTION)?;
@@ -469,7 +475,7 @@ impl DirtyTracker {
         for region in &mut self.regions {
             region.blocks.fill(false);
         }
-        Ok(DirtySet { blocks, complete })
+        Ok(DirtySet { blocks, baseline })
     }
 
     fn dirty_blocks(&self) -> Vec<DirtyBlock> {
@@ -527,10 +533,16 @@ fn hv_protect(guest_addr: u64, size: u64, protection: u64) -> Result<(), Error> 
     Ok(())
 }
 
-/// Write-protects `ranges` and starts recording writes to them from a clean,
-/// complete state.
-pub fn enable_dirty_tracking(ranges: &[(u64, u64)]) -> Result<(), Error> {
-    DIRTY_TRACKER.lock().unwrap().reset(ranges, hv_protect)
+/// Write-protects `ranges` and starts recording writes to them. `baseline`
+/// names the stored image guest RAM matches right now, if any.
+pub fn enable_dirty_tracking(
+    ranges: &[(u64, u64)],
+    baseline: Option<DirtyBaseline>,
+) -> Result<(), Error> {
+    DIRTY_TRACKER
+        .lock()
+        .unwrap()
+        .reset(ranges, baseline, hv_protect)
 }
 
 fn mark_dirty_ranges_in_regions(regions: &mut [DirtyRegion], ranges: &[(u64, u64)]) {
@@ -644,10 +656,12 @@ mod tests {
         Ok(())
     }
 
-    fn tracker_with_four_blocks() -> DirtyTracker {
+    const RAM: (u64, u64) = (0x1000_0000, DIRTY_BLOCK_SIZE * 4);
+
+    fn tracker_with_baseline(baseline: Option<DirtyBaseline>) -> DirtyTracker {
         let mut tracker = DirtyTracker::default();
         tracker
-            .reset(&[(0x1000_0000, DIRTY_BLOCK_SIZE * 4)], allow_protect)
+            .reset(&[RAM], baseline, allow_protect)
             .expect("reset");
         tracker
     }
@@ -657,30 +671,40 @@ mod tests {
     }
 
     #[test]
-    fn dirty_set_is_complete_only_for_first_take_after_reset() {
-        let mut tracker = tracker_with_four_blocks();
+    fn only_the_first_take_after_reset_carries_the_baseline() {
+        let mut tracker = tracker_with_baseline(Some(7));
         tracker.mark(&[(0x1000_0000 + DIRTY_BLOCK_SIZE, 0x1000)]);
 
         let first = tracker.take(allow_protect).expect("first take");
-        assert!(first.complete);
+        assert_eq!(first.baseline, Some(7));
         assert_eq!(block_addrs(&first), vec![0x1000_0000 + DIRTY_BLOCK_SIZE]);
 
         tracker.mark(&[(0x1000_0000, 0x1000)]);
         let second = tracker.take(allow_protect).expect("second take");
-        assert!(!second.complete);
+        assert_eq!(second.baseline, None);
         assert_eq!(block_addrs(&second), vec![0x1000_0000]);
 
         tracker
-            .reset(&[(0x1000_0000, DIRTY_BLOCK_SIZE * 4)], allow_protect)
+            .reset(&[RAM], Some(8), allow_protect)
             .expect("reset");
         let after_reset = tracker.take(allow_protect).expect("take after reset");
-        assert!(after_reset.complete);
+        assert_eq!(after_reset.baseline, Some(8));
         assert_eq!(block_addrs(&after_reset), Vec::<u64>::new());
     }
 
     #[test]
-    fn failed_reprotect_keeps_blocks_dirty_and_set_incomplete() {
-        let mut tracker = tracker_with_four_blocks();
+    fn reset_without_baseline_reports_none() {
+        let mut tracker = tracker_with_baseline(None);
+        tracker.mark(&[(0x1000_0000, 0x1000)]);
+
+        let set = tracker.take(allow_protect).expect("take");
+        assert_eq!(set.baseline, None);
+        assert_eq!(block_addrs(&set), vec![0x1000_0000]);
+    }
+
+    #[test]
+    fn failed_reprotect_keeps_blocks_dirty_and_drops_baseline() {
+        let mut tracker = tracker_with_baseline(Some(7));
         tracker.mark(&[(0x1000_0000, DIRTY_BLOCK_SIZE * 3)]);
 
         let mut calls = 0;
@@ -697,7 +721,7 @@ mod tests {
         assert!(matches!(error, Error::MemoryMap));
 
         let retry = tracker.take(allow_protect).expect("retry take");
-        assert!(!retry.complete);
+        assert_eq!(retry.baseline, None);
         assert_eq!(
             block_addrs(&retry),
             vec![
@@ -709,12 +733,12 @@ mod tests {
     }
 
     #[test]
-    fn untracked_ram_never_reports_a_complete_set() {
+    fn untracked_ram_never_reports_a_baseline() {
         let mut tracker = DirtyTracker::default();
         tracker.mark(&[(0x1000_0000, 0x1000)]);
 
         let set = tracker.take(allow_protect).expect("take");
-        assert!(!set.complete);
+        assert_eq!(set.baseline, None);
         assert_eq!(block_addrs(&set), Vec::<u64>::new());
     }
 

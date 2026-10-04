@@ -7,9 +7,12 @@
 //   3. Walk virtio MMIO transports: pause() each underlying device, then
 //      serialize_state(). Collect MmioTransportState too.
 //   4. Capture GICv3 state (distributor + per-vCPU pending IRQ bitmaps).
-//   5. Write or clone-and-patch pages.img from guest memory.
-//   6. Assemble vmstate.bin (META + per-vcpu + GICDIST + GICVCPU + per-virtio).
-//   7. Atomic publish: write into a staging directory, rename to <path>.
+//   5. Write or clone-and-patch pages.img from guest memory. Patching is only
+//      allowed when <path> holds the image the dirty tracker is relative to.
+//   6. Assemble vmstate.bin (META + new pages.img id + per-vcpu + GICDIST +
+//      GICVCPU + per-virtio).
+//   7. Atomic publish: write into a staging directory, rename to <path>, then
+//      re-arm dirty tracking relative to the new image.
 //   8. Resume devices, then vCPUs.
 
 use std::path::{Path, PathBuf};
@@ -386,7 +389,8 @@ pub fn arm_dirty_tracking(inputs: &CaptureInputs<'_>) -> Result<()> {
     };
     drop(vcpu_states);
 
-    let result = enable_dirty_tracking(inputs);
+    // The guest has been running, so RAM matches no stored image.
+    let result = enable_dirty_tracking(inputs, None);
     let resume = resume_vcpus(inputs.vcpu_handles);
     result?;
     resume?;
@@ -488,8 +492,8 @@ where
 
     let result = (|| {
         crate::timing_event("snapshot.capture_paused.dirty_blocks.begin");
-        // Taking the dirty set marks it incomplete until the reset below, so
-        // if anything between here and that reset fails, the next capture
+        // Taking the dirty set consumes the tracker's baseline until the
+        // re-arm below, so if anything in between fails, the next capture
         // writes all of RAM instead of patching with blocks this one consumed.
         let dirty = hvf::take_dirty_blocks_and_reprotect()
             .map_err(|e| SnapshotError::Io(std::io::Error::other(format!("dirty RAM: {e}"))))?;
@@ -501,21 +505,20 @@ where
             &mut dirty_blocks,
         );
         crate::timing_event(&format!(
-            "snapshot.capture_paused.dirty_blocks.done count={} complete={}",
-            dirty_blocks.len(),
-            dirty.complete
+            "snapshot.capture_paused.dirty_blocks.done count={}",
+            dirty_blocks.len()
         ));
+        let image_id = new_pages_image_id()?;
         crate::timing_event("snapshot.capture_paused.ram.begin");
-        let ram = if dirty.complete && dir.join(super::PAGES_IMG).exists() {
-            clone_and_patch_dirty_pages_img(
+        let ram = match incremental_base(dir, dirty.baseline) {
+            Some(base) => clone_and_patch_dirty_pages_img(
                 inputs.guest_memory,
                 inputs.ram_ranges,
-                dir,
+                base,
                 &stage_dir,
                 &dirty_blocks,
-            )?
-        } else {
-            write_full_pages_img(inputs.guest_memory, inputs.ram_ranges, &stage_dir)?
+            )?,
+            None => write_full_pages_img(inputs.guest_memory, inputs.ram_ranges, &stage_dir)?,
         };
         crate::timing_event("snapshot.capture_paused.ram.done");
 
@@ -556,6 +559,7 @@ where
 
         let mut writer = SnapshotWriter::new(total_ram, ram_base, meta.vcpu_count);
         writer.add_bincode(SectionId::Meta, 0, &meta)?;
+        writer.add_bincode(SectionId::PagesImageId, 0, &image_id)?;
 
         for (i, bytes) in vcpu_states.iter().enumerate() {
             writer.add_raw(SectionId::Vcpu, i as u32, bytes.clone());
@@ -583,7 +587,7 @@ where
         publish_snapshot_dir(&stage_dir, dir)?;
         crate::timing_event("snapshot.capture_paused.publish.done");
         crate::timing_event("snapshot.capture_paused.dirty_tracking.begin");
-        enable_dirty_tracking(inputs)?;
+        enable_dirty_tracking(inputs, Some(image_id))?;
         crate::timing_event("snapshot.capture_paused.dirty_tracking.done");
         Ok(())
     })();
@@ -607,9 +611,56 @@ fn resume_devices(inputs: &CaptureInputs<'_>) -> Result<()> {
     Ok(())
 }
 
-fn enable_dirty_tracking(inputs: &CaptureInputs<'_>) -> Result<()> {
-    hvf::enable_dirty_tracking(inputs.ram_ranges)
+/// `baseline` is the pages.img guest RAM matches at this instant, if any.
+pub(crate) fn enable_dirty_tracking(
+    inputs: &CaptureInputs<'_>,
+    baseline: Option<PagesImageId>,
+) -> Result<()> {
+    hvf::enable_dirty_tracking(inputs.ram_ranges, baseline)
         .map_err(|e| SnapshotError::Io(std::io::Error::other(format!("enable dirty RAM: {e}"))))
+}
+
+/// Identifies the contents of one pages.img. Every capture mints a new id and
+/// records it in vmstate.bin next to the image; restore hands it to the dirty
+/// tracker. Copies of a snapshot keep its id because they keep its contents.
+pub(crate) type PagesImageId = hvf::DirtyBaseline;
+
+fn new_pages_image_id() -> Result<PagesImageId> {
+    let mut bytes = [0u8; 16];
+    // SAFETY: getentropy writes at most `bytes.len()` (<= 256) bytes into
+    // the buffer it is given.
+    if unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(PagesImageId::from_le_bytes(bytes))
+}
+
+fn stored_pages_image_id(reader: &super::SnapshotReader) -> Option<PagesImageId> {
+    reader.get_bincode(SectionId::PagesImageId, 0).ok()
+}
+
+/// The snapshot whose pages.img a capture may clone and patch with the blocks
+/// dirtied since `baseline`: `dir` itself, but only when it holds exactly the
+/// image `baseline` names. Anything else (no baseline, no image, an image from
+/// another VM or another point in this VM's history) needs a full RAM write.
+fn incremental_base(dir: &Path, baseline: Option<PagesImageId>) -> Option<&Path> {
+    let Some(baseline) = baseline else {
+        crate::timing_event("snapshot.capture_paused.ram.full reason=no_baseline");
+        return None;
+    };
+    if !dir.join(super::PAGES_IMG).exists() {
+        crate::timing_event("snapshot.capture_paused.ram.full reason=no_pages_img");
+        return None;
+    }
+    let stored = super::SnapshotReader::open(dir)
+        .ok()
+        .and_then(|reader| stored_pages_image_id(&reader));
+    if stored != Some(baseline) {
+        crate::timing_event("snapshot.capture_paused.ram.full reason=image_mismatch");
+        return None;
+    }
+    crate::timing_event("snapshot.capture_paused.ram.incremental");
+    Some(dir)
 }
 
 fn add_virtio_dma_dirty_blocks(
@@ -1003,7 +1054,9 @@ pub fn restore(inputs: &CaptureInputs<'_>, reader: &super::SnapshotReader) -> Re
     }
 
     crate::timing_event("snapshot.restore.dirty_tracking.begin");
-    enable_dirty_tracking(inputs)?;
+    // Guest RAM was mapped from this snapshot's pages.img and no vCPU has run
+    // yet, so RAM matches that image exactly.
+    enable_dirty_tracking(inputs, stored_pages_image_id(reader))?;
     crate::timing_event("snapshot.restore.dirty_tracking.done");
 
     // Restore virtio devices by MMIO base rather than by vector index so
@@ -1358,6 +1411,192 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Temporary directory holding one snapshot directory, removed on drop.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "lnx-macos-snapshot-{name}-{}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            Self(dir)
+        }
+
+        fn snapshot(&self) -> PathBuf {
+            self.0.join("snap")
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_snapshot(dir: &Path, image_id: Option<PagesImageId>, pages: &[u8]) {
+        std::fs::create_dir_all(dir).expect("create snapshot dir");
+        let mut writer = SnapshotWriter::new(0, 0, 0);
+        if let Some(image_id) = image_id {
+            writer
+                .add_bincode(SectionId::PagesImageId, 0, &image_id)
+                .expect("add image id");
+        }
+        writer.write_to_dir(dir).expect("write vmstate");
+        std::fs::write(super::super::pages_img_path(dir), pages).expect("write pages");
+    }
+
+    fn read_pages(dir: &Path) -> Vec<u8> {
+        std::fs::read(super::super::pages_img_path(dir)).expect("read pages")
+    }
+
+    fn read_image_id(dir: &Path) -> Option<PagesImageId> {
+        stored_pages_image_id(&super::super::SnapshotReader::open(dir).expect("open"))
+    }
+
+    #[test]
+    fn incremental_base_requires_the_tracked_image() {
+        let scratch = ScratchDir::new("base-match");
+        let snapshot = scratch.snapshot();
+        write_snapshot(&snapshot, Some(7), b"pages");
+
+        assert_eq!(
+            incremental_base(&snapshot, Some(7)),
+            Some(snapshot.as_path())
+        );
+        assert_eq!(incremental_base(&snapshot, Some(8)), None);
+        assert_eq!(incremental_base(&snapshot, None), None);
+    }
+
+    #[test]
+    fn incremental_base_rejects_snapshot_without_image_id() {
+        let scratch = ScratchDir::new("base-legacy");
+        let snapshot = scratch.snapshot();
+        write_snapshot(&snapshot, None, b"pages");
+
+        assert_eq!(incremental_base(&snapshot, Some(7)), None);
+    }
+
+    #[test]
+    fn incremental_base_requires_pages_img() {
+        let scratch = ScratchDir::new("base-no-pages");
+        let snapshot = scratch.snapshot();
+        write_snapshot(&snapshot, Some(7), b"pages");
+        std::fs::remove_file(super::super::pages_img_path(&snapshot)).expect("remove pages");
+
+        assert_eq!(incremental_base(&snapshot, Some(7)), None);
+    }
+
+    #[test]
+    fn pages_image_ids_are_unique() {
+        assert_ne!(
+            new_pages_image_id().expect("first id"),
+            new_pages_image_id().expect("second id")
+        );
+    }
+
+    /// Serializes tests that drive the process-wide HVF dirty tracker. They
+    /// use a VM without RAM ranges, so arming the tracker needs no HVF VM, a
+    /// full capture writes an empty pages.img, and an incremental capture
+    /// leaves the cloned base image's bytes untouched.
+    static DIRTY_TRACKER_LOCK: Mutex<()> = Mutex::new(());
+
+    struct RamlessVm {
+        memory: GuestMemoryMmap,
+        vcpu_list: Arc<VcpuList>,
+    }
+
+    impl RamlessVm {
+        fn new() -> Self {
+            Self {
+                memory: GuestMemoryMmap::from_ranges(&[(GuestAddress(0x8000_0000), 0x1000)])
+                    .expect("guest memory"),
+                vcpu_list: Arc::new(VcpuList::new(0)),
+            }
+        }
+
+        fn inputs(&self) -> CaptureInputs<'_> {
+            CaptureInputs {
+                guest_memory: &self.memory,
+                ram_ranges: &[],
+                vcpu_handles: &[],
+                vcpu_ids: &[],
+                vcpu_list: &self.vcpu_list,
+                irqchip: None,
+                gic: None,
+                virtio_transports: &[],
+                nested_enabled: false,
+            }
+        }
+
+        fn arm(&self, baseline: Option<PagesImageId>) {
+            enable_dirty_tracking(&self.inputs(), baseline).expect("arm dirty tracking");
+        }
+
+        fn capture(&self, dir: &Path, hook: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+            capture_paused(&self.inputs(), dir, &[], 0, hook)
+        }
+    }
+
+    #[test]
+    fn capture_patches_the_image_tracking_was_armed_from() {
+        let _lock = DIRTY_TRACKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let vm = RamlessVm::new();
+        let scratch = ScratchDir::new("capture-chain");
+        let snapshot = scratch.snapshot();
+        write_snapshot(&snapshot, Some(7), b"base");
+        vm.arm(Some(7));
+
+        vm.capture(&snapshot, |_| Ok(())).expect("first capture");
+        let first_id = read_image_id(&snapshot);
+        assert_eq!(read_pages(&snapshot), b"base");
+        assert_ne!(first_id, Some(7));
+        assert_ne!(first_id, None);
+
+        vm.capture(&snapshot, |_| Ok(())).expect("second capture");
+        assert_eq!(read_pages(&snapshot), b"base");
+        assert_ne!(read_image_id(&snapshot), first_id);
+    }
+
+    #[test]
+    fn capture_after_failed_capture_writes_all_of_ram() {
+        let _lock = DIRTY_TRACKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let vm = RamlessVm::new();
+        let scratch = ScratchDir::new("capture-failure");
+        let snapshot = scratch.snapshot();
+        write_snapshot(&snapshot, Some(7), b"stale");
+        vm.arm(Some(7));
+
+        let failed = vm.capture(&snapshot, |_| {
+            Err(SnapshotError::DeviceRefused("injected".to_string()))
+        });
+        assert!(matches!(failed, Err(SnapshotError::DeviceRefused(_))));
+        assert_eq!(read_pages(&snapshot), b"stale");
+        assert_eq!(read_image_id(&snapshot), Some(7));
+
+        vm.capture(&snapshot, |_| Ok(()))
+            .expect("capture after failure");
+        assert_eq!(read_pages(&snapshot), b"");
+    }
+
+    #[test]
+    fn capture_over_another_vms_snapshot_writes_all_of_ram() {
+        let _lock = DIRTY_TRACKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let vm = RamlessVm::new();
+        let scratch = ScratchDir::new("capture-foreign");
+        let snapshot = scratch.snapshot();
+        write_snapshot(&snapshot, Some(9), b"foreign");
+        vm.arm(Some(7));
+
+        vm.capture(&snapshot, |_| Ok(())).expect("capture");
+        assert_eq!(read_pages(&snapshot), b"");
     }
 
     #[test]

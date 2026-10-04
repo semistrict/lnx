@@ -613,7 +613,9 @@ impl Vmm {
             })
             .map(|region| (region.start_addr().raw_value(), region.len()))
             .collect::<Vec<_>>();
-        hvf::enable_dirty_tracking(&ranges).map_err(|e| e.to_string())?;
+        // Freshly loaded guest RAM matches no stored pages.img, so the first
+        // capture writes RAM in full whatever the target directory holds.
+        hvf::enable_dirty_tracking(&ranges, None).map_err(|e| e.to_string())?;
         hvf::mark_dirty_ranges(initial_dirty_ranges).map_err(|e| e.to_string())
     }
 

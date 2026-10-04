@@ -1,7 +1,8 @@
 // RAM capture and restore helpers.
 //
-// Capture: the first snapshot writes guest memory into pages.img. Later
-// snapshots clone the previous pages.img and patch only dirty RAM blocks. The
+// Capture: write all of guest memory into pages.img, or, when the target
+// already holds the exact image the dirty tracker is relative to (see
+// orchestrator::incremental_base), clone it and patch only dirty RAM blocks. The
 // offsets and region descriptors are recorded in vmstate so restore can rebuild
 // the same mapping.
 //

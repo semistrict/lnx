@@ -47,6 +47,8 @@ pub enum SectionId {
     VirtioMmio = 5,
     HvfGic = 6,
     HvfGicDistRegs = 7,
+    /// Identity of the pages.img captured alongside this vmstate.bin.
+    PagesImageId = 8,
 }
 
 #[derive(Clone, Debug)]
