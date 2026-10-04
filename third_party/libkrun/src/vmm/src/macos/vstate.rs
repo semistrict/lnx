@@ -19,7 +19,7 @@ use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 
 use arch::ArchMemoryInfo;
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
+use crossbeam_channel::{Receiver, Select, Sender, TryRecvError, unbounded};
 use devices::legacy::VcpuList;
 use hvf::{HvfVcpu, HvfVm, InterruptController, VcpuExit, Vcpus};
 use serde::Deserialize;
@@ -209,7 +209,6 @@ pub struct Vcpu {
     #[cfg(target_arch = "aarch64")]
     mpidr: u64,
 
-    #[allow(unused)]
     event_receiver: Receiver<VcpuEvent>,
     // The transmitting end of the events channel which will be given to the handler.
     event_sender: Option<Sender<VcpuEvent>>,
@@ -671,34 +670,44 @@ impl Vcpu {
                         .response_sender
                         .send(VcpuResponse::Error("not paused".into()));
                 }
-                Err(crossbeam_channel::TryRecvError::Empty) => return true,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => return false,
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => return false,
             }
         }
     }
 
+    /// Parks this vCPU until a device IRQ arrives on `receiver`, the optional
+    /// vtimer `timeout` elapses, or a control event is queued. Watching the
+    /// control channel is load-bearing: an idle vCPU blocks here rather than
+    /// in hv_vcpu_run, so hv_vcpus_exit cannot break it out, and without it a
+    /// Pause would never be seen. The control event stays queued for
+    /// process_control_events at the top of the run loop.
     fn wait_for_event(
         &mut self,
         hvf_vcpuid: u64,
         receiver: &Receiver<u32>,
         timeout: Option<Duration>,
     ) {
-        if self.vcpu_list.should_wait(hvf_vcpuid) {
-            debug!("vcpu.debug wait_for_event.enter vcpu={hvf_vcpuid} timeout={timeout:?}");
-            if let Some(timeout) = timeout {
-                match receiver.recv_timeout(timeout) {
-                    Ok(_) => debug!("vcpu.debug wait_for_event.wake vcpu={hvf_vcpuid}"),
-                    Err(e) => match e {
-                        RecvTimeoutError::Timeout => {
-                            debug!("vcpu.debug wait_for_event.timeout vcpu={hvf_vcpuid}")
-                        }
-                        RecvTimeoutError::Disconnected => panic!("WFE channel closed unexpectedly"),
-                    },
+        if !self.vcpu_list.should_wait(hvf_vcpuid) {
+            return;
+        }
+        debug!("vcpu.debug wait_for_event.enter vcpu={hvf_vcpuid} timeout={timeout:?}");
+        let mut select = Select::new();
+        let wfe = select.recv(receiver);
+        select.recv(&self.event_receiver);
+        let ready = match timeout {
+            Some(timeout) => select.ready_timeout(timeout).ok(),
+            None => Some(select.ready()),
+        };
+        match ready {
+            Some(index) if index == wfe => match receiver.try_recv() {
+                Err(TryRecvError::Disconnected) => panic!("WFE channel closed unexpectedly"),
+                Ok(_) | Err(TryRecvError::Empty) => {
+                    debug!("vcpu.debug wait_for_event.wake vcpu={hvf_vcpuid}")
                 }
-            } else {
-                receiver.recv().unwrap();
-                debug!("vcpu.debug wait_for_event.wake vcpu={hvf_vcpuid}");
-            }
+            },
+            Some(_) => debug!("vcpu.debug wait_for_event.control vcpu={hvf_vcpuid}"),
+            None => debug!("vcpu.debug wait_for_event.timeout vcpu={hvf_vcpuid}"),
         }
     }
 
@@ -1586,6 +1595,73 @@ mod tests {
         vcpu.init_thread_local_data().unwrap();
         // Trying to initialize non-empty TLS should error.
         vcpu.init_thread_local_data().unwrap_err();
+    }
+
+    /// Parks `vcpu` in wait_for_event on its own thread and returns it once
+    /// woken, so a missed wakeup fails the test instead of hanging it.
+    fn spawn_wait_for_event(
+        mut vcpu: Vcpu,
+        wfe: Receiver<u32>,
+        timeout: Option<Duration>,
+    ) -> Receiver<Vcpu> {
+        let (woken_sender, woken) = unbounded();
+        thread::spawn(move || {
+            vcpu.wait_for_event(0, &wfe, timeout);
+            woken_sender.send(vcpu).unwrap();
+        });
+        woken
+    }
+
+    fn expect_woken(woken: &Receiver<Vcpu>) -> Vcpu {
+        woken
+            .recv_timeout(Duration::from_secs(10))
+            .expect("vCPU still parked in wait_for_event")
+    }
+
+    #[test]
+    fn pause_wakes_vcpu_parked_in_wait_for_event() {
+        let (vcpu, _) = setup_vcpu(0x1000);
+        let events = vcpu.event_sender.clone().unwrap();
+        let (_wfe_sender, wfe) = unbounded();
+
+        let woken = spawn_wait_for_event(vcpu, wfe, None);
+        events.send(VcpuEvent::Pause).unwrap();
+        let vcpu = expect_woken(&woken);
+
+        assert!(matches!(
+            vcpu.event_receiver.try_recv(),
+            Ok(VcpuEvent::Pause)
+        ));
+    }
+
+    #[test]
+    fn device_irq_wakes_vcpu_parked_in_wait_for_event() {
+        let (vcpu, _) = setup_vcpu(0x1000);
+        let (wfe_sender, wfe) = unbounded();
+        let wfe_after_wake = wfe.clone();
+
+        let woken = spawn_wait_for_event(vcpu, wfe, None);
+        wfe_sender.send(0).unwrap();
+        let vcpu = expect_woken(&woken);
+
+        assert!(matches!(
+            wfe_after_wake.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            vcpu.event_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn vtimer_deadline_wakes_vcpu_parked_in_wait_for_event() {
+        let (vcpu, _) = setup_vcpu(0x1000);
+        let (_wfe_sender, wfe) = unbounded();
+
+        let woken = spawn_wait_for_event(vcpu, wfe, Some(Duration::from_millis(1)));
+
+        expect_woken(&woken);
     }
 
     #[cfg(target_arch = "x86_64")]
