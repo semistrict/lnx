@@ -197,7 +197,38 @@ pub struct PortForward {
     pub guest_port: u16,
 }
 
+/// The owner was already stopping when the command reached it, so the
+/// command never started and running it again is safe.
+#[derive(Debug)]
+struct CommandNotStarted;
+
+impl std::fmt::Display for CommandNotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(OWNER_STOPPING_NOT_STARTED)
+    }
+}
+
+impl std::error::Error for CommandNotStarted {}
+
+/// How many times a command is offered to a VM owner that turns out to be
+/// stopping before lnx gives up.
+const NOT_STARTED_ATTEMPTS: usize = 3;
+
+/// Runs a guest command, starting a VM owner if none is running. A command
+/// that reached an owner just as it stopped is run again on the next one.
 pub fn run(config: RunConfig) -> Result<i32> {
+    let mut attempt = 1;
+    loop {
+        match run_once(&config) {
+            Err(error) if error.is::<CommandNotStarted>() && attempt < NOT_STARTED_ATTEMPTS => {
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+fn run_once(config: &RunConfig) -> Result<i32> {
     if config.trace_events && config.deterministic.is_none() {
         bail!("trace events require deterministic mode");
     }
@@ -246,20 +277,20 @@ pub fn run(config: RunConfig) -> Result<i32> {
                 &config.layout,
                 config.deterministic.as_ref(),
             )?;
-            validate_runtime_share_compatibility(&config)?;
+            validate_runtime_share_compatibility(config)?;
         }
-        if let Some(status) = run_existing_broker_client(&broker_socket, &config, Some(&run_log))? {
+        if let Some(status) = run_existing_broker_client(&broker_socket, config, Some(&run_log))? {
             run_log.line(format!("run.done run_id={run_id} status={status}"));
             return Ok(status);
         }
     } else {
-        preflight_fresh_owner_network(&config, &run_log)?;
+        preflight_fresh_owner_network(config, &run_log)?;
         prepare_fresh_owner_slot(&config.layout, no_daemon_reuse, &run_log)?;
     }
-    preflight_fresh_owner_network(&config, &run_log)?;
+    preflight_fresh_owner_network(config, &run_log)?;
     let start_lock = match acquire_owner_start_or_run_client(
         &broker_socket,
-        &config,
+        config,
         config.forwards.is_empty() && !no_daemon_reuse,
         &run_log,
     )? {
@@ -269,8 +300,8 @@ pub fn run(config: RunConfig) -> Result<i32> {
             return Ok(status);
         }
     };
-    let mut owner = spawn_owner_process(&config, &run_log, &run_id)?;
-    let status = match run_broker_client_awaiting_owner(&broker_socket, &mut owner, &config, &run_log)
+    let mut owner = spawn_owner_process(config, &run_log, &run_id)?;
+    let status = match run_broker_client_awaiting_owner(&broker_socket, &mut owner, config, &run_log)
     {
         Ok(status) => status,
         Err(e) => {
@@ -1696,7 +1727,12 @@ fn relay_channel_output(
             Message::Error {
                 channel_id: id,
                 message,
-            } if id == channel_id => bail!("{message}"),
+            } if id == channel_id => {
+                if message == OWNER_STOPPING_NOT_STARTED {
+                    return Err(CommandNotStarted.into());
+                }
+                bail!("{message}")
+            }
             _ => {}
         }
     }

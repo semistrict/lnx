@@ -5,6 +5,10 @@
 use super::*;
 
 pub(crate) const OWNER_STOPPING: &str = "VM owner is stopping after a final snapshot";
+/// Sent instead of opening a channel when the owner is already stopping:
+/// the command never started, so the client may run it again.
+pub(crate) const OWNER_STOPPING_NOT_STARTED: &str =
+    "VM owner is stopping after a final snapshot; the command was not started";
 
 /// How long a connected client may take to say hello and send its request.
 /// A client that stalls longer cannot keep the owner from going idle.
@@ -447,7 +451,7 @@ pub(crate) fn handle_broker_client(
     )?;
     let rejection = match admission {
         ChannelAdmission::Opened => None,
-        ChannelAdmission::Stopping => Some(OWNER_STOPPING.to_string()),
+        ChannelAdmission::Stopping => Some(OWNER_STOPPING_NOT_STARTED.to_string()),
         ChannelAdmission::Collision => {
             let message = format!(
                 "channel id collision for live channel {channel_id:016x}; deterministic mode cannot run identical commands concurrently"

@@ -280,6 +280,31 @@ fn a_run_that_ended_before_the_guest_flushed_is_left_for_recover() {
     assert!(!layout.instance_dir.join(LAST_RUN_NOTICE).exists());
 }
 
+fn relay_after(message: &str) -> anyhow::Error {
+    let (mut client, mut broker) = UnixStream::pair().expect("socket pair");
+    write_message(
+        &mut broker,
+        &Message::Error {
+            channel_id: 7,
+            message: message.to_string(),
+        },
+    )
+    .expect("write error");
+    relay_channel_output(&mut client, 7, None).expect_err("relay fails")
+}
+
+#[test]
+fn a_command_refused_by_a_stopping_owner_can_be_retried() {
+    assert!(relay_after(OWNER_STOPPING_NOT_STARTED).is::<CommandNotStarted>());
+}
+
+#[test]
+fn a_command_stopped_while_running_is_not_retried() {
+    let error = relay_after(OWNER_STOPPING);
+    assert!(!error.is::<CommandNotStarted>());
+    assert_eq!(error.to_string(), OWNER_STOPPING);
+}
+
 #[test]
 fn a_new_owner_waits_for_its_first_client_before_it_may_stop() {
     let (state, _agent_rx, _temp) = test_broker();
