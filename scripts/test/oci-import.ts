@@ -63,8 +63,11 @@ try {
       "busybox init owns pid 1",
     );
     assertEq((await ctx.vm.cli(["id", "-un"])).stdout, "lnxuser", "exec user provisioned");
+    // A gid the image already has keeps the image's name; Alpine, like
+    // Ubuntu, calls macOS's gid 20 dialout.
     const hostGroup = (await run(["id", "-gn"])).stdout;
-    assertEq((await ctx.vm.cli(["id", "-gn"])).stdout, hostGroup, "primary group named like host");
+    const expectedGroup = process.getgid?.() === 20 ? "dialout" : hostGroup;
+    assertEq((await ctx.vm.cli(["id", "-gn"])).stdout, expectedGroup, "primary group name");
   });
 
   await testStep("login shell resolves to the image shell", async () => {
