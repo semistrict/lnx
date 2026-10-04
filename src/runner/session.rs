@@ -19,8 +19,15 @@ pub(crate) struct RunSession {
     /// The generation whose `pages.img` the VM's dirty tracking is relative
     /// to: the base at first, then each generation this run captures.
     last_capture: Mutex<Option<GenerationId>>,
+    /// Whether the guest has flushed its writes for the final snapshot, so
+    /// the run's disk is a sound saved state even if the capture fails.
+    quiesced: AtomicBool,
     run_log: Arc<RunLog>,
 }
+
+/// What the next command in an instance should be told about the last run,
+/// written by an owner that had to fall back to keeping only its disk.
+pub(crate) const LAST_RUN_NOTICE: &str = "last-run.notice";
 
 impl RunSession {
     /// Takes over the instance for a new VM run: migrates an old layout,
@@ -82,6 +89,7 @@ impl RunSession {
             instance: layout.instance.clone(),
             dirty: Mutex::new(false),
             last_capture: Mutex::new(last_capture),
+            quiesced: AtomicBool::new(false),
             run_log,
         })
     }
@@ -171,11 +179,33 @@ impl RunSession {
         Store::export(&pin, dest)
     }
 
+    /// Records that the guest flushed its writes for the final snapshot.
+    pub(crate) fn guest_quiesced(&self) {
+        self.quiesced.store(true, Ordering::SeqCst);
+    }
+
     /// Ends a run that will not produce a final snapshot. A run that never
-    /// served a command is dropped (O4); one that did is left for `recover`,
-    /// because its disk may hold writes a client was told about.
-    pub(crate) fn abandon(&self) -> Result<()> {
+    /// served a command is dropped (O4). One that did may hold writes a
+    /// client was told about: if the guest had flushed them for the final
+    /// snapshot and only capturing its memory failed, its disk is kept as the
+    /// new saved state (what `recover --keep` does) and the next command is
+    /// told; otherwise it is left for `recover`.
+    pub(crate) fn abandon(&self, reason: &anyhow::Error) -> Result<()> {
         let dirty = self.dirty.lock().map(|dirty| *dirty).unwrap_or(true);
+        if dirty && self.quiesced.load(Ordering::SeqCst) {
+            let id = self.store.salvage(&self.lock)?;
+            self.run_log.line(format!(
+                "store.run.kept_disk run={} latest={id} reason={reason:#}",
+                self.run.id
+            ));
+            let notice = format!(
+                "lnx: the memory of {}'s last run could not be saved ({reason:#}); its disk was kept, so this run boots from it\n",
+                self.instance
+            );
+            let path = self.store.dir().join(LAST_RUN_NOTICE);
+            fs::write(&path, notice).with_context(|| format!("write {}", path.display()))?;
+            return Ok(());
+        }
         if dirty {
             self.run_log.line(format!(
                 "store.run.left_dirty run={} instance={} action=recover",

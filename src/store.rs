@@ -383,6 +383,11 @@ impl Store {
         }
     }
 
+    /// The instance directory the store lives in.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     fn state_path(&self) -> PathBuf {
         self.dir.join(STATE_FILE)
     }

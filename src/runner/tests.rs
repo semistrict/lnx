@@ -228,6 +228,54 @@ fn broker_shutdown_closes_registration_gate_before_draining_clients() {
     );
 }
 
+/// A run of `layout` that has served a command and written `disk`.
+fn dirty_session(layout: &Layout, disk: &[u8]) -> RunSession {
+    crate::store::test_support::initialized(layout, b"saved disk", true);
+    let run_log = Arc::new(RunLog::open(layout).expect("run log"));
+    let lock = test_support::hold_as_owner(layout);
+    let session = RunSession::begin(layout, lock, None, run_log).expect("begin run");
+    session.mark_dirty().expect("mark dirty");
+    fs::write(session.run().rootfs(), disk).expect("guest writes");
+    session
+}
+
+#[test]
+fn a_failed_final_capture_after_the_guest_flushed_keeps_the_disk() {
+    let temp = TempDir::new("session-keep-disk");
+    let layout = temp_layout(&temp, "vm");
+    let session = dirty_session(&layout, b"acknowledged writes");
+
+    session.guest_quiesced();
+    session
+        .abandon(&anyhow!("VM I/O operation failed"))
+        .expect("abandon");
+    drop(session);
+
+    assert_eq!(
+        crate::store::test_support::latest_disk(&layout),
+        b"acknowledged writes"
+    );
+    refuse_crashed_run(&layout).expect("no recovery needed");
+    assert_eq!(
+        fs::read_to_string(layout.instance_dir.join(LAST_RUN_NOTICE)).expect("notice"),
+        "lnx: the memory of vm's last run could not be saved (VM I/O operation failed); its disk was kept, so this run boots from it\n"
+    );
+}
+
+#[test]
+fn a_run_that_ended_before_the_guest_flushed_is_left_for_recover() {
+    let temp = TempDir::new("session-left-dirty");
+    let layout = temp_layout(&temp, "vm");
+    let session = dirty_session(&layout, b"unflushed writes");
+
+    session.abandon(&anyhow!("VM exited")).expect("abandon");
+    drop(session);
+
+    let error = refuse_crashed_run(&layout).expect_err("recovery needed");
+    assert!(format!("{error:#}").contains("recover --keep"));
+    assert!(!layout.instance_dir.join(LAST_RUN_NOTICE).exists());
+}
+
 #[test]
 fn a_new_owner_waits_for_its_first_client_before_it_may_stop() {
     let (state, _agent_rx, _temp) = test_broker();

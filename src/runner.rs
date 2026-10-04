@@ -208,6 +208,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
     INTERRUPT_SIGNAL.store(0, Ordering::SeqCst);
     config.layout.create_runtime_dirs()?;
     refuse_crashed_run(&config.layout)?;
+    show_last_run_notice(&config.layout);
     let run_log = Arc::new(RunLog::open(&config.layout)?);
     let run_id = current_run_id();
     run_log.line(format!(
@@ -485,7 +486,7 @@ fn own_vm(config: RunConfig) -> Result<()> {
     ) {
         Ok(vm) => vm,
         Err(error) => {
-            if let Err(abandon_error) = session.abandon() {
+            if let Err(abandon_error) = session.abandon(&error) {
                 run_log.line(format!("store.run.abandon_error error={abandon_error:#}"));
             }
             if error.downcast_ref::<RestoreRefused>().is_some() {
@@ -501,7 +502,7 @@ fn own_vm(config: RunConfig) -> Result<()> {
         .and_then(|result| result);
     if let Err(error) = &owner_result {
         run_log.line(format!("owner.error error={error:#}"));
-        if let Err(abandon_error) = session.abandon() {
+        if let Err(abandon_error) = session.abandon(error) {
             run_log.line(format!("store.run.abandon_error error={abandon_error:#}"));
         }
     }
@@ -1180,6 +1181,15 @@ pub fn proxy_stream_to_guest(
 /// The client stops on SIGINT, SIGTERM and SIGHUP by closing its channel,
 /// which ends the guest command's process group, instead of dying and
 /// leaving the command running.
+/// Tells the user, once, what an owner had to do when its run ended badly.
+fn show_last_run_notice(layout: &Layout) {
+    let path = layout.instance_dir.join(LAST_RUN_NOTICE);
+    if let Ok(notice) = fs::read_to_string(&path) {
+        eprint!("{notice}");
+        let _ = fs::remove_file(&path);
+    }
+}
+
 fn install_signal_handlers() {
     SIGNAL_INIT.call_once(|| {
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
@@ -3163,6 +3173,7 @@ fn serve_snapshot(
     if ready[0] != b'R' {
         bail!("bad snapshot ready");
     }
+    capture.session.guest_quiesced();
     timings.event("snapshot.ready.read");
     timings.event("snapshot.capture.begin");
     let id = capture.capture(Origin::Snapshot {

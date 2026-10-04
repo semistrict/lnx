@@ -683,6 +683,23 @@ async function waitForInnerOwnerDone(
   );
 }
 
+/**
+ * Prelude lines that stage an inner base on the outer VM's own disk, where
+ * nested KVM can map it: files shared over virtio-fs cannot back the inner
+ * VM's memory-mapped rootfs ("Bad address"). Staging is skipped when the
+ * outer already has it, so inner state persists across runs of one outer.
+ */
+function stageLocalInnerBase(localBase: string, hostBase: string, instance: string): string[] {
+  const local = `${localBase}/instances/${instance}`;
+  return [
+    `if [ ! -e ${quoteShell(local)} ]; then`,
+    `  mkdir -p ${quoteShell(local)}`,
+    `  cp ${quoteShell(join(hostBase, "vmlinuz"))} ${quoteShell(`${localBase}/vmlinuz`)}`,
+    `  cp --sparse=always ${quoteShell(join(hostBase, "instances", instance, "rootfs.ext4"))} ${quoteShell(`${local}/rootfs.ext4`)}`,
+    "fi",
+  ];
+}
+
 async function runInnerViaOuter(
   outer: string,
   innerBase: string,
@@ -1329,13 +1346,19 @@ print("mac-source-after", flush=True)
           const innerInstance = `si-${process.pid}`;
           await prepareInnerBase(innerBase, innerInstance);
           const instance = outerInstance("resume");
+          const localBase = `/root/lnx-nested-resume-${process.pid}`;
           const result = await runInnerViaOuter(
             instance,
-            innerBase,
+            localBase,
             innerInstance,
             ["uname", "-m"],
             {
-              prelude: ["lnxctl snapshot-exit"],
+              prelude: [
+                ...stageLocalInnerBase(localBase, innerBase, innerInstance),
+                "lnxctl snapshot-exit",
+              ],
+              sharedInnerDir: join(innerBase, "instances", innerInstance),
+              hostVisibleInnerBase: false,
               timeoutMs: 300_000,
             },
           );
@@ -1362,23 +1385,36 @@ print("mac-source-after", flush=True)
           const innerInstance = `ri-${process.pid}`;
           const outer = outerInstance("restore");
           await prepareInnerBase(innerBase, innerInstance);
+          const localBase = `/root/lnx-nested-restore-${process.pid}`;
+          const local = {
+            prelude: stageLocalInnerBase(localBase, innerBase, innerInstance),
+            sharedInnerDir: join(innerBase, "instances", innerInstance),
+            hostVisibleInnerBase: false,
+          };
 
-          const cold = await runInnerViaOuter(outer, innerBase, innerInstance, [
-            "bash",
-            "-lc",
-            "printf nested-disk >/home/lnxuser/nested-kvm-state && cat /home/lnxuser/nested-kvm-state",
-          ]);
-          assertEq(cold.stdout, "nested-disk", "inner cold write");
-
-          const restored = await runInnerViaOuter(
+          const cold = await runInnerViaOuter(
             outer,
-            innerBase,
+            localBase,
             innerInstance,
             [
               "bash",
               "-lc",
-              "cat /home/lnxuser/nested-kvm-state && printf /restored",
+              "printf nested-disk >/var/tmp/nested-kvm-state && cat /var/tmp/nested-kvm-state",
             ],
+            local,
+          );
+          assertEq(cold.stdout, "nested-disk", "inner cold write");
+
+          const restored = await runInnerViaOuter(
+            outer,
+            localBase,
+            innerInstance,
+            [
+              "bash",
+              "-lc",
+              "cat /var/tmp/nested-kvm-state && printf /restored",
+            ],
+            local,
           );
           assertEq(
             restored.stdout,
@@ -1430,7 +1466,13 @@ print("mac-source-after", flush=True)
             `cd ${quoteShell(ctx.repoRoot)}`,
             "rm -rf /tmp/lnx-nested-kvm-cargo-target",
             "export CARGO_TARGET_DIR=/tmp/lnx-nested-kvm-cargo-target",
-            `export LNX_BASE=${quoteShell(suiteBase)}`,
+            // Inner VMs cannot map rootfs files shared over virtio-fs, so
+            // the suite runs on a copy of its base on the outer's own disk.
+            "suite_base=/root/lnx-nested-suite-base",
+            'rm -rf "$suite_base"',
+            'mkdir -p "$suite_base"',
+            `cp -a --sparse=always ${quoteShell(suiteBase)}/. "$suite_base"/`,
+            'export LNX_BASE="$suite_base"',
             "export LNX_BROKER_IDLE_TTL_MS=250",
             "export LNX_SKIP_TEST_CLEANUP=1",
             `suite_log=${quoteShell(suiteLog)}`,
