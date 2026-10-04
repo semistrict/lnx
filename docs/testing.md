@@ -16,6 +16,10 @@ bun run test:snapshot-roundtrip
 bun run test:full          # everything CI runs
 ```
 
+Integration suites keep their instances, snapshots and image downloads in
+`~/.lnx-test` (set `LNX_BASE` to use another directory), never in `~/.lnx`.
+The first run in a fresh base downloads the kernel and rootfs image once.
+
 Nested KVM coverage (Linux-host paths inside an outer lnx guest):
 
 ```sh

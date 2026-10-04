@@ -12,6 +12,7 @@ import {
   fileSize,
   prepareContext,
   skip,
+  testBase,
   testStep,
 } from "./lib";
 
@@ -30,7 +31,7 @@ const iterations = Number(Bun.env.LNX_SNAPSHOT_ROUNDTRIP_ITERATIONS ?? 2);
 // smoke budget; set LNX_SNAPSHOT_RESTORE_MAX_MS for stricter perf runs.
 const maxRestoreMs = Number(Bun.env.LNX_SNAPSHOT_RESTORE_MAX_MS ?? 5000);
 const largeSparseImageBytes = 8 * 1024 * 1024 * 1024;
-const base = Bun.env.LNX_BASE ?? join(Bun.env.HOME ?? ".", ".lnx");
+const base = testBase();
 const runBase = Bun.env.LNX_RUN_BASE ?? base;
 const childInstances: string[] = [];
 const childWorkDirs: string[] = [];

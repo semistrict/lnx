@@ -29,10 +29,22 @@ export function repoRoot(): string {
   return resolve(import.meta.dir, "../..");
 }
 
+/**
+ * The lnx state directory tests run against. It defaults to ~/.lnx-test so
+ * test instances, snapshots and downloads never land in the user's ~/.lnx;
+ * set LNX_BASE to choose another. It is exported into the environment so
+ * every lnx process a test spawns agrees on it.
+ */
+export function testBase(): string {
+  const base = Bun.env.LNX_BASE ?? join(Bun.env.HOME ?? ".", ".lnx-test");
+  process.env.LNX_BASE = base;
+  return base;
+}
+
 export function defaultContext(name: string): TestContext {
   const root = repoRoot();
   const instance = Bun.env.LNX_TEST_INSTANCE ?? `lnx-${name}-${process.pid}`;
-  const base = Bun.env.LNX_BASE ?? join(Bun.env.HOME ?? ".", ".lnx");
+  const base = testBase();
   const lnxBin = resolve(Bun.env.LNX_BIN ?? join(root, "target/debug/lnx"));
   const client = createLnxClient({ binary: lnxBin, defaultInstance: instance });
   const imageDir = join(base, "instances", instance);
