@@ -37,14 +37,6 @@ impl Drop for LnxBaseGuard {
 }
 
 #[test]
-fn rejects_path_like_instance_names() {
-    assert!(validate_instance_name("ok-name_1.2").is_ok());
-    assert!(validate_instance_name("../nope").is_err());
-    assert!(validate_instance_name("bad/name").is_err());
-    assert!(validate_instance_name("").is_err());
-}
-
-#[test]
 fn server_instance_listing_keeps_valid_dot_names_and_hides_transactions() {
     let temp = tempfile::tempdir().expect("tempdir");
     let instances = temp.path().join("instances");

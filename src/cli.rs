@@ -460,6 +460,7 @@ impl Cli {
                 .with_context(|| format!("change directory to {}", directory.display()))?;
         }
 
+        crate::paths::validate_instance_name(&instance)?;
         let explicit_kernel = kernel.is_some();
         let explicit_rootfs = rootfs.is_some();
         let deterministic = deterministic.map(|seed| runner::DeterministicConfig { seed });
@@ -839,7 +840,6 @@ fn init_local_default_instance(
 /// Changes an instance's persisted settings. Settings of an instance that
 /// does not exist yet apply when its first run creates it.
 fn set_instance_settings(layout: &Layout, settings: &[String]) -> Result<()> {
-    crate::server::validate_instance_name(&layout.instance)?;
     fs::create_dir_all(&layout.instance_dir)
         .with_context(|| format!("create {}", layout.instance_dir.display()))?;
     let config = runner::with_instance_guard(layout, |state| {
@@ -1199,7 +1199,9 @@ fn list_instances(base: &Path) -> Result<()> {
 }
 
 fn delete_instance(base: &Path, name: &str) -> Result<()> {
-    crate::server::validate_instance_name(name)?;
+    if !crate::paths::is_instance_dir_name(name) {
+        bail!("invalid instance name {name:?}");
+    }
     let layout = Layout::resolve_in_base(name, base.to_path_buf(), None, None);
     delete_resolved_instance(base, name, &layout)
 }
@@ -2159,7 +2161,7 @@ fn run_lnx_child(
 }
 
 fn create_checkpoint(layout: &Layout, name: Option<&str>) -> Result<()> {
-    ensure_image_and_instance(layout, false)?;
+    require_instance(layout)?;
     let checkpoint = checkpoints::create(layout, name)?;
     println!("{}", checkpoint.name.as_deref().unwrap_or(&checkpoint.id));
     Ok(())
@@ -2200,9 +2202,7 @@ fn run_snapshots_command(layout: &Layout, args: SnapshotsArgs) -> Result<()> {
 /// Resolves a VM run that crashed after serving commands: keep its disk or
 /// return to the last saved state. Without a choice, explains both.
 fn recover_instance(layout: &Layout, args: &RecoverArgs) -> Result<()> {
-    if !init::instance_has_state(layout) {
-        bail!("instance does not exist: {}", layout.instance);
-    }
+    require_instance(layout)?;
     runner::ensure_store(layout)?;
     let outcome = runner::with_exclusive_instance_state(layout, |lock, _| {
         let store = store::Store::new(&layout.instance_dir);
@@ -2240,9 +2240,7 @@ fn recover_instance(layout: &Layout, args: &RecoverArgs) -> Result<()> {
 /// Drops the instance's saved memory so the next run boots from its saved
 /// disk. The disk itself is never discarded.
 fn drop_saved_memory(layout: &Layout) -> Result<()> {
-    if !init::instance_has_state(layout) {
-        bail!("instance does not exist: {}", layout.instance);
-    }
+    require_instance(layout)?;
     runner::ensure_store(layout)?;
     let dropped = runner::with_exclusive_instance_state(layout, |lock, _| {
         let store = store::Store::new(&layout.instance_dir);
@@ -2263,10 +2261,22 @@ fn drop_saved_memory(layout: &Layout) -> Result<()> {
     Ok(())
 }
 
-/// Atomically detaches snapshot state while the instance lock is held.
-/// Recursive deletion happens after the lock is released so a large snapshot
-/// cannot keep the instance from starting.
+/// Commands about an instance's saved state never create it.
+fn require_instance(layout: &Layout) -> Result<()> {
+    if init::instance_has_state(layout) {
+        return Ok(());
+    }
+    bail!(
+        "no instance named {}; running a command in it creates it",
+        layout.instance
+    )
+}
+
+/// Forks `source` (its current state, or one of its checkpoints) into a new
+/// instance named `instance` in the same base.
 fn fork_checkpoint(source: Layout, checkpoint: Option<&str>, instance: &str) -> Result<()> {
+    crate::paths::validate_instance_name(instance)?;
+    require_instance(&source)?;
     let checkpoint = checkpoint
         .map(|checkpoint| checkpoints::resolve(&source, checkpoint))
         .transpose()?;

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import {
   join } from "node:path";
 import {
@@ -86,6 +87,19 @@ try {
     const notFound = await ctx.vm.cli(["definitely-not-a-command"], { check: false });
     assertEq(notFound.status, 127, "command-not-found status");
     assertContains(notFound.stderr, "command not found: definitely-not-a-command", "command-not-found stderr");
+  });
+
+  await testStep("lnx errors exit 125 and never create instances", async () => {
+    const badName = await run([ctx.lnxBin, "--instance", "bad name", "true"], { check: false });
+    assertEq(badName.status, 125, "invalid instance name status");
+    assertContains(badName.stderr, `invalid instance name "bad name"`, "invalid instance name message");
+
+    const ghost = `${ctx.instance}-ghost`;
+    const fork = await run([ctx.lnxBin, "--instance", ghost, "fork", `${ghost}-copy`], { check: false });
+    assertEq(fork.status, 125, "fork of a missing instance status");
+    assertContains(fork.stderr, `no instance named ${ghost}`, "fork of a missing instance message");
+    assertEq(existsSync(join(ctx.base, "instances", ghost)), false, "fork created no source instance");
+    assertEq(existsSync(join(ctx.base, "instances", `${ghost}-copy`)), false, "fork created no copy");
   });
 
   await testStep("guest shape", async () => {

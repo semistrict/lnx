@@ -387,8 +387,38 @@ fn dropping_memory_of_a_missing_instance_creates_nothing() {
 
     let error = drop_saved_memory(&layout).expect_err("missing instance is rejected");
 
-    assert!(error.to_string().contains("instance does not exist"));
+    assert_eq!(
+        error.to_string(),
+        "no instance named dev; running a command in it creates it"
+    );
     assert!(!layout.instance_dir.exists());
+}
+
+#[test]
+fn forking_a_missing_instance_creates_neither() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+
+    let error = fork_checkpoint(layout.clone(), None, "copy").expect_err("missing source");
+
+    assert_eq!(
+        error.to_string(),
+        "no instance named dev; running a command in it creates it"
+    );
+    assert!(!layout.instance_dir.exists());
+    assert!(!temp.path().join("instances/copy").exists());
+}
+
+#[test]
+fn forking_into_an_invalid_name_is_refused() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+    store_instance(&layout, b"disk", false);
+
+    let error = fork_checkpoint(layout, None, "../escape").expect_err("invalid name");
+
+    assert!(error.to_string().starts_with("invalid instance name"));
+    assert!(!temp.path().join("escape").exists());
 }
 
 #[test]

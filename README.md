@@ -80,8 +80,13 @@ lnx --forward 8080:80 nginx       # forward Mac localhost:8080 to guest :80
 lnx checkpoint -m "deps installed"
 lnx fork dev2                     # clone the instance, memory and disk
 lnx instances list
-lnx set cpus=4 memory-mib=8192    # persist per-instance settings
+lnx set cpus=4 memory-mib=8192    # applies at the instance's next cold boot
+lnx snapshots clear               # drop saved memory; the next run boots from disk
 ```
+
+`lnx` exits with the guest command's status; failures in `lnx` itself exit
+125. Killing the client (`SIGINT`, `SIGTERM`, `SIGHUP`, or `SIGKILL`) ends the
+guest command too.
 
 Optional HTTPS ingress — stable local URLs for every instance:
 

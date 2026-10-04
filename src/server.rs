@@ -30,7 +30,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::{
     checkpoints, descriptor, init,
-    paths::{GVPROXY_KRUN_SOCKET_SUFFIX, Layout, RuntimeSocket},
+    paths::{GVPROXY_KRUN_SOCKET_SUFFIX, Layout, RuntimeSocket, validate_instance_name},
     runner, sparse_copy,
     status::{self, InstanceState},
     store::{self, Store},
@@ -2530,19 +2530,6 @@ fn new_upload_session_id(target_instance: &str) -> Result<String> {
         target_instance,
         &sha256_hex(seed.as_bytes())[..16]
     ))
-}
-
-pub(crate) fn validate_instance_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name
-            .chars()
-            .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
-    {
-        bail!("invalid instance name: {name}");
-    }
-    Ok(())
 }
 
 #[cfg(test)]

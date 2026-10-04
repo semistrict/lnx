@@ -9,6 +9,29 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 pub(crate) const INSTANCE_TRANSACTION_DIR: &str = "@lnx-transactions";
+
+/// Instance names are made of ASCII letters, digits, `-`, `_` and `.`, so a
+/// name is always one plain path component and a plain shell word.
+pub(crate) fn validate_instance_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name
+            .chars()
+            .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+    {
+        bail!(
+            "invalid instance name {name:?}: use letters, digits, '-', '_' and '.'"
+        );
+    }
+    Ok(())
+}
+
+/// Whether `name` could name an existing instance directory, including one
+/// an older lnx created under a name that is no longer valid.
+pub(crate) fn is_instance_dir_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/')
+}
 const INSTANCE_TRANSACTION_MARKER: &str = ".lnx-transactions-v1";
 const INSTANCE_TRANSACTION_MARKER_CONTENT: &[u8] = b"lnx-instance-transactions-v1\n";
 

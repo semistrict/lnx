@@ -21,6 +21,25 @@ impl Drop for TempDir {
 }
 
 #[test]
+fn instance_names_are_plain_path_components() {
+    assert!(validate_instance_name("ok-name_1.2").is_ok());
+    for name in ["", ".", "..", "../nope", "bad/name", "bad name", "@lnx-transactions"] {
+        assert!(validate_instance_name(name).is_err(), "{name:?} accepted");
+    }
+    assert_eq!(
+        validate_instance_name("bad name").unwrap_err().to_string(),
+        "invalid instance name \"bad name\": use letters, digits, '-', '_' and '.'"
+    );
+}
+
+#[test]
+fn an_old_invalid_name_still_names_its_directory() {
+    assert!(is_instance_dir_name("bad name"));
+    assert!(!is_instance_dir_name("../x"));
+    assert!(!is_instance_dir_name(".."));
+}
+
+#[test]
 fn resolve_builds_per_instance_paths() {
     let home = PathBuf::from("/Users/test");
     let layout = Layout::resolve_with_env("dev", None, None, None, None, home.clone());
