@@ -11,6 +11,23 @@ const ctx = defaultContext("stress");
 try {
   await prepareContext(ctx);
 
+  await testStep("first commands as the user, in parallel, keep the guest's accounts intact", async () => {
+    // Boot as root so the parallel commands below are the first to set up
+    // the exec user.
+    const groupsBefore = (await ctx.vm.cli(["--root", "cat", "/etc/group"])).stdout;
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () => ctx.vm.cli(["id", "-un"])),
+    );
+    for (const result of results) assertEq(result.stdout, "lnxuser", "parallel first exec user");
+    // Groups are only ever added: renaming the image's own groups (gid 20
+    // is the host's `staff` but Ubuntu's `dialout`) broke package scripts.
+    const groupsAfter = new Set((await ctx.vm.cli(["--root", "cat", "/etc/group"])).stdout.split("\n"));
+    for (const line of groupsBefore.split("\n")) {
+      assertEq(groupsAfter.has(line), true, `group entry <${line}> survives the first user commands`);
+    }
+    assertEq((await ctx.vm.cli(["--root", "bash", "-c", "dpkg --audit && echo dpkg-ok"])).stdout, "dpkg-ok", "dpkg consistent");
+  });
+
   await testStep("warm VM", async () => {
     assertEq((await ctx.vm.cli(["echo", "warm"])).stdout, "warm", "warm exec");
   });

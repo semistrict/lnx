@@ -15,6 +15,8 @@ import {
   write,
   latestSnapshotDir,
   latestGenerationDir,
+  instanceLeasePid,
+  spawn,
 } from "./lib";
 
 // Shorten the detached owner's idle grace period so suspend-dependent
@@ -135,12 +137,39 @@ try {
     }
   });
 
+  await testStep("--forward attaches to a running VM", async () => {
+    // A command keeps the VM running; a second one adds a forward to it.
+    const holder = spawn([ctx.lnxBin, "--instance", ctx.instance, "bash", "-c",
+      "mkdir -p /tmp/fwd && echo forwarded-ok >/tmp/fwd/index.html && cd /tmp/fwd && exec python3 -m http.server 18093 --bind 127.0.0.1 2>/dev/null"],
+      { stdout: "inherit", stderr: "inherit" });
+    try {
+      let owner: number | null = null;
+      for (let i = 0; i < 100 && owner === null; i++) {
+        const probe = await run([ctx.lnxBin, "--instance", ctx.instance, "bash", "-c", "curl -fsS http://127.0.0.1:18093/ || true"], { timeoutMs: 20_000 });
+        if (probe.stdout === "forwarded-ok") owner = instanceLeasePid(ctx.imageDir);
+      }
+      assertEq(owner === null, false, "guest server is up");
+      const hostPort = 20_000 + Math.floor(Math.random() * 20_000);
+      assertEq((await run([ctx.lnxBin, "--instance", ctx.instance, "--forward", `${hostPort}:18093`, "true"], { timeoutMs: 20_000 })).status, 0, "forward added");
+      const fetched = await run(["curl", "-fsS", "--max-time", "5", `http://127.0.0.1:${hostPort}/`], { timeoutMs: 20_000 });
+      assertEq(fetched.stdout, "forwarded-ok", "forwarded request reaches the guest");
+      assertEq(instanceLeasePid(ctx.imageDir), owner, "the same VM owner serves the forward");
+    } finally {
+      holder.kill("SIGTERM");
+      await holder.exited.catch(() => {});
+    }
+  });
+
   await testStep("guest shape", async () => {
     assertEq((await ctx.vm.cli(["id", "-un"])).stdout, "lnxuser", "exec runs as lnxuser");
     assertEq((await ctx.vm.cli(["bash", "-lc", 'printf "%s:%s:%s" "$USER" "$LOGNAME" "$HOME"'])).stdout, "lnxuser:lnxuser:/home/lnxuser", "exec user environment");
     assertContains((await ctx.vm.cli(["bash", "-lc", "id -u; id -g"])).stdout, `${process.getuid?.() ?? 0}\n${process.getgid?.() ?? 0}`, "exec uid/gid match host");
+    // A gid the image already has keeps the image's name (renaming
+    // distribution groups broke package scripts); a free gid gets the
+    // host's name. macOS users are gid 20, which Ubuntu calls dialout.
     const hostGroup = (await run(["id", "-gn"])).stdout;
-    assertEq((await ctx.vm.cli(["id", "-gn"])).stdout, hostGroup, "exec primary group named like host");
+    const expectedGroup = process.getgid?.() === 20 ? "dialout" : hostGroup;
+    assertEq((await ctx.vm.cli(["id", "-gn"])).stdout, expectedGroup, "exec primary group name");
     assertEq((await ctx.vm.cli(["--root", "id", "-un"])).stdout, "root", "--root runs as root");
     assertEq((await ctx.vm.cli(["getconf", "PAGESIZE"])).stdout, "16384", "guest page size");
     assertEq((await ctx.vm.cli(["nproc"])).stdout, "2", "default cpu count");

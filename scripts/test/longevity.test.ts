@@ -33,15 +33,28 @@ const configuredIngressPort = Bun.env.LNX_LONGEVITY_INGRESS_PORT
   ? Number(Bun.env.LNX_LONGEVITY_INGRESS_PORT)
   : undefined;
 
+/**
+ * Runs one soak step. A failure fails the test, after saving a debug bundle
+ * (logs and host process state) for it. Steps that cannot run here throw
+ * `SkipStep` instead.
+ */
 async function maybe(name: string, fn: () => Promise<void>) {
   try {
     await fn();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (error instanceof SkipStep) {
+      console.warn(`SKIP ${name}: ${message}`);
+      return;
+    }
     const bundle = await writeDebugBundle(name, message).catch(() => "");
-    console.warn(`SKIP ${name}: ${message}${bundle ? `\nDEBUG ${name}: ${bundle}` : ""}`);
+    console.error(`FAIL ${name}: ${message}${bundle ? `\nDEBUG ${name}: ${bundle}` : ""}`);
+    throw error;
   }
 }
+
+/** A step that cannot run in this environment (not a failure). */
+class SkipStep extends Error {}
 
 async function writeDebugBundle(name: string, message: string): Promise<string> {
   const safeName = name.replace(/[^a-zA-Z0-9._-]+/g, "-");
@@ -70,8 +83,9 @@ async function writeDebugBundle(name: string, message: string): Promise<string> 
   return dir;
 }
 
+/** Runs a guest command as root: the soak exercises apt, snap, systemd and /root. */
 async function lnxExpect(args: string[], options: LnxCliOptions = {}) {
-  const result = await ctx.vm.cli(args, { timeoutMs: 240_000, ...options });
+  const result = await ctx.vm.cli(["--root", ...args], { timeoutMs: 240_000, ...options });
   expect(result.status).toBe(0);
   return result;
 }
@@ -189,7 +203,11 @@ test("ingress restore", async () => {
       LNX_INGRESS_RESOLVER_DIR: ctx.tmpdir,
       LNX_INGRESS_STATE_DIR: join(ctx.tmpdir, "ingress-state"),
     };
-    await run([ctx.lnxBin, "ingress", "enable"], { env, timeoutMs: 30_000 });
+    const enabled = await run([ctx.lnxBin, "ingress", "enable"], { env, timeoutMs: 30_000, check: false });
+    if (enabled.status !== 0 && enabled.stderr.includes("needs sudo from an interactive terminal")) {
+      throw new SkipStep("ingress needs `sudo lnx ingress enable` from a terminal");
+    }
+    expect(enabled.status).toBe(0);
     await lnxExpect([
       "bash",
       "-lc",
@@ -232,7 +250,7 @@ test("fork after many restores", async () => {
       await lnxExpect(["bash", "-lc", `printf ${i} >/root/many-restores-marker`]);
     }
     await run([ctx.lnxBin, "--instance", ctx.instance, "fork", forkName], { timeoutMs: 240_000 });
-    const forked = await run([ctx.lnxBin, "--instance", forkName, "cat", "/root/many-restores-marker"], { timeoutMs: 240_000 });
+    const forked = await run([ctx.lnxBin, "--instance", forkName, "--root", "cat", "/root/many-restores-marker"], { timeoutMs: 240_000 });
     expect(forked.stdout).toBe(String(expensiveIterations - 1));
     await cleanupInstance(ctx, forkName);
   });
@@ -245,6 +263,8 @@ test("apt and snap state across restore", async () => {
     await lnxExpect(["jq", "--version"]);
     await lnxExpect(["bash", "-lc", "DEBIAN_FRONTEND=noninteractive apt-get install -y snapd squashfs-tools"], { timeoutMs: 300_000 });
     await lnxExpect(["systemctl", "enable", "--now", "snapd.socket"]);
+    // A freshly installed snapd refuses installs until it has seeded.
+    await lnxExpect(["snap", "wait", "system", "seed.loaded"], { timeoutMs: 600_000 });
     await lnxExpect(["snap", "install", "hello-world"], { timeoutMs: 600_000 });
     await lnxExpect(["hello-world"]);
     await lnxExpect(["bash", "-lc", "dpkg --audit; snap list hello-world >/dev/null; echo sane"]);
