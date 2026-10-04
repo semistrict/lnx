@@ -93,6 +93,7 @@
     "aws:arm:stop": "bun scripts/aws/arm-metal.ts stop",
     "aws:arm:terminate": "bun scripts/aws/arm-metal.ts terminate",
     "rootfs": "docker buildx build --platform linux/arm64 -f Dockerfile.rootfs -t lnx-rootfs --load . && (docker rm -f lnx-rootfs-extract >/dev/null 2>&1 || true) && docker create --name lnx-rootfs-extract lnx-rootfs true && docker cp lnx-rootfs-extract:/rootfs.ext4 rootfs.ext4 && docker rm lnx-rootfs-extract && scripts/prepare-rootfs-image.sh rootfs.ext4",
+    "tla:check": "scripts/tla/check.sh",
     "fmt": "cargo fmt",
     "clean": "cargo clean"
   }
