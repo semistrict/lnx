@@ -34,6 +34,7 @@
     "test-client-chaos": "bun run test:client-chaos",
     "test-pty-resume": "bun run test:pty-resume",
     "test-browser": "bun run test:browser",
+    "demo:cua-fork": "bun scripts/demo/cua-fork/demo.ts",
     "test-privileged-ingress": "bun run test:privileged-ingress",
     "test-stress": "bun run test:stress",
     "test-stock": "bun run test:stock",

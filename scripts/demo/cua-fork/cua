@@ -1,0 +1,11 @@
+#!/bin/sh
+# Run cua-driver as the desktop user, against the desktop's daemon.
+if [ "$(id -u)" = 0 ]; then
+  exec runuser -u ubuntu -- "$0" "$@"
+fi
+export HOME=/home/ubuntu
+export DISPLAY=:1
+export XDG_RUNTIME_DIR=/run/cua-desktop
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/cua-desktop/bus
+export CUA_DRIVER_RS_UPDATE_CHECK=0
+exec cua-driver "$@"

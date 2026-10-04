@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Agent scratchpad</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 40px 56px;
+    font-family: "DejaVu Sans", sans-serif;
+    background: #0f172a;
+    color: #e2e8f0;
+  }
+  h1 { margin: 0 0 6px; font-size: 34px; }
+  .sub { color: #94a3b8; margin: 0 0 28px; font-size: 17px; }
+  .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 28px; }
+  .card { background: #1e293b; border-radius: 12px; padding: 16px 20px; }
+  .label { color: #94a3b8; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; }
+  .value { font-size: 30px; font-weight: bold; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  #alive { color: #4ade80; }
+  .pulse { height: 4px; background: #334155; border-radius: 2px; margin-top: 10px; overflow: hidden; }
+  .pulse div { height: 100%; width: 0; background: #4ade80; }
+  form { display: flex; gap: 12px; margin-bottom: 20px; }
+  input {
+    flex: 1; font-size: 20px; padding: 12px 16px; border-radius: 10px;
+    border: 2px solid #334155; background: #020617; color: #e2e8f0;
+  }
+  input:focus { outline: none; border-color: #60a5fa; }
+  button {
+    font-size: 20px; padding: 12px 22px; border-radius: 10px; border: 0;
+    background: #2563eb; color: white; font-weight: bold;
+  }
+  ol { margin: 0; padding: 0; list-style: none; }
+  li {
+    display: flex; gap: 16px; align-items: baseline; background: #1e293b;
+    border-radius: 10px; padding: 12px 18px; margin-bottom: 10px; font-size: 20px;
+  }
+  li time { color: #94a3b8; font-size: 15px; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+  <h1>Agent scratchpad</h1>
+  <p class="sub">Everything on this page lives in the browser's memory. Nothing is saved anywhere.</p>
+  <div class="cards">
+    <div class="card"><div class="label">Page id</div><div class="value" id="page-id"></div></div>
+    <div class="card"><div class="label">Loaded at</div><div class="value" id="loaded"></div></div>
+    <div class="card">
+      <div class="label">Alive for</div><div class="value" id="alive">0.0s</div>
+      <div class="pulse"><div id="pulse"></div></div>
+    </div>
+    <div class="card"><div class="label">Notes</div><div class="value" id="count">0</div></div>
+  </div>
+  <form id="form">
+    <input id="note" aria-label="Note" placeholder="Write a note" autocomplete="off">
+    <button type="submit">Add note</button>
+  </form>
+  <ol id="notes"></ol>
+<script>
+  const started = performance.now();
+  const pad = (n) => String(n).padStart(2, "0");
+  const clock = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  document.getElementById("page-id").textContent =
+    Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, "0");
+  document.getElementById("loaded").textContent = clock(new Date());
+  const alive = document.getElementById("alive");
+  const pulse = document.getElementById("pulse");
+  function tick() {
+    const ms = performance.now() - started;
+    const s = ms / 1000;
+    alive.textContent = s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m ${pad(Math.floor(s % 60))}s`;
+    pulse.style.width = `${(ms % 1000) / 10}%`;
+    requestAnimationFrame(tick);
+  }
+  tick();
+  const notes = document.getElementById("notes");
+  const input = document.getElementById("note");
+  document.getElementById("form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    const item = document.createElement("li");
+    const time = document.createElement("time");
+    time.textContent = clock(new Date());
+    item.append(time, text);
+    notes.append(item);
+    document.getElementById("count").textContent = notes.children.length;
+    input.value = "";
+  });
+</script>
+</body>
+</html>
