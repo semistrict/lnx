@@ -491,10 +491,16 @@ impl Cli {
             );
         }
         let persisted = descriptor::load(&layout)?;
-        let cpus = cpus.or(persisted.cpus).unwrap_or(DEFAULT_CPUS);
+        let snapshot_shape = latest_snapshot_shape(&layout);
+        let cpus = cpus
+            .or(persisted.cpus)
+            .or(snapshot_shape.map(|shape| shape.cpus))
+            .unwrap_or(DEFAULT_CPUS);
         let memory_mib = memory_mib
             .or(persisted.memory_mib)
+            .or(snapshot_shape.map(|shape| shape.memory_mib))
             .unwrap_or(DEFAULT_MEMORY_MIB);
+        let nested_kvm = nested_kvm || snapshot_shape.is_some_and(|shape| shape.nested_kvm);
         let cpus = effective_cpus(cpus, deterministic.as_ref());
         match command {
             Some(Command::Init(args)) => run_init_command(
@@ -1914,6 +1920,30 @@ fn validate_deterministic_args(
         bail!("--deterministic cannot be combined with --vhost-user-fs yet");
     }
     Ok(())
+}
+
+/// The VM shape an instance's latest memory snapshot was taken with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotShape {
+    cpus: u8,
+    memory_mib: u32,
+    nested_kvm: bool,
+}
+
+/// Restoring a snapshot needs the shape it was taken with, so a command that
+/// asks for no particular CPUs, memory or nested virtualization (by flag or
+/// saved setting) resumes the instance however it was booted, instead of
+/// failing with a mismatch against the defaults.
+fn latest_snapshot_shape(layout: &Layout) -> Option<SnapshotShape> {
+    let latest = layout.snapshot_dir.join("latest");
+    let config = runner::snapshot_vm_config(&latest).ok()??;
+    let nested_kvm = runner::read_launch_metadata(&latest)
+        .is_ok_and(|metadata| metadata.owner_args.iter().any(|arg| arg == "--nested-kvm"));
+    Some(SnapshotShape {
+        cpus: u8::try_from(config.vcpu_count).ok()?,
+        memory_mib: u32::try_from(config.memory_mib()).ok()?,
+        nested_kvm,
+    })
 }
 
 fn effective_cpus(configured: u8, deterministic: Option<&runner::DeterministicConfig>) -> u8 {

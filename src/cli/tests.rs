@@ -950,3 +950,51 @@ fn linux_lnx_candidates_use_current_profile() {
         "/Users/test/src/target/aarch64-unknown-linux-musl/release/lnx"
     )));
 }
+
+fn write_snapshot_shape(snapshot: &Path, cpus: u32, memory_mib: u64, owner_args: &[&str]) {
+    fs::create_dir_all(snapshot).expect("create snapshot");
+    let mut header = [0u8; 40];
+    header[0..8].copy_from_slice(b"LKRNSS01");
+    header[8..12].copy_from_slice(&runner::SNAPSHOT_VMSTATE_VERSION.to_le_bytes());
+    header[16..24].copy_from_slice(&(memory_mib * 1024 * 1024).to_le_bytes());
+    header[32..36].copy_from_slice(&cpus.to_le_bytes());
+    fs::write(snapshot.join("vmstate.bin"), header).expect("write vmstate header");
+    let owner_args: Vec<_> = owner_args.iter().map(|arg| format!("{arg:?}")).collect();
+    fs::write(
+        snapshot.join("launch.json"),
+        format!(
+            r#"{{"version":2,"owner_args":[{}],"compatibility":{{"host_share_cache":{{"dax":true}}}},"shares":{{"no_host_shares":false,"host_home":"/Users/test","outside_home_cwd":null}}}}"#,
+            owner_args.join(",")
+        ),
+    )
+    .expect("write launch metadata");
+}
+
+#[test]
+fn latest_snapshot_shape_reads_the_booted_vm_shape() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+    write_snapshot_shape(
+        &layout.snapshot_dir.join("latest"),
+        8,
+        16384,
+        &["--cpus", "8", "--memory-mib", "16384", "--nested-kvm", "_vm-owner"],
+    );
+
+    assert_eq!(
+        latest_snapshot_shape(&layout),
+        Some(SnapshotShape {
+            cpus: 8,
+            memory_mib: 16384,
+            nested_kvm: true,
+        })
+    );
+}
+
+#[test]
+fn instance_without_a_snapshot_has_no_snapshot_shape() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+
+    assert_eq!(latest_snapshot_shape(&layout), None);
+}
