@@ -690,6 +690,56 @@ fn stored_instance(layout: &Layout, write: impl FnOnce(&Path)) {
     store.initialize(&lock, staging).expect("initialize instance");
 }
 
+#[test]
+fn replacing_an_instance_swaps_in_the_import_and_removes_the_old_state() {
+    let base = TempDir::new().expect("tempdir");
+    let dest = test_layout(base.path(), "target");
+    stored_instance(&dest, |generation| {
+        fs::write(generation.join(store::ROOTFS), b"old").expect("write old disk");
+    });
+    let import_base = TempDir::new_in(base.path()).expect("import tempdir");
+    let imported = test_layout(import_base.path(), "source");
+    stored_instance(&imported, |generation| {
+        fs::write(generation.join(store::ROOTFS), b"new").expect("write new disk");
+    });
+
+    replace_instance_dir(&dest, &imported.instance_dir).expect("replace");
+
+    assert_eq!(fs::read(latest_rootfs(&dest)).expect("read disk"), b"new");
+    assert!(!imported.instance_dir.exists());
+    let transactions = crate::paths::instance_transaction_roots(&base.path().join("instances"))
+        .expect("transaction roots");
+    for root in transactions {
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .expect("read root")
+            .map(|entry| entry.expect("entry").file_name())
+            .filter(|name| name.to_string_lossy().starts_with("replace-"))
+            .collect();
+        assert!(leftovers.is_empty(), "replaced state left: {leftovers:?}");
+    }
+}
+
+#[test]
+fn replacing_an_instance_in_use_changes_nothing() {
+    let base = TempDir::new().expect("tempdir");
+    let dest = test_layout(base.path(), "target");
+    stored_instance(&dest, |generation| {
+        fs::write(generation.join(store::ROOTFS), b"old").expect("write old disk");
+    });
+    let import_base = TempDir::new_in(base.path()).expect("import tempdir");
+    let imported = test_layout(import_base.path(), "source");
+    stored_instance(&imported, |generation| {
+        fs::write(generation.join(store::ROOTFS), b"new").expect("write new disk");
+    });
+    let _owner = runner::test_support::hold_as_owner(&dest);
+
+    let error = replace_instance_dir(&dest, &imported.instance_dir).expect_err("busy");
+
+    assert_eq!(error.to_string(), "target instance target is busy; stop it and retry");
+    assert_eq!(fs::read(latest_rootfs(&dest)).expect("read disk"), b"old");
+    assert!(imported.instance_dir.exists());
+}
+
 fn latest_rootfs(layout: &Layout) -> PathBuf {
     Store::new(&layout.instance_dir)
         .latest()

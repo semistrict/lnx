@@ -960,27 +960,69 @@ fn install_imported_sandbox(
     }
     validate_imported_snapshot(&imported, state)?;
 
-    if replace {
-        remove_path_if_exists(&dest.instance_dir)?;
-        if dest.run_dir != dest.instance_dir {
-            remove_path_if_exists(&dest.run_dir)?;
-        }
-    }
     let parent = dest
         .instance_dir
         .parent()
         .context("instance dir has no parent")?;
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    fs::rename(&imported, &dest.instance_dir).with_context(|| {
-        format!(
-            "move imported sandbox {} to {}",
-            imported.display(),
-            dest.instance_dir.display()
-        )
-    })?;
+    if replace && fs::symlink_metadata(&dest.instance_dir).is_ok() {
+        replace_instance_dir(dest, &imported)?;
+    } else {
+        move_into_place(&imported, &dest.instance_dir)?;
+    }
     install_kernel_if_present(scratch, dest)?;
     rewrite_descriptor_name(dest)?;
     index_layout_into_cas(dest)
+}
+
+fn move_into_place(imported: &Path, instance_dir: &Path) -> Result<()> {
+    fs::rename(imported, instance_dir).with_context(|| {
+        format!(
+            "move imported sandbox {} to {}",
+            imported.display(),
+            instance_dir.display()
+        )
+    })
+}
+
+/// Swaps an imported sandbox in for an existing instance while holding that
+/// instance's lock, so no VM owner or state operation can be using it, and
+/// removes the replaced state afterwards.
+fn replace_instance_dir(dest: &Layout, imported: &Path) -> Result<()> {
+    let instances_root = dest
+        .instance_dir
+        .parent()
+        .context("instance dir has no parent")?;
+    let trash = tempfile::Builder::new()
+        .prefix(&format!("replace-{}-", dest.instance))
+        .tempdir_in(crate::paths::ensure_instance_transaction_root(instances_root)?)
+        .context("create replace transaction")?;
+    let replaced = trash.path().join("state");
+    let swapped = runner::with_exclusive_instance_state(dest, |_, _| {
+        fs::rename(&dest.instance_dir, &replaced).with_context(|| {
+            format!("detach {} for replacement", dest.instance_dir.display())
+        })?;
+        if let Err(error) = move_into_place(imported, &dest.instance_dir) {
+            fs::rename(&replaced, &dest.instance_dir).with_context(|| {
+                format!(
+                    "restore {} after a failed replacement ({error:#})",
+                    dest.instance_dir.display()
+                )
+            })?;
+            return Err(error);
+        }
+        Ok(())
+    })?;
+    if swapped.is_none() {
+        bail!(
+            "target instance {} is busy; stop it and retry",
+            dest.instance
+        );
+    }
+    if dest.run_dir != dest.instance_dir {
+        remove_path_if_exists(&dest.run_dir)?;
+    }
+    remove_path_if_exists(trash.path())
 }
 
 fn extract_archive(archive: &Path, dest: &Path) -> Result<()> {
