@@ -374,13 +374,17 @@ mod tests {
     }
 
     fn tempdir() -> std::path::PathBuf {
+        // Tests run in parallel and the clock may not tick between two calls
+        // (macOS reports microseconds), so a counter keeps the names unique.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let mut p = std::env::temp_dir();
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        p.push(format!("krun-snap-test-{pid}-{nanos}"));
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        p.push(format!("krun-snap-test-{pid}-{nanos}-{seq}"));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
