@@ -209,6 +209,10 @@ fn broker_shutdown_closes_registration_gate_before_draining_clients() {
     assert!(state.is_stopping());
     assert_eq!(dropped, 1);
     assert_eq!(state.active_channels(), 0);
+    assert_eq!(
+        agent_rx.try_recv().expect("the guest is told to end the command"),
+        Message::Close { channel_id }
+    );
     assert!(matches!(
         rx.recv().expect("shutdown error"),
         Message::Error { channel_id: id, .. } if id == channel_id

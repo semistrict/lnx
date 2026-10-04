@@ -206,11 +206,18 @@ impl BrokerState {
     }
 
     /// Closes the stopping barrier, then fails and forgets every open
-    /// channel. Returns how many active channels were released.
+    /// channel, and asks the guest to end what they were running, so the
+    /// final snapshot does not freeze commands nobody is waiting for any
+    /// more (O7). The closes reach the agent before the snapshot request,
+    /// which goes through the same queue. Returns how many active channels
+    /// were released.
     pub(crate) fn begin_shutdown(&self, error: &str) -> usize {
         match self.channels.lock() {
             Ok(mut channels) => {
                 self.stopping.store(true, Ordering::SeqCst);
+                for &channel_id in channels.keys() {
+                    let _ = self.agent_tx.send(Message::Close { channel_id });
+                }
                 self.drain_locked(&mut channels, Some(error))
             }
             Err(_) => {

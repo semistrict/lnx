@@ -114,6 +114,17 @@ try {
     assertEq(await guestSleepGone(7775), "gone", "stubborn guest command");
   });
 
+  await testStep("stopping an instance ends its running commands", async () => {
+    const proc = ctx.vm.spawnCli(["bash", "-c", "echo started; sleep 7776"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    await waitForOutput(proc.stdout, "started");
+    await ctx.vm.stop();
+    assertEq((await proc.exited) === 0, false, "the stopped command's client fails");
+    assertEq(await guestSleepGone(7776), "gone", "the command does not resume after a stop");
+  });
+
   await testStep("an instance whose client was killed goes idle", async () => {
     const proc = ctx.vm.spawnCli(["bash", "-c", "echo started; sleep 7774"], {
       stdout: "pipe",

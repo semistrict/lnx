@@ -1644,6 +1644,31 @@ fn write_message_locked(agent_fd: &Arc<Mutex<c_int>>, message: &Message) -> bool
     write_message(*fd, message)
 }
 
+/// Closes the host connection `old` and replaces it with what `connect`
+/// returns, holding the shared connection throughout. A channel thread
+/// writing through it in between would otherwise write into whatever reused
+/// the closed fd number (the snapshot connection, for one), and its frame
+/// would reach the host as something else.
+fn replace_agent_connection(
+    agent_fd: &Arc<Mutex<c_int>>,
+    old: c_int,
+    connect: impl FnOnce() -> c_int,
+) -> c_int {
+    let mut shared = agent_fd.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    unsafe {
+        close(old);
+    }
+    let fd = connect();
+    *shared = fd;
+    let _ = write_message(
+        fd,
+        &Message::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    );
+    fd
+}
+
 fn publish_agent_fd_and_hello(agent_fd: &Arc<Mutex<c_int>>, fd: c_int) -> bool {
     let Ok(mut shared) = agent_fd.lock() else {
         return false;
@@ -2775,12 +2800,8 @@ fn agent_loop() {
         let message = read_message(fd);
         let Some(message) = message else {
             log!("agent.loop.read_closed fd={fd}; reconnecting");
-            unsafe {
-                close(fd);
-            }
-            fd = reconnect_after_snapshot_point();
+            fd = replace_agent_connection(&agent_fd, fd, reconnect_after_snapshot_point);
             log!("agent.loop.reconnected fd={fd}");
-            let _ = publish_agent_fd_and_hello(&agent_fd, fd);
             continue;
         };
         match message {
@@ -2927,18 +2948,8 @@ fn agent_loop() {
             Message::SnapshotReady => {
                 unsafe {
                     sync();
-                    close(fd);
                 }
-                fd = request_snapshot_and_reconnect();
-                if let Ok(mut shared) = agent_fd.lock() {
-                    *shared = fd;
-                }
-                let _ = write_message_locked(
-                    &agent_fd,
-                    &Message::Hello {
-                        version: PROTOCOL_VERSION,
-                    },
-                );
+                fd = replace_agent_connection(&agent_fd, fd, request_snapshot_and_reconnect);
             }
             _ => {}
         }
