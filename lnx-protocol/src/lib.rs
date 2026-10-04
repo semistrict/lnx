@@ -33,9 +33,11 @@ pub enum Message {
         host: String,
         port: u16,
     },
+    /// A client asks a running owner for a capture. `request` is the
+    /// JSON-encoded checkpoint request (what to name it, where to export it).
     Checkpoint {
         channel_id: u64,
-        path: String,
+        request: String,
     },
     CheckpointCreated {
         channel_id: u64,

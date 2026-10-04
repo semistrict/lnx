@@ -368,18 +368,22 @@ pub(crate) fn handle_broker_client(
         .set_read_timeout(None)
         .context("clear broker client handshake timeout")?;
     let first_activity = krun::deterministic_host_activity();
-    if let Message::Checkpoint { channel_id, path } = first {
+    if let Message::Checkpoint {
+        channel_id,
+        request,
+    } = first
+    {
         if let Some(trace) = trace_log {
             trace.event(
                 "client_checkpoint_request",
                 vec![
                     trace_text("channel_id", format!("{channel_id:016x}")),
-                    trace_text("path", path.as_str()),
+                    trace_text("request", request.as_str()),
                 ],
             );
         }
         let spec: CheckpointSpec =
-            serde_json::from_str(&path).context("parse checkpoint request")?;
+            serde_json::from_str(&request).context("parse checkpoint request")?;
         let (reply_tx, reply_rx) = mpsc::channel();
         let job = CaptureJob::Checkpoint(CheckpointRequest {
             spec,

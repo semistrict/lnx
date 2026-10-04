@@ -9,7 +9,7 @@ use super::*;
 use crate::store::CheckpointRef;
 
 /// What a client asks for in a checkpoint request. It travels JSON-encoded in
-/// the `path` field of the protocol's `Checkpoint` message.
+/// the `request` field of the protocol's `Checkpoint` message.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CheckpointSpec {
     /// Record the capture as a named checkpoint of the instance.

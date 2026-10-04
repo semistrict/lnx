@@ -966,7 +966,7 @@ fn request_checkpoint_with_timeout(
         &mut stream,
         &Message::Checkpoint {
             channel_id,
-            path: serde_json::to_string(spec).context("encode checkpoint request")?,
+            request: serde_json::to_string(spec).context("encode checkpoint request")?,
         },
     )?;
     loop {
