@@ -19,7 +19,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -210,14 +210,21 @@ struct HeldLock {
 
 impl HeldLock {
     fn try_acquire(path: &Path) -> Result<Option<Self>> {
-        let file = open_lock_file(path)?;
-        match flock(&file, libc::LOCK_EX | libc::LOCK_NB)? {
-            true => Ok(Some(Self {
-                file,
-                path: path.to_path_buf(),
-                clear_lease_on_release: true,
-            })),
-            false => Ok(None),
+        loop {
+            let file = open_lock_file(path)?;
+            if !flock(&file, libc::LOCK_EX | libc::LOCK_NB)? {
+                return Ok(None);
+            }
+            // The file may have been renamed away, with its instance, between
+            // our open and our flock (instance delete or replace). A lock on
+            // it would guard nothing, so take the lock at the path instead.
+            if is_file_at(&file, path)? {
+                return Ok(Some(Self {
+                    file,
+                    path: path.to_path_buf(),
+                    clear_lease_on_release: true,
+                }));
+            }
         }
     }
 
@@ -256,6 +263,18 @@ impl Drop for HeldLock {
         if self.clear_lease_on_release {
             let _ = self.file.set_len(0);
         }
+    }
+}
+
+/// Whether `file` is the file currently at `path`.
+fn is_file_at(file: &File, path: &Path) -> Result<bool> {
+    let held = file
+        .metadata()
+        .with_context(|| format!("stat held lock {}", path.display()))?;
+    match fs::symlink_metadata(path) {
+        Ok(current) => Ok(current.dev() == held.dev() && current.ino() == held.ino()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("stat {}", path.display())),
     }
 }
 
@@ -484,6 +503,14 @@ pub(crate) mod test_support {
     use std::process::{Child, Command, Stdio};
 
     use super::*;
+
+    pub(crate) fn open_lock(path: &Path) -> File {
+        open_lock_file(path).expect("open lock file")
+    }
+
+    pub(crate) fn is_file_at(file: &File, path: &Path) -> bool {
+        super::is_file_at(file, path).expect("compare lock file")
+    }
 
     /// Takes the instance lock as a VM owner in this process.
     pub(crate) fn hold_as_owner(layout: &Layout) -> InstanceLock {

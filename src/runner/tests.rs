@@ -447,6 +447,20 @@ fn live_foreign_holder_is_not_reclaimed() {
 }
 
 #[test]
+fn a_lock_file_moved_away_with_its_instance_is_not_the_lock_at_its_path() {
+    let temp = TempDir::new("lock-file-identity");
+    let path = temp.path().join("instance.lock");
+    let file = locks::test_support::open_lock(&path);
+    assert!(locks::test_support::is_file_at(&file, &path));
+
+    fs::rename(&path, temp.path().join("detached.lock")).expect("detach lock file");
+    assert!(!locks::test_support::is_file_at(&file, &path));
+
+    drop(locks::test_support::open_lock(&path));
+    assert!(!locks::test_support::is_file_at(&file, &path));
+}
+
+#[test]
 fn killed_holder_releases_the_instance_lock_and_leaves_its_lease() {
     let temp = TempDir::new("instance-lock-crash-release");
     let layout = temp_layout(&temp, "vm");
