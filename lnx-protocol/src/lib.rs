@@ -94,6 +94,18 @@ pub enum Message {
         ports: Vec<u16>,
     },
     SnapshotReady,
+    /// A client asks a running owner to forward a host port into the guest
+    /// (broker only; the agent never sees it).
+    AddForward {
+        channel_id: u64,
+        listen_host: String,
+        listen_port: u16,
+        guest_host: String,
+        guest_port: u16,
+    },
+    ForwardAdded {
+        channel_id: u64,
+    },
 }
 
 #[cfg(test)]

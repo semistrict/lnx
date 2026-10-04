@@ -271,7 +271,7 @@ fn run_once(config: &RunConfig) -> Result<i32> {
             "debug[nodaemonreuse]: replacing any existing VM owner for this instance before starting a fresh owner."
         );
     }
-    if config.forwards.is_empty() && !no_daemon_reuse {
+    if !no_daemon_reuse {
         if broker_socket.exists() {
             validate_runtime_deterministic_compatibility(
                 &config.layout,
@@ -291,7 +291,7 @@ fn run_once(config: &RunConfig) -> Result<i32> {
     let start_lock = match acquire_owner_start_or_run_client(
         &broker_socket,
         config,
-        config.forwards.is_empty() && !no_daemon_reuse,
+        !no_daemon_reuse,
         &run_log,
     )? {
         OwnerStartOutcome::Lock(lock) => lock,
@@ -1477,6 +1477,7 @@ fn run_existing_broker_client(
                     socket.display()
                 ));
             }
+            add_forwards(socket, &config.forwards)?;
             run_broker_session(stream, config).map(Some)
         }
         Err(e) => {
@@ -1494,6 +1495,39 @@ fn run_existing_broker_client(
             Ok(None)
         }
     }
+}
+
+/// Asks a running owner for the forwards a command wants (`--forward`), so
+/// they work without restarting the VM.
+fn add_forwards(socket: &Path, forwards: &[PortForward]) -> Result<()> {
+    for forward in forwards {
+        let mut stream = connect_broker(socket)?;
+        let channel_id = new_request_id()?;
+        write_message(
+            &mut stream,
+            &Message::AddForward {
+                channel_id,
+                listen_host: forward.listen_host.clone(),
+                listen_port: forward.listen_port,
+                guest_host: forward.guest_host.clone(),
+                guest_port: forward.guest_port,
+            },
+        )?;
+        match read_message(&mut stream)? {
+            Message::ForwardAdded { channel_id: id } if id == channel_id => {}
+            Message::Error {
+                channel_id: id,
+                message,
+            } if id == channel_id => {
+                if message == OWNER_STOPPING_NOT_STARTED {
+                    return Err(CommandNotStarted.into());
+                }
+                bail!("forward {}: {message}", forward_spec(forward));
+            }
+            other => bail!("unexpected reply to a forward request: {other:?}"),
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn connect_broker(socket: &Path) -> Result<UnixStream> {
@@ -2152,8 +2186,7 @@ fn run_broker_owner(parts: OwnerParts) -> Result<thread::JoinHandle<Result<()>>>
         .set_nonblocking(true)
         .context("set broker listener nonblocking")?;
     for forward in forwards {
-        reserve_forward_port(&state, &forward);
-        start_forward_listener(forward, &state)?;
+        add_user_forward(&state, forward)?;
     }
     let client_context = Arc::new(ClientContext {
         state: Arc::clone(&state),

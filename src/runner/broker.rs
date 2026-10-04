@@ -69,6 +69,9 @@ pub(crate) struct BrokerState {
     /// and other connections that open nothing do not count.
     first_client_deadline: Mutex<Option<Instant>>,
     auto_forward_ports: Mutex<HashSet<(String, u16)>>,
+    /// Forwards users asked for, by host address, to the guest address they
+    /// reach.
+    user_forwards: Mutex<HashMap<(String, u16), (String, u16)>>,
     agent_tx: mpsc::Sender<Message>,
     /// Runs under the channel lock before any channel's opening message
     /// reaches the guest; the owner records there that the run now holds
@@ -93,6 +96,7 @@ impl BrokerState {
             awake_until: Mutex::new(None),
             first_client_deadline: Mutex::new(Some(Instant::now() + FIRST_CLIENT_GRACE)),
             auto_forward_ports: Mutex::new(HashSet::new()),
+            user_forwards: Mutex::new(HashMap::new()),
             agent_tx,
             before_dispatch: Box::new(before_dispatch),
             run_log,
@@ -386,6 +390,31 @@ pub(crate) fn handle_broker_client(
         .set_read_timeout(None)
         .context("clear broker client handshake timeout")?;
     let first_activity = krun::deterministic_host_activity();
+    if let Message::AddForward {
+        channel_id,
+        listen_host,
+        listen_port,
+        guest_host,
+        guest_port,
+    } = first
+    {
+        let forward = PortForward {
+            listen_host,
+            listen_port,
+            guest_host,
+            guest_port,
+        };
+        let reply = match add_user_forward(&context.state, forward) {
+            Ok(()) => Message::ForwardAdded { channel_id },
+            Err(error) => Message::Error {
+                channel_id,
+                message: format!("{error:#}"),
+            },
+        };
+        write_message(&mut client, &reply)?;
+        drop(pending);
+        return Ok(());
+    }
     if let Message::Checkpoint {
         channel_id,
         request,
@@ -673,6 +702,50 @@ pub(crate) fn ensure_auto_forward_port(
         "auto_forward.listen host={listen_host} port={port} guest_port={port}"
     ));
     Ok(true)
+}
+
+/// Forwards a host port into the guest for as long as this owner runs, as
+/// `--forward` asks. Asking again for the same forward changes nothing; a
+/// host port already forwarded elsewhere is refused.
+pub(crate) fn add_user_forward(state: &Arc<BrokerState>, forward: PortForward) -> Result<()> {
+    if state.is_stopping() {
+        bail!("{OWNER_STOPPING_NOT_STARTED}");
+    }
+    let host = (forward.listen_host.clone(), forward.listen_port);
+    let guest = (forward.guest_host.clone(), forward.guest_port);
+    let mut forwards = state
+        .user_forwards
+        .lock()
+        .map_err(|_| anyhow!("forwards lock poisoned"))?;
+    match forwards.get(&host) {
+        Some(existing) if *existing == guest => return Ok(()),
+        Some((guest_host, guest_port)) => bail!(
+            "{}:{} is already forwarded to the guest's {guest_host}:{guest_port}",
+            forward.listen_host,
+            forward.listen_port
+        ),
+        None => {}
+    }
+    let auto_forwarded = state
+        .auto_forward_ports
+        .lock()
+        .map(|ports| ports.contains(&host))
+        .unwrap_or(false);
+    if auto_forwarded {
+        if forward.guest_port != forward.listen_port || forward.guest_host != forward.listen_host {
+            bail!(
+                "{}:{} is already forwarded to the guest's port {} (the guest listens there)",
+                forward.listen_host,
+                forward.listen_port,
+                forward.listen_port
+            );
+        }
+    } else {
+        reserve_forward_port(state, &forward);
+        start_forward_listener(forward, state)?;
+    }
+    forwards.insert(host, guest);
+    Ok(())
 }
 
 /// Records a user-requested forward so auto-forwarding does not try to bind

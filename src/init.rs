@@ -103,22 +103,38 @@ pub fn ensure_instance_from(layout: &Layout, rootfs: &Path) -> Result<()> {
         layout.instance,
         rootfs.display()
     );
-    let created = crate::runner::with_exclusive_instance_state(layout, |lock, _| {
-        let store = crate::store::Store::new(&layout.instance_dir);
-        if store.exists() {
+    // Two first commands in a new instance race to create it; the one that
+    // finds the instance busy waits for the other to finish.
+    let deadline = std::time::Instant::now() + CREATE_WAIT;
+    loop {
+        let created = crate::runner::with_exclusive_instance_state(layout, |lock, _| {
+            let store = crate::store::Store::new(&layout.instance_dir);
+            if store.exists() {
+                return Ok(());
+            }
+            let staging = store.stage(lock)?;
+            crate::sparse_copy::clone_or_copy_file(
+                rootfs,
+                &staging.dir().join(crate::store::ROOTFS),
+            )?;
+            store.initialize(lock, staging).map(drop)
+        })?;
+        if created.is_some() || instance_has_state(layout) {
             return Ok(());
         }
-        let staging = store.stage(lock)?;
-        crate::sparse_copy::clone_or_copy_file(rootfs, &staging.dir().join(crate::store::ROOTFS))?;
-        store.initialize(lock, staging).map(drop)
-    })?;
-    created.with_context(|| {
-        format!(
-            "instance {} is being created by another command",
-            layout.instance
-        )
-    })
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "instance {} was still being created by another command after {}s",
+                layout.instance,
+                CREATE_WAIT.as_secs()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
+
+/// How long a command waits for another one creating the same instance.
+const CREATE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 pub fn ensure_base_ignored(base: &Path) -> Result<()> {
     fs::create_dir_all(base).with_context(|| format!("create {}", base.display()))?;

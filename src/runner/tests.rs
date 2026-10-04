@@ -346,6 +346,51 @@ fn an_owner_whose_guest_panicked_at_boot_is_reported_as_such() {
     );
 }
 
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
+}
+
+fn forward(listen_port: u16, guest_port: u16) -> PortForward {
+    PortForward {
+        listen_host: "127.0.0.1".to_string(),
+        listen_port,
+        guest_host: "127.0.0.1".to_string(),
+        guest_port,
+    }
+}
+
+#[test]
+fn a_running_owner_takes_new_forwards_and_repeats_are_harmless() {
+    let (state, _agent_rx, _temp) = test_broker();
+    let port = free_port();
+
+    add_user_forward(&state, forward(port, 8080)).expect("add forward");
+    add_user_forward(&state, forward(port, 8080)).expect("same forward again");
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
+        "the host port listens"
+    );
+
+    let error = add_user_forward(&state, forward(port, 9090)).expect_err("conflicting forward");
+    assert_eq!(
+        error.to_string(),
+        format!("127.0.0.1:{port} is already forwarded to the guest's 127.0.0.1:8080")
+    );
+}
+
+#[test]
+fn a_stopping_owner_takes_no_new_forwards() {
+    let (state, _agent_rx, _temp) = test_broker();
+    state.begin_shutdown(OWNER_STOPPING);
+
+    let error = add_user_forward(&state, forward(free_port(), 8080)).expect_err("stopping");
+    assert_eq!(error.to_string(), OWNER_STOPPING_NOT_STARTED);
+}
+
 #[test]
 fn a_new_owner_waits_for_its_first_client_before_it_may_stop() {
     let (state, _agent_rx, _temp) = test_broker();

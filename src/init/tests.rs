@@ -151,3 +151,33 @@ fn unique_siblings_differ_between_calls() {
     assert_ne!(first, second);
     assert_eq!(first.parent(), path.parent());
 }
+
+#[test]
+fn a_command_that_finds_the_instance_being_created_waits_for_it() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = Layout::resolve_in_base("new", temp.path().to_path_buf(), None, None);
+    let image = temp.path().join("image.ext4");
+    fs::write(&image, b"image").expect("write image");
+    fs::create_dir_all(&layout.instance_dir).expect("create instance dir");
+    // Another command holds the instance while creating it.
+    let creator = crate::runner::test_support::hold_as_owner(&layout);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let waiter = {
+        let layout = layout.clone();
+        let image = image.clone();
+        std::thread::spawn(move || {
+            started_tx.send(()).expect("signal start");
+            ensure_instance_from(&layout, &image)
+        })
+    };
+    started_rx.recv().expect("waiter started");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let store = crate::store::Store::new(&layout.instance_dir);
+    let staging = store.stage(&creator).expect("stage");
+    fs::write(staging.dir().join(crate::store::ROOTFS), b"image").expect("write rootfs");
+    store.initialize(&creator, staging).expect("initialize");
+    drop(creator);
+
+    waiter.join().expect("join").expect("the waiter succeeds once it exists");
+    assert!(instance_has_state(&layout));
+}
