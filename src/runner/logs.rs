@@ -51,20 +51,6 @@ enum TraceValue {
     Blob(Vec<u8>),
 }
 
-pub(crate) fn json_escape(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|ch| match ch {
-            '"' => "\\\"".chars().collect::<Vec<_>>(),
-            '\\' => "\\\\".chars().collect::<Vec<_>>(),
-            '\n' => "\\n".chars().collect::<Vec<_>>(),
-            '\r' => "\\r".chars().collect::<Vec<_>>(),
-            '\t' => "\\t".chars().collect::<Vec<_>>(),
-            ch => vec![ch],
-        })
-        .collect()
-}
-
 pub(crate) fn current_run_id() -> String {
     std::env::var(RUN_ID_ENV)
         .ok()

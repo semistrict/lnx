@@ -1,5 +1,5 @@
 import { mkdir, rm, writeFile, readFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { createLnxClient, type LnxClient, type LnxInstance } from "../../ts/index";
@@ -65,17 +65,30 @@ export async function cleanupContext(ctx: TestContext): Promise<void> {
   await rm(ctx.runDir, { recursive: true, force: true });
 }
 
+/**
+ * The pid recorded in an instance lock's lease. A holder that releases the
+ * lock cleanly erases its lease, so a pid here belongs to a live holder or to
+ * one that died while holding the lock.
+ */
+export function instanceLeasePid(instanceDir: string): number | null {
+  const lockFile = join(instanceDir, "instance.lock");
+  if (!existsSync(lockFile)) {
+    return null;
+  }
+  const match = /"pid":\s*(\d+)/.exec(readFileSync(lockFile, "utf8"));
+  return match ? Number(match[1]) : null;
+}
+
 export async function waitForOwnerExit(ctx: TestContext, timeoutMs = 30_000): Promise<void> {
   const broker = join(ctx.runDir, "broker.sock");
-  const lock = join(ctx.runDir, "bootstrap.lock.d");
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!existsSync(broker) && !existsSync(lock)) {
+    if (!existsSync(broker) && instanceLeasePid(ctx.imageDir) === null) {
       return;
     }
     await sleep(100);
   }
-  throw new Error(`timeout waiting for VM owner exit (broker.sock or bootstrap.lock.d remains)`);
+  throw new Error(`timeout waiting for VM owner exit (broker.sock or instance.lock lease remains)`);
 }
 
 export async function waitForVmSuspend(ctx: TestContext, timeoutMs = 60_000): Promise<void> {

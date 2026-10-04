@@ -7,6 +7,7 @@ import { join } from "node:path";
 import {
   assertEq,
   defaultContext,
+  instanceLeasePid,
   run,
   sleep,
   testStep,
@@ -55,13 +56,8 @@ function lnxCommand(
 }
 
 async function stopOwner(instance: string) {
-  const pidfile = join(instanceRunDir(instance), "bootstrap.lock.d", "owner.pid");
-  if (!existsSync(pidfile)) {
-    return;
-  }
-  const raw = await readFile(pidfile, "utf8");
-  const pid = Number(raw.replaceAll(/\D/g, ""));
-  if (!Number.isInteger(pid) || pid <= 0 || !existsSync(`/proc/${pid}`)) {
+  const pid = instanceLeasePid(join(ctx.base, "instances", instance));
+  if (pid === null || !existsSync(`/proc/${pid}`)) {
     return;
   }
   try {

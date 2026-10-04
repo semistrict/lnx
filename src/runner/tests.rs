@@ -1,7 +1,7 @@
 use super::*;
 use rusqlite::Connection;
 use std::ffi::CString;
-use std::os::unix::{ffi::OsStrExt, process::CommandExt};
+use std::os::unix::ffi::OsStrExt;
 use std::{
     io::{Seek, SeekFrom, Write},
     time::{SystemTime, UNIX_EPOCH},
@@ -549,55 +549,53 @@ fn broker_shutdown_closes_registration_gate_before_draining_clients() {
 }
 
 #[test]
-fn fresh_owner_slot_removes_stale_bootstrap_lock() {
+fn fresh_owner_slot_accepts_a_dead_owners_acknowledged_lease() {
     let temp = TempDir::new("fresh-owner-stale-lock");
     let layout = temp_layout(&temp, "vm");
     fs::create_dir_all(&layout.run_dir).expect("create run dir");
-    let lock = layout.run_dir.join("bootstrap.lock.d");
-    fs::create_dir(&lock).expect("create lock");
-    let mut exited = Command::new("/bin/sh")
-        .args(["-c", "exit 0"])
-        .spawn()
-        .expect("spawn short-lived owner");
-    let stale_pid = exited.id();
-    exited.wait().expect("reap short-lived owner");
-    fs::write(lock.join("owner.pid"), stale_pid.to_string()).expect("write stale pid");
-    acknowledge_final_snapshot_outcome(&layout, stale_pid)
+    let dead_owner = locks::test_support::exited_process();
+    locks::test_support::write_instance_lease(
+        &layout,
+        &locks::test_support::lease_for(LeaseRole::Owner, dead_owner),
+    );
+    acknowledge_final_snapshot_outcome(&layout, dead_owner.pid as u32)
         .expect("acknowledge stale owner outcome");
     let run_log = RunLog::open(&layout).expect("open run log");
 
-    wait_for_fresh_owner_slot(&layout, &run_log).expect("stale lock should be validated");
+    wait_for_fresh_owner_slot(&layout, &run_log).expect("stale lease should be validated");
 
-    assert!(lock.exists(), "validation does not create an unowned gap");
-    let replacement = try_acquire_validated_bootstrap(&layout, &lock)
-        .expect("replace stale lock atomically")
+    let replacement = try_acquire_validated_instance(&layout, LeaseRole::Owner)
+        .expect("replace stale lease")
         .expect("replacement lock");
-    assert_eq!(owner_pid_from_lock(&lock), Some(std::process::id() as i32));
+    assert_eq!(
+        live_owner(&layout).map(|lease| lease.process),
+        Some(ProcessIdentity::current())
+    );
     drop(replacement);
 }
 
 #[test]
-fn validated_bootstrap_reclaims_a_dead_maintenance_lease() {
+fn validated_instance_lock_reclaims_a_dead_maintenance_lease() {
     let temp = TempDir::new("fresh-owner-stale-maintenance");
     let layout = temp_layout(&temp, "vm");
     fs::create_dir_all(&layout.run_dir).expect("create run dir");
-    let lock = layout.run_dir.join("bootstrap.lock.d");
-    fs::create_dir(&lock).expect("create lock");
-    let mut exited = Command::new("/bin/sh")
-        .args(["-c", "exit 0"])
-        .spawn()
-        .expect("spawn short-lived maintenance process");
-    let stale_pid = exited.id();
-    exited.wait().expect("reap maintenance process");
-    fs::write(lock.join("maintenance.pid"), stale_pid.to_string())
-        .expect("write stale maintenance pid");
+    locks::test_support::write_instance_lease(
+        &layout,
+        &locks::test_support::lease_for(
+            LeaseRole::Maintenance,
+            locks::test_support::exited_process(),
+        ),
+    );
 
-    let replacement = try_acquire_validated_bootstrap(&layout, &lock)
+    let replacement = try_acquire_validated_instance(&layout, LeaseRole::Owner)
         .expect("reclaim dead maintenance lease")
         .expect("replacement owner lease");
 
-    assert_eq!(owner_pid_from_lock(&lock), Some(std::process::id() as i32));
-    assert!(!lock.join("maintenance.pid").exists());
+    let state = instance_lock_state(&layout).expect("inspect lock");
+    assert_eq!(
+        state.live_owner().map(|lease| lease.process),
+        Some(ProcessIdentity::current())
+    );
     drop(replacement);
 }
 
@@ -607,179 +605,161 @@ fn fresh_owner_slot_replace_stops_recorded_owner() {
     let layout = temp_layout(&temp, "vm");
     fs::create_dir_all(&layout.run_dir).expect("create run dir");
     fs::create_dir_all(&layout.snapshot_dir).expect("create snapshot dir");
-    let lock = layout.run_dir.join("bootstrap.lock.d");
-    let ready = layout.run_dir.join("owner-ready");
-    fs::create_dir(&lock).expect("create lock");
-    let mut child = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(
-            "trap 'printf \"version=1\\npid=%s\\nstatus=success\\n\" \"$$\" > \"$OUTCOME\"; rm -rf \"$LOCK\"; rm -f \"$BROKER\"; exit 0' TERM; : > \"$READY\"; while :; do sleep 1; done",
-        )
-        .env(
-            "OUTCOME",
-            layout.snapshot_dir.join(FINAL_SNAPSHOT_OUTCOME),
-        )
-        .env("LOCK", &lock)
-        .env("BROKER", layout.run_dir.join("broker.sock"))
-        .env("READY", &ready)
-        .process_group(0)
-        .spawn()
-        .expect("spawn child owner");
-    let ready_deadline = Instant::now() + Duration::from_secs(5);
-    while !ready.exists() && Instant::now() < ready_deadline {
-        if let Some(status) = child.try_wait().expect("poll child owner readiness") {
-            panic!("child owner exited before becoming ready: {status}");
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    if !ready.exists() {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("child owner did not install its signal handler within 5 seconds");
-    }
-    let child_pid = child.id();
-    fs::write(lock.join("owner.pid"), child_pid.to_string()).expect("write owner pid");
-    fs::write(layout.run_dir.join("broker.sock"), "").expect("write broker socket placeholder");
+    let outcome = layout.snapshot_dir.join(FINAL_SNAPSHOT_OUTCOME);
+    let mut holder = locks::test_support::spawn_foreign_holder(
+        &layout,
+        LeaseRole::Owner,
+        &format!(
+            r#"open(my $o, ">", "{}") or die; printf $o "version=1\npid=%d\nstatus=success\n", $$; close($o); exit 0"#,
+            outcome.display()
+        ),
+    );
+    let owner = holder.process;
     let run_log = RunLog::open(&layout).expect("open run log");
-    let reaper = thread::spawn(move || child.wait().expect("wait for child owner"));
+    let reaper = thread::spawn(move || holder.child.wait().expect("wait for child owner"));
 
     prepare_fresh_owner_slot(&layout, true, &run_log).expect("replace owner");
 
     let _ = reaper.join().expect("join owner reaper");
-    assert!(!process_alive(child_pid as libc::pid_t));
-    assert!(!lock.exists());
-    assert!(!layout.run_dir.join("broker.sock").exists());
+    assert!(!owner.is_running());
+    assert_eq!(live_owner(&layout), None);
 }
 
 #[test]
-fn bootstrap_lock_stale_reclaim_takes_ownership() {
-    let temp = TempDir::new("bootstrap-lock-stale-reclaim");
-    let lock_path = temp.path().join("bootstrap.lock.d");
-    fs::create_dir(&lock_path).expect("create lock dir");
-    // pid 0 is never alive per process_alive, so the lock is stale.
-    fs::write(lock_path.join("owner.pid"), "0").expect("write stale owner pid");
+fn dead_holders_lease_does_not_block_the_instance_lock() {
+    let temp = TempDir::new("instance-lock-stale-reclaim");
+    let layout = temp_layout(&temp, "vm");
+    let dead = locks::test_support::exited_process();
+    locks::test_support::write_instance_lease(
+        &layout,
+        &locks::test_support::lease_for(LeaseRole::Owner, dead),
+    );
 
-    let lock = BootstrapLock::try_acquire(&lock_path).expect("try_acquire should not error");
+    let mut seen_stale = None;
+    let lock = InstanceLock::try_acquire(&layout, LeaseRole::Owner, |stale| {
+        seen_stale = stale.cloned();
+        Ok(())
+    })
+    .expect("try_acquire should not error");
 
     assert!(lock.is_some());
-    let owner_pid = fs::read_to_string(lock_path.join("owner.pid")).expect("read owner pid");
-    assert_eq!(owner_pid, std::process::id().to_string());
+    assert_eq!(seen_stale.map(|lease| lease.process), Some(dead));
 }
 
 #[test]
-fn bootstrap_lock_live_lock_is_not_reclaimed() {
-    let temp = TempDir::new("bootstrap-lock-live");
-    let lock_path = temp.path().join("bootstrap.lock.d");
-    fs::create_dir(&lock_path).expect("create lock dir");
-    let live_pid = std::process::id().to_string();
-    fs::write(lock_path.join("owner.pid"), &live_pid).expect("write live owner pid");
+fn live_foreign_holder_is_not_reclaimed() {
+    let temp = TempDir::new("instance-lock-live");
+    let layout = temp_layout(&temp, "vm");
+    let mut holder = locks::test_support::spawn_foreign_holder(&layout, LeaseRole::Owner, "exit 0");
 
-    let lock = BootstrapLock::try_acquire(&lock_path).expect("try_acquire should not error");
+    let lock = InstanceLock::try_acquire(&layout, LeaseRole::Owner, |_| Ok(()))
+        .expect("try_acquire should not error");
 
     assert!(lock.is_none());
-    let owner_pid = fs::read_to_string(lock_path.join("owner.pid")).expect("read owner pid");
-    assert_eq!(owner_pid, live_pid);
+    assert_eq!(
+        live_owner(&layout).map(|lease| lease.process),
+        Some(holder.process)
+    );
+    holder.child.kill().expect("kill holder");
+    holder.child.wait().expect("reap holder");
 }
 
 #[test]
-fn stale_lock_removal_rechecks_after_lease_replacement() {
-    let temp = TempDir::new("bootstrap-lock-stale-removal-aba");
-    let lock_path = temp.path().join("bootstrap.lock.d");
-    fs::create_dir(&lock_path).expect("create lock dir");
-    fs::write(lock_path.join("owner.pid"), "0").expect("write stale owner pid");
+fn killed_holder_releases_the_instance_lock_and_leaves_its_lease() {
+    let temp = TempDir::new("instance-lock-crash-release");
+    let layout = temp_layout(&temp, "vm");
+    let mut holder = locks::test_support::spawn_foreign_holder(&layout, LeaseRole::Owner, "exit 0");
 
-    let guard_path = temp.path().join("bootstrap.lock.d.guard");
-    let guard = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&guard_path)
-        .expect("open stale-lock guard");
-    lock_file(&guard).expect("lock stale-lock guard");
+    holder.child.kill().expect("SIGKILL holder");
+    holder.child.wait().expect("reap holder");
 
-    let remover_path = lock_path.clone();
-    let remover = thread::spawn(move || {
-        remove_stale_lock_dir(&remover_path, bootstrap_lock_is_stale)
-            .expect("guarded stale removal")
-    });
-
-    fs::remove_dir_all(&lock_path).expect("remove observed stale lease");
-    fs::create_dir(&lock_path).expect("create replacement lease");
-    fs::write(lock_path.join("owner.pid"), std::process::id().to_string())
-        .expect("write fresh owner pid");
-    unlock_file(&guard).expect("unlock stale-lock guard");
-
-    assert!(!remover.join().expect("join stale remover"));
+    let state = instance_lock_state(&layout).expect("inspect lock");
     assert_eq!(
-        fs::read_to_string(lock_path.join("owner.pid")).expect("read replacement owner pid"),
-        std::process::id().to_string()
+        state.stale_lease().map(|lease| lease.process),
+        Some(holder.process)
+    );
+    assert!(!state.is_held());
+}
+
+#[test]
+fn recycled_pid_is_not_mistaken_for_the_recorded_holder() {
+    let temp = TempDir::new("instance-lock-pid-reuse");
+    let layout = temp_layout(&temp, "vm");
+    // This process is alive, but it did not start at the recorded time: the
+    // lease names an earlier process that had the same pid.
+    let impostor = ProcessIdentity {
+        started: ProcessIdentity::current().started.wrapping_sub(1),
+        ..ProcessIdentity::current()
+    };
+    locks::test_support::write_instance_lease(
+        &layout,
+        &locks::test_support::lease_for(LeaseRole::Owner, impostor),
+    );
+
+    assert!(!impostor.is_running());
+    assert_eq!(live_owner(&layout), None);
+    let state = instance_lock_state(&layout).expect("inspect lock");
+    assert_eq!(
+        state.stale_lease().map(|lease| lease.process),
+        Some(impostor)
     );
 }
 
 #[test]
-fn bootstrap_lock_concurrent_stale_reclaim_has_single_winner() {
-    let temp = TempDir::new("bootstrap-lock-concurrent");
-    let lock_path = temp.path().join("bootstrap.lock.d");
-    fs::create_dir(&lock_path).expect("create lock dir");
-    fs::write(lock_path.join("owner.pid"), "0").expect("write stale owner pid");
-
-    const THREADS: usize = 8;
-    let barrier = Arc::new(std::sync::Barrier::new(THREADS));
-    // Pre-fix, this test failed only probabilistically (the race window is
-    // narrow); it exists as the regression guard for the invariant that
-    // exactly one thread may reclaim a stale lock.
-    let winners: Arc<Mutex<Vec<BootstrapLock>>> = Arc::new(Mutex::new(Vec::new()));
-    let handles: Vec<_> = (0..THREADS)
-        .map(|_| {
-            let lock_path = lock_path.clone();
-            let barrier = Arc::clone(&barrier);
-            let winners = Arc::clone(&winners);
-            thread::spawn(move || {
-                barrier.wait();
-                if let Ok(Some(lock)) = BootstrapLock::try_acquire(&lock_path) {
-                    // Keep the winning lock alive until every thread has
-                    // finished: dropping it early would remove the lock dir
-                    // and let a later thread win too.
-                    winners.lock().unwrap().push(lock);
-                }
-            })
+fn guard_makes_inspect_then_act_atomic_with_acquisition() {
+    let temp = TempDir::new("instance-lock-guard");
+    let layout = temp_layout(&temp, "vm");
+    fs::create_dir_all(&layout.instance_dir).expect("create instance");
+    let (inspected_tx, inspected_rx) = mpsc::channel();
+    let (finish_tx, finish_rx) = mpsc::channel::<()>();
+    let inspector_layout = layout.clone();
+    let inspector = thread::spawn(move || {
+        with_instance_guard(&inspector_layout, |state| {
+            inspected_tx.send(state.is_held()).expect("report state");
+            finish_rx.recv().expect("wait to finish");
+            Ok(())
         })
-        .collect();
-    for handle in handles {
-        handle.join().expect("thread should not panic");
-    }
+        .expect("guarded inspection");
+    });
+    assert!(!inspected_rx.recv().expect("inspected state"));
 
-    let winners = Arc::try_unwrap(winners)
-        .unwrap_or_else(|_| panic!("winners still shared"))
-        .into_inner()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    assert_eq!(winners.len(), 1);
+    let acquirer_layout = layout.clone();
+    let acquirer = thread::spawn(move || {
+        let lock = locks::test_support::hold_as_owner(&acquirer_layout);
+        drop(lock);
+        Instant::now()
+    });
+    // Give a broken guard the chance to let the acquirer in early.
+    thread::sleep(Duration::from_millis(50));
+    let released_at = Instant::now();
+    finish_tx.send(()).expect("finish inspection");
+    inspector.join().expect("join inspector");
+
+    assert!(acquirer.join().expect("join acquirer") >= released_at);
 }
 
 #[test]
-fn owner_start_lock_concurrent_stale_reclaim_has_single_winner() {
-    let temp = TempDir::new("owner-start-lock-concurrent");
-    let lock_path = temp.path().join("owner-start.lock.d");
-    fs::create_dir(&lock_path).expect("create lock dir");
-    fs::write(lock_path.join("starter.pid"), "0").expect("write stale starter pid");
+fn concurrent_instance_lock_acquisition_has_single_winner() {
+    let temp = TempDir::new("instance-lock-concurrent");
+    let layout = temp_layout(&temp, "vm");
+    locks::test_support::write_instance_lease(
+        &layout,
+        &locks::test_support::lease_for(LeaseRole::Owner, locks::test_support::exited_process()),
+    );
 
     const THREADS: usize = 8;
     let barrier = Arc::new(std::sync::Barrier::new(THREADS));
-    // Pre-fix, this test failed only probabilistically (the race window is
-    // narrow); it exists as the regression guard for the invariant that
-    // exactly one thread may reclaim a stale lock.
-    let winners: Arc<Mutex<Vec<OwnerStartLock>>> = Arc::new(Mutex::new(Vec::new()));
+    let winners: Arc<Mutex<Vec<InstanceLock>>> = Arc::new(Mutex::new(Vec::new()));
     let handles: Vec<_> = (0..THREADS)
         .map(|_| {
-            let lock_path = lock_path.clone();
+            let layout = layout.clone();
             let barrier = Arc::clone(&barrier);
             let winners = Arc::clone(&winners);
             thread::spawn(move || {
                 barrier.wait();
-                if let Ok(Some(lock)) = OwnerStartLock::try_acquire(&lock_path) {
-                    // Keep the winning lock alive until every thread has
-                    // finished: dropping it early would remove the lock dir
-                    // and let a later thread win too.
+                if let Some(lock) = InstanceLock::try_acquire(&layout, LeaseRole::Owner, |_| Ok(()))
+                    .expect("try_acquire should not error")
+                {
                     winners.lock().unwrap().push(lock);
                 }
             })
@@ -789,11 +769,69 @@ fn owner_start_lock_concurrent_stale_reclaim_has_single_winner() {
         handle.join().expect("thread should not panic");
     }
 
-    let winners = Arc::try_unwrap(winners)
-        .unwrap_or_else(|_| panic!("winners still shared"))
-        .into_inner()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    assert_eq!(winners.len(), 1);
+    assert_eq!(winners.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn concurrent_owner_start_lock_acquisition_has_single_winner() {
+    let temp = TempDir::new("owner-start-lock-concurrent");
+    let layout = temp_layout(&temp, "vm");
+
+    const THREADS: usize = 8;
+    let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+    let winners: Arc<Mutex<Vec<OwnerStartLock>>> = Arc::new(Mutex::new(Vec::new()));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let layout = layout.clone();
+            let barrier = Arc::clone(&barrier);
+            let winners = Arc::clone(&winners);
+            thread::spawn(move || {
+                barrier.wait();
+                if let Some(lock) =
+                    OwnerStartLock::try_acquire(&layout).expect("try_acquire should not error")
+                {
+                    winners.lock().unwrap().push(lock);
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("thread should not panic");
+    }
+
+    assert_eq!(winners.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn released_lock_is_reacquirable_and_carries_no_lease() {
+    let temp = TempDir::new("instance-lock-release");
+    let layout = temp_layout(&temp, "vm");
+
+    drop(locks::test_support::hold_as_owner(&layout));
+
+    assert_eq!(
+        instance_lock_state(&layout).expect("inspect lock"),
+        InstanceLockState::Free { stale: None }
+    );
+    drop(locks::test_support::hold_as_owner(&layout));
+}
+
+#[test]
+fn failed_validation_releases_the_lock_and_keeps_the_stale_lease() {
+    let temp = TempDir::new("instance-lock-validation");
+    let layout = temp_layout(&temp, "vm");
+    let dead = locks::test_support::exited_process();
+    locks::test_support::write_instance_lease(
+        &layout,
+        &locks::test_support::lease_for(LeaseRole::Owner, dead),
+    );
+
+    let error = InstanceLock::try_acquire(&layout, LeaseRole::Owner, |_| bail!("not clean"))
+        .expect_err("validation failure propagates");
+
+    assert_eq!(error.to_string(), "not clean");
+    let state = instance_lock_state(&layout).expect("inspect lock");
+    assert_eq!(state.stale_lease().map(|lease| lease.process), Some(dead));
 }
 
 #[test]

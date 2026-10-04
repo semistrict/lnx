@@ -395,9 +395,7 @@ fn running_owner_skips_unused_default_snapshot_version_check() {
     fs::create_dir_all(&snapshot).expect("create snapshot");
     fs::write(snapshot.join("launch.json"), r#"{"version":1}"#)
         .expect("write legacy launch metadata");
-    let owner = runner::BootstrapLock::try_acquire(&layout.run_dir.join("bootstrap.lock.d"))
-        .expect("acquire owner lock")
-        .expect("owner lock");
+    let owner = runner::test_support::hold_as_owner(&layout);
 
     let selected =
         require_default_restore_version_compatibility(Some(snapshot.clone()), false, &layout)
@@ -490,9 +488,7 @@ fn clear_latest_snapshot_refuses_while_owner_is_live() {
         .expect("write failed snapshot outcome");
     let outcome_before = fs::read(layout.snapshot_dir.join(runner::FINAL_SNAPSHOT_OUTCOME))
         .expect("read outcome before clear");
-    let owner = runner::BootstrapLock::try_acquire(&layout.run_dir.join("bootstrap.lock.d"))
-        .expect("acquire owner lock")
-        .expect("owner lock");
+    let owner = runner::test_support::hold_as_owner(&layout);
 
     let error = clear_latest_snapshot(&layout).expect_err("running owner blocks snapshot clear");
 
@@ -530,8 +526,8 @@ fn clear_snapshot_recovery_works_after_split_run_directory_loss() {
 
     assert!(!layout.snapshot_dir.join("latest").exists());
     assert!(
-        layout.run_dir.exists(),
-        "coordination directory is recreated"
+        layout.instance_dir.join(runner::INSTANCE_LOCK).exists(),
+        "coordination lives with the persistent instance state"
     );
     let outcome = runner::read_final_snapshot_outcome(&layout)
         .expect("read clear acknowledgement")
@@ -548,7 +544,7 @@ fn clear_nonexistent_instance_does_not_create_phantom_state() {
 
     assert!(error.to_string().contains("instance does not exist"));
     assert!(!layout.instance_dir.exists());
-    assert!(!layout.run_dir.join("bootstrap.lock.d.guard").exists());
+    assert!(!layout.instance_dir.join(runner::INSTANCE_LOCK).exists());
 }
 
 #[test]
@@ -586,7 +582,7 @@ fn delete_instance_refuses_a_concurrent_state_copy() {
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let holder_layout = layout.clone();
     let holder = std::thread::spawn(move || {
-        runner::with_exclusive_instance_state(&holder_layout, || {
+        runner::with_exclusive_instance_state(&holder_layout, |_| {
             held_tx.send(()).expect("signal held lease");
             release_rx.recv().expect("wait for release");
             Ok(())
@@ -622,7 +618,7 @@ fn set_settings_refuses_a_concurrent_state_operation() {
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let holder_layout = layout.clone();
     let holder = std::thread::spawn(move || {
-        runner::with_exclusive_instance_state(&holder_layout, || {
+        runner::with_exclusive_instance_state(&holder_layout, |_| {
             held_tx.send(()).expect("signal held lease");
             release_rx.recv().expect("wait for release");
             Ok(())
@@ -693,16 +689,13 @@ fn split_delete_recovers_after_only_persistent_state_was_detached() {
     fs::create_dir_all(persistent_trash.join("state")).expect("create detached persistent state");
     fs::write(persistent_trash.join("state/rootfs.ext4"), b"old rootfs")
         .expect("write detached rootfs");
-    let lock = layout.run_dir.join("bootstrap.lock.d");
-    fs::create_dir_all(&lock).expect("create interrupted maintenance lease");
-    let mut exited = std::process::Command::new("/bin/sh")
-        .args(["-c", "exit 0"])
-        .spawn()
-        .expect("spawn short-lived maintenance process");
-    let stale_pid = exited.id();
-    exited.wait().expect("reap maintenance process");
-    fs::write(lock.join("maintenance.pid"), stale_pid.to_string())
-        .expect("write stale maintenance pid");
+    runner::test_support::write_instance_lease(
+        &layout,
+        &runner::test_support::lease_for(
+            runner::LeaseRole::Maintenance,
+            runner::test_support::exited_process(),
+        ),
+    );
 
     delete_resolved_instance(&persistent_base, "dev", &layout)
         .expect("recover interrupted split deletion");

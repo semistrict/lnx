@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -17,7 +17,7 @@ use crate::{
         Layout, ensure_instance_transaction_root, instance_transaction_roots,
         is_instance_transaction_root,
     },
-    runner,
+    runner, status,
 };
 
 const DEFAULT_CPUS: u8 = 2;
@@ -911,10 +911,13 @@ fn set_instance_settings(layout: &Layout, settings: &[String]) -> Result<()> {
     if !layout.instance_dir.exists() {
         bail!("instance not found: {}", layout.instance);
     }
-    let lock_path = layout.run_dir.join("bootstrap.lock.d");
-    let config = runner::with_existing_lock_dir_guard(&lock_path, || {
-        let maintenance_pid = runner::recorded_maintenance_pid_from_lock(&lock_path)?;
-        if maintenance_pid.is_some_and(runner::process_alive) {
+    let config = runner::with_instance_guard(layout, |state| {
+        let maintenance = matches!(
+            state,
+            runner::InstanceLockState::Held { lease: Some(lease) }
+                if lease.role == runner::LeaseRole::Maintenance
+        );
+        if maintenance {
             bail!(
                 "cannot change settings while instance {} has a state operation in progress",
                 layout.instance
@@ -1256,8 +1259,8 @@ fn inspect_instance(layout: &Layout, cpus: u8, memory_mib: u32) -> Result<()> {
     };
     let inspect = serde_json::json!({
         "name": layout.instance,
-        "state": instance_state(layout),
-        "pids": instance_pids(layout),
+        "state": status::instance_state(layout),
+        "pids": status::instance_pids(layout),
         "cpus": cpus,
         "memory_mib": memory_mib,
         "created": config.created,
@@ -1317,12 +1320,16 @@ fn list_instances(base: &Path) -> Result<()> {
         .into_iter()
         .map(|name| {
             let layout = Layout::resolve_in_base(&name, base.to_path_buf(), None, None);
-            let state = instance_state(&layout);
-            let pids = instance_pids(&layout).join(",");
+            let state = status::instance_state(&layout);
+            let pids = status::instance_pids(&layout)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
             Ok(InstanceRow { name, state, pids })
         })
         .collect::<Result<Vec<_>>>()?;
-    instances.sort_by_key(|row| (instance_state_rank(row.state), row.name.clone()));
+    instances.sort_by_key(|row| (row.state, row.name.clone()));
 
     println!("{:<36} {:<12} PIDS", "NAME", "STATE");
     for row in instances {
@@ -1357,12 +1364,11 @@ fn delete_resolved_instance(base: &Path, name: &str, layout: &Layout) -> Result<
     if !layout.instance_dir.exists() && !layout.run_dir.exists() && stale_trash.is_empty() {
         bail!("instance not found: {name}");
     }
-    let state = instance_state(layout);
-    if state == "running" || state == "starting" {
+    if status::instance_state(layout).is_active() {
         terminate_instance_owner(layout)?;
     }
 
-    let detached = runner::with_exclusive_instance_state(layout, || {
+    let detached = runner::with_exclusive_instance_state(layout, |_| {
         let mut planned = Vec::new();
         if let Some(plan) =
             plan_contained_instance_detach(&layout.instance_dir, &persistent_root, name)?
@@ -1392,31 +1398,33 @@ fn delete_resolved_instance(base: &Path, name: &str, layout: &Layout) -> Result<
 }
 
 fn terminate_instance_owner(layout: &Layout) -> Result<()> {
-    let lock_dir = layout.run_dir.join("bootstrap.lock.d");
-    let Some(pid) = alive_owner_pid(&lock_dir) else {
+    let Some(owner) = runner::live_owner(layout) else {
         return Ok(());
     };
+    let owner = owner.process;
+    let owner_alive = || runner::live_owner(layout).is_some_and(|lease| lease.process == owner);
 
-    runner::signal_process_group(pid, libc::SIGTERM)?;
+    owner.signal_group(libc::SIGTERM)?;
     let term_deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < term_deadline {
-        if alive_owner_pid(&lock_dir).is_none() {
+        if !owner_alive() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
     }
 
-    runner::signal_process_group(pid, libc::SIGKILL)?;
+    owner.signal_group(libc::SIGKILL)?;
     let kill_deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < kill_deadline {
-        if alive_owner_pid(&lock_dir).is_none() {
+        if !owner_alive() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
     }
 
     bail!(
-        "owner process {pid} for instance {} did not exit after SIGTERM/SIGKILL; refusing to delete a live instance",
+        "owner process {} for instance {} did not exit after SIGTERM/SIGKILL; refusing to delete a live instance",
+        owner.pid,
         layout.instance
     );
 }
@@ -1537,17 +1545,8 @@ fn remove_contained_instance_dir(dir: &Path, instances_root: &Path, name: &str) 
 
 struct InstanceRow {
     name: String,
-    state: &'static str,
+    state: status::InstanceState,
     pids: String,
-}
-
-fn instance_state_rank(state: &str) -> u8 {
-    match state {
-        "running" => 0,
-        "starting" => 1,
-        "stopped" => 2,
-        _ => 3,
-    }
 }
 
 fn collect_child_dir_names(parent: &Path, names: &mut BTreeSet<String>) -> Result<()> {
@@ -1563,67 +1562,6 @@ fn collect_child_dir_names(parent: &Path, names: &mut BTreeSet<String>) -> Resul
         }
     }
     Ok(())
-}
-
-fn instance_state(layout: &Layout) -> &'static str {
-    let broker = layout.socket(crate::paths::RuntimeSocket::Broker);
-    if broker.exists() && runner::connect_broker(&broker).is_ok() {
-        "running"
-    } else if alive_owner_pid(&layout.run_dir.join("bootstrap.lock.d")).is_some() {
-        "starting"
-    } else if layout.rootfs.exists() {
-        "stopped"
-    } else {
-        "partial"
-    }
-}
-
-fn instance_pids(layout: &Layout) -> Vec<String> {
-    let mut pids = BTreeMap::new();
-    if let Some(pid) = alive_owner_pid(&layout.run_dir.join("bootstrap.lock.d")) {
-        pids.insert(pid, ());
-    }
-    for pid in host_pids_for_instance(&layout.instance) {
-        pids.insert(pid, ());
-    }
-    pids.keys().map(ToString::to_string).collect()
-}
-
-fn alive_owner_pid(lock_dir: &Path) -> Option<i32> {
-    let pid = fs::read_to_string(lock_dir.join("owner.pid"))
-        .ok()?
-        .trim()
-        .parse::<i32>()
-        .ok()?;
-    process_alive(pid).then_some(pid)
-}
-
-fn host_pids_for_instance(instance: &str) -> Vec<i32> {
-    let output = ProcessCommand::new("pgrep")
-        .arg("-f")
-        .arg(format!("--instance[= ]{instance}"))
-        .output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().parse::<i32>().ok())
-        .filter(|pid| *pid != std::process::id() as i32 && process_alive(*pid))
-        .collect()
-}
-
-fn process_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    unsafe {
-        libc::kill(pid, 0) == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2654,12 +2592,10 @@ fn clear_latest_snapshot(layout: &Layout) -> Result<()> {
     fs::create_dir_all(&layout.snapshot_dir)
         .with_context(|| format!("create {}", layout.snapshot_dir.display()))?;
     let latest = layout.snapshot_dir.join("latest");
-    let lock_path = layout.run_dir.join("bootstrap.lock.d");
-    let detached = runner::with_unowned_bootstrap_lock(&lock_path, || {
-        let recorded_pid = runner::recorded_owner_pid_from_lock(&lock_path)
-            .ok()
-            .flatten()
-            .and_then(|pid| u32::try_from(pid).ok());
+    let detached = runner::with_exclusive_instance_state(layout, |stale| {
+        let recorded_pid = stale
+            .filter(|lease| lease.role == runner::LeaseRole::Owner)
+            .and_then(|lease| u32::try_from(lease.pid()).ok());
         let outcome = runner::read_final_snapshot_outcome(layout).ok().flatten();
         let acknowledged_pid = recorded_pid.or_else(|| outcome.as_ref().map(|outcome| outcome.pid));
         let mut targets = vec![
@@ -2719,9 +2655,9 @@ fn clear_latest_snapshot(layout: &Layout) -> Result<()> {
     Ok(())
 }
 
-/// Atomically detaches snapshot state while the owner guard is held. Recursive
-/// deletion happens after the guard is released so a large snapshot cannot
-/// stall unrelated owner lock operations.
+/// Atomically detaches snapshot state while the instance lock is held.
+/// Recursive deletion happens after the lock is released so a large snapshot
+/// cannot keep the instance from starting.
 fn detach_snapshot_paths(targets: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut stale_trash = Vec::new();
     for target in targets {

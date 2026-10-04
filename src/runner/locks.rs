@@ -1,41 +1,119 @@
-use std::fs;
+//! Instance locks.
+//!
+//! Every lock is an `flock(2)` on a file inside the instance directory, so the
+//! kernel releases it when the holder exits, however it exits. A holder
+//! records who it is (a [`Lease`]) inside the lock file; the record is only
+//! trusted while the lock is held, and it names the holder by pid *and*
+//! process start time so a recycled pid is never mistaken for the holder.
+//!
+//! Two locks protect an instance:
+//!
+//! - `instance.lock` is held exclusively by whoever may mutate the instance's
+//!   state: the VM owner for its whole lifetime, or a maintenance command
+//!   (snapshot clear, checkpoint delete, instance delete, state copy) while
+//!   the instance is stopped. Acquiring and inspecting it happen under
+//!   `instance.lock.guard`, a short-lived lock that makes "inspect, then act"
+//!   sequences atomic with respect to other acquirers.
+//! - `owner-start.lock` serializes clients that spawn a new VM owner.
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use lnx_protocol::PROTOCOL_VERSION;
+use serde::{Deserialize, Serialize};
 
-use super::json_escape;
+use crate::paths::Layout;
 
-pub(crate) fn owner_pid_from_lock(lock_path: &Path) -> Option<libc::pid_t> {
-    let pid = recorded_owner_pid_from_lock(lock_path).ok().flatten()?;
-    process_alive(pid).then_some(pid)
+pub(crate) const INSTANCE_LOCK: &str = "instance.lock";
+pub(crate) const INSTANCE_LOCK_GUARD: &str = "instance.lock.guard";
+pub(crate) const OWNER_START_LOCK: &str = "owner-start.lock";
+pub(crate) const LOCK_FILES: [&str; 3] = [INSTANCE_LOCK, INSTANCE_LOCK_GUARD, OWNER_START_LOCK];
+
+const GUARD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A process named so that it cannot be confused with a later process that
+/// happens to reuse its pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProcessIdentity {
+    pub(crate) pid: libc::pid_t,
+    /// Opaque, platform-specific start time of the process.
+    pub(crate) started: u64,
 }
 
-pub(crate) fn recorded_owner_pid_from_lock(lock_path: &Path) -> Result<Option<libc::pid_t>> {
-    let path = lock_path.join("owner.pid");
-    let value = match fs::read_to_string(&path) {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
-    };
-    let pid = value
-        .trim()
-        .parse::<libc::pid_t>()
-        .with_context(|| format!("parse {}", path.display()))?;
-    if pid <= 0 {
-        bail!("invalid owner pid {pid} in {}", path.display());
+impl ProcessIdentity {
+    pub(crate) fn current() -> Self {
+        static CURRENT: OnceLock<ProcessIdentity> = OnceLock::new();
+        *CURRENT.get_or_init(|| {
+            let pid = std::process::id() as libc::pid_t;
+            Self::of(pid).unwrap_or(Self { pid, started: 0 })
+        })
     }
-    Ok(Some(pid))
+
+    /// The identity of the process currently running as `pid`, if any.
+    pub(crate) fn of(pid: libc::pid_t) -> Option<Self> {
+        if pid <= 0 {
+            return None;
+        }
+        process_start_time(pid).map(|started| Self { pid, started })
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        Self::of(self.pid).is_some_and(|current| current == *self)
+    }
+
+    /// Signals the process group led by this process (falling back to the
+    /// process alone), unless the process has already exited.
+    pub(crate) fn signal_group(&self, signal: libc::c_int) -> Result<()> {
+        if !self.is_running() {
+            return Ok(());
+        }
+        signal_process_group(self.pid, signal)
+    }
+
+    pub(crate) fn signal(&self, signal: libc::c_int) -> Result<()> {
+        if !self.is_running() {
+            return Ok(());
+        }
+        signal_process(self.pid, signal)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_time(pid: libc::pid_t) -> Option<u64> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (written == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: libc::pid_t) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name (field 2) may contain spaces and parentheses; the
+    // remaining fields follow the last ')'. Start time is field 22.
+    let fields = stat.get(stat.rfind(')')? + 1..)?;
+    fields.split_whitespace().nth(19)?.parse().ok()
 }
 
 pub(crate) fn signal_process_group(pid: libc::pid_t, signal: libc::c_int) -> Result<()> {
     if pid <= 0 {
         bail!("invalid owner pid: {pid}");
     }
-    let pgid = -pid;
-    let rc = unsafe { libc::kill(pgid, signal) };
+    let rc = unsafe { libc::kill(-pid, signal) };
     if rc == 0 {
         return Ok(());
     }
@@ -58,339 +136,294 @@ pub(crate) fn signal_process(pid: libc::pid_t, signal: libc::c_int) -> Result<()
     Err(std::io::Error::last_os_error()).with_context(|| format!("signal process {pid}"))
 }
 
-pub(crate) struct BootstrapLock {
-    path: PathBuf,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LeaseRole {
+    /// A VM owner process; holds the instance lock for its whole lifetime.
+    Owner,
+    /// A command operating on the stopped instance's state.
+    Maintenance,
+    /// A client spawning a new VM owner.
+    Starter,
 }
 
-pub(crate) struct OwnerStartLock {
-    path: PathBuf,
+/// Who holds a lock, as recorded by the holder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Lease {
+    pub(crate) role: LeaseRole,
+    pub(crate) process: ProcessIdentity,
+    pub(crate) protocol_version: u16,
+    pub(crate) agent_source_stamp: String,
+    pub(crate) binary_path: String,
 }
 
-pub(crate) struct InstanceStateLock {
-    path: PathBuf,
-}
-
-pub(crate) enum BootstrapOutcome {
-    Lock(BootstrapLock),
-    Status(i32),
-}
-
-pub(crate) enum OwnerStartOutcome {
-    Lock(OwnerStartLock),
-    Status(i32),
-}
-
-impl BootstrapLock {
-    #[cfg(test)]
-    pub(crate) fn try_acquire(path: &Path) -> Result<Option<Self>> {
-        Self::try_acquire_validated(path, || Ok(()))
+impl Lease {
+    fn for_current_process(role: LeaseRole) -> Self {
+        Self {
+            role,
+            process: ProcessIdentity::current(),
+            protocol_version: PROTOCOL_VERSION,
+            agent_source_stamp: env!("LNX_AGENT_SOURCE_STAMP").to_string(),
+            binary_path: std::env::current_exe()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        }
     }
 
-    pub(crate) fn try_acquire_validated(
-        path: &Path,
-        validate: impl FnOnce() -> Result<()>,
-    ) -> Result<Option<Self>> {
-        try_acquire_lock_dir(path, bootstrap_lock_is_stale, validate, write_owner_lease).map(
-            |acquired| {
-                acquired.then(|| Self {
-                    path: path.to_path_buf(),
-                })
-            },
-        )
+    pub(crate) fn pid(&self) -> libc::pid_t {
+        self.process.pid
     }
 }
 
-fn lock_dir_guard_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".guard");
-    path.with_file_name(name)
+/// An exclusive `flock` on a lock file, released when dropped.
+#[derive(Debug)]
+struct HeldLock {
+    file: File,
+    path: PathBuf,
+    /// Whether releasing the lock erases the lease in it.
+    clear_lease_on_release: bool,
 }
 
-pub(crate) fn with_lock_dir_guard<T>(path: &Path, action: impl FnOnce() -> Result<T>) -> Result<T> {
-    with_lock_dir_guard_inner(path, true, action)
+impl HeldLock {
+    fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        let file = open_lock_file(path)?;
+        match flock(&file, libc::LOCK_EX | libc::LOCK_NB)? {
+            true => Ok(Some(Self {
+                file,
+                path: path.to_path_buf(),
+                clear_lease_on_release: true,
+            })),
+            false => Ok(None),
+        }
+    }
+
+    fn acquire_with_timeout(path: &Path, timeout: Duration) -> Result<Self> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(lock) = Self::try_acquire(path)? {
+                return Ok(lock);
+            }
+            if Instant::now() >= deadline {
+                bail!("timed out waiting for lock {}", path.display());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn write_lease(&mut self, lease: &Lease) -> Result<()> {
+        let mut content = serde_json::to_vec(lease).context("encode lease")?;
+        content.push(b'\n');
+        self.file
+            .set_len(0)
+            .and_then(|()| self.file.seek(SeekFrom::Start(0)).map(drop))
+            .and_then(|()| self.file.write_all(&content))
+            .with_context(|| format!("write lease {}", self.path.display()))
+    }
+
+    fn read_lease(&mut self) -> Result<Option<Lease>> {
+        read_lease_from(&mut self.file, &self.path)
+    }
 }
 
-pub(crate) fn with_existing_lock_dir_guard<T>(
-    path: &Path,
-    action: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    with_lock_dir_guard_inner(path, false, action)
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        // A cleanly released lock carries no lease; a lease left behind
+        // therefore names a holder that died while holding the lock.
+        if self.clear_lease_on_release {
+            let _ = self.file.set_len(0);
+        }
+    }
 }
 
-fn with_lock_dir_guard_inner<T>(
-    path: &Path,
-    create_parent: bool,
-    action: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    let guard_path = lock_dir_guard_path(path);
-    if create_parent && let Some(parent) = guard_path.parent() {
+fn open_lock_file(path: &Path) -> Result<File> {
+    if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let guard = fs::OpenOptions::new()
+    OpenOptions::new()
+        .read(true)
+        .write(true)
         .create(true)
         .truncate(false)
-        .write(true)
-        .open(&guard_path)
-        .with_context(|| format!("open {}", guard_path.display()))?;
-    lock_file_with_timeout(&guard, Duration::from_secs(5))
-        .with_context(|| format!("lock {}", guard_path.display()))?;
-    let result = action();
-    let _ = unlock_file(&guard);
-    result
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open lock {}", path.display()))
 }
 
-fn lock_file_with_timeout(file: &fs::File, timeout: Duration) -> std::io::Result<()> {
-    let deadline = Instant::now() + timeout;
+/// Returns whether the lock was taken; `false` means another holder has it.
+fn flock(file: &File, operation: libc::c_int) -> Result<bool> {
     loop {
-        if Instant::now() >= deadline {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "timed out waiting for lock-directory guard",
-            ));
-        }
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(());
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(true);
         }
         let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::Interrupted {
-            continue;
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => return Ok(false),
+            _ => return Err(error).context("flock"),
         }
-        let would_block = matches!(
-            error.raw_os_error(),
-            Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK
-        );
-        if !would_block {
-            return Err(error);
-        }
-        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn try_acquire_lock_dir(
-    path: &Path,
-    is_stale: impl Fn(&Path) -> Result<bool>,
-    validate: impl FnOnce() -> Result<()>,
-    write_lease: impl Fn(&Path) -> Result<()>,
-) -> Result<bool> {
-    with_lock_dir_guard(path, || {
-        if path.exists() && !is_stale(path)? {
-            return Ok(false);
-        }
-        validate()?;
-        if path.exists() {
-            fs::remove_dir_all(path)
-                .with_context(|| format!("remove stale lock {}", path.display()))?;
-        }
-        fs::create_dir(path).with_context(|| format!("create {}", path.display()))?;
-        if let Err(error) = write_lease(path) {
-            let _ = fs::remove_dir_all(path);
-            return Err(error);
-        }
-        Ok(true)
-    })
+fn read_lease_from(file: &mut File, path: &Path) -> Result<Option<Lease>> {
+    let mut content = String::new();
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.read_to_string(&mut content))
+        .with_context(|| format!("read lease {}", path.display()))?;
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+    // A holder killed mid-write leaves a torn record; it names nobody.
+    Ok(serde_json::from_str(content.trim()).ok())
 }
 
-/// Removes a stale directory lock without claiming it.
+pub(crate) fn instance_lock_path(layout: &Layout) -> PathBuf {
+    layout.instance_dir.join(INSTANCE_LOCK)
+}
+
+fn instance_guard_path(layout: &Layout) -> PathBuf {
+    layout.instance_dir.join(INSTANCE_LOCK_GUARD)
+}
+
+pub(crate) fn owner_start_lock_path(layout: &Layout) -> PathBuf {
+    layout.instance_dir.join(OWNER_START_LOCK)
+}
+
+/// The instance lock as seen by someone who does not hold it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InstanceLockState {
+    /// Nobody holds the lock. `stale` is the lease a holder left behind when
+    /// it died without releasing cleanly, if any.
+    Free { stale: Option<Lease> },
+    /// A live process holds the lock. `lease` is `None` only in the instant
+    /// between a holder taking the lock and recording itself.
+    Held { lease: Option<Lease> },
+}
+
+impl InstanceLockState {
+    pub(crate) fn live_owner(&self) -> Option<&Lease> {
+        match self {
+            Self::Held { lease: Some(lease) } if lease.role == LeaseRole::Owner => Some(lease),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_held(&self) -> bool {
+        matches!(self, Self::Held { .. })
+    }
+
+    /// The lease of a holder that died while holding the lock.
+    pub(crate) fn stale_lease(&self) -> Option<&Lease> {
+        match self {
+            Self::Free { stale } => stale.as_ref(),
+            Self::Held { .. } => None,
+        }
+    }
+}
+
+/// Runs `action` while no other process can acquire or release-and-reacquire
+/// the instance lock, passing it the lock's current state.
 ///
-/// This uses the same sidecar guard as stale reclamation and re-checks the
-/// lease while holding that guard. A caller may therefore act on an earlier
-/// stale observation without deleting a fresh lease installed in the
-/// meantime.
-#[cfg(test)]
-pub(crate) fn remove_stale_lock_dir(
-    path: &Path,
-    is_stale: impl Fn(&Path) -> Result<bool>,
-) -> Result<bool> {
-    with_lock_dir_guard(path, || {
-        if !path.exists() {
-            return Ok(false);
-        }
-        if !is_stale(path)? {
-            return Ok(false);
-        }
-        fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))?;
-        Ok(true)
-    })
-}
-
-pub(crate) fn with_unowned_bootstrap_lock<T>(
-    path: &Path,
-    action: impl FnOnce() -> Result<T>,
-) -> Result<Option<T>> {
-    with_lock_dir_guard(path, || {
-        if path.exists() && !bootstrap_lock_is_stale(path)? {
-            return Ok(None);
-        }
-        let result = action()?;
-        if path.exists() {
-            fs::remove_dir_all(path)
-                .with_context(|| format!("remove stale lock {}", path.display()))?;
-        }
-        Ok(Some(result))
-    })
-}
-
-impl Drop for BootstrapLock {
-    fn drop(&mut self) {
-        release_lock_dir(&self.path, "owner.pid", &["owner.pid", "owner.json"]);
+/// Inspecting an instance never creates it: without an instance directory
+/// there is nothing to guard and nobody can hold the lock.
+pub(crate) fn with_instance_guard<T>(
+    layout: &Layout,
+    action: impl FnOnce(&InstanceLockState) -> Result<T>,
+) -> Result<T> {
+    if !layout.instance_dir.exists() {
+        return action(&InstanceLockState::Free { stale: None });
     }
+    let _guard = HeldLock::acquire_with_timeout(&instance_guard_path(layout), GUARD_TIMEOUT)?;
+    let state = probe_instance_lock(layout)?;
+    action(&state)
 }
 
-impl InstanceStateLock {
-    pub(crate) fn try_acquire_validated(
-        path: &Path,
-        validate: impl FnOnce() -> Result<()>,
+/// Must only be called while holding the instance guard, so that the probe
+/// cannot make a concurrent acquirer see the lock as busy.
+fn probe_instance_lock(layout: &Layout) -> Result<InstanceLockState> {
+    let path = instance_lock_path(layout);
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(InstanceLockState::Free { stale: None });
+        }
+        Err(error) => return Err(error).with_context(|| format!("open lock {}", path.display())),
+    };
+    let free = flock(&file, libc::LOCK_SH | libc::LOCK_NB)?;
+    let lease = read_lease_from(&mut file, &path)?;
+    // Dropping `file` releases the probe's shared lock.
+    Ok(if free {
+        InstanceLockState::Free { stale: lease }
+    } else {
+        InstanceLockState::Held { lease }
+    })
+}
+
+pub(crate) fn instance_lock_state(layout: &Layout) -> Result<InstanceLockState> {
+    with_instance_guard(layout, |state| Ok(state.clone()))
+}
+
+/// The live VM owner of an instance, if one is running.
+pub(crate) fn live_owner(layout: &Layout) -> Option<Lease> {
+    instance_lock_state(layout)
+        .ok()
+        .and_then(|state| state.live_owner().cloned())
+}
+
+/// Exclusive ownership of an instance's mutable state.
+#[derive(Debug)]
+pub(crate) struct InstanceLock {
+    _held: HeldLock,
+}
+
+impl InstanceLock {
+    /// Takes the instance lock for `role` unless another live process holds
+    /// it. `validate` runs after the lock is taken but before the new lease
+    /// replaces any stale one, so it can inspect what a dead holder left.
+    /// When it fails, the lock is released again and the error returned.
+    pub(crate) fn try_acquire(
+        layout: &Layout,
+        role: LeaseRole,
+        validate: impl FnOnce(Option<&Lease>) -> Result<()>,
     ) -> Result<Option<Self>> {
-        try_acquire_lock_dir(path, bootstrap_lock_is_stale, validate, |path| {
-            write_pid_file(path, "maintenance.pid")
-        })
-        .map(|acquired| {
-            acquired.then(|| Self {
-                path: path.to_path_buf(),
-            })
-        })
+        let _guard = HeldLock::acquire_with_timeout(&instance_guard_path(layout), GUARD_TIMEOUT)?;
+        let Some(mut held) = HeldLock::try_acquire(&instance_lock_path(layout))? else {
+            return Ok(None);
+        };
+        let stale = held.read_lease()?;
+        if let Err(error) = validate(stale.as_ref()) {
+            // Leave the stale lease in place for whoever acts on the error.
+            held.clear_lease_on_release = false;
+            return Err(error);
+        }
+        held.write_lease(&Lease::for_current_process(role))?;
+        Ok(Some(Self { _held: held }))
     }
 }
 
-impl Drop for InstanceStateLock {
-    fn drop(&mut self) {
-        release_lock_dir(&self.path, "maintenance.pid", &["maintenance.pid"]);
-    }
+/// Serializes clients that spawn a VM owner for one instance.
+#[derive(Debug)]
+pub(crate) struct OwnerStartLock {
+    _held: HeldLock,
 }
 
 impl OwnerStartLock {
-    pub(crate) fn try_acquire(path: &Path) -> Result<Option<Self>> {
-        try_acquire_lock_dir(
-            path,
-            owner_start_lock_is_stale,
-            || Ok(()),
-            |p| write_pid_file(p, "starter.pid"),
-        )
-        .map(|acquired| {
-            acquired.then(|| Self {
-                path: path.to_path_buf(),
-            })
-        })
+    pub(crate) fn try_acquire(layout: &Layout) -> Result<Option<Self>> {
+        let Some(mut held) = HeldLock::try_acquire(&owner_start_lock_path(layout))? else {
+            return Ok(None);
+        };
+        held.write_lease(&Lease::for_current_process(LeaseRole::Starter))?;
+        Ok(Some(Self { _held: held }))
     }
 }
 
-impl Drop for OwnerStartLock {
-    fn drop(&mut self) {
-        release_lock_dir(&self.path, "starter.pid", &["starter.pid"]);
-    }
-}
-
-fn release_lock_dir(path: &Path, pid_file: &str, lease_files: &[&str]) {
-    if !path.exists() {
-        return;
-    }
-    let expected_pid = std::process::id() as libc::pid_t;
-    let _ = with_existing_lock_dir_guard(path, || {
-        let recorded_pid = fs::read_to_string(path.join(pid_file))
-            .ok()
-            .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok());
-        if recorded_pid != Some(expected_pid) {
-            return Ok(());
-        }
-        for lease_file in lease_files {
-            let _ = fs::remove_file(path.join(lease_file));
-        }
-        let _ = fs::remove_dir(path);
-        Ok(())
-    });
-}
-
-pub(crate) fn write_pid_file(path: &Path, name: &str) -> Result<()> {
-    let file = path.join(name);
-    fs::write(&file, std::process::id().to_string())
-        .with_context(|| format!("write {}", file.display()))
-}
-
-pub(crate) fn write_owner_lease(path: &Path) -> Result<()> {
-    let pid = std::process::id();
-    write_pid_file(path, "owner.pid")?;
-    let exe = std::env::current_exe()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| String::new());
-    let lease = format!(
-        "{{\"pid\":{pid},\"protocol_version\":{},\"agent_source_stamp\":\"{}\",\"binary_path\":\"{}\"}}\n",
-        PROTOCOL_VERSION,
-        json_escape(env!("LNX_AGENT_SOURCE_STAMP")),
-        json_escape(&exe)
-    );
-    fs::write(path.join("owner.json"), lease)
-        .with_context(|| format!("write {}", path.join("owner.json").display()))?;
-    Ok(())
-}
-
-pub(crate) fn bootstrap_lock_is_stale(path: &Path) -> Result<bool> {
-    let owner_pid = path.join("owner.pid");
-    if let Ok(pid) = fs::read_to_string(&owner_pid) {
-        if let Ok(pid) = pid.trim().parse::<libc::pid_t>() {
-            return Ok(!process_alive(pid));
-        }
-        return Ok(true);
-    }
-
-    let maintenance_pid = path.join("maintenance.pid");
-    if let Ok(pid) = fs::read_to_string(&maintenance_pid) {
-        if let Ok(pid) = pid.trim().parse::<libc::pid_t>() {
-            return Ok(!process_alive(pid));
-        }
-        return Ok(true);
-    }
-
-    let modified = fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?
-        .modified()
-        .with_context(|| format!("stat modified time {}", path.display()))?;
-    Ok(modified.elapsed().unwrap_or_default() > Duration::from_secs(10))
-}
-
-pub(crate) fn recorded_maintenance_pid_from_lock(path: &Path) -> Result<Option<libc::pid_t>> {
-    let pid_path = path.join("maintenance.pid");
-    let value = match fs::read_to_string(&pid_path) {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("read {}", pid_path.display())),
-    };
-    let pid = value
-        .trim()
-        .parse::<libc::pid_t>()
-        .with_context(|| format!("parse {}", pid_path.display()))?;
-    if pid <= 0 {
-        bail!("invalid maintenance pid {pid} in {}", pid_path.display());
-    }
-    Ok(Some(pid))
-}
-
-pub(crate) fn owner_start_lock_is_stale(path: &Path) -> Result<bool> {
-    let starter_pid = path.join("starter.pid");
-    if let Ok(pid) = fs::read_to_string(&starter_pid) {
-        if let Ok(pid) = pid.trim().parse::<libc::pid_t>() {
-            return Ok(!process_alive(pid));
-        }
-        return Ok(true);
-    }
-
-    let modified = fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?
-        .modified()
-        .with_context(|| format!("stat modified time {}", path.display()))?;
-    Ok(modified.elapsed().unwrap_or_default() > Duration::from_secs(10))
-}
-
-pub(crate) fn process_alive(pid: libc::pid_t) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    unsafe {
-        libc::kill(pid, 0) == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-}
-
-pub(crate) fn lock_file(file: &fs::File) -> std::io::Result<()> {
+/// An advisory lock on an already-open file, for single-file critical
+/// sections such as the timing-log state.
+pub(crate) fn lock_file(file: &File) -> std::io::Result<()> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
         Ok(())
     } else {
@@ -398,10 +431,100 @@ pub(crate) fn lock_file(file: &fs::File) -> std::io::Result<()> {
     }
 }
 
-pub(crate) fn unlock_file(file: &fs::File) -> std::io::Result<()> {
+pub(crate) fn unlock_file(file: &File) -> std::io::Result<()> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::process::{Child, Command, Stdio};
+
+    use super::*;
+
+    /// Takes the instance lock as a VM owner in this process.
+    pub(crate) fn hold_as_owner(layout: &Layout) -> InstanceLock {
+        InstanceLock::try_acquire(layout, LeaseRole::Owner, |_| Ok(()))
+            .expect("acquire instance lock")
+            .expect("instance lock is free")
+    }
+
+    pub(crate) fn lease_for(role: LeaseRole, process: ProcessIdentity) -> Lease {
+        Lease {
+            process,
+            ..Lease::for_current_process(role)
+        }
+    }
+
+    /// Records `lease` in the instance lock file without taking the lock,
+    /// as a holder that died while holding the lock leaves it, or as a live
+    /// holder that has not finished recording itself would.
+    pub(crate) fn write_instance_lease(layout: &Layout, lease: &Lease) {
+        let path = instance_lock_path(layout);
+        let mut file = open_lock_file(&path).expect("open instance lock");
+        let mut content = serde_json::to_vec(lease).expect("encode lease");
+        content.push(b'\n');
+        file.set_len(0).expect("truncate lease");
+        file.write_all(&content).expect("write lease");
+    }
+
+    /// The identity of a process that has exited and been reaped.
+    pub(crate) fn exited_process() -> ProcessIdentity {
+        let mut child = Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn short-lived process");
+        let identity = ProcessIdentity::of(child.id() as libc::pid_t).expect("child identity");
+        child.kill().expect("kill short-lived process");
+        child.wait().expect("reap short-lived process");
+        identity
+    }
+
+    /// A separate process holding the instance lock, recorded as `role`.
+    /// `term_handler` is the Perl body of its SIGTERM handler; the kernel
+    /// releases the lock when the process exits.
+    pub(crate) struct ForeignHolder {
+        pub(crate) child: Child,
+        pub(crate) process: ProcessIdentity,
+    }
+
+    pub(crate) fn spawn_foreign_holder(
+        layout: &Layout,
+        role: LeaseRole,
+        term_handler: &str,
+    ) -> ForeignHolder {
+        let path = instance_lock_path(layout);
+        drop(open_lock_file(&path).expect("create instance lock"));
+        let script = format!(
+            r#"use Fcntl qw(:flock);
+               open(my $lock, "+<", $ARGV[0]) or die "open: $!";
+               flock($lock, LOCK_EX) or die "flock: $!";
+               $SIG{{TERM}} = sub {{ {term_handler} }};
+               $| = 1; print "locked\n";
+               sleep 1 while 1;"#
+        );
+        let mut child = Command::new("/usr/bin/perl")
+            .arg("-e")
+            .arg(script)
+            .arg(&path)
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn lock holder");
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.as_mut().expect("holder stdout")),
+            &mut ready,
+        )
+        .expect("read holder readiness");
+        assert_eq!(ready, "locked\n");
+        let process = ProcessIdentity::of(child.id() as libc::pid_t).expect("holder identity");
+        write_instance_lease(layout, &lease_for(role, process));
+        ForeignHolder { child, process }
+    }
+
+    use std::os::unix::process::CommandExt;
 }

@@ -249,7 +249,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
 
     preflight_fresh_owner_network(&config, &run_log)?;
     let start_lock = match acquire_owner_start_or_run_client(
-        &config.layout.run_dir.join("owner-start.lock.d"),
+        &config.layout,
         &broker_socket,
         &config.command,
         &config.cwd,
@@ -288,64 +288,43 @@ pub fn run(config: RunConfig) -> Result<i32> {
     Ok(status)
 }
 
-/// Validates recovery state before any path can discard it. A live owner
-/// legitimately owns in-progress state; once no owner is live, missing or
-/// failed final-snapshot state requires explicit acknowledgement.
+/// Validates recovery state before any path can discard it. A live holder of
+/// the instance lock legitimately owns in-progress state; once nobody holds
+/// it, missing or failed final-snapshot state requires explicit
+/// acknowledgement. Returns whether the instance is currently held.
 pub(crate) fn validate_restore_work_for_command(layout: &Layout) -> Result<bool> {
-    let lock_path = layout.run_dir.join("bootstrap.lock.d");
-    with_lock_dir_guard(&lock_path, || {
-        validate_recovery_state_locked(layout, &lock_path)
-    })
+    with_instance_guard(layout, |state| validate_recovery_state(layout, state))
 }
 
-fn validate_recovery_state_locked(layout: &Layout, lock_path: &Path) -> Result<bool> {
-    let recorded_pid = recorded_owner_pid_from_lock(lock_path).with_context(|| {
-        format!(
-            "owner lease is corrupt; recovery: lnx --instance {} snapshots clear to acknowledge and explicitly cold-boot",
-            layout.instance
-        )
-    })?;
-    if recorded_pid.is_some_and(process_alive) {
-        return Ok(true);
-    }
-    let maintenance_pid = recorded_maintenance_pid_from_lock(lock_path).with_context(|| {
-        format!(
-            "maintenance lease is corrupt; recovery: lnx --instance {} snapshots clear to acknowledge and explicitly cold-boot",
-            layout.instance
-        )
-    })?;
-    if maintenance_pid.is_some_and(process_alive) {
+fn validate_recovery_state(layout: &Layout, state: &InstanceLockState) -> Result<bool> {
+    if state.is_held() {
         return Ok(true);
     }
     refuse_active_restore_work(layout)?;
-    if lock_path.exists() && recorded_pid.is_none() && maintenance_pid.is_none() {
-        bail!(
-            "instance {} has an incomplete owner lease at {}; run lnx --instance {} snapshots clear to acknowledge and explicitly cold-boot",
-            layout.instance,
-            lock_path.display(),
-            layout.instance
-        );
-    }
-    let expected_pid = recorded_pid
-        .map(u32::try_from)
+    let expected_pid = state
+        .stale_lease()
+        .filter(|lease| lease.role == LeaseRole::Owner)
+        .map(|lease| u32::try_from(lease.pid()))
         .transpose()
         .context("owner pid does not fit final snapshot outcome")?;
     validate_final_snapshot_outcome(layout, expected_pid)?;
     Ok(false)
 }
 
-fn try_acquire_validated_bootstrap(
+/// Takes the instance lock for a stopped instance whose recovery state is
+/// clean, recording `role` as the holder.
+fn try_acquire_validated_instance(
     layout: &Layout,
-    lock_path: &Path,
-) -> Result<Option<BootstrapLock>> {
-    BootstrapLock::try_acquire_validated(lock_path, || {
-        if validate_recovery_state_locked(layout, lock_path)? {
-            bail!(
-                "instance {} acquired a live VM owner while exclusive startup was being validated",
-                layout.instance
-            );
-        }
-        Ok(())
+    role: LeaseRole,
+) -> Result<Option<InstanceLock>> {
+    InstanceLock::try_acquire(layout, role, |stale| {
+        validate_recovery_state(
+            layout,
+            &InstanceLockState::Free {
+                stale: stale.cloned(),
+            },
+        )
+        .map(drop)
     })
 }
 
@@ -353,17 +332,7 @@ pub(crate) fn with_validated_stopped_instance<T>(
     layout: &Layout,
     action: impl FnOnce() -> Result<T>,
 ) -> Result<Option<T>> {
-    let lock_path = layout.run_dir.join("bootstrap.lock.d");
-    let Some(state_lock) = InstanceStateLock::try_acquire_validated(&lock_path, || {
-        if validate_recovery_state_locked(layout, &lock_path)? {
-            bail!(
-                "instance {} became busy while stopped-state access was being reserved",
-                layout.instance
-            );
-        }
-        Ok(())
-    })?
-    else {
+    let Some(state_lock) = try_acquire_validated_instance(layout, LeaseRole::Maintenance)? else {
         return Ok(None);
     };
     let result = action();
@@ -375,15 +344,22 @@ pub(crate) fn with_validated_stopped_instance<T>(
 /// destroys it. Unlike `with_validated_stopped_instance`, this does not require
 /// recoverable snapshot state because deleting the instance is itself the
 /// explicit destructive action.
+///
+/// `action` receives the lease of a holder that died holding the lock, if
+/// any, so recovery commands can acknowledge what that holder left behind.
 pub(crate) fn with_exclusive_instance_state<T>(
     layout: &Layout,
-    action: impl FnOnce() -> Result<T>,
+    action: impl FnOnce(Option<&Lease>) -> Result<T>,
 ) -> Result<Option<T>> {
-    let lock_path = layout.run_dir.join("bootstrap.lock.d");
-    let Some(state_lock) = InstanceStateLock::try_acquire_validated(&lock_path, || Ok(()))? else {
+    let mut stale = None;
+    let Some(state_lock) = InstanceLock::try_acquire(layout, LeaseRole::Maintenance, |lease| {
+        stale = lease.cloned();
+        Ok(())
+    })?
+    else {
         return Ok(None);
     };
-    let result = action();
+    let result = action(stale.as_ref());
     drop(state_lock);
     result.map(Some)
 }
@@ -418,22 +394,13 @@ fn prepare_fresh_owner_slot(
 }
 
 fn wait_for_fresh_owner_slot(layout: &Layout, run_log: &RunLog) -> Result<()> {
-    let lock_path = layout.run_dir.join("bootstrap.lock.d");
     let start = Instant::now();
     let mut logged_wait = false;
-    while lock_path.exists() {
-        if owner_pid_from_lock(&lock_path).is_none() {
-            validate_restore_work_for_command(layout)?;
-            run_log.line(format!(
-                "fresh_owner.slot.stale_lock.validated lock={}",
-                lock_path.display()
-            ));
-            return Ok(());
-        }
+    while validate_restore_work_for_command(layout)? {
         if !logged_wait {
             run_log.line(format!(
                 "fresh_owner.slot.wait lock={} timeout_ms={}",
-                lock_path.display(),
+                instance_lock_path(layout).display(),
                 FRESH_OWNER_SLOT_TIMEOUT.as_millis()
             ));
             logged_wait = true;
@@ -450,42 +417,44 @@ fn wait_for_fresh_owner_slot(layout: &Layout, run_log: &RunLog) -> Result<()> {
 }
 
 fn replace_existing_owner(layout: &Layout, run_log: &RunLog) -> Result<()> {
-    let lock_path = layout.run_dir.join("bootstrap.lock.d");
-    let Some(pid) = owner_pid_from_lock(&lock_path) else {
+    let Some(owner) = live_owner(layout) else {
         validate_restore_work_for_command(layout)?;
         return Ok(());
     };
+    let owner = owner.process;
     run_log.line(format!(
-        "owner.replace.term pid={pid} instance={}",
-        layout.instance
+        "owner.replace.term pid={} instance={}",
+        owner.pid, layout.instance
     ));
-    signal_process(pid, libc::SIGTERM)?;
+    owner.signal(libc::SIGTERM)?;
     let deadline = Instant::now() + OWNER_REPLACE_GRACE;
     while Instant::now() < deadline {
-        match owner_pid_from_lock(&lock_path) {
-            Some(current_pid) if current_pid == pid => {}
-            Some(current_pid) => {
+        match live_owner(layout).map(|lease| lease.process) {
+            Some(current) if current == owner => {}
+            Some(current) => {
                 run_log.line(format!(
-                    "owner.replace.changed previous_pid={pid} current_pid={current_pid}"
+                    "owner.replace.changed previous_pid={} current_pid={}",
+                    owner.pid, current.pid
                 ));
                 return Ok(());
             }
             None => {
-                validate_expected_owner_shutdown(layout, pid)?;
-                run_log.line(format!("owner.replace.exited pid={pid}"));
+                validate_expected_owner_shutdown(layout, owner.pid)?;
+                run_log.line(format!("owner.replace.exited pid={}", owner.pid));
                 return Ok(());
             }
         }
         thread::sleep(Duration::from_millis(50));
     }
-    if owner_pid_from_lock(&lock_path) == Some(pid) {
+    if live_owner(layout).is_some_and(|lease| lease.process == owner) {
         bail!(
-            "owner process {pid} for instance {} did not finish its shutdown snapshot within 120 seconds; it was left running so recoverable state is not discarded",
+            "owner process {} for instance {} did not finish its shutdown snapshot within 120 seconds; it was left running so recoverable state is not discarded",
+            owner.pid,
             layout.instance
         );
     }
-    validate_expected_owner_shutdown(layout, pid)?;
-    run_log.line(format!("owner.replace.exited pid={pid}"));
+    validate_expected_owner_shutdown(layout, owner.pid)?;
+    run_log.line(format!("owner.replace.exited pid={}", owner.pid));
     Ok(())
 }
 
@@ -495,16 +464,12 @@ fn validate_expected_owner_shutdown(layout: &Layout, pid: libc::pid_t) -> Result
     validate_or_record_final_snapshot_failure(layout, pid)
 }
 
-fn acquire_bootstrap_for_forward(
-    layout: &Layout,
-    lock_path: &Path,
-    run_log: &RunLog,
-) -> Result<BootstrapLock> {
-    match try_acquire_validated_bootstrap(layout, lock_path)? {
+fn acquire_instance_for_forward(layout: &Layout, run_log: &RunLog) -> Result<InstanceLock> {
+    match try_acquire_validated_instance(layout, LeaseRole::Owner)? {
         Some(lock) => {
             run_log.line(format!(
-                "bootstrap.lock.acquired path={} forward=true",
-                lock_path.display()
+                "instance.lock.acquired path={} forward=true",
+                instance_lock_path(layout).display()
             ));
             Ok(lock)
         }
@@ -538,12 +503,7 @@ pub fn run_owner(mut config: RunConfig) -> Result<()> {
             .unwrap_or_else(|| "false".to_string())
     ));
     let broker_socket = config.layout.socket(RuntimeSocket::Broker);
-    let Some(bootstrap_lock) = acquire_bootstrap_for_owner(
-        &config.layout,
-        &config.layout.run_dir.join("bootstrap.lock.d"),
-        &broker_socket,
-        &run_log,
-    )?
+    let Some(instance_lock) = acquire_instance_for_owner(&config.layout, &broker_socket, &run_log)?
     else {
         run_log.line("owner.exit reason=existing_broker");
         return Ok(());
@@ -568,7 +528,7 @@ pub fn run_owner(mut config: RunConfig) -> Result<()> {
         // the client can report a hard memory-restore failure.
         Err(e) if e.downcast_ref::<RestoreRefused>().is_some() => {
             run_log.line(format!("owner.start.restore_failed error={e:#}"));
-            drop(bootstrap_lock);
+            drop(instance_lock);
             std::process::exit(EXIT_RESTORE_FAILED);
         }
         Err(e) => return Err(e),
@@ -583,7 +543,7 @@ pub fn run_owner(mut config: RunConfig) -> Result<()> {
     flush_deterministic_trace_events(&config.layout, vm.trace_log.as_deref())?;
     run_log.line(format!("owner.done owner_run_id={owner_run_id}"));
     drop(vm.network);
-    drop(bootstrap_lock);
+    drop(instance_lock);
     Ok(())
 }
 
@@ -595,9 +555,8 @@ fn run_foreground(
 ) -> Result<i32> {
     OWNER_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
     install_owner_signal_handlers();
-    let lock_path = config.layout.run_dir.join("bootstrap.lock.d");
     let owner_start_lock = match acquire_owner_start_or_run_client(
-        &config.layout.run_dir.join("owner-start.lock.d"),
+        &config.layout,
         &broker_socket,
         &config.command,
         &config.cwd,
@@ -616,10 +575,9 @@ fn run_foreground(
         preflight_fresh_owner_network(&config, &run_log)?;
         prepare_fresh_owner_slot(&config.layout, true, &run_log)?;
     }
-    let bootstrap_lock = if config.forwards.is_empty() {
-        match acquire_bootstrap_or_run_client(
+    let instance_lock = if config.forwards.is_empty() {
+        match acquire_instance_or_run_client(
             &config.layout,
-            &lock_path,
             &broker_socket,
             &config.command,
             &config.cwd,
@@ -630,11 +588,11 @@ fn run_foreground(
             true,
             &run_log,
         )? {
-            BootstrapOutcome::Lock(lock) => lock,
-            BootstrapOutcome::Status(status) => return Ok(status),
+            InstanceOutcome::Lock(lock) => lock,
+            InstanceOutcome::Status(status) => return Ok(status),
         }
     } else {
-        acquire_bootstrap_for_forward(&config.layout, &lock_path, &run_log)?
+        acquire_instance_for_forward(&config.layout, &run_log)?
     };
     drop(owner_start_lock);
     refresh_default_restore_snapshot(&mut config)?;
@@ -692,7 +650,7 @@ fn run_foreground(
     vm.timings.event(&format!("run.done status={status}"));
     run_log.line(format!("run.done run_id={owner_run_id} status={status}"));
     drop(vm.network);
-    drop(bootstrap_lock);
+    drop(instance_lock);
     Ok(status)
 }
 
@@ -1330,17 +1288,19 @@ fn request_checkpoint_from_current_owner(
     validate_deterministic: bool,
     timeout: Duration,
 ) -> Result<()> {
-    let lock_path = layout.run_dir.join("bootstrap.lock.d");
     let broker_socket = layout.socket(RuntimeSocket::Broker);
-    let expected_pid = owner_pid_from_lock(&lock_path)
-        .context("checkpoint requested for an instance without a live VM owner")?;
+    let current_owner = || live_owner(layout).map(|lease| lease.process);
+    let expected =
+        current_owner().context("checkpoint requested for an instance without a live VM owner")?;
+    let expected_pid = expected.pid;
     let deadline = Instant::now() + timeout;
     loop {
-        match owner_pid_from_lock(&lock_path) {
-            Some(pid) if pid == expected_pid => {}
-            Some(pid) => bail!(
-                "instance {} changed VM owner from pid {expected_pid} to pid {pid} while waiting to checkpoint",
-                layout.instance
+        match current_owner() {
+            Some(owner) if owner == expected => {}
+            Some(owner) => bail!(
+                "instance {} changed VM owner from pid {expected_pid} to pid {} while waiting to checkpoint",
+                layout.instance,
+                owner.pid
             ),
             None => {
                 validate_expected_owner_shutdown(layout, expected_pid)?;
@@ -1351,7 +1311,7 @@ fn request_checkpoint_from_current_owner(
             }
         }
         if broker_socket.exists() && connect_broker(&broker_socket).is_ok() {
-            if owner_pid_from_lock(&lock_path) != Some(expected_pid) {
+            if current_owner() != Some(expected) {
                 continue;
             }
             if validate_deterministic {
@@ -1365,12 +1325,13 @@ fn request_checkpoint_from_current_owner(
                 );
             }
             request_checkpoint_with_timeout(&broker_socket, checkpoint_path, Some(remaining))?;
-            if let Some(pid) = owner_pid_from_lock(&lock_path)
-                && pid != expected_pid
+            if let Some(owner) = current_owner()
+                && owner != expected
             {
                 bail!(
-                    "instance {} changed VM owner from pid {expected_pid} to pid {pid} while checkpointing",
-                    layout.instance
+                    "instance {} changed VM owner from pid {expected_pid} to pid {} while checkpointing",
+                    layout.instance,
+                    owner.pid
                 );
             }
             return Ok(());
@@ -1788,10 +1749,21 @@ fn bind_unix_listener(path: &Path) -> Result<UnixListener> {
         .with_context(|| format!("listen on {}", path.display()))
 }
 
+/// Either the lock a caller asked for, or the exit status of its command
+/// after it attached to a VM owner that another process started meanwhile.
+enum InstanceOutcome {
+    Lock(InstanceLock),
+    Status(i32),
+}
+
+enum OwnerStartOutcome {
+    Lock(OwnerStartLock),
+    Status(i32),
+}
+
 #[allow(clippy::too_many_arguments)]
-fn acquire_bootstrap_or_run_client(
+fn acquire_instance_or_run_client(
     layout: &Layout,
-    lock_path: &Path,
     socket: &Path,
     command: &[String],
     cwd: &Path,
@@ -1801,19 +1773,20 @@ fn acquire_bootstrap_or_run_client(
     instance: &str,
     no_daemon_reuse: bool,
     run_log: &RunLog,
-) -> Result<BootstrapOutcome> {
+) -> Result<InstanceOutcome> {
+    let lock_path = instance_lock_path(layout);
     let start = Instant::now();
     let mut logged_wait = false;
     loop {
-        if let Some(lock) = try_acquire_validated_bootstrap(layout, lock_path)? {
+        if let Some(lock) = try_acquire_validated_instance(layout, LeaseRole::Owner)? {
             run_log.line(format!(
-                "bootstrap.lock.acquired path={}",
+                "instance.lock.acquired path={}",
                 lock_path.display()
             ));
-            return Ok(BootstrapOutcome::Lock(lock));
+            return Ok(InstanceOutcome::Lock(lock));
         }
         if !logged_wait {
-            run_log.line(format!("bootstrap.lock.busy path={}", lock_path.display()));
+            run_log.line(format!("instance.lock.busy path={}", lock_path.display()));
             logged_wait = true;
         }
         if !no_daemon_reuse {
@@ -1827,12 +1800,12 @@ fn acquire_bootstrap_or_run_client(
                 instance,
                 Some(run_log),
             )? {
-                return Ok(BootstrapOutcome::Status(status));
+                return Ok(InstanceOutcome::Status(status));
             }
         }
         if start.elapsed() > Duration::from_secs(120) {
             run_log.line(format!(
-                "bootstrap.lock.timeout path={}",
+                "instance.lock.timeout path={}",
                 lock_path.display()
             ));
             bail!("timed out waiting for {}", lock_path.display());
@@ -1843,7 +1816,7 @@ fn acquire_bootstrap_or_run_client(
 
 #[allow(clippy::too_many_arguments)]
 fn acquire_owner_start_or_run_client(
-    lock_path: &Path,
+    layout: &Layout,
     socket: &Path,
     command: &[String],
     cwd: &Path,
@@ -1854,10 +1827,11 @@ fn acquire_owner_start_or_run_client(
     allow_existing_broker: bool,
     run_log: &RunLog,
 ) -> Result<OwnerStartOutcome> {
+    let lock_path = owner_start_lock_path(layout);
     let start = Instant::now();
     let mut logged_wait = false;
     loop {
-        if let Some(lock) = OwnerStartLock::try_acquire(lock_path)? {
+        if let Some(lock) = OwnerStartLock::try_acquire(layout)? {
             run_log.line(format!(
                 "owner_start.lock.acquired path={}",
                 lock_path.display()
@@ -3364,25 +3338,25 @@ fn run_broker_client_awaiting_owner(
     }
 }
 
-fn acquire_bootstrap_for_owner(
+fn acquire_instance_for_owner(
     layout: &Layout,
-    lock_path: &Path,
     broker_socket: &Path,
     run_log: &RunLog,
-) -> Result<Option<BootstrapLock>> {
+) -> Result<Option<InstanceLock>> {
+    let lock_path = instance_lock_path(layout);
     let start = Instant::now();
     let mut logged_wait = false;
     loop {
-        if let Some(lock) = try_acquire_validated_bootstrap(layout, lock_path)? {
+        if let Some(lock) = try_acquire_validated_instance(layout, LeaseRole::Owner)? {
             run_log.line(format!(
-                "owner.bootstrap.lock.acquired path={}",
+                "owner.instance.lock.acquired path={}",
                 lock_path.display()
             ));
             return Ok(Some(lock));
         }
         if !logged_wait {
             run_log.line(format!(
-                "owner.bootstrap.lock.busy path={}",
+                "owner.instance.lock.busy path={}",
                 lock_path.display()
             ));
             logged_wait = true;
@@ -3392,7 +3366,7 @@ fn acquire_bootstrap_for_owner(
         }
         if start.elapsed() > Duration::from_secs(120) {
             run_log.line(format!(
-                "owner.bootstrap.lock.timeout path={}",
+                "owner.instance.lock.timeout path={}",
                 lock_path.display()
             ));
             bail!("timed out waiting for {}", lock_path.display());

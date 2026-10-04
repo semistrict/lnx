@@ -12,6 +12,7 @@ mod paths;
 mod runner;
 mod server;
 mod sparse_copy;
+mod status;
 
 use anyhow::Result;
 use clap::Parser;

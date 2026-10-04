@@ -31,6 +31,7 @@ use crate::{
     checkpoints, descriptor,
     paths::{GVPROXY_KRUN_SOCKET_SUFFIX, Layout, RuntimeSocket},
     runner, sparse_copy,
+    status::{self, InstanceState},
 };
 
 #[cfg(feature = "server-ui")]
@@ -92,7 +93,7 @@ struct ImportResponse {
 struct LifecycleResponse {
     ok: bool,
     instance: String,
-    state: &'static str,
+    state: status::InstanceState,
     message: &'static str,
 }
 
@@ -104,7 +105,7 @@ struct InstancesResponse {
 #[derive(Serialize)]
 struct InstanceSummary {
     name: String,
-    state: &'static str,
+    state: status::InstanceState,
     pids: Vec<i32>,
     cpus: u8,
     memory_mib: u32,
@@ -355,7 +356,7 @@ async fn start_instance(
         Ok::<_, anyhow::Error>(LifecycleResponse {
             ok: true,
             instance: instance_name,
-            state: instance_state(&layout),
+            state: status::instance_state(&layout),
             message: "started",
         })
     })
@@ -376,7 +377,7 @@ async fn stop_instance(
     let response = LifecycleResponse {
         ok: true,
         instance,
-        state: instance_state(&layout),
+        state: status::instance_state(&layout),
         message: "stopped",
     };
     Ok(Json(response))
@@ -638,8 +639,8 @@ fn instance_summaries(state: &AppState) -> Result<Vec<InstanceSummary>> {
             };
             Ok(InstanceSummary {
                 name,
-                state: instance_state(&layout),
-                pids: instance_pids(&layout),
+                state: status::instance_state(&layout),
+                pids: status::instance_pids(&layout),
                 cpus: descriptor.cpus.unwrap_or(state.cpus),
                 memory_mib: descriptor.memory_mib.unwrap_or(state.memory_mib),
                 image: descriptor.image,
@@ -650,12 +651,7 @@ fn instance_summaries(state: &AppState) -> Result<Vec<InstanceSummary>> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    instances.sort_by_key(|instance| {
-        (
-            instance_state_rank(instance.state),
-            instance.name.to_ascii_lowercase(),
-        )
-    });
+    instances.sort_by_key(|instance| (instance.state, instance.name.to_ascii_lowercase()));
     Ok(instances)
 }
 
@@ -673,80 +669,6 @@ fn collect_child_dir_names(parent: &Path, names: &mut BTreeSet<String>) -> Resul
         }
     }
     Ok(())
-}
-
-fn instance_state(layout: &Layout) -> &'static str {
-    let broker = layout.socket(RuntimeSocket::Broker);
-    if broker.exists() && runner::connect_broker(&broker).is_ok() {
-        "running"
-    } else if alive_owner_pid(&layout.run_dir.join("bootstrap.lock.d")).is_some() {
-        "starting"
-    } else if layout.rootfs.exists() {
-        "stopped"
-    } else {
-        "partial"
-    }
-}
-
-fn instance_state_rank(state: &str) -> u8 {
-    match state {
-        "running" => 0,
-        "starting" => 1,
-        "stopped" => 2,
-        _ => 3,
-    }
-}
-
-fn instance_pids(layout: &Layout) -> Vec<i32> {
-    let mut pids = BTreeMap::new();
-    if let Some(pid) = alive_owner_pid(&layout.run_dir.join("bootstrap.lock.d")) {
-        pids.insert(pid, ());
-    }
-    for pid in host_pids_for_instance(&layout.instance) {
-        pids.insert(pid, ());
-    }
-    pids.keys().copied().collect()
-}
-
-fn alive_owner_pid(lock_dir: &Path) -> Option<i32> {
-    let pid = recorded_owner_pid(lock_dir)?;
-    process_alive(pid).then_some(pid)
-}
-
-fn recorded_owner_pid(lock_dir: &Path) -> Option<i32> {
-    fs::read_to_string(lock_dir.join("owner.pid"))
-        .ok()?
-        .trim()
-        .parse::<i32>()
-        .ok()
-}
-
-fn host_pids_for_instance(instance: &str) -> Vec<i32> {
-    let output = Command::new("pgrep")
-        .arg("-f")
-        .arg(format!("--instance[= ]{instance}"))
-        .output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().parse::<i32>().ok())
-        .filter(|pid| *pid != std::process::id() as i32 && process_alive(*pid))
-        .collect()
-}
-
-fn process_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    unsafe {
-        libc::kill(pid, 0) == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
 }
 
 fn file_len(path: &Path) -> Option<u64> {
@@ -1577,18 +1499,18 @@ fn reject_running_instance(layout: &Layout) -> Result<()> {
     if broker.exists() && runner::connect_broker(&broker).is_ok() {
         bail!("target instance is running: {}", layout.instance);
     }
-    if layout.run_dir.join("bootstrap.lock.d").exists() {
+    if runner::instance_lock_state(layout)?.is_held() {
         bail!("target instance is starting: {}", layout.instance);
     }
     Ok(())
 }
 
 fn start_existing_instance(layout: &Layout, state: &AppState) -> Result<()> {
-    match instance_state(layout) {
-        "running" => return Ok(()),
-        "starting" => bail!("instance is already starting: {}", layout.instance),
-        "partial" => bail!("instance is missing rootfs: {}", layout.instance),
-        _ => {}
+    match status::instance_state(layout) {
+        InstanceState::Running => return Ok(()),
+        InstanceState::Starting => bail!("instance is already starting: {}", layout.instance),
+        InstanceState::Partial => bail!("instance is missing rootfs: {}", layout.instance),
+        InstanceState::Stopped => {}
     }
     if !layout.rootfs.exists() {
         bail!("instance rootfs is missing: {}", layout.rootfs.display());
@@ -1675,24 +1597,23 @@ async fn stop_existing_instance_with_timeout(layout: &Layout, timeout: Duration)
         return Ok(());
     }
     let deadline = std::time::Instant::now() + timeout;
-    let lock_dir = layout.run_dir.join("bootstrap.lock.d");
-    let mut signaled_pid = alive_owner_pid(&lock_dir);
-    if let Some(pid) = signaled_pid {
+    let current_owner = || runner::live_owner(layout).map(|lease| lease.process);
+    let mut signaled = current_owner();
+    if let Some(owner) = signaled {
         // The process that launched the initial command keeps owner-start.lock
         // until that command returns. Signal the established owner first so
         // shutdown can release that client and, in turn, the start lock.
-        signal_owner_process(pid)?;
+        owner.signal(libc::SIGTERM)?;
     }
-    let start_lock_path = layout.run_dir.join("owner-start.lock.d");
     let _start_lock = loop {
-        if let Some(lock) = runner::OwnerStartLock::try_acquire(&start_lock_path)? {
+        if let Some(lock) = runner::OwnerStartLock::try_acquire(layout)? {
             break lock;
         }
-        if let Some(pid) = alive_owner_pid(&lock_dir)
-            && signaled_pid != Some(pid)
+        if let Some(owner) = current_owner()
+            && signaled != Some(owner)
         {
-            signal_owner_process(pid)?;
-            signaled_pid = Some(pid);
+            owner.signal(libc::SIGTERM)?;
+            signaled = Some(owner);
         }
         if std::time::Instant::now() >= deadline {
             bail!(
@@ -1703,99 +1624,69 @@ async fn stop_existing_instance_with_timeout(layout: &Layout, timeout: Duration)
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
-    let pid = loop {
-        if let Some(pid) = alive_owner_pid(&lock_dir) {
-            if signaled_pid != Some(pid) {
-                signal_owner_process(pid)?;
+    // With the start lock held no new owner can appear, so wait for whoever
+    // holds the instance lock (an owner or a state copy) to let go.
+    let owner = loop {
+        let state = runner::instance_lock_state(layout)?;
+        match &state {
+            runner::InstanceLockState::Free { stale } => {
+                let expected_pid = signaled.map(|owner| owner.pid).or_else(|| {
+                    stale
+                        .as_ref()
+                        .filter(|lease| lease.role == runner::LeaseRole::Owner)
+                        .map(runner::Lease::pid)
+                });
+                return ensure_shutdown_state_under_guard(layout, expected_pid);
             }
-            break pid;
-        }
-        let (lock_exists, recorded_pid, maintenance_pid) = runner::with_lock_dir_guard(
-            &lock_dir,
-            || {
-                let recorded_pid = runner::recorded_owner_pid_from_lock(&lock_dir).with_context(|| {
-                format!(
-                    "instance {} has a corrupt owner lease; recovery: lnx --instance {} snapshots clear to acknowledge and explicitly cold-boot",
-                    layout.instance, layout.instance
-                )
-            })?;
-                let maintenance_pid = runner::recorded_maintenance_pid_from_lock(&lock_dir)
-                    .context("read instance state-copy lease")?;
-                Ok((lock_dir.exists(), recorded_pid, maintenance_pid))
-            },
-        )?;
-        if recorded_pid.is_some_and(process_alive) {
-            continue;
-        }
-        if maintenance_pid.is_some_and(process_alive) {
-            if std::time::Instant::now() >= deadline {
-                bail!(
-                    "instance {} state copy did not finish within {} seconds; retry stop",
-                    layout.instance,
-                    timeout.as_secs_f64()
-                );
+            runner::InstanceLockState::Held { lease } => {
+                if let Some(lease) = lease
+                    && lease.role == runner::LeaseRole::Owner
+                {
+                    if signaled != Some(lease.process) {
+                        lease.process.signal(libc::SIGTERM)?;
+                    }
+                    break lease.process;
+                }
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            continue;
         }
-        if lock_exists && recorded_pid.is_none() && maintenance_pid.is_none() {
-            if std::time::Instant::now() >= deadline {
-                bail!(
-                    "instance {} owner lease remained incomplete at {} for {} seconds; run lnx --instance {} snapshots clear to acknowledge and explicitly cold-boot",
-                    layout.instance,
-                    lock_dir.display(),
-                    timeout.as_secs_f64(),
-                    layout.instance
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            continue;
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "instance {} state operation did not finish within {} seconds; retry stop",
+                layout.instance,
+                timeout.as_secs_f64()
+            );
         }
-        let expected_pid = signaled_pid.or(recorded_pid);
-        ensure_shutdown_state_under_guard(layout, expected_pid)?;
-        return Ok(());
+        tokio::time::sleep(Duration::from_millis(10)).await;
     };
-    while std::time::Instant::now() < deadline {
-        match alive_owner_pid(&lock_dir) {
-            None => {
-                ensure_shutdown_state_under_guard(layout, Some(pid))?;
-                return Ok(());
-            }
-            Some(current_pid) if current_pid != pid => {
-                bail!(
-                    "instance {} changed VM owner from pid {pid} to pid {current_pid} while stopping",
-                    layout.instance
-                );
-            }
+    loop {
+        match current_owner() {
+            None => return ensure_shutdown_state_under_guard(layout, Some(owner.pid)),
+            Some(current) if current != owner => bail!(
+                "instance {} changed VM owner from pid {} to pid {} while stopping",
+                layout.instance,
+                owner.pid,
+                current.pid
+            ),
             Some(_) => {}
         }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "owner process {} for instance {} did not finish its shutdown snapshot within {} seconds; it was left running so recoverable state is not discarded",
+                owner.pid,
+                layout.instance,
+                timeout.as_secs_f64()
+            );
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    match alive_owner_pid(&lock_dir) {
-        None => ensure_shutdown_state_under_guard(layout, Some(pid)),
-        Some(current_pid) if current_pid != pid => bail!(
-            "instance {} changed VM owner from pid {pid} to pid {current_pid} while stopping",
-            layout.instance
-        ),
-        Some(_) => bail!(
-            "owner process {pid} for instance {} did not finish its shutdown snapshot within {} seconds; it was left running so recoverable state is not discarded",
-            layout.instance,
-            timeout.as_secs_f64()
-        ),
     }
 }
 
 fn ensure_shutdown_state_under_guard(layout: &Layout, expected_pid: Option<i32>) -> Result<()> {
-    let lock_dir = layout.run_dir.join("bootstrap.lock.d");
-    let checked = runner::with_lock_dir_guard(&lock_dir, || {
-        if lock_dir.exists() && !runner::bootstrap_lock_is_stale(&lock_dir)? {
+    let checked = runner::with_instance_guard(layout, |state| {
+        if state.is_held() {
             return Ok(false);
         }
         ensure_no_failed_shutdown_state(layout, expected_pid)?;
-        if lock_dir.exists() {
-            fs::remove_dir_all(&lock_dir)
-                .with_context(|| format!("remove {}", lock_dir.display()))?;
-        }
         Ok(true)
     })?;
     if !checked {
@@ -1828,21 +1719,6 @@ fn ensure_no_failed_shutdown_state(layout: &Layout, expected_pid: Option<i32>) -
     } else {
         runner::validate_final_snapshot_outcome(layout, None)
     }
-}
-
-fn signal_owner_process(pid: i32) -> Result<()> {
-    signal_process(pid, libc::SIGTERM)
-}
-
-fn signal_process(pid: i32, signal: i32) -> Result<()> {
-    if pid <= 0 {
-        bail!("invalid owner pid: {pid}");
-    }
-    let rc = unsafe { libc::kill(pid as libc::pid_t, signal) };
-    if rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-        return Ok(());
-    }
-    Err(std::io::Error::last_os_error()).with_context(|| format!("signal process {pid}"))
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<()> {
@@ -2234,17 +2110,12 @@ fn bundle_runtime_path_is_excluded(layout: &Layout, path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    let runtime_exact = [
-        "bootstrap.lock.d",
-        "bootstrap.lock.d.guard",
-        "owner-start.lock.d",
-        "owner-start.lock.d.guard",
-    ]
-    .into_iter()
-    .chain(RuntimeSocket::ALL.map(RuntimeSocket::file_name))
-    .any(|runtime| path == layout.run_dir.join(runtime));
-    let runtime_lock_descendant = path.starts_with(layout.run_dir.join("bootstrap.lock.d"))
-        || path.starts_with(layout.run_dir.join("owner-start.lock.d"));
+    let runtime_socket_exact = RuntimeSocket::ALL
+        .into_iter()
+        .any(|socket| path == layout.run_dir.join(socket.file_name()));
+    let lock_file = runner::LOCK_FILES
+        .into_iter()
+        .any(|lock| path == layout.instance_dir.join(lock));
     let runtime_socket = path.parent() == Some(layout.run_dir.as_path())
         && name.ends_with(GVPROXY_KRUN_SOCKET_SUFFIX);
     let persistent_transaction_file = path.parent() == Some(layout.instance_dir.as_path())
@@ -2255,8 +2126,8 @@ fn bundle_runtime_path_is_excluded(layout: &Layout, path: &Path) -> bool {
             ".restore-work" | ".restore-work.active" | ".latest.next" | ".latest.previous"
         ) || (name.starts_with('.') && name.contains(".clear-"))
             || name.starts_with(".final-snapshot.outcome.tmp-"));
-    runtime_exact
-        || runtime_lock_descendant
+    runtime_socket_exact
+        || lock_file
         || runtime_socket
         || persistent_transaction_file
         || snapshot_runtime

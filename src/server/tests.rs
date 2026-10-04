@@ -29,21 +29,6 @@ impl Drop for ChildGuard {
     }
 }
 
-async fn wait_for_ready(path: &Path) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        if path.exists() {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for {}",
-            path.display()
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-}
-
 struct LnxBaseGuard {
     _guard: MutexGuard<'static, ()>,
     previous: Option<std::ffi::OsString>,
@@ -384,9 +369,7 @@ fn push_refuses_live_owner_without_broker() {
     let source = test_layout(source_base.path(), "source");
     fs::create_dir_all(&source.instance_dir).expect("create source instance");
     fs::write(&source.rootfs, b"live-rootfs").expect("write source rootfs");
-    let owner = runner::BootstrapLock::try_acquire(&source.run_dir.join("bootstrap.lock.d"))
-        .expect("acquire owner lock")
-        .expect("owner lock");
+    let owner = runner::test_support::hold_as_owner(&source);
 
     let error = runner::request_coherent_checkpoint_awaiting_owner(
         &source,
@@ -434,14 +417,9 @@ fn stopped_push_uses_stable_copy_without_runtime_leases() {
         fs::read(&prepared.layout.rootfs).expect("read stable rootfs copy"),
         b"stable-rootfs"
     );
-    assert!(!prepared.layout.run_dir.join("bootstrap.lock.d").exists());
-    assert!(
-        !prepared
-            .layout
-            .run_dir
-            .join("bootstrap.lock.d.guard")
-            .exists()
-    );
+    for lock in runner::LOCK_FILES {
+        assert!(!prepared.layout.instance_dir.join(lock).exists());
+    }
     assert!(!prepared.layout.run_dir.join("lnx-agent.sock").exists());
     assert!(
         !prepared
@@ -789,8 +767,6 @@ fn test_layout(base: &Path, instance: &str) -> Layout {
 async fn stop_reports_final_snapshot_failure_from_recovery_marker() {
     let temp = TempDir::new().expect("tempdir");
     let layout = test_layout(temp.path(), "stop-failed-snapshot");
-    let lock = layout.run_dir.join("bootstrap.lock.d");
-    fs::create_dir_all(&lock).expect("create owner lock");
     fs::create_dir_all(layout.snapshot_dir.join(runner::RESTORE_WORK_SNAPSHOT))
         .expect("create restore work");
     fs::write(
@@ -798,20 +774,10 @@ async fn stop_reports_final_snapshot_failure_from_recovery_marker() {
         b"generation_id=recovery\n",
     )
     .expect("write recovery marker");
-    let ready = layout.run_dir.join("owner-ready");
     let mut owner = ChildGuard::new(
-        Command::new("/bin/sh")
-        .arg("-c")
-        .arg(
-            "trap 'rm -rf \"$LOCK_PATH\"; exit 1' TERM; touch \"$READY_PATH\"; while :; do sleep 1; done",
-        )
-        .env("LOCK_PATH", &lock)
-        .env("READY_PATH", &ready)
-        .spawn()
-        .expect("spawn fake owner"),
+        runner::test_support::spawn_foreign_holder(&layout, runner::LeaseRole::Owner, "exit 1")
+            .child,
     );
-    fs::write(lock.join("owner.pid"), owner.id().to_string()).expect("write owner pid");
-    wait_for_ready(&ready).await;
 
     let error = stop_existing_instance_with_timeout(&layout, Duration::from_secs(2))
         .await
@@ -831,22 +797,10 @@ async fn stop_reports_final_snapshot_failure_from_recovery_marker() {
 async fn stop_reports_missing_fresh_owner_snapshot_outcome() {
     let temp = TempDir::new().expect("tempdir");
     let layout = test_layout(temp.path(), "stop-missing-outcome");
-    let lock = layout.run_dir.join("bootstrap.lock.d");
-    fs::create_dir_all(&lock).expect("create owner lock");
-    let ready = layout.run_dir.join("owner-ready");
     let mut owner = ChildGuard::new(
-        Command::new("/bin/sh")
-        .arg("-c")
-        .arg(
-            "trap 'rm -rf \"$LOCK_PATH\"; exit 1' TERM; touch \"$READY_PATH\"; while :; do sleep 1; done",
-        )
-        .env("LOCK_PATH", &lock)
-        .env("READY_PATH", &ready)
-        .spawn()
-        .expect("spawn fake owner"),
+        runner::test_support::spawn_foreign_holder(&layout, runner::LeaseRole::Owner, "exit 1")
+            .child,
     );
-    fs::write(lock.join("owner.pid"), owner.id().to_string()).expect("write owner pid");
-    wait_for_ready(&ready).await;
 
     let error = stop_existing_instance_with_timeout(&layout, Duration::from_secs(2))
         .await
@@ -868,15 +822,12 @@ async fn stop_reports_missing_fresh_owner_snapshot_outcome() {
 async fn stop_reports_missing_snapshot_outcome_after_owner_crash() {
     let temp = TempDir::new().expect("tempdir");
     let layout = test_layout(temp.path(), "stop-crashed-owner");
-    let lock = layout.run_dir.join("bootstrap.lock.d");
-    fs::create_dir_all(&lock).expect("create stale owner lock");
-    let mut exited = Command::new("/bin/sh")
-        .args(["-c", "exit 0"])
-        .spawn()
-        .expect("spawn short-lived owner");
-    let stale_pid = exited.id();
-    exited.wait().expect("reap short-lived owner");
-    fs::write(lock.join("owner.pid"), stale_pid.to_string()).expect("write stale owner pid");
+    let crashed = runner::test_support::exited_process();
+    let stale_pid = crashed.pid as u32;
+    runner::test_support::write_instance_lease(
+        &layout,
+        &runner::test_support::lease_for(runner::LeaseRole::Owner, crashed),
+    );
 
     let error = stop_existing_instance_with_timeout(&layout, Duration::from_millis(50))
         .await
@@ -884,8 +835,12 @@ async fn stop_reports_missing_snapshot_outcome_after_owner_crash() {
 
     assert!(error.to_string().contains("without reporting whether"));
     assert!(error.to_string().contains(&stale_pid.to_string()));
-    assert!(
-        lock.exists(),
+    assert_eq!(
+        runner::instance_lock_state(&layout)
+            .expect("inspect lock")
+            .stale_lease()
+            .map(|lease| lease.process),
+        Some(crashed),
         "failed verification must retain PID evidence"
     );
     let retry = runner::validate_restore_work_for_command(&layout)
@@ -902,26 +857,16 @@ async fn stop_reports_missing_snapshot_outcome_after_owner_crash() {
 async fn stop_timeout_leaves_unresponsive_owner_running() {
     let temp = TempDir::new().expect("tempdir");
     let layout = test_layout(temp.path(), "stop-timeout");
-    let lock = layout.run_dir.join("bootstrap.lock.d");
-    fs::create_dir_all(&lock).expect("create owner lock");
-    let ready = layout.run_dir.join("owner-ready");
-    let mut owner = ChildGuard::new(
-        Command::new("/bin/sh")
-            .arg("-c")
-            .arg("trap '' TERM; touch \"$READY_PATH\"; while :; do sleep 1; done")
-            .env("READY_PATH", &ready)
-            .spawn()
-            .expect("spawn fake owner"),
-    );
-    fs::write(lock.join("owner.pid"), owner.id().to_string()).expect("write owner pid");
-    wait_for_ready(&ready).await;
+    let holder = runner::test_support::spawn_foreign_holder(&layout, runner::LeaseRole::Owner, "1");
+    let owner_process = holder.process;
+    let mut owner = ChildGuard::new(holder.child);
 
     let error = stop_existing_instance_with_timeout(&layout, Duration::from_millis(50))
         .await
         .expect_err("unresponsive owner times out");
 
     assert!(error.to_string().contains("left running"));
-    assert!(process_alive(owner.id() as i32));
+    assert!(owner_process.is_running());
     unsafe { libc::kill(owner.id() as i32, libc::SIGKILL) };
     let _ = owner.wait();
 }
