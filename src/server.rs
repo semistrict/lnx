@@ -27,7 +27,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use crate::{checkpoints, descriptor, paths::Layout, runner, sparse_copy};
+use crate::{
+    checkpoints, descriptor,
+    paths::{GVPROXY_KRUN_SOCKET_SUFFIX, Layout, RuntimeSocket},
+    runner, sparse_copy,
+};
 
 #[cfg(feature = "server-ui")]
 include!(concat!(env!("OUT_DIR"), "/lnx_server_ui_assets.rs"));
@@ -467,7 +471,7 @@ fn setup_terminal_broker(
     input_rx: std::sync::mpsc::Receiver<BrokerInput>,
 ) -> Result<()> {
     let layout = Layout::resolve(instance, None, None)?;
-    let broker = layout.run_dir.join("broker.sock");
+    let broker = layout.socket(RuntimeSocket::Broker);
     let mut stream = runner::connect_broker(&broker)
         .with_context(|| format!("connect running instance {instance}"))?;
     let channel_id = runner::new_request_id()?;
@@ -672,7 +676,7 @@ fn collect_child_dir_names(parent: &Path, names: &mut BTreeSet<String>) -> Resul
 }
 
 fn instance_state(layout: &Layout) -> &'static str {
-    let broker = layout.run_dir.join("broker.sock");
+    let broker = layout.socket(RuntimeSocket::Broker);
     if broker.exists() && runner::connect_broker(&broker).is_ok() {
         "running"
     } else if alive_owner_pid(&layout.run_dir.join("bootstrap.lock.d")).is_some() {
@@ -1569,7 +1573,7 @@ fn validate_imported_snapshot(imported: &Path, state: &AppState) -> Result<()> {
 }
 
 fn reject_running_instance(layout: &Layout) -> Result<()> {
-    let broker = layout.run_dir.join("broker.sock");
+    let broker = layout.socket(RuntimeSocket::Broker);
     if broker.exists() && runner::connect_broker(&broker).is_ok() {
         bail!("target instance is running: {}", layout.instance);
     }
@@ -2235,19 +2239,14 @@ fn bundle_runtime_path_is_excluded(layout: &Layout, path: &Path) -> bool {
         "bootstrap.lock.d.guard",
         "owner-start.lock.d",
         "owner-start.lock.d.guard",
-        "broker.sock",
-        "checkpoint-broker.sock",
-        "lnx-agent.sock",
-        "lnx-snapshot.sock",
-        "lnx-control.sock",
-        "gvproxy.sock",
     ]
     .into_iter()
+    .chain(RuntimeSocket::ALL.map(RuntimeSocket::file_name))
     .any(|runtime| path == layout.run_dir.join(runtime));
     let runtime_lock_descendant = path.starts_with(layout.run_dir.join("bootstrap.lock.d"))
         || path.starts_with(layout.run_dir.join("owner-start.lock.d"));
-    let runtime_socket =
-        path.parent() == Some(layout.run_dir.as_path()) && name.ends_with("-krun.sock");
+    let runtime_socket = path.parent() == Some(layout.run_dir.as_path())
+        && name.ends_with(GVPROXY_KRUN_SOCKET_SUFFIX);
     let persistent_transaction_file = path.parent() == Some(layout.instance_dir.as_path())
         && (name == ".lnx-fork-lease" || name.starts_with(".lnx-descriptor-"));
     let snapshot_runtime = path.parent() == Some(layout.snapshot_dir.as_path())

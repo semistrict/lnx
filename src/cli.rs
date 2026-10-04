@@ -24,7 +24,11 @@ const DEFAULT_CPUS: u8 = 2;
 const DEFAULT_MEMORY_MIB: u32 = 4096;
 
 #[derive(Debug, Parser)]
-#[command(name = "lnx", version, about = "Linux VM runner using Rust and libkrun")]
+#[command(
+    name = "lnx",
+    version,
+    about = "Linux VM runner using Rust and libkrun"
+)]
 pub struct Cli {
     #[arg(short = 'C', value_name = "DIR", help = "Run as if started in DIR")]
     directory: Option<PathBuf>,
@@ -1562,7 +1566,7 @@ fn collect_child_dir_names(parent: &Path, names: &mut BTreeSet<String>) -> Resul
 }
 
 fn instance_state(layout: &Layout) -> &'static str {
-    let broker = layout.run_dir.join("broker.sock");
+    let broker = layout.socket(crate::paths::RuntimeSocket::Broker);
     if broker.exists() && runner::connect_broker(&broker).is_ok() {
         "running"
     } else if alive_owner_pid(&layout.run_dir.join("bootstrap.lock.d")).is_some() {

@@ -1,10 +1,12 @@
 use std::{
     fs::{self, OpenOptions},
     io::Write,
+    os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 
 pub(crate) const INSTANCE_TRANSACTION_DIR: &str = "@lnx-transactions";
 const INSTANCE_TRANSACTION_MARKER: &str = ".lnx-transactions-v1";
@@ -106,6 +108,99 @@ pub(crate) fn is_instance_transaction_root(path: &Path) -> bool {
             .is_ok_and(|contents| contents == INSTANCE_TRANSACTION_MARKER_CONTENT)
 }
 
+/// Unix-domain sockets that a VM owner listens on or creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeSocket {
+    Broker,
+    CheckpointBroker,
+    Agent,
+    Snapshot,
+    Control,
+    Gvproxy,
+}
+
+impl RuntimeSocket {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Broker,
+        Self::CheckpointBroker,
+        Self::Agent,
+        Self::Snapshot,
+        Self::Control,
+        Self::Gvproxy,
+    ];
+
+    pub(crate) fn file_name(self) -> &'static str {
+        match self {
+            Self::Broker => "broker.sock",
+            Self::CheckpointBroker => "checkpoint-broker.sock",
+            Self::Agent => "lnx-agent.sock",
+            Self::Snapshot => "lnx-snapshot.sock",
+            Self::Control => "lnx-control.sock",
+            Self::Gvproxy => "gvproxy.sock",
+        }
+    }
+}
+
+/// Embedded gvproxy derives the socket libkrun connects to by appending this
+/// suffix to the gvproxy socket path, which makes it the longest socket name.
+pub(crate) const GVPROXY_KRUN_SOCKET_SUFFIX: &str = "-krun.sock";
+
+/// Capacity of `sockaddr_un.sun_path`, including the terminating NUL
+/// (104 bytes on macOS, 108 on Linux).
+pub(crate) const UNIX_SOCKET_PATH_CAPACITY: usize = {
+    // SAFETY: sockaddr_un is plain old data; only the array length is read.
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_path.len()
+};
+
+pub(crate) fn unix_socket_path_fits(path: &Path) -> bool {
+    path.as_os_str().len() < UNIX_SOCKET_PATH_CAPACITY
+}
+
+fn longest_runtime_socket_path(dir: &Path) -> PathBuf {
+    let gvproxy_krun = format!(
+        "{}{GVPROXY_KRUN_SOCKET_SUFFIX}",
+        RuntimeSocket::Gvproxy.file_name()
+    );
+    let longest = RuntimeSocket::ALL
+        .into_iter()
+        .map(|socket| socket.file_name().to_string())
+        .chain([gvproxy_krun])
+        .max_by_key(String::len)
+        .expect("runtime sockets are not empty");
+    dir.join(longest)
+}
+
+/// Chooses where an instance's sockets live. They stay next to the rest of
+/// the runtime state when every socket path fits in `sun_path`; deep
+/// project-local instance directories instead get a short per-user directory
+/// keyed by the run directory, so the location is the same for every process
+/// that resolves this instance.
+fn socket_dir_for(run_dir: &Path, short_root: &Path) -> PathBuf {
+    if unix_socket_path_fits(&longest_runtime_socket_path(run_dir)) {
+        return run_dir.to_path_buf();
+    }
+    let digest = Sha256::digest(run_dir.as_os_str().as_encoded_bytes());
+    let key: String = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    short_root.join(key)
+}
+
+/// A private per-user root for relocated sockets. macOS gives every user a
+/// private `$TMPDIR`; elsewhere prefer `$XDG_RUNTIME_DIR` and fall back to a
+/// uid-scoped directory under the shared temp dir.
+fn short_socket_root() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        return std::env::temp_dir().join("lnx");
+    }
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("lnx"),
+        _ => std::env::temp_dir().join(format!("lnx-{}", unsafe { libc::getuid() })),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Layout {
     pub base: PathBuf,
@@ -186,6 +281,41 @@ impl Layout {
             home.clone(),
             home,
         )
+    }
+
+    pub(crate) fn socket_dir(&self) -> PathBuf {
+        socket_dir_for(&self.run_dir, &short_socket_root())
+    }
+
+    pub(crate) fn socket(&self, socket: RuntimeSocket) -> PathBuf {
+        self.socket_dir().join(socket.file_name())
+    }
+
+    /// Creates the run and socket directories. A relocated socket directory
+    /// is private to the current user, and an existing one owned by someone
+    /// else is refused rather than used.
+    pub(crate) fn create_runtime_dirs(&self) -> Result<()> {
+        fs::create_dir_all(&self.run_dir)
+            .with_context(|| format!("create {}", self.run_dir.display()))?;
+        let socket_dir = self.socket_dir();
+        if socket_dir == self.run_dir {
+            return Ok(());
+        }
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&socket_dir)
+            .with_context(|| format!("create {}", socket_dir.display()))?;
+        let metadata = fs::symlink_metadata(&socket_dir)
+            .with_context(|| format!("stat {}", socket_dir.display()))?;
+        let uid = unsafe { libc::getuid() };
+        if !metadata.is_dir() || metadata.uid() != uid {
+            bail!(
+                "socket directory {} is not a directory owned by uid {uid}",
+                socket_dir.display()
+            );
+        }
+        Ok(())
     }
 
     fn resolve_with_env_and_cwd(

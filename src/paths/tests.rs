@@ -211,3 +211,41 @@ fn transaction_root_coexists_with_a_legacy_reserved_name() {
     assert!(!is_instance_transaction_root(&legacy));
     assert_eq!(fs::read(legacy.join("rootfs.ext4")).unwrap(), b"legacy");
 }
+
+#[test]
+fn sockets_stay_in_a_short_run_dir() {
+    let run_dir = PathBuf::from("/Users/test/.lnx/instances/dev");
+    let socket_dir = socket_dir_for(&run_dir, Path::new("/short/lnx"));
+    assert_eq!(socket_dir, run_dir);
+}
+
+#[test]
+fn sockets_move_to_a_stable_short_dir_when_the_run_dir_is_too_deep() {
+    let run_dir = PathBuf::from(format!(
+        "/Users/test/{}/.lnx/instances/dev",
+        "deeply-nested-project-directory/".repeat(3)
+    ));
+    let socket_dir = socket_dir_for(&run_dir, Path::new("/short/lnx"));
+    assert_eq!(socket_dir, PathBuf::from("/short/lnx/c3682337bb288ec3"));
+    assert_eq!(
+        socket_dir,
+        socket_dir_for(&run_dir, Path::new("/short/lnx"))
+    );
+    assert!(unix_socket_path_fits(&longest_runtime_socket_path(
+        &socket_dir
+    )));
+}
+
+#[test]
+fn relocated_socket_dir_is_private() {
+    let temp = TempDir::new("socket-dir");
+    let deep = temp.path.join("d".repeat(UNIX_SOCKET_PATH_CAPACITY));
+    let layout = Layout::resolve_for_base("dev", None, None, deep.clone(), None, deep.clone());
+    let socket_dir = layout.socket_dir();
+    assert_ne!(socket_dir, layout.run_dir);
+    layout.create_runtime_dirs().expect("create runtime dirs");
+    let mode = fs::metadata(&socket_dir).expect("stat").permissions();
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(mode.mode() & 0o777, 0o700);
+    let _ = fs::remove_dir(&socket_dir);
+}

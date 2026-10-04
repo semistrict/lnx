@@ -1725,7 +1725,7 @@ fn route_http_host(
         }
     };
     let layout = Layout::resolve(&route.instance, None, None)?;
-    let broker_socket = layout.run_dir.join("broker.sock");
+    let broker_socket = layout.socket(crate::paths::RuntimeSocket::Broker);
     ensure_instance_broker(&route.instance, &broker_socket, config)?;
     Ok(Some((broker_socket, route)))
 }

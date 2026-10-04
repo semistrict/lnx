@@ -24,7 +24,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use libkrun::{Error as KrunError, Kernel, Network, VmBuilder, VmHandle};
 use lnx_protocol::{Message, PROTOCOL_VERSION};
 
-use crate::{host_share, initramfs, krun, paths::Layout};
+use crate::{
+    host_share, initramfs, krun,
+    paths::{
+        GVPROXY_KRUN_SOCKET_SUFFIX, Layout, RuntimeSocket, UNIX_SOCKET_PATH_CAPACITY,
+        unix_socket_path_fits,
+    },
+};
 
 const AGENT_PORT: u32 = 10240;
 const SNAPSHOT_PORT: u32 = 10241;
@@ -168,8 +174,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
     }
     install_signal_handlers();
     INTERRUPTED.store(false, Ordering::SeqCst);
-    fs::create_dir_all(&config.layout.run_dir)
-        .with_context(|| format!("create {}", config.layout.run_dir.display()))?;
+    config.layout.create_runtime_dirs()?;
     fs::create_dir_all(&config.layout.snapshot_dir)
         .with_context(|| format!("create {}", config.layout.snapshot_dir.display()))?;
     validate_restore_work_for_command(&config.layout)?;
@@ -199,14 +204,11 @@ pub fn run(config: RunConfig) -> Result<i32> {
     // Foreground snapshot-output owners are intentionally private: attaching
     // an unrelated command would mutate state captured only into the
     // checkpoint and make that successful command disappear from `latest`.
-    let broker_socket = config
-        .layout
-        .run_dir
-        .join(if config.snapshot_output.is_some() {
-            "checkpoint-broker.sock"
-        } else {
-            "broker.sock"
-        });
+    let broker_socket = config.layout.socket(if config.snapshot_output.is_some() {
+        RuntimeSocket::CheckpointBroker
+    } else {
+        RuntimeSocket::Broker
+    });
     let no_daemon_reuse = !config.reuse_owner || debug_flag_enabled("nodaemonreuse");
     if no_daemon_reuse {
         run_log.line("debug.nodaemonreuse enabled");
@@ -518,8 +520,7 @@ pub fn run_owner(mut config: RunConfig) -> Result<()> {
     }
     OWNER_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
     install_owner_signal_handlers();
-    fs::create_dir_all(&config.layout.run_dir)
-        .with_context(|| format!("create {}", config.layout.run_dir.display()))?;
+    config.layout.create_runtime_dirs()?;
     fs::create_dir_all(&config.layout.snapshot_dir)
         .with_context(|| format!("create {}", config.layout.snapshot_dir.display()))?;
     let run_log = Arc::new(RunLog::open(&config.layout)?);
@@ -536,7 +537,7 @@ pub fn run_owner(mut config: RunConfig) -> Result<()> {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "false".to_string())
     ));
-    let broker_socket = config.layout.run_dir.join("broker.sock");
+    let broker_socket = config.layout.socket(RuntimeSocket::Broker);
     let Some(bootstrap_lock) = acquire_bootstrap_for_owner(
         &config.layout,
         &config.layout.run_dir.join("bootstrap.lock.d"),
@@ -744,12 +745,12 @@ fn start_network(
     timings: &TimingLog,
 ) -> Result<NetworkBacking> {
     let _ = config;
-    let gvproxy = start_gvproxy(&config.layout.run_dir)?;
+    let gvproxy = start_gvproxy(
+        &config.layout.socket(RuntimeSocket::Gvproxy),
+        &config.layout.run_dir.join("gvproxy.log"),
+    )?;
     timings.event("gvproxy.ready");
-    run_log.line(format!(
-        "gvproxy.ready socket={}",
-        config.layout.run_dir.join("gvproxy.sock").display()
-    ));
+    run_log.line(format!("gvproxy.ready socket={}", gvproxy.socket.display()));
     Ok(NetworkBacking::Gvproxy(gvproxy))
 }
 
@@ -995,9 +996,9 @@ fn start_vm(
         .map(|restore| restore.snapshot.clone());
     configure_snapshot_restore_compat(vm_restore_snapshot.as_deref(), run_log);
 
-    let socket = config.layout.run_dir.join("lnx-agent.sock");
-    let snapshot_socket = config.layout.run_dir.join("lnx-snapshot.sock");
-    let control_socket = config.layout.run_dir.join("lnx-control.sock");
+    let socket = config.layout.socket(RuntimeSocket::Agent);
+    let snapshot_socket = config.layout.socket(RuntimeSocket::Snapshot);
+    let control_socket = config.layout.socket(RuntimeSocket::Control);
     let listener = bind_unix_listener(&socket)?;
     let snapshot_listener = bind_unix_listener(&snapshot_socket)?;
     let control_listener = bind_unix_listener(&control_socket)?;
@@ -1330,7 +1331,7 @@ fn request_checkpoint_from_current_owner(
     timeout: Duration,
 ) -> Result<()> {
     let lock_path = layout.run_dir.join("bootstrap.lock.d");
-    let broker_socket = layout.run_dir.join("broker.sock");
+    let broker_socket = layout.socket(RuntimeSocket::Broker);
     let expected_pid = owner_pid_from_lock(&lock_path)
         .context("checkpoint requested for an instance without a live VM owner")?;
     let deadline = Instant::now() + timeout;
@@ -1686,24 +1687,22 @@ impl Drop for Gvproxy {
     fn drop(&mut self) {
         drop(self.embedded.take());
         let _ = fs::remove_file(&self.socket);
-        if let (Some(parent), Some(name)) = (self.socket.parent(), self.socket.file_name()) {
-            let krun_socket = parent.join(format!("{}-krun.sock", name.to_string_lossy()));
-            let _ = fs::remove_file(krun_socket);
-        }
+        let mut krun_socket = self.socket.clone().into_os_string();
+        krun_socket.push(GVPROXY_KRUN_SOCKET_SUFFIX);
+        let _ = fs::remove_file(krun_socket);
     }
 }
 
-fn start_gvproxy(run_dir: &Path) -> Result<Gvproxy> {
-    let socket = run_dir.join("gvproxy.sock");
-    let log = run_dir.join("gvproxy.log");
-    let _ = fs::remove_file(&socket);
+fn start_gvproxy(socket: &Path, log: &Path) -> Result<Gvproxy> {
+    ensure_unix_socket_path_fits(socket)?;
+    let _ = fs::remove_file(socket);
     let ssh_port = unused_local_port().context("find unused localhost port for gvproxy ssh")?;
 
-    let embedded = crate::gvproxy_embedded::EmbeddedGvproxy::start(&socket, &log, ssh_port)?;
-    wait_for_path(&socket, Duration::from_secs(30))
+    let embedded = crate::gvproxy_embedded::EmbeddedGvproxy::start(socket, log, ssh_port)?;
+    wait_for_path(socket, Duration::from_secs(30))
         .with_context(|| format!("embedded gvproxy did not create {}", socket.display()))?;
     Ok(Gvproxy {
-        socket,
+        socket: socket.to_path_buf(),
         embedded: Some(embedded),
     })
 }
@@ -1757,7 +1756,22 @@ fn path_is_visible(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Fails with an actionable message instead of the platform's opaque
+/// `EINVAL`/`ENAMETOOLONG` when a socket path does not fit in `sun_path`.
+fn ensure_unix_socket_path_fits(path: &Path) -> Result<()> {
+    if unix_socket_path_fits(path) {
+        return Ok(());
+    }
+    bail!(
+        "unix socket path is {} bytes, longer than the {} bytes the OS allows: {}",
+        path.as_os_str().len(),
+        UNIX_SOCKET_PATH_CAPACITY - 1,
+        path.display()
+    )
+}
+
 fn bind_unix_listener(path: &Path) -> Result<UnixListener> {
+    ensure_unix_socket_path_fits(path)?;
     let mut last_error = None;
     for _ in 0..20 {
         let _ = fs::remove_file(path);
