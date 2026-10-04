@@ -481,29 +481,41 @@ fn snapshot_vm_config_parses_header_and_matches_config() {
     assert!(!config.matches(2, 8192));
 }
 
+fn test_broker() -> (Arc<BrokerState>, mpsc::Receiver<Message>, TempDir) {
+    let temp = TempDir::new("broker-state");
+    let layout = temp_layout(&temp, "vm");
+    fs::create_dir_all(&layout.run_dir).expect("create run dir");
+    let run_log = Arc::new(RunLog::open(&layout).expect("run log"));
+    let (agent_tx, agent_rx) = mpsc::channel();
+    (BrokerState::new(agent_tx, false, run_log), agent_rx, temp)
+}
+
+fn open_exec(state: &BrokerState, channel_id: u64) -> (ChannelAdmission, mpsc::Receiver<Message>) {
+    let (tx, rx) = mpsc::channel();
+    let admission = state
+        .open_channel(
+            channel_id,
+            BrokerChannel {
+                tx,
+                counts_as_active: true,
+            },
+            Message::Close { channel_id },
+            || Ok(()),
+        )
+        .expect("open channel");
+    (admission, rx)
+}
+
 #[test]
 fn agent_reader_failure_notifies_waiting_clients() {
-    let clients = Mutex::new(HashMap::new());
-    let active = AtomicUsize::new(1);
-    let (tx, rx) = mpsc::channel();
+    let (state, _agent_rx, _temp) = test_broker();
     let channel_id = 0xabcddcba_u64;
-    clients.lock().unwrap().insert(
-        channel_id,
-        BrokerChannel {
-            tx,
-            active_owned_by_reader: true,
-        },
-    );
+    let (_, rx) = open_exec(&state, channel_id);
 
-    let dropped = drain_broker_channels(
-        &clients,
-        &active,
-        Some("guest agent disconnected before command completed".to_string()),
-    );
+    let dropped = state.drain(Some("guest agent disconnected before command completed"));
 
     assert_eq!(dropped, 1);
-    assert_eq!(active.load(Ordering::SeqCst), 0);
-    assert!(clients.lock().unwrap().is_empty());
+    assert_eq!(state.active_channels(), 0);
     match rx.recv().expect("client error") {
         Message::Error {
             channel_id: id,
@@ -518,34 +530,135 @@ fn agent_reader_failure_notifies_waiting_clients() {
 
 #[test]
 fn broker_shutdown_closes_registration_gate_before_draining_clients() {
-    let clients = Mutex::new(HashMap::new());
-    let active = AtomicUsize::new(1);
-    let stopping = AtomicBool::new(false);
-    let (tx, rx) = mpsc::channel();
+    let (state, agent_rx, _temp) = test_broker();
     let channel_id = 0x1234_u64;
-    clients.lock().unwrap().insert(
-        channel_id,
-        BrokerChannel {
-            tx,
-            active_owned_by_reader: true,
-        },
-    );
+    let (_, rx) = open_exec(&state, channel_id);
+    assert!(matches!(
+        agent_rx.recv().expect("open forwarded"),
+        Message::Close { .. }
+    ));
 
-    let dropped = begin_broker_shutdown(
-        &stopping,
-        &clients,
-        &active,
-        "VM owner is stopping after a final snapshot".to_string(),
-    );
+    let dropped = state.begin_shutdown(OWNER_STOPPING);
 
-    assert!(stopping.load(Ordering::SeqCst));
+    assert!(state.is_stopping());
     assert_eq!(dropped, 1);
-    assert_eq!(active.load(Ordering::SeqCst), 0);
-    assert!(clients.lock().unwrap().is_empty());
+    assert_eq!(state.active_channels(), 0);
     assert!(matches!(
         rx.recv().expect("shutdown error"),
         Message::Error { channel_id: id, .. } if id == channel_id
     ));
+    assert!(
+        !state
+            .send_to_agent(Message::Eof { channel_id })
+            .expect("send")
+    );
+    assert!(matches!(
+        open_exec(&state, 0x5678).0,
+        ChannelAdmission::Stopping
+    ));
+    assert!(
+        agent_rx.try_recv().is_err(),
+        "nothing reaches the agent after the barrier"
+    );
+}
+
+#[test]
+fn pending_connections_delay_stopping_without_restarting_the_idle_timer() {
+    let (state, _agent_rx, _temp) = test_broker();
+
+    let probe = state.pending_connection();
+    let status = state.idle_status();
+    assert!(!status.busy, "a status probe must not keep the VM awake");
+    assert!(status.pending);
+
+    drop(probe);
+    assert_eq!(
+        state.idle_status(),
+        IdleStatus {
+            busy: false,
+            pending: false,
+            seen_active: false,
+        }
+    );
+}
+
+#[test]
+fn open_channels_keep_the_vm_busy_until_the_agent_closes_them() {
+    let (state, _agent_rx, _temp) = test_broker();
+    let channel_id = 0x42_u64;
+
+    assert!(matches!(
+        open_exec(&state, channel_id).0,
+        ChannelAdmission::Opened
+    ));
+    assert!(matches!(
+        open_exec(&state, channel_id).0,
+        ChannelAdmission::Collision
+    ));
+    assert!(state.idle_status().busy);
+    assert!(state.idle_status().seen_active);
+
+    state.deliver_to_client(channel_id, Message::Close { channel_id });
+
+    assert_eq!(state.active_channels(), 0);
+    assert!(!state.idle_status().busy);
+}
+
+#[test]
+fn lingering_forward_keeps_the_vm_awake() {
+    let (state, _agent_rx, _temp) = test_broker();
+
+    state.keep_awake_for(Duration::from_secs(60));
+
+    assert!(state.idle_status().busy);
+}
+
+struct RecordingCaptures {
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl Captures for RecordingCaptures {
+    fn checkpoint(&self, request: &CheckpointRequest) -> Result<()> {
+        // Slow enough that a worker which did not wait would be caught.
+        thread::sleep(Duration::from_millis(20));
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("checkpoint {}", request.path.display()));
+        Ok(())
+    }
+
+    fn snapshot_exit(&self, channel_id: u64) {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("snapshot-exit {channel_id}"));
+    }
+}
+
+#[test]
+fn capture_worker_runs_jobs_in_order_and_finishes_them_before_stopping() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let worker = CaptureWorker::spawn(RecordingCaptures {
+        log: Arc::clone(&log),
+    });
+    let jobs = worker.jobs();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    jobs.send(CaptureJob::Checkpoint(CheckpointRequest {
+        path: PathBuf::from("/checkpoints/a"),
+        reply: reply_tx,
+    }))
+    .expect("queue checkpoint");
+    jobs.send(CaptureJob::SnapshotExit { channel_id: 7 })
+        .expect("queue snapshot-exit");
+
+    worker.finish().expect("finish worker");
+
+    assert_eq!(
+        *log.lock().unwrap(),
+        ["checkpoint /checkpoints/a", "snapshot-exit 7"]
+    );
+    assert_eq!(reply_rx.recv().expect("checkpoint reply"), Ok(()));
 }
 
 #[test]

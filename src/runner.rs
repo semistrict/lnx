@@ -1460,103 +1460,6 @@ pub fn proxy_stream_to_guest(
     }
 }
 
-struct ActiveReservation {
-    active: Arc<AtomicUsize>,
-    armed: bool,
-}
-
-#[derive(Clone)]
-struct BrokerChannel {
-    tx: mpsc::Sender<Message>,
-    active_owned_by_reader: bool,
-}
-
-struct CheckpointRequest {
-    path: PathBuf,
-    reply: mpsc::Sender<Result<(), String>>,
-}
-
-impl ActiveReservation {
-    fn new(active: Arc<AtomicUsize>) -> Self {
-        active.fetch_add(1, Ordering::SeqCst);
-        Self {
-            active,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for ActiveReservation {
-    fn drop(&mut self) {
-        if self.armed {
-            self.active.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-}
-
-fn drain_broker_channels(
-    clients: &Mutex<HashMap<u64, BrokerChannel>>,
-    active: &AtomicUsize,
-    error_message: Option<String>,
-) -> usize {
-    let drained = match clients.lock() {
-        Ok(mut clients) => clients.drain().collect::<Vec<_>>(),
-        Err(_) => return 0,
-    };
-    let active_owned = drained
-        .iter()
-        .filter(|(_, channel)| channel.active_owned_by_reader)
-        .count();
-    if let Some(message) = error_message {
-        for (channel_id, channel) in &drained {
-            let _ = channel.tx.send(Message::Error {
-                channel_id: *channel_id,
-                message: message.clone(),
-            });
-        }
-    }
-    if active_owned > 0 {
-        active.fetch_sub(active_owned, Ordering::SeqCst);
-    }
-    active_owned
-}
-
-fn begin_broker_shutdown(
-    stopping: &AtomicBool,
-    clients: &Mutex<HashMap<u64, BrokerChannel>>,
-    active: &AtomicUsize,
-    error_message: String,
-) -> usize {
-    let drained = match clients.lock() {
-        Ok(mut clients) => {
-            stopping.store(true, Ordering::SeqCst);
-            clients.drain().collect::<Vec<_>>()
-        }
-        Err(_) => {
-            stopping.store(true, Ordering::SeqCst);
-            return 0;
-        }
-    };
-    let active_owned = drained
-        .iter()
-        .filter(|(_, channel)| channel.active_owned_by_reader)
-        .count();
-    for (channel_id, channel) in &drained {
-        let _ = channel.tx.send(Message::Error {
-            channel_id: *channel_id,
-            message: error_message.clone(),
-        });
-    }
-    if active_owned > 0 {
-        active.fetch_sub(active_owned, Ordering::SeqCst);
-    }
-    active_owned
-}
-
 fn install_signal_handlers() {
     SIGNAL_INIT.call_once(|| unsafe {
         libc::signal(
@@ -2283,57 +2186,6 @@ fn localhost_url_forward(url: &str) -> Option<(&'static str, u16)> {
     Some(("127.0.0.1", port.parse().ok()?))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn ensure_auto_forward_port(
-    listen_host: &str,
-    port: u16,
-    agent_tx: mpsc::Sender<Message>,
-    clients: Arc<Mutex<HashMap<u64, BrokerChannel>>>,
-    active: Arc<AtomicUsize>,
-    seen_active: Arc<AtomicBool>,
-    stopping: Arc<AtomicBool>,
-    auto_forward_ports: Arc<Mutex<HashSet<(String, u16)>>>,
-    run_log: Arc<RunLog>,
-) -> Result<bool> {
-    if port <= 1024 || stopping.load(Ordering::SeqCst) {
-        return Ok(false);
-    }
-    let key = (listen_host.to_string(), port);
-    {
-        let mut ports = auto_forward_ports
-            .lock()
-            .map_err(|_| anyhow!("auto-forward ports lock poisoned"))?;
-        if ports.contains(&key) {
-            return Ok(false);
-        }
-        ports.insert(key.clone());
-    }
-    let forward = PortForward {
-        listen_host: listen_host.to_string(),
-        listen_port: port,
-        guest_host: listen_host.to_string(),
-        guest_port: port,
-    };
-    if let Err(e) = start_forward_listener(
-        forward,
-        agent_tx,
-        clients,
-        active,
-        seen_active,
-        stopping,
-        Arc::clone(&run_log),
-    ) {
-        if let Ok(mut ports) = auto_forward_ports.lock() {
-            ports.remove(&key);
-        }
-        return Err(e);
-    }
-    run_log.line(format!(
-        "auto_forward.listen host={listen_host} port={port} guest_port={port}"
-    ));
-    Ok(true)
-}
-
 fn forwarded_exec_env() -> Vec<(String, String)> {
     const EXACT: &[&str] = &[
         "TERM",
@@ -2572,13 +2424,7 @@ fn run_broker_owner(
     }
 
     let (agent_tx, agent_rx) = mpsc::channel::<Message>();
-    let (checkpoint_tx, checkpoint_rx) = mpsc::channel::<CheckpointRequest>();
-    let (snapshot_exit_tx, snapshot_exit_rx) = mpsc::channel::<u64>();
-    let client_senders = Arc::new(Mutex::new(HashMap::<u64, BrokerChannel>::new()));
-    let auto_forward_ports = Arc::new(Mutex::new(HashSet::<(String, u16)>::new()));
-    let active = Arc::new(AtomicUsize::new(0));
-    let seen_active = Arc::new(AtomicBool::new(idle.starts_idle));
-    let stopping = Arc::new(AtomicBool::new(false));
+    let state = BrokerState::new(agent_tx.clone(), idle.starts_idle, Arc::clone(&run_log));
     let agent_failed_before_snapshot = Arc::new(AtomicBool::new(false));
     let snapshot_started = Arc::new(AtomicBool::new(false));
 
@@ -2594,187 +2440,63 @@ fn run_broker_owner(
         }
     });
 
-    let mut agent_reader = agent_stream;
-    let reader_clients = Arc::clone(&client_senders);
-    let reader_auto_forward_ports = Arc::clone(&auto_forward_ports);
-    let reader_active = Arc::clone(&active);
-    let reader_seen_active = Arc::clone(&seen_active);
-    let reader_stopping = Arc::clone(&stopping);
-    let reader_snapshot_exit_tx = snapshot_exit_tx.clone();
-    let reader_agent_failed_before_snapshot = Arc::clone(&agent_failed_before_snapshot);
-    let reader_snapshot_started = Arc::clone(&snapshot_started);
-    let reader_log = Arc::clone(&run_log);
-    let reader_trace = trace_log.clone();
-    let reader_agent_tx = agent_tx.clone();
-    thread::spawn(move || {
-        let reader_err = loop {
-            let message = match read_message(&mut agent_reader) {
-                Ok(message) => message,
-                Err(e) => break e,
-            };
-            let _activity = krun::deterministic_host_activity();
-            let channel_id = match &message {
-                Message::Data { channel_id, .. }
-                | Message::Stderr { channel_id, .. }
-                | Message::Eof { channel_id }
-                | Message::ExitStatus { channel_id, .. }
-                | Message::Close { channel_id }
-                | Message::ExecStarted { channel_id }
-                | Message::Error { channel_id, .. }
-                | Message::SnapshotExit { channel_id }
-                | Message::OpenUrl { channel_id, .. } => Some(*channel_id),
-                _ => None,
-            };
-            if let Message::ExecStarted { channel_id } = message {
-                if let Some(trace) = &reader_trace {
-                    trace_agent_message(trace, &Message::ExecStarted { channel_id });
-                }
-                continue;
-            }
-            if let Message::SnapshotExit { channel_id } = message {
-                if let Some(trace) = &reader_trace {
-                    trace.event(
-                        "guest_snapshot_exit",
-                        vec![trace_text("channel_id", format!("{channel_id:016x}"))],
-                    );
-                }
-                let _ = reader_snapshot_exit_tx.send(channel_id);
-                continue;
-            }
-            if let Message::OpenUrl { channel_id, url } = message {
-                if reader_stopping.load(Ordering::SeqCst) {
-                    continue;
-                }
-                if let Some((host, port)) = localhost_url_forward(&url) {
-                    if let Err(e) = ensure_auto_forward_port(
-                        host,
-                        port,
-                        reader_agent_tx.clone(),
-                        Arc::clone(&reader_clients),
-                        Arc::clone(&reader_active),
-                        Arc::clone(&reader_seen_active),
-                        Arc::clone(&reader_stopping),
-                        Arc::clone(&reader_auto_forward_ports),
-                        Arc::clone(&reader_log),
-                    ) {
-                        reader_log.line(format!(
-                            "open_url.forward_error channel_id={channel_id:016x} host={host} port={port} error={e:#}"
-                        ));
-                    }
-                }
-                let ok = match open_url_on_host(&url) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        reader_log.line(format!(
-                            "open_url.error channel_id={channel_id:016x} error={e:#}"
-                        ));
-                        false
-                    }
-                };
-                if let Some(trace) = &reader_trace {
-                    trace.event(
-                        "guest_open_url",
-                        vec![
-                            trace_text("channel_id", format!("{channel_id:016x}")),
-                            trace_text("url", url),
-                            trace_bool("ok", ok),
-                        ],
-                    );
-                }
-                if let Ok(_clients) = reader_clients.lock()
-                    && !reader_stopping.load(Ordering::SeqCst)
-                {
-                    let _ = reader_agent_tx.send(Message::OpenUrlResult { channel_id, ok });
-                }
-                continue;
-            }
-            if let Message::PortListeners { ports } = message {
-                if reader_stopping.load(Ordering::SeqCst) {
-                    continue;
-                }
-                for port in ports.into_iter().filter(|port| *port > 1024) {
-                    if let Err(e) = ensure_auto_forward_port(
-                        "127.0.0.1",
-                        port,
-                        reader_agent_tx.clone(),
-                        Arc::clone(&reader_clients),
-                        Arc::clone(&reader_active),
-                        Arc::clone(&reader_seen_active),
-                        Arc::clone(&reader_stopping),
-                        Arc::clone(&reader_auto_forward_ports),
-                        Arc::clone(&reader_log),
-                    ) {
-                        reader_log.line(format!("auto_forward.skip port={port} reason={e:#}"));
-                    }
-                }
-                continue;
-            }
-            if let Some(channel_id) = channel_id {
-                if let Some(trace) = &reader_trace {
-                    trace_agent_message(trace, &message);
-                }
-                let channel = reader_clients
-                    .lock()
-                    .ok()
-                    .and_then(|clients| clients.get(&channel_id).cloned());
-                if let Some(channel) = channel {
-                    let _ = channel.tx.send(message.clone());
-                }
-                if matches!(message, Message::Close { .. }) {
-                    let decrement = reader_clients
-                        .lock()
-                        .ok()
-                        .and_then(|mut clients| clients.remove(&channel_id))
-                        .map(|channel| channel.active_owned_by_reader)
-                        .unwrap_or(false);
-                    if decrement {
-                        reader_active.fetch_sub(1, Ordering::SeqCst);
-                    }
-                }
-            }
-        };
-        let snapshot_started = reader_snapshot_started.load(Ordering::SeqCst);
-        let error_message = if snapshot_started {
-            None
-        } else {
-            reader_agent_failed_before_snapshot.store(true, Ordering::SeqCst);
-            Some(format!(
-                "guest agent disconnected before command completed: {reader_err:#}"
-            ))
-        };
-        let dropped = drain_broker_channels(&reader_clients, &reader_active, error_message.clone());
-        reader_log.line(format!(
-            "broker.agent.reader_eof dropped_channels={dropped} snapshot_started={snapshot_started} error={reader_err:#}"
-        ));
+    let restore_generation = restore_snapshot.as_deref().map(snapshot_generation_id);
+    let capture_worker = CaptureWorker::spawn(Capturer {
+        vm: Arc::clone(&ctx),
+        layout: layout.clone(),
+        rootfs: rootfs.clone(),
+        snapshot_path: snapshot_path.clone(),
+        canonical_rootfs: canonical_rootfs.clone(),
+        promote_rootfs_after_snapshot,
+        restore_snapshot: restore_snapshot.clone(),
+        restore_generation: restore_generation.clone(),
+        initramfs_stamp: initramfs_stamp.clone(),
+        deterministic_clock_state: deterministic_clock_state.clone(),
+        agent_tx: agent_tx.clone(),
+        timings: Arc::clone(&timings),
+        run_log: Arc::clone(&run_log),
+        trace_log: trace_log.clone(),
+        owner_run_id: owner_run_id.clone(),
     });
+
+    {
+        let state = Arc::clone(&state);
+        let captures = capture_worker.jobs();
+        let snapshot_started = Arc::clone(&snapshot_started);
+        let agent_failed_before_snapshot = Arc::clone(&agent_failed_before_snapshot);
+        let trace_log = trace_log.clone();
+        thread::spawn(move || {
+            run_agent_reader(
+                agent_stream,
+                state,
+                captures,
+                snapshot_started,
+                agent_failed_before_snapshot,
+                trace_log,
+            )
+        });
+    }
 
     broker_listener
         .set_nonblocking(true)
         .context("set broker listener nonblocking")?;
-    let owner_timings = Arc::clone(&timings);
-    let owner_log = Arc::clone(&run_log);
-    let force_full_snapshot = restore_snapshot.is_none();
-    let restore_generation = restore_snapshot.as_deref().map(snapshot_generation_id);
-    let broker_idle_ttl = idle.ttl;
     for forward in forwards {
-        if forward.listen_host == "127.0.0.1" && forward.listen_port > 1024 {
-            if let Ok(mut ports) = auto_forward_ports.lock() {
-                ports.insert((forward.listen_host.clone(), forward.listen_port));
-            }
-        }
-        start_forward_listener(
-            forward,
-            agent_tx.clone(),
-            Arc::clone(&client_senders),
-            Arc::clone(&active),
-            Arc::clone(&seen_active),
-            Arc::clone(&stopping),
-            Arc::clone(&run_log),
-        )?;
+        reserve_forward_port(&state, &forward);
+        start_forward_listener(forward, &state)?;
     }
+    let client_context = Arc::new(ClientContext {
+        state: Arc::clone(&state),
+        captures: capture_worker.jobs(),
+        vm: Arc::clone(&ctx),
+        host_home,
+        no_host_shares,
+        trace_log: trace_log.clone(),
+    });
+    let force_full_snapshot = restore_snapshot.is_none();
+    let broker_idle_ttl = idle.ttl;
     Ok(thread::spawn(move || {
-        owner_timings.event("broker.ready");
-        owner_log.line(format!(
+        timings.event("broker.ready");
+        run_log.line(format!(
             "broker.ready socket={} idle_ttl_ms={}",
             broker_socket.display(),
             broker_idle_ttl.as_millis()
@@ -2782,230 +2504,41 @@ fn run_broker_owner(
         let mut idle_deadline: Option<Instant> = None;
         loop {
             if OWNER_SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-                owner_timings.event("owner.shutdown.requested");
-                let dropped = begin_broker_shutdown(
-                    &stopping,
-                    &client_senders,
-                    &active,
-                    "VM owner is stopping after a final snapshot".to_string(),
-                );
-                while let Ok(request) = checkpoint_rx.try_recv() {
-                    let _ = request.reply.send(Err(
-                        "VM owner is stopping after a final snapshot".to_string()
-                    ));
-                }
-                owner_log.line(format!(
+                timings.event("owner.shutdown.requested");
+                let dropped = state.begin_shutdown(OWNER_STOPPING);
+                run_log.line(format!(
                     "owner.shutdown.requested owner_run_id={owner_run_id} active_clients={} notified_clients={dropped}",
-                    active.load(Ordering::SeqCst),
+                    state.active_channels(),
                 ));
                 break;
             }
             match broker_listener.accept() {
                 Ok((client, _)) => {
-                    owner_log.line("broker.client.accepted");
-                    let tx = agent_tx.clone();
-                    let clients = Arc::clone(&client_senders);
-                    // Reserve at accept time so the idle grace period cannot
-                    // expire between a client connecting and its first message.
-                    let reservation = ActiveReservation::new(Arc::clone(&active));
-                    let seen = Arc::clone(&seen_active);
-                    let client_stopping = Arc::clone(&stopping);
-                    let checkpoint_tx = checkpoint_tx.clone();
-                    let client_log = Arc::clone(&owner_log);
-                    let client_ctx = Arc::clone(&ctx);
-                    let client_host_home = host_home.clone();
-                    let client_trace = trace_log.clone();
+                    run_log.line("broker.client.accepted");
+                    // Counted from accept so the owner cannot stop between a
+                    // client connecting and its request arriving.
+                    let pending = state.pending_connection();
+                    let context = Arc::clone(&client_context);
                     thread::spawn(move || {
-                        if let Err(e) = handle_broker_client(
-                            client,
-                            tx,
-                            checkpoint_tx,
-                            clients,
-                            reservation,
-                            seen,
-                            client_stopping,
-                            client_ctx,
-                            client_host_home,
-                            no_host_shares,
-                            Arc::clone(&client_log),
-                            client_trace,
-                        ) {
-                            client_log.line(format!("broker.client.error {e:#}"));
+                        if let Err(error) = handle_broker_client(client, pending, &context) {
+                            context
+                                .state
+                                .run_log()
+                                .line(format!("broker.client.error {error:#}"));
                         }
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    while let Ok(request) = checkpoint_rx.try_recv() {
-                        let generation_id = new_lifecycle_id("snapshot");
-                        owner_timings.event("checkpoint.request.begin");
-                        owner_log.line(format!(
-                            "checkpoint.request owner_run_id={} generation_id={} path={}",
-                            owner_run_id,
-                            generation_id,
-                            request.path.display()
-                        ));
-                        if let Some(trace) = &trace_log {
-                            trace.event(
-                                "checkpoint_request",
-                                vec![trace_text("path", request.path.display().to_string())],
-                            );
-                        }
-                        let result = (|| -> Result<()> {
-                            seed_incremental_snapshot(
-                                &request.path,
-                                restore_snapshot.as_deref(),
-                                &snapshot_path,
-                                &owner_log,
-                            )?;
-                            ensure_deterministic_clock_state_file(
-                                &initramfs_stamp,
-                                deterministic_clock_state.as_ref(),
-                            )?;
-                            owner_log.line(format!(
-                                "checkpoint.capture.begin owner_run_id={} generation_id={} path={} source_rootfs={} source_generation={}",
-                                owner_run_id,
-                                generation_id,
-                                request.path.display(),
-                                rootfs.display(),
-                                restore_generation.as_deref().unwrap_or("none")
-                            ));
-                            capture_vm_state(&ctx, &request.path, &rootfs, &layout)?;
-                            validate_snapshot_rootfs(&request.path)?;
-                            align_snapshot_rootfs_mtime_with_memory(&request.path)?;
-                            owner_log.line(format!(
-                                "checkpoint.capture.done owner_run_id={} generation_id={} path={}",
-                                owner_run_id,
-                                generation_id,
-                                request.path.display()
-                            ));
-                            copy_snapshot_stamp(
-                                &request.path,
-                                &initramfs_stamp,
-                                trace_log.as_deref(),
-                                deterministic_clock_state.as_ref(),
-                            )?;
-                            write_snapshot_lifecycle_manifest(
-                                &request.path,
-                                &generation_id,
-                                &owner_run_id,
-                                &rootfs,
-                            )?;
-                            owner_log.line(format!(
-                                "checkpoint.stamp.done owner_run_id={} generation_id={} path={}",
-                                owner_run_id,
-                                generation_id,
-                                request.path.display()
-                            ));
-                            Ok(())
-                        })()
-                        .map_err(|e| format!("{e:#}"));
-                        if result.is_ok() {
-                            owner_log.line(format!(
-                                "checkpoint.done owner_run_id={} generation_id={} path={}",
-                                owner_run_id,
-                                generation_id,
-                                request.path.display()
-                            ));
-                            if let Some(trace) = &trace_log {
-                                trace.event(
-                                    "checkpoint_done",
-                                    vec![trace_text("path", request.path.display().to_string())],
-                                );
-                            }
-                            log_snapshot_summary(&owner_log, "checkpoint", &request.path);
-                        }
-                        let _ = request.reply.send(result);
-                    }
-                    while let Ok(channel_id) = snapshot_exit_rx.try_recv() {
-                        let generation_id = new_lifecycle_id("snapshot");
-                        owner_timings.event("snapshot_exit.request.begin");
-                        owner_log.line(format!(
-                            "snapshot_exit.request owner_run_id={} generation_id={} channel_id={channel_id} path={}",
-                            owner_run_id,
-                            generation_id,
-                            snapshot_path.display()
-                        ));
-                        let result = capture_snapshot_for_publish(
-                            &ctx,
-                            &snapshot_path,
-                            &rootfs,
-                            &initramfs_stamp,
-                            &layout,
-                            trace_log.as_deref(),
-                            deterministic_clock_state.as_ref(),
-                            restore_snapshot.as_deref(),
-                            false,
-                            &owner_log,
-                            &owner_run_id,
-                            &generation_id,
-                        )
-                        .and_then(|()| {
-                            if promote_rootfs_after_snapshot {
-                                promote_snapshot_rootfs(
-                                    &snapshot_path,
-                                    &canonical_rootfs,
-                                    &owner_timings,
-                                    &owner_log,
-                                    Some(&generation_id),
-                                    Some(&owner_run_id),
-                                )
-                            } else {
-                                Ok(())
-                            }
-                        });
-                        match result {
-                            Ok(()) => {
-                                owner_log.line(format!(
-                                    "snapshot_exit.done owner_run_id={} generation_id={} channel_id={channel_id} path={}",
-                                    owner_run_id,
-                                    generation_id,
-                                    snapshot_path.display()
-                                ));
-                                if let Some(trace) = &trace_log {
-                                    trace.event(
-                                        "snapshot_exit_done",
-                                        vec![
-                                            trace_text("channel_id", format!("{channel_id:016x}")),
-                                            trace_text("path", snapshot_path.display().to_string()),
-                                        ],
-                                    );
-                                }
-                                log_snapshot_summary(&owner_log, "snapshot.latest", &snapshot_path);
-                                let _ = agent_tx.send(Message::CheckpointCreated { channel_id });
-                            }
-                            Err(e) => {
-                                owner_log.line(format!(
-                                    "snapshot_exit.error owner_run_id={} generation_id={} channel_id={channel_id} error={e:#}",
-                                    owner_run_id,
-                                    generation_id
-                                ));
-                                let _ = agent_tx.send(Message::Error {
-                                    channel_id,
-                                    message: format!("snapshot-exit failed: {e:#}"),
-                                });
-                            }
-                        }
-                    }
                     if agent_failed_before_snapshot.load(Ordering::SeqCst) {
-                        owner_timings.event("snapshot.skipped.agent_failed");
-                        owner_log.line(
-                            "snapshot.skipped reason=guest_agent_disconnected_before_snapshot",
-                        );
-                        let _ = fs::remove_file(&broker_socket);
-                        drop(broker_listener);
-                        return Err(anyhow!(
-                            "guest agent disconnected before the final snapshot"
-                        ));
+                        break;
                     }
-                    if active.load(Ordering::SeqCst) > 0 {
+                    let status = state.idle_status();
+                    if status.busy {
                         idle_deadline = None;
-                    } else if seen_active.load(Ordering::SeqCst) {
-                        if broker_idle_ttl.is_zero() {
-                            break;
-                        }
+                    } else if status.seen_active {
                         let deadline =
                             idle_deadline.get_or_insert_with(|| Instant::now() + broker_idle_ttl);
-                        if Instant::now() >= *deadline {
+                        if Instant::now() >= *deadline && !status.pending {
                             break;
                         }
                     }
@@ -3017,34 +2550,27 @@ fn run_broker_owner(
         // Establish the same registration barrier for every loop exit, not
         // only signal-driven shutdown. This closes the accept/idle race before
         // the final snapshot begins.
-        let dropped = begin_broker_shutdown(
-            &stopping,
-            &client_senders,
-            &active,
-            "VM owner is stopping after a final snapshot".to_string(),
-        );
-        while let Ok(request) = checkpoint_rx.try_recv() {
-            let _ = request.reply.send(Err(
-                "VM owner is stopping after a final snapshot".to_string()
-            ));
-        }
-        owner_log.line(format!(
+        let dropped = state.begin_shutdown(OWNER_STOPPING);
+        run_log.line(format!(
             "broker.shutdown.barrier owner_run_id={owner_run_id} active_clients={} notified_clients={dropped}",
-            active.load(Ordering::SeqCst),
+            state.active_channels(),
         ));
         let _ = fs::remove_file(&broker_socket);
         drop(broker_listener);
+        // Checkpoints and snapshot-exits accepted before the barrier finish
+        // before the final snapshot captures the VM.
+        capture_worker.finish()?;
         if agent_failed_before_snapshot.load(Ordering::SeqCst) {
-            owner_timings.event("snapshot.skipped.agent_failed");
-            owner_log.line("snapshot.skipped reason=guest_agent_disconnected_before_snapshot");
+            timings.event("snapshot.skipped.agent_failed");
+            run_log.line("snapshot.skipped reason=guest_agent_disconnected_before_snapshot");
             return Err(anyhow!(
                 "guest agent disconnected before the final snapshot"
             ));
         }
         snapshot_started.store(true, Ordering::SeqCst);
         let generation_id = new_lifecycle_id("snapshot");
-        owner_timings.event("snapshot.request.guest");
-        owner_log.line(format!(
+        timings.event("snapshot.request.guest");
+        run_log.line(format!(
             "snapshot.request.guest owner_run_id={} generation_id={} path={} full={} source_rootfs={} source_generation={}",
             owner_run_id,
             generation_id,
@@ -3075,8 +2601,8 @@ fn run_broker_owner(
             restore_snapshot.as_deref(),
             force_full_snapshot,
             promote_rootfs_after_snapshot.then_some(canonical_rootfs.as_path()),
-            &owner_timings,
-            &owner_log,
+            &timings,
+            &run_log,
             &owner_run_id,
             &generation_id,
         );
@@ -3086,7 +2612,7 @@ fn run_broker_owner(
             snapshot_result,
         ) {
             Ok(()) => {
-                owner_log.line(format!(
+                run_log.line(format!(
                     "snapshot.done owner_run_id={} generation_id={} path={}",
                     owner_run_id,
                     generation_id,
@@ -3098,9 +2624,9 @@ fn run_broker_owner(
                         vec![trace_text("path", snapshot_path.display().to_string())],
                     );
                 }
-                log_snapshot_summary(&owner_log, "snapshot.latest", &snapshot_path);
+                log_snapshot_summary(&run_log, "snapshot.latest", &snapshot_path);
                 if clear_restore_marker_after_final_snapshot {
-                    owner_log.line(format!(
+                    run_log.line(format!(
                         "snapshot.work.mark_inactive owner_run_id={owner_run_id} generation_id={generation_id} path={}",
                         layout
                             .snapshot_dir
@@ -3111,7 +2637,7 @@ fn run_broker_owner(
                 Ok(())
             }
             Err(e) => {
-                owner_log.line(format!(
+                run_log.line(format!(
                     "snapshot.error owner_run_id={} generation_id={} error={e:#}",
                     owner_run_id, generation_id
                 ));
@@ -3418,231 +2944,6 @@ fn agent_accept_timeout_from_env(value: Option<String>) -> Duration {
         .unwrap_or(DEFAULT_AGENT_ACCEPT_TIMEOUT)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_broker_client(
-    mut client: UnixStream,
-    agent_tx: mpsc::Sender<Message>,
-    checkpoint_tx: mpsc::Sender<CheckpointRequest>,
-    clients: Arc<Mutex<HashMap<u64, BrokerChannel>>>,
-    mut active_reservation: ActiveReservation,
-    seen_active: Arc<AtomicBool>,
-    stopping: Arc<AtomicBool>,
-    ctx: Arc<VmHandle>,
-    host_home: PathBuf,
-    no_host_shares: bool,
-    run_log: Arc<RunLog>,
-    trace_log: Option<Arc<TraceLog>>,
-) -> Result<()> {
-    client
-        .set_nonblocking(false)
-        .context("set broker client blocking")?;
-    match read_message(&mut client)? {
-        Message::Hello { version } if version == PROTOCOL_VERSION => {}
-        Message::Hello { version } => {
-            run_log.line(format!(
-                "broker.client.protocol_mismatch expected={} actual={} action=close",
-                PROTOCOL_VERSION, version
-            ));
-            return Ok(());
-        }
-        other => bail!("bad client hello: {other:?}"),
-    }
-    write_message(
-        &mut client,
-        &Message::Hello {
-            version: PROTOCOL_VERSION,
-        },
-    )?;
-    let first = read_message(&mut client)?;
-    if stopping.load(Ordering::SeqCst) {
-        let channel_id = match &first {
-            Message::Checkpoint { channel_id, .. }
-            | Message::OpenExec { channel_id, .. }
-            | Message::OpenTcp { channel_id, .. } => Some(*channel_id),
-            _ => None,
-        };
-        if let Some(channel_id) = channel_id {
-            write_message(
-                &mut client,
-                &Message::Error {
-                    channel_id,
-                    message: "VM owner is stopping after a final snapshot".to_string(),
-                },
-            )?;
-        }
-        return Ok(());
-    }
-    let first_activity = krun::deterministic_host_activity();
-    if let Message::Checkpoint { channel_id, path } = first {
-        if let Some(trace) = &trace_log {
-            trace.event(
-                "client_checkpoint_request",
-                vec![
-                    trace_text("channel_id", format!("{channel_id:016x}")),
-                    trace_text("path", path.as_str()),
-                ],
-            );
-        }
-        let (reply_tx, reply_rx) = mpsc::channel();
-        let stopping_rejected = {
-            let _clients = clients
-                .lock()
-                .map_err(|_| anyhow::anyhow!("lock broker clients"))?;
-            if stopping.load(Ordering::SeqCst) {
-                true
-            } else {
-                checkpoint_tx
-                    .send(CheckpointRequest {
-                        path: PathBuf::from(path),
-                        reply: reply_tx,
-                    })
-                    .context("send checkpoint request to owner")?;
-                false
-            }
-        };
-        if stopping_rejected {
-            write_message(
-                &mut client,
-                &Message::Error {
-                    channel_id,
-                    message: "VM owner is stopping after a final snapshot".to_string(),
-                },
-            )?;
-            return Ok(());
-        }
-        match reply_rx.recv().context("receive checkpoint result")? {
-            Ok(()) => write_message(&mut client, &Message::CheckpointCreated { channel_id })?,
-            Err(message) => write_message(
-                &mut client,
-                &Message::Error {
-                    channel_id,
-                    message,
-                },
-            )?,
-        }
-        return Ok(());
-    };
-    let channel_id = match &first {
-        Message::OpenExec { channel_id, .. } | Message::OpenTcp { channel_id, .. } => *channel_id,
-        _ => bail!("client did not open a channel"),
-    };
-    run_log.line(format!("broker.client.open channel={channel_id:016x}"));
-    if let Some(trace) = &trace_log {
-        trace_client_open(trace, &first);
-    }
-    let (to_client_tx, to_client_rx) = mpsc::channel::<Message>();
-    let mut first = Some(first);
-    let rejection = {
-        let mut clients = clients
-            .lock()
-            .map_err(|_| anyhow::anyhow!("lock broker clients"))?;
-        if stopping.load(Ordering::SeqCst) {
-            Some("VM owner is stopping after a final snapshot".to_string())
-        } else {
-            match clients.entry(channel_id) {
-                Entry::Occupied(_) => Some(format!(
-                    "channel id collision for live channel {channel_id:016x}; deterministic mode cannot run identical commands concurrently"
-                )),
-                Entry::Vacant(entry) => {
-                    if !no_host_shares && let Some(Message::OpenExec { cwd, .. }) = first.as_ref() {
-                        replace_home_write_allowlist(ctx.as_ref(), Path::new(cwd), &host_home)?;
-                    }
-                    seen_active.store(true, Ordering::SeqCst);
-                    entry.insert(BrokerChannel {
-                        tx: to_client_tx,
-                        active_owned_by_reader: true,
-                    });
-                    if let Err(e) = agent_tx.send(first.take().expect("first broker message")) {
-                        clients.remove(&channel_id);
-                        return Err(e).context("send open exec to agent");
-                    }
-                    None
-                }
-            }
-        }
-    };
-    if let Some(message) = rejection {
-        if message.starts_with("channel id collision") {
-            run_log.line(format!("broker.client.channel_collision {message}"));
-        }
-        write_message(
-            &mut client,
-            &Message::Error {
-                channel_id,
-                message,
-            },
-        )?;
-        return Ok(());
-    }
-    drop(first_activity);
-    active_reservation.disarm();
-    let mut writer = client.try_clone().context("clone broker client")?;
-    thread::spawn(move || {
-        while let Ok(message) = to_client_rx.recv() {
-            let _activity = krun::deterministic_host_activity();
-            if write_message(&mut writer, &message).is_err() {
-                break;
-            }
-        }
-    });
-    loop {
-        match read_message(&mut client) {
-            Ok(message) => {
-                let _activity = krun::deterministic_host_activity();
-                match &message {
-                    Message::Data { channel_id, bytes } => run_log.line(format!(
-                        "broker.client.data channel={channel_id:016x} bytes={}",
-                        bytes.len()
-                    )),
-                    Message::Eof { channel_id } => {
-                        run_log.line(format!("broker.client.eof channel={channel_id:016x}"))
-                    }
-                    Message::Close { channel_id } => {
-                        run_log.line(format!("broker.client.close channel={channel_id:016x}"))
-                    }
-                    _ => {}
-                }
-                if let Some(trace) = &trace_log {
-                    trace_client_message(trace, &message);
-                }
-                let send_result = {
-                    let _clients = clients
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("lock broker clients"))?;
-                    if stopping.load(Ordering::SeqCst) {
-                        return Ok(());
-                    }
-                    agent_tx.send(message)
-                };
-                if let Err(e) = send_result {
-                    // The agent writer is gone; this channel can never
-                    // complete, so release its idle-accounting slot.
-                    let owned = clients
-                        .lock()
-                        .ok()
-                        .and_then(|mut clients| clients.remove(&channel_id))
-                        .map(|channel| channel.active_owned_by_reader)
-                        .unwrap_or(false);
-                    if owned {
-                        active_reservation.active.fetch_sub(1, Ordering::SeqCst);
-                    }
-                    return Err(e).context("send client message to agent");
-                }
-            }
-            Err(_) => {
-                let _activity = krun::deterministic_host_activity();
-                run_log.line(format!("broker.client.read_eof channel={channel_id:016x}"));
-                if let Ok(_clients) = clients.lock() {
-                    if !stopping.load(Ordering::SeqCst) {
-                        let _ = agent_tx.send(Message::Eof { channel_id });
-                    }
-                }
-                return Ok(());
-            }
-        }
-    }
-}
-
 fn trace_client_open(trace: &TraceLog, message: &Message) {
     match message {
         Message::OpenExec {
@@ -3815,207 +3116,6 @@ fn trace_agent_message(trace: &TraceLog, message: &Message) {
         ),
         _ => {}
     }
-}
-
-fn start_forward_listener(
-    forward: PortForward,
-    agent_tx: mpsc::Sender<Message>,
-    clients: Arc<Mutex<HashMap<u64, BrokerChannel>>>,
-    active: Arc<AtomicUsize>,
-    seen_active: Arc<AtomicBool>,
-    stopping: Arc<AtomicBool>,
-    run_log: Arc<RunLog>,
-) -> Result<()> {
-    let listener = TcpListener::bind((forward.listen_host.as_str(), forward.listen_port))
-        .with_context(|| format!("listen on {}:{}", forward.listen_host, forward.listen_port))?;
-    listener.set_nonblocking(true).with_context(|| {
-        format!(
-            "set forward listener nonblocking {}:{}",
-            forward.listen_host, forward.listen_port
-        )
-    })?;
-    run_log.line(format!(
-        "forward.listen host={} port={} guest_host={} guest_port={}",
-        forward.listen_host, forward.listen_port, forward.guest_host, forward.guest_port
-    ));
-    thread::spawn(move || {
-        loop {
-            if stopping.load(Ordering::SeqCst) {
-                break;
-            }
-            match listener.accept() {
-                Ok((stream, peer)) => {
-                    let _ = stream.set_nonblocking(false);
-                    run_log.line(format!(
-                        "forward.accept listen_port={} peer={peer}",
-                        forward.listen_port
-                    ));
-                    let connection_forward = forward.clone();
-                    let connection_tx = agent_tx.clone();
-                    let connection_clients = Arc::clone(&clients);
-                    let connection_active = Arc::clone(&active);
-                    let connection_seen = Arc::clone(&seen_active);
-                    let connection_stopping = Arc::clone(&stopping);
-                    let connection_log = Arc::clone(&run_log);
-                    thread::spawn(move || {
-                        if let Err(e) = handle_forward_connection(
-                            stream,
-                            connection_forward,
-                            connection_tx,
-                            connection_clients,
-                            connection_active,
-                            connection_seen,
-                            connection_stopping,
-                            Arc::clone(&connection_log),
-                        ) {
-                            connection_log.line(format!("forward.connection.error {e:#}"));
-                        }
-                    });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => {
-                    run_log.line(format!("forward.accept.error {e:#}"));
-                    break;
-                }
-            }
-        }
-    });
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn handle_forward_connection(
-    mut local: TcpStream,
-    forward: PortForward,
-    agent_tx: mpsc::Sender<Message>,
-    clients: Arc<Mutex<HashMap<u64, BrokerChannel>>>,
-    active: Arc<AtomicUsize>,
-    seen_active: Arc<AtomicBool>,
-    stopping: Arc<AtomicBool>,
-    run_log: Arc<RunLog>,
-) -> Result<()> {
-    if stopping.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-    let reservation = ActiveReservation::new(active);
-    seen_active.store(true, Ordering::SeqCst);
-    let channel_id = new_request_id()?;
-    let (to_forward_tx, to_forward_rx) = mpsc::channel::<Message>();
-    {
-        let mut clients = clients
-            .lock()
-            .map_err(|_| anyhow::anyhow!("lock broker clients"))?;
-        if stopping.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        clients.insert(
-            channel_id,
-            BrokerChannel {
-                tx: to_forward_tx,
-                active_owned_by_reader: false,
-            },
-        );
-        if let Err(e) = agent_tx.send(Message::OpenTcp {
-            channel_id,
-            host: forward.guest_host,
-            port: forward.guest_port,
-        }) {
-            clients.remove(&channel_id);
-            return Err(e).context("send open tcp to agent");
-        }
-    }
-
-    let mut local_reader = local.try_clone().context("clone local forward stream")?;
-    let input_tx = agent_tx.clone();
-    let input_stopping = Arc::clone(&stopping);
-    let input_clients = Arc::clone(&clients);
-    thread::spawn(move || {
-        let mut buf = [0u8; 8192];
-        loop {
-            if input_stopping.load(Ordering::SeqCst) {
-                break;
-            }
-            match local_reader.read(&mut buf) {
-                Ok(0) => {
-                    if let Ok(clients) = input_clients.lock() {
-                        if !input_stopping.load(Ordering::SeqCst)
-                            && clients.contains_key(&channel_id)
-                        {
-                            let _ = input_tx.send(Message::Eof { channel_id });
-                        }
-                    }
-                    break;
-                }
-                Ok(n) => {
-                    let sent = if let Ok(clients) = input_clients.lock() {
-                        !input_stopping.load(Ordering::SeqCst)
-                            && clients.contains_key(&channel_id)
-                            && input_tx
-                                .send(Message::Data {
-                                    channel_id,
-                                    bytes: buf[..n].to_vec(),
-                                })
-                                .is_ok()
-                    } else {
-                        false
-                    };
-                    if !sent {
-                        break;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(1));
-                }
-                Err(_) => {
-                    if let Ok(clients) = input_clients.lock() {
-                        if !input_stopping.load(Ordering::SeqCst)
-                            && clients.contains_key(&channel_id)
-                        {
-                            let _ = input_tx.send(Message::Close { channel_id });
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-    });
-
-    while let Ok(message) = to_forward_rx.recv() {
-        match message {
-            Message::Data {
-                channel_id: id,
-                bytes,
-            } if id == channel_id => {
-                if local.write_all(&bytes).is_err() {
-                    run_log.line(format!("forward.local_write.error channel={channel_id}"));
-                    break;
-                }
-            }
-            Message::Eof { channel_id: id } if id == channel_id => {
-                let _ = local.shutdown(Shutdown::Write);
-            }
-            Message::Close { channel_id: id } if id == channel_id => {
-                break;
-            }
-            Message::Error {
-                channel_id: id,
-                message,
-            } if id == channel_id => bail!("{message}"),
-            _ => {}
-        }
-    }
-    if let Ok(mut clients) = clients.lock() {
-        clients.remove(&channel_id);
-        if !stopping.load(Ordering::SeqCst) {
-            let _ = agent_tx.send(Message::Close { channel_id });
-        }
-    }
-    thread::sleep(Duration::from_secs(60));
-    drop(reservation);
-    Ok(())
 }
 
 struct RestoreSnapshotUnblocker {
@@ -4811,12 +3911,16 @@ fn console_hint(path: &Path) -> String {
     )
 }
 
+mod broker;
+mod capture;
 mod deterministic;
 mod launch_meta;
 mod locks;
 mod logs;
 mod protocol_io;
 mod snapshots;
+pub(crate) use broker::*;
+pub(crate) use capture::*;
 pub(crate) use deterministic::*;
 pub(crate) use launch_meta::*;
 pub(crate) use locks::*;
