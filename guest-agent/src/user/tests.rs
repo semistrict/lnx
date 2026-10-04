@@ -96,3 +96,25 @@ fn current_sudoers_dropin_skips_rewrite() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn replacing_a_file_keeps_its_mode_and_leaves_no_temporary() {
+    let dir = std::env::temp_dir().join(format!(
+        "lnx-replace-file-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).expect("create dir");
+    let path = dir.join("group");
+    fs::write(&path, "root:x:0:\n").expect("write");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+
+    replace_file(path.to_str().unwrap(), "root:x:0:\nstaff:x:20:\n").expect("replace");
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), "root:x:0:\nstaff:x:20:\n");
+    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    let _ = fs::remove_dir_all(&dir);
+}

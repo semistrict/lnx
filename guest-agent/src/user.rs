@@ -2,7 +2,9 @@ use std::ffi::{CString, c_char, c_int, c_uint};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::Command;
+use std::sync::Mutex;
 
 pub const EXEC_USER: &str = "lnxuser";
 pub const EXEC_HOME: &str = "/home/lnxuser";
@@ -72,10 +74,29 @@ unsafe extern "C" {
     fn chown(path: *const c_char, owner: c_uint, group: c_uint) -> c_int;
 }
 
+/// The exec identity last set up, so later commands as the same user skip
+/// the work. Holding it also serializes setup: commands start on their own
+/// threads, and two of them editing /etc/group at once could each write back
+/// a copy missing the other's view of the file (dpkg then fails on groups
+/// that "got removed").
+static EXEC_IDENTITY: Mutex<Option<(u32, u32, String)>> = Mutex::new(None);
+
 pub fn ensure_exec_user(uid: u32, gid: u32, group: &str) {
     if uid == 0 {
         return;
     }
+    let mut done = EXEC_IDENTITY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let identity = (uid, gid, group.to_string());
+    if done.as_ref() == Some(&identity) {
+        return;
+    }
+    set_up_exec_user(uid, gid, group);
+    *done = Some(identity);
+}
+
+fn set_up_exec_user(uid: u32, gid: u32, group: &str) {
     ensure_exec_group(gid, group);
     let shell = default_image_shell();
     if !file_contains_line_prefix("/etc/passwd", "lnxuser:") {
@@ -179,42 +200,26 @@ fn rewrite_passwd_shell(user: &str, shell: &str) {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let _ = fs::write("/etc/passwd", rewritten + "\n");
+    let _ = replace_file("/etc/passwd", &(rewritten + "\n"));
 }
 
-/// Make the guest's group for `gid` carry the host's name for it, so shared
-/// files list the same owner group on both sides (e.g. gid 20 is `staff` on
-/// macOS but ships as `dialout` in the rootfs). Renames an existing group or
-/// creates a missing one; host names that are not portable Linux group names
-/// leave the guest untouched.
+/// Give the exec user's group a name in the guest: the host's name for it
+/// when the guest has no group with that id. A guest group that already has
+/// the id keeps its name: renaming a distribution's system group (macOS's
+/// gid 20 `staff` is Ubuntu's `dialout`) breaks package scripts that expect
+/// it, which then leave dpkg unable to install anything.
 fn ensure_exec_group(gid: u32, host_name: &str) {
-    if !is_portable_group_name(host_name) {
+    if !is_portable_group_name(host_name) || group_name_for_gid(gid).is_some() {
         return;
     }
-    match group_name_for_gid(gid) {
-        Some(name) if name == host_name => {}
-        Some(name) => {
-            let renamed = Command::new("/usr/sbin/groupmod")
-                .arg("-n")
-                .arg(host_name)
-                .arg(&name)
-                .status()
-                .is_ok_and(|status| status.success());
-            if !renamed {
-                rename_group_entry(&name, host_name);
-            }
-        }
-        None => {
-            let added = Command::new("/usr/sbin/groupadd")
-                .arg("-g")
-                .arg(gid.to_string())
-                .arg(host_name)
-                .status()
-                .is_ok_and(|status| status.success());
-            if !added {
-                append_file("/etc/group", &format!("{host_name}:x:{gid}:\n"));
-            }
-        }
+    let added = Command::new("/usr/sbin/groupadd")
+        .arg("-g")
+        .arg(gid.to_string())
+        .arg(host_name)
+        .status()
+        .is_ok_and(|status| status.success());
+    if !added {
+        append_file("/etc/group", &format!("{host_name}:x:{gid}:\n"));
     }
 }
 
@@ -241,23 +246,25 @@ fn group_name_for_gid(gid: u32) -> Option<String> {
         })
 }
 
-fn rename_group_entry(old: &str, new: &str) {
-    let Ok(contents) = fs::read_to_string("/etc/group") else {
-        return;
-    };
-    let prefix = format!("{old}:");
-    let renamed = contents
-        .lines()
-        .map(|line| {
-            if let Some(rest) = line.strip_prefix(&prefix) {
-                format!("{new}:{rest}")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let _ = fs::write("/etc/group", renamed + "\n");
+/// Replaces `path` with `contents` in one step (a sibling temporary file
+/// renamed over it, keeping the mode), so no reader ever sees it half
+/// written.
+fn replace_file(path: &str, contents: &str) -> std::io::Result<()> {
+    let path = Path::new(path);
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("path has no file name"))?
+        .to_string_lossy();
+    let tmp = path.with_file_name(format!(".{name}.lnx-tmp"));
+    let mode = fs::metadata(path).map(|metadata| metadata.permissions().mode())?;
+    let _ = fs::remove_file(&tmp);
+    {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)
 }
 
 fn create_exec_user_with_useradd(uid: u32, gid: u32, shell: &str) -> bool {
