@@ -25,6 +25,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use libkrun::{Error as KrunError, Kernel, Network, VmBuilder, VmHandle};
 use lnx_protocol::{Message, PROTOCOL_VERSION};
 
+use crate::store::{self, GenerationId, Origin, Store};
 use crate::{
     host_share, initramfs, krun,
     paths::{
@@ -42,7 +43,6 @@ const FRAME_SNAPSHOT: u8 = b'K';
 // configured"; the client reports a hard restore failure.
 const EXIT_RESTORE_FAILED: i32 = 86;
 
-const DEFAULT_BROKER_IDLE_TTL: Duration = Duration::ZERO;
 const DEFAULT_OWNER_IDLE_TTL: Duration = Duration::from_secs(5);
 // The detached owner counts idle time from broker start, so a TTL shorter than
 // the client's connect retry interval would suspend the VM before the client
@@ -51,6 +51,7 @@ const MIN_OWNER_IDLE_TTL: Duration = Duration::from_millis(250);
 const OWNER_BOOT_TIMEOUT: Duration = Duration::from_secs(120);
 const FRESH_OWNER_SLOT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_AGENT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(90);
+const RESTORE_AGENT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(20);
 const BROKER_HELLO_TIMEOUT: Duration = Duration::from_secs(1);
 const OWNER_REPLACE_GRACE: Duration = Duration::from_secs(120);
 const ROOTFS_BACKEND_ENV: &str = "LNX_ROOTFS_BACKEND";
@@ -89,9 +90,7 @@ pub struct RunConfig {
     pub memory_mib: u32,
     pub nested_kvm: bool,
     pub restore_snapshot: Option<PathBuf>,
-    pub restore_latest_if_available: bool,
     pub forwards: Vec<PortForward>,
-    pub snapshot_output: Option<PathBuf>,
     pub run_as_root: bool,
     pub no_host_shares: bool,
     pub vhost_user_fs: Vec<VhostUserFsMount>,
@@ -176,9 +175,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
     install_signal_handlers();
     INTERRUPTED.store(false, Ordering::SeqCst);
     config.layout.create_runtime_dirs()?;
-    fs::create_dir_all(&config.layout.snapshot_dir)
-        .with_context(|| format!("create {}", config.layout.snapshot_dir.display()))?;
-    validate_restore_work_for_command(&config.layout)?;
+    refuse_crashed_run(&config.layout)?;
     let run_log = Arc::new(RunLog::open(&config.layout)?);
     let run_id = current_run_id();
     run_log.line(format!(
@@ -202,14 +199,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
         config.layout.run_dir.join("gvproxy.log").display()
     ));
     preflight_host_share_cwd(&config.layout, &config.cwd, config.no_host_shares)?;
-    // Foreground snapshot-output owners are intentionally private: attaching
-    // an unrelated command would mutate state captured only into the
-    // checkpoint and make that successful command disappear from `latest`.
-    let broker_socket = config.layout.socket(if config.snapshot_output.is_some() {
-        RuntimeSocket::CheckpointBroker
-    } else {
-        RuntimeSocket::Broker
-    });
+    let broker_socket = config.layout.socket(RuntimeSocket::Broker);
     let no_daemon_reuse = !config.reuse_owner || debug_flag_enabled("nodaemonreuse");
     if no_daemon_reuse {
         run_log.line("debug.nodaemonreuse enabled");
@@ -217,7 +207,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
             "debug[nodaemonreuse]: replacing any existing VM owner for this instance before starting a fresh owner."
         );
     }
-    if config.snapshot_output.is_none() && config.forwards.is_empty() && !no_daemon_reuse {
+    if config.forwards.is_empty() && !no_daemon_reuse {
         if broker_socket.exists() {
             validate_runtime_deterministic_compatibility(
                 &config.layout,
@@ -242,12 +232,6 @@ pub fn run(config: RunConfig) -> Result<i32> {
         preflight_fresh_owner_network(&config, &run_log)?;
         prepare_fresh_owner_slot(&config.layout, no_daemon_reuse, &run_log)?;
     }
-    if config.snapshot_output.is_some() {
-        // Checkpoint and vm-init runs need the snapshot written before they
-        // return, so they keep the VM in the foreground.
-        return run_foreground(config, run_log, broker_socket, run_id);
-    }
-
     preflight_fresh_owner_network(&config, &run_log)?;
     let start_lock = match acquire_owner_start_or_run_client(
         &config.layout,
@@ -289,80 +273,47 @@ pub fn run(config: RunConfig) -> Result<i32> {
     Ok(status)
 }
 
-/// Validates recovery state before any path can discard it. A live holder of
-/// the instance lock legitimately owns in-progress state; once nobody holds
-/// it, missing or failed final-snapshot state requires explicit
-/// acknowledgement. Returns whether the instance is currently held.
-pub(crate) fn validate_restore_work_for_command(layout: &Layout) -> Result<bool> {
-    with_instance_guard(layout, |state| validate_recovery_state(layout, state))
+/// Whether a VM owner or a maintenance command holds the instance now.
+pub(crate) fn instance_is_held(layout: &Layout) -> Result<bool> {
+    Ok(instance_lock_state(layout)?.is_held())
 }
 
-fn validate_recovery_state(layout: &Layout, state: &InstanceLockState) -> Result<bool> {
-    if state.is_held() {
-        return Ok(true);
-    }
-    refuse_active_restore_work(layout)?;
-    let expected_pid = state
-        .stale_lease()
-        .filter(|lease| lease.role == LeaseRole::Owner)
-        .map(|lease| u32::try_from(lease.pid()))
-        .transpose()
-        .context("owner pid does not fit final snapshot outcome")?;
-    validate_final_snapshot_outcome(layout, expected_pid)?;
-    Ok(false)
-}
-
-/// Takes the instance lock for a stopped instance whose recovery state is
-/// clean, recording `role` as the holder.
-fn try_acquire_validated_instance(
-    layout: &Layout,
-    role: LeaseRole,
-) -> Result<Option<InstanceLock>> {
-    InstanceLock::try_acquire(layout, role, |stale| {
-        validate_recovery_state(
-            layout,
-            &InstanceLockState::Free {
-                stale: stale.cloned(),
-            },
-        )
-        .map(drop)
+/// Fails early, with the recovery commands, when the instance's last VM run
+/// crashed after serving commands and nobody has chosen what to keep.
+pub(crate) fn refuse_crashed_run(layout: &Layout) -> Result<()> {
+    with_instance_guard(layout, |state| {
+        if state.is_held() {
+            return Ok(());
+        }
+        refuse_crashed_run_unguarded(layout)
     })
 }
 
-pub(crate) fn with_validated_stopped_instance<T>(
-    layout: &Layout,
-    action: impl FnOnce() -> Result<T>,
-) -> Result<Option<T>> {
-    let Some(state_lock) = try_acquire_validated_instance(layout, LeaseRole::Maintenance)? else {
-        return Ok(None);
-    };
-    let result = action();
-    drop(state_lock);
-    result.map(Some)
+/// [`refuse_crashed_run`] for callers that already hold the instance guard
+/// (or the lock) and know nobody is running the instance.
+pub(crate) fn refuse_crashed_run_unguarded(layout: &Layout) -> Result<()> {
+    match Store::new(&layout.instance_dir).crashed()? {
+        Some(crashed) => Err(crashed.into()),
+        None => Ok(()),
+    }
 }
 
-/// Reserves an instance's stopped state for an operation that intentionally
-/// destroys it. Unlike `with_validated_stopped_instance`, this does not require
-/// recoverable snapshot state because deleting the instance is itself the
-/// explicit destructive action.
-///
-/// `action` receives the lease of a holder that died holding the lock, if
-/// any, so recovery commands can acknowledge what that holder left behind.
+/// Runs `action` while holding the instance lock as a maintenance command,
+/// unless a VM owner or another command holds it. `action` receives the lease
+/// of a holder that died holding the lock, if any.
 pub(crate) fn with_exclusive_instance_state<T>(
     layout: &Layout,
-    action: impl FnOnce(Option<&Lease>) -> Result<T>,
+    action: impl FnOnce(&InstanceLock, Option<&Lease>) -> Result<T>,
 ) -> Result<Option<T>> {
     let mut stale = None;
-    let Some(state_lock) = InstanceLock::try_acquire(layout, LeaseRole::Maintenance, |lease| {
+    let Some(lock) = InstanceLock::try_acquire(layout, LeaseRole::Maintenance, |lease| {
         stale = lease.cloned();
         Ok(())
     })?
     else {
         return Ok(None);
     };
-    let result = action(stale.as_ref());
-    drop(state_lock);
-    result.map(Some)
+    action(&lock, stale.as_ref()).map(Some)
 }
 
 fn validate_runtime_share_compatibility(config: &RunConfig) -> Result<()> {
@@ -389,7 +340,6 @@ fn prepare_fresh_owner_slot(
 ) -> Result<()> {
     if replace_existing {
         replace_existing_owner(layout, run_log)?;
-        validate_restore_work_for_command(layout)?;
     }
     wait_for_fresh_owner_slot(layout, run_log)
 }
@@ -397,7 +347,7 @@ fn prepare_fresh_owner_slot(
 fn wait_for_fresh_owner_slot(layout: &Layout, run_log: &RunLog) -> Result<()> {
     let start = Instant::now();
     let mut logged_wait = false;
-    while validate_restore_work_for_command(layout)? {
+    while instance_is_held(layout)? {
         if !logged_wait {
             run_log.line(format!(
                 "fresh_owner.slot.wait lock={} timeout_ms={}",
@@ -419,8 +369,7 @@ fn wait_for_fresh_owner_slot(layout: &Layout, run_log: &RunLog) -> Result<()> {
 
 fn replace_existing_owner(layout: &Layout, run_log: &RunLog) -> Result<()> {
     let Some(owner) = live_owner(layout) else {
-        validate_restore_work_for_command(layout)?;
-        return Ok(());
+        return refuse_crashed_run(layout);
     };
     let owner = owner.process;
     run_log.line(format!(
@@ -440,9 +389,8 @@ fn replace_existing_owner(layout: &Layout, run_log: &RunLog) -> Result<()> {
                 return Ok(());
             }
             None => {
-                validate_expected_owner_shutdown(layout, owner.pid)?;
                 run_log.line(format!("owner.replace.exited pid={}", owner.pid));
-                return Ok(());
+                return refuse_crashed_run(layout);
             }
         }
         thread::sleep(Duration::from_millis(50));
@@ -454,45 +402,35 @@ fn replace_existing_owner(layout: &Layout, run_log: &RunLog) -> Result<()> {
             layout.instance
         );
     }
-    validate_expected_owner_shutdown(layout, owner.pid)?;
     run_log.line(format!("owner.replace.exited pid={}", owner.pid));
-    Ok(())
+    refuse_crashed_run(layout)
 }
 
-fn validate_expected_owner_shutdown(layout: &Layout, pid: libc::pid_t) -> Result<()> {
-    refuse_active_restore_work(layout)?;
-    let pid = u32::try_from(pid).context("owner pid does not fit final snapshot outcome")?;
-    validate_or_record_final_snapshot_failure(layout, pid)
-}
-
-fn acquire_instance_for_forward(layout: &Layout, run_log: &RunLog) -> Result<InstanceLock> {
-    match try_acquire_validated_instance(layout, LeaseRole::Owner)? {
-        Some(lock) => {
-            run_log.line(format!(
-                "instance.lock.acquired path={} forward=true",
-                instance_lock_path(layout).display()
-            ));
-            Ok(lock)
-        }
-        None => bail!(
-            "starting a fresh VM owner requires exclusive ownership, but another owner started for this instance"
-        ),
+/// Runs the detached VM owner process. A refused memory restore exits with a
+/// distinct status, once the run has released the instance, so the client
+/// waiting for the broker can report it as such.
+pub fn run_owner(config: RunConfig) -> Result<()> {
+    let result = own_vm(config);
+    if let Err(error) = &result
+        && error.downcast_ref::<RestoreRefused>().is_some()
+    {
+        eprintln!("Error: {error:#}");
+        std::process::exit(EXIT_RESTORE_FAILED);
     }
+    result
 }
 
-pub fn run_owner(mut config: RunConfig) -> Result<()> {
+fn own_vm(config: RunConfig) -> Result<()> {
     if config.trace_events && config.deterministic.is_none() {
         bail!("trace events require deterministic mode");
     }
     OWNER_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
     install_owner_signal_handlers();
     config.layout.create_runtime_dirs()?;
-    fs::create_dir_all(&config.layout.snapshot_dir)
-        .with_context(|| format!("create {}", config.layout.snapshot_dir.display()))?;
     let run_log = Arc::new(RunLog::open(&config.layout)?);
     let owner_run_id = current_run_id();
     run_log.line(format!(
-        "owner.start owner_run_id={} pid={} instance={} cwd={} restore={}",
+        "owner.start owner_run_id={} pid={} instance={} cwd={} snapshot={}",
         owner_run_id,
         std::process::id(),
         config.layout.instance,
@@ -501,7 +439,7 @@ pub fn run_owner(mut config: RunConfig) -> Result<()> {
             .restore_snapshot
             .as_ref()
             .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "false".to_string())
+            .unwrap_or_else(|| "latest".to_string())
     ));
     let broker_socket = config.layout.socket(RuntimeSocket::Broker);
     let Some(instance_lock) = acquire_instance_for_owner(&config.layout, &broker_socket, &run_log)?
@@ -509,7 +447,6 @@ pub fn run_owner(mut config: RunConfig) -> Result<()> {
         run_log.line("owner.exit reason=existing_broker");
         return Ok(());
     };
-    refresh_default_restore_snapshot(&mut config)?;
     reset_owner_attempt_logs(&config.layout, &run_log);
     if broker_socket.exists() {
         run_log.line(format!(
@@ -518,169 +455,57 @@ pub fn run_owner(mut config: RunConfig) -> Result<()> {
         ));
         let _ = fs::remove_file(&broker_socket);
     }
+    let session = Arc::new(RunSession::begin(
+        &config.layout,
+        instance_lock,
+        config.restore_snapshot.as_deref(),
+        Arc::clone(&run_log),
+    )?);
 
     let idle = IdlePolicy {
         ttl: owner_idle_ttl(),
         starts_idle: !debug_flag_enabled("nodaemonreuse"),
     };
-    let vm = match start_vm(&config, &run_log, &broker_socket, idle, &owner_run_id) {
+    let vm = match start_vm(
+        &config,
+        &session,
+        &run_log,
+        &broker_socket,
+        idle,
+        &owner_run_id,
+    ) {
         Ok(vm) => vm,
-        // Keep restore refusals distinct from unrelated boot failures so
-        // the client can report a hard memory-restore failure.
-        Err(e) if e.downcast_ref::<RestoreRefused>().is_some() => {
-            run_log.line(format!("owner.start.restore_failed error={e:#}"));
-            drop(instance_lock);
-            std::process::exit(EXIT_RESTORE_FAILED);
+        Err(error) => {
+            if let Err(abandon_error) = session.abandon() {
+                run_log.line(format!("store.run.abandon_error error={abandon_error:#}"));
+            }
+            if error.downcast_ref::<RestoreRefused>().is_some() {
+                run_log.line(format!("owner.start.restore_failed error={error:#}"));
+            }
+            return Err(error);
         }
-        Err(e) => return Err(e),
     };
     let owner_result = vm
         .owner
         .join()
         .map_err(|_| anyhow!("VM owner thread panicked"))
         .and_then(|result| result);
-    write_final_snapshot_outcome(&config.layout, &owner_result)?;
+    if let Err(error) = &owner_result {
+        run_log.line(format!("owner.error error={error:#}"));
+        if let Err(abandon_error) = session.abandon() {
+            run_log.line(format!("store.run.abandon_error error={abandon_error:#}"));
+        }
+    }
     owner_result?;
     flush_deterministic_trace_events(&config.layout, vm.trace_log.as_deref())?;
     run_log.line(format!("owner.done owner_run_id={owner_run_id}"));
     drop(vm.network);
-    drop(instance_lock);
-    Ok(())
-}
-
-fn run_foreground(
-    mut config: RunConfig,
-    run_log: Arc<RunLog>,
-    broker_socket: PathBuf,
-    owner_run_id: String,
-) -> Result<i32> {
-    OWNER_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
-    install_owner_signal_handlers();
-    let owner_start_lock = match acquire_owner_start_or_run_client(
-        &config.layout,
-        &broker_socket,
-        &config.command,
-        &config.cwd,
-        config.run_as_root,
-        config.no_host_shares,
-        config.deterministic.as_ref(),
-        &config.layout.instance,
-        false,
-        &run_log,
-    )? {
-        OwnerStartOutcome::Lock(lock) => lock,
-        OwnerStartOutcome::Status(_) => unreachable!("foreground startup never attaches"),
-    };
-    let no_daemon_reuse = !config.reuse_owner || debug_flag_enabled("nodaemonreuse");
-    if no_daemon_reuse {
-        preflight_fresh_owner_network(&config, &run_log)?;
-        prepare_fresh_owner_slot(&config.layout, true, &run_log)?;
-    }
-    let instance_lock = if config.forwards.is_empty() {
-        match acquire_instance_or_run_client(
-            &config.layout,
-            &broker_socket,
-            &config.command,
-            &config.cwd,
-            config.run_as_root,
-            config.no_host_shares,
-            config.deterministic.as_ref(),
-            &config.layout.instance,
-            true,
-            &run_log,
-        )? {
-            InstanceOutcome::Lock(lock) => lock,
-            InstanceOutcome::Status(status) => return Ok(status),
-        }
-    } else {
-        acquire_instance_for_forward(&config.layout, &run_log)?
-    };
-    drop(owner_start_lock);
-    refresh_default_restore_snapshot(&mut config)?;
-    if broker_socket.exists() {
-        run_log.line(format!(
-            "broker.stale_socket.remove path={}",
-            broker_socket.display()
-        ));
-        let _ = fs::remove_file(&broker_socket);
-    }
-
-    preflight_fresh_owner_network(&config, &run_log)?;
-    let vm = start_vm(
-        &config,
-        &run_log,
-        &broker_socket,
-        IdlePolicy {
-            ttl: broker_idle_ttl(),
-            starts_idle: false,
-        },
-        &owner_run_id,
-    )?;
-    let client_result = run_broker_client_retry(
-        &broker_socket,
-        &config.command,
-        &config.cwd,
-        config.run_as_root,
-        config.no_host_shares,
-        config.deterministic.as_ref(),
-        &config.layout.instance,
-        Duration::from_secs(5),
-    )
-    .with_context(|| console_hint(&config.layout.console_log));
-    if let Err(error) = &client_result {
-        vm.timings.event(&format!("restore.client.error {error:#}"));
-        run_log.line(format!("client.error {error:#}"));
-        log_console_tail(&run_log, &config.layout.console_log);
-        OWNER_SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
-    }
-    let owner_result = vm
-        .owner
-        .join()
-        .map_err(|_| anyhow!("VM owner thread panicked"))
-        .and_then(|result| result);
-    write_final_snapshot_outcome(&config.layout, &owner_result)?;
-    let status = match (client_result, owner_result) {
-        (Ok(status), Ok(())) => status,
-        (Err(client_error), Ok(())) => return Err(client_error),
-        (Ok(_), Err(owner_error)) => return Err(owner_error),
-        (Err(client_error), Err(owner_error)) => {
-            return Err(client_error.context(format!("VM owner also failed: {owner_error:#}")));
-        }
-    };
-    flush_deterministic_trace_events(&config.layout, vm.trace_log.as_deref())?;
-    vm.timings.event(&format!("run.done status={status}"));
-    run_log.line(format!("run.done run_id={owner_run_id} status={status}"));
-    drop(vm.network);
-    drop(instance_lock);
-    Ok(status)
-}
-
-fn refresh_default_restore_snapshot(config: &mut RunConfig) -> Result<()> {
-    if !config.restore_latest_if_available {
-        return Ok(());
-    }
-    let latest = config.layout.snapshot_dir.join("latest");
-    if !latest.exists() {
-        // Any earlier value was only a pre-lock observation of the default
-        // snapshot. Under exclusive ownership, absence means cold boot.
-        config.restore_snapshot = None;
-        return Ok(());
-    }
-    if !default_restore_version_matches(&latest)? {
-        bail!(
-            "latest snapshot is incompatible with this lnx version: {}\nrecovery: lnx --instance {} snapshots clear to explicitly cold-boot",
-            latest.display(),
-            config.layout.instance
-        );
-    }
-    config.restore_snapshot = Some(latest);
     Ok(())
 }
 
 struct VmHandles {
     owner: thread::JoinHandle<Result<()>>,
     network: NetworkBacking,
-    timings: Arc<TimingLog>,
     trace_log: Option<Arc<TraceLog>>,
 }
 
@@ -743,17 +568,20 @@ struct IdlePolicy {
 
 fn start_vm(
     config: &RunConfig,
+    session: &Arc<RunSession>,
     run_log: &Arc<RunLog>,
     broker_socket: &Path,
     idle: IdlePolicy,
     owner_run_id: &str,
 ) -> Result<VmHandles> {
-    refuse_active_restore_work(&config.layout)?;
-    validate_final_snapshot_outcome(&config.layout, None)?;
+    let run = session.run();
+    // The memory snapshot this run resumes: the run's private clones of its
+    // base generation.
+    let restore_dir = run.restores_memory().then(|| run.dir.clone());
     let timings = Arc::new(TimingLog::open(
         &config.layout,
         &config.command,
-        config.restore_snapshot.as_deref(),
+        restore_dir.as_deref(),
     )?);
     timings.install_for_libkrun();
     timings.event("dirs.ready");
@@ -775,7 +603,6 @@ fn start_vm(
     } else {
         "initramfs.cached"
     });
-    let requested_restore_snapshot = config.restore_snapshot.clone();
     let initramfs_stamp = config.layout.run_dir.join("initramfs.stamp");
     let mut network = start_network(config, run_log, &timings)?;
     let current_host_home = host_home_for_cwd(&config.cwd)?;
@@ -788,7 +615,7 @@ fn start_vm(
         no_host_shares: config.no_host_shares,
     };
     let mut launch_metadata = current_launch_metadata.clone();
-    if let Some(snapshot) = &config.restore_snapshot {
+    if let Some(snapshot) = &restore_dir {
         if let Some(snapshot_share_layout) = snapshot_share_layout(snapshot)? {
             if launch_metadata_matches_ignoring_cwd(
                 &snapshot_share_layout.metadata,
@@ -810,10 +637,8 @@ fn start_vm(
     fs::write(&deterministic_stamp_path, &deterministic_stamp)
         .with_context(|| format!("write {}", deterministic_stamp_path.display()))?;
     configure_libkrun_deterministic_time(config.deterministic.is_some());
-    let deterministic_clock_state = deterministic_clock_state_for_start(
-        config.deterministic.as_ref(),
-        config.restore_snapshot.as_deref(),
-    )?;
+    let deterministic_clock_state =
+        deterministic_clock_state_for_start(config.deterministic.as_ref(), restore_dir.as_deref())?;
     if let Some(clock_state) = &deterministic_clock_state {
         let clock_state_path = config.layout.run_dir.join(DETERMINISTIC_CLOCK_STATE);
         write_deterministic_clock_state(&clock_state_path, clock_state)?;
@@ -837,7 +662,7 @@ fn start_vm(
             trace_integer("memory_mib", config.memory_mib as i64),
             trace_bool("nested_kvm", config.nested_kvm),
             trace_bool("no_host_shares", config.no_host_shares),
-            trace_bool("restore_snapshot", config.restore_snapshot.is_some()),
+            trace_bool("restore_snapshot", restore_dir.is_some()),
             trace_text("network", "embedded-gvproxy"),
         ];
         if let Some(deterministic) = &config.deterministic {
@@ -868,91 +693,17 @@ fn start_vm(
             );
         }
     }
-    let restore_snapshot = if let Some(snapshot) = &config.restore_snapshot {
-        if let Err(error) =
-            validate_snapshot_initramfs_compatibility(snapshot, &initramfs_stamp, &config.layout)
-        {
-            run_log.line(format!(
-                "snapshot.initramfs_stamp_mismatch refused snapshot={} current={}",
-                snapshot.join("initramfs.stamp").display(),
-                initramfs_stamp.display()
-            ));
-            return Err(error);
-        }
-        if let Some(reason) = snapshot_launch_incompatibility(snapshot, &launch_metadata) {
-            bail!(
-                "snapshot launch metadata is incompatible ({reason}): {}\n{}",
-                snapshot.join(LAUNCH_METADATA).display(),
-                snapshot_restore_recovery_guidance(&config.layout, snapshot)
-            );
-        }
-        if let Some(reason) = snapshot_deterministic_incompatibility(snapshot, &deterministic_stamp)
-        {
-            bail!(
-                "snapshot deterministic stamp is incompatible ({reason}): {}\n{}",
-                snapshot.join("deterministic.stamp").display(),
-                snapshot_restore_recovery_guidance(&config.layout, snapshot)
-            );
-        }
-        match snapshot_vm_config(snapshot) {
-            Ok(Some(snapshot_config))
-                if !snapshot_config.matches(config.cpus, config.memory_mib) =>
-            {
-                bail!(
-                    "snapshot VM config mismatch: snapshot_cpus={} configured_cpus={} snapshot_memory_mib={} configured_memory_mib={}\n{}",
-                    snapshot_config.vcpu_count,
-                    config.cpus,
-                    snapshot_config.memory_mib(),
-                    config.memory_mib,
-                    snapshot_restore_recovery_guidance(&config.layout, snapshot)
-                );
-            }
-            Ok(_) => Some(snapshot.clone()),
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "read snapshot header from {}",
-                        snapshot.join("vmstate.bin").display()
-                    )
-                });
-            }
-        }
-    } else {
-        None
-    };
-    if let Some(snapshot) = &requested_restore_snapshot {
-        log_snapshot_summary(run_log, "snapshot.requested", snapshot);
+    if let Some(snapshot) = &restore_dir {
+        validate_restore_compatibility(
+            snapshot,
+            &initramfs_stamp,
+            &launch_metadata,
+            &deterministic_stamp,
+            config,
+            run_log,
+        )?;
     }
-    let restore_generation = restore_snapshot.as_deref().map(snapshot_generation_id);
-    match (&requested_restore_snapshot, &restore_snapshot, &restore_generation) {
-        (Some(requested), Some(accepted), Some(generation_id)) => run_log.line(format!(
-            "snapshot.restore.accepted owner_run_id={owner_run_id} generation_id={generation_id} requested={} accepted={}",
-            requested.display(),
-            accepted.display()
-        )),
-        (Some(requested), None, _) => run_log.line(format!(
-            "snapshot.restore.ignored owner_run_id={owner_run_id} requested={} reason=compatibility_check",
-            requested.display()
-        )),
-        (None, None, _) => run_log.line(format!(
-            "snapshot.restore.none owner_run_id={owner_run_id}"
-        )),
-        (None, Some(accepted), Some(generation_id)) => run_log.line(format!(
-            "snapshot.restore.accepted owner_run_id={owner_run_id} generation_id={generation_id} requested=<implicit> accepted={}",
-            accepted.display()
-        )),
-        _ => {}
-    }
-    let prepared_restore = prepare_restore_for_start(
-        &config.layout,
-        restore_snapshot.as_deref(),
-        restore_generation.as_deref(),
-        run_log,
-    )
-    .context("prepare restore snapshot")?;
-    let vm_restore_snapshot = prepared_restore
-        .as_ref()
-        .map(|restore| restore.snapshot.clone());
+    let vm_restore_snapshot = restore_dir.clone();
     configure_snapshot_restore_compat(vm_restore_snapshot.as_deref(), run_log);
 
     let socket = config.layout.socket(RuntimeSocket::Agent);
@@ -981,29 +732,13 @@ fn start_vm(
     if config.nested_kvm {
         vm_builder.nested_virt(true);
     }
-    let rootfs = prepared_restore
-        .as_ref()
-        .map(|restore| restore.rootfs.clone())
-        .unwrap_or_else(|| config.layout.rootfs.clone());
-    let rootfs_role = if prepared_restore.is_some() {
-        "restore-live-clone"
-    } else {
-        "canonical"
-    };
+    let rootfs = run.rootfs();
     run_log.line(format!(
-        "rootfs.live owner_run_id={owner_run_id} role={rootfs_role} writable=true path={} source_generation={}",
-        rootfs.display(),
-        prepared_restore
-            .as_ref()
-            .map(|restore| restore.generation_id.as_str())
-            .unwrap_or("none")
+        "rootfs.live owner_run_id={owner_run_id} run={} path={}",
+        run.id,
+        rootfs.display()
     ));
-    let rootfs_label = if rootfs != config.layout.rootfs {
-        "snapshot rootfs"
-    } else {
-        "rootfs"
-    };
-    crate::init::ensure_ext4_has_no_errors(&rootfs, rootfs_label).map_err(|e| {
+    crate::init::ensure_ext4_has_no_errors(&rootfs, "rootfs").map_err(|e| {
         run_log.line(format!(
             "rootfs.health.error path={} error={e:#}",
             rootfs.display()
@@ -1037,14 +772,14 @@ fn start_vm(
             "home",
             &share_layout.host_home,
             &home_write_allowlist(&config.cwd, &share_layout.host_home),
-            &host_share_unshare_dir(&config.layout, "home"),
+            &run.host_share_state().join("home"),
         ))?;
         if let Some(cwd) = &share_layout.outside_home_cwd {
             vm_builder.virtiofs(krun::host_share_virtiofs(
                 "cwd",
                 cwd,
                 &cwd_write_allowlist(),
-                &host_share_unshare_dir(&config.layout, "cwd"),
+                &run.host_share_state().join("cwd"),
             ))?;
         }
     }
@@ -1085,11 +820,11 @@ fn start_vm(
         vm_builder.restore_from_snapshot(snapshot)?;
         timings.event("snapshot.restore.configured");
         run_log.line(format!(
-            "snapshot.restore.configured owner_run_id={owner_run_id} generation_id={} path={}",
-            prepared_restore
-                .as_ref()
-                .map(|restore| restore.generation_id.as_str())
-                .unwrap_or("unknown"),
+            "snapshot.restore.configured owner_run_id={owner_run_id} generation={} path={}",
+            session
+                .base()
+                .map(|base| base.id().to_string())
+                .unwrap_or_else(|| "none".to_string()),
             snapshot.display()
         ));
     }
@@ -1125,41 +860,8 @@ fn start_vm(
     vm_builder.exec("/init", &["--init".to_string()], &init_env);
     timings.event("krun.exec.configured");
 
-    let snapshot_output = config
-        .snapshot_output
-        .clone()
-        .unwrap_or_else(|| config.layout.snapshot_dir.join("latest"));
-    let latest_snapshot = config.layout.snapshot_dir.join("latest");
-    let promote_rootfs_after_snapshot = prepared_restore.is_some()
-        && snapshot_output == latest_snapshot
-        && requested_restore_snapshot
-            .as_deref()
-            .is_some_and(|requested| paths_refer_to_same_snapshot(requested, &latest_snapshot));
-    let clear_restore_marker_after_final_snapshot = prepared_restore.is_some();
-
     let vm = vm_builder.build();
     let ctx = Arc::new(vm.handle());
-    if clear_restore_marker_after_final_snapshot {
-        let generation_id = prepared_restore
-            .as_ref()
-            .map(|restore| restore.generation_id.as_str())
-            .unwrap_or("unknown");
-        mark_restore_work_active(&config.layout, generation_id)?;
-        run_log.line(format!(
-            "snapshot.work.mark_active owner_run_id={owner_run_id} generation_id={generation_id} path={}",
-            config
-                .layout
-                .snapshot_dir
-                .join(RESTORE_WORK_ACTIVE_MARKER)
-                .display()
-        ));
-    }
-    if let Err(error) = write_final_snapshot_pending(&config.layout) {
-        if clear_restore_marker_after_final_snapshot {
-            let _ = clear_restore_work_active(&config.layout);
-        }
-        return Err(error.context("record pending final snapshot outcome"));
-    }
     let console_log = config.layout.console_log.clone();
     let vm_timings = Arc::clone(&timings);
     let vm_run_log = Arc::clone(run_log);
@@ -1181,34 +883,28 @@ fn start_vm(
     });
     timings.event("krun.thread.spawned");
 
-    let owner = run_broker_owner(
-        listener,
-        config.layout.clone(),
-        config.layout.console_log.clone(),
-        Arc::clone(&ctx),
-        snapshot_output,
-        rootfs,
-        config.layout.rootfs.clone(),
-        promote_rootfs_after_snapshot,
-        clear_restore_marker_after_final_snapshot,
+    let owner = run_broker_owner(OwnerParts {
+        layout: config.layout.clone(),
+        vm: Arc::clone(&ctx),
+        session: Arc::clone(session),
+        agent_listener: listener,
         snapshot_listener,
         control_listener,
         broker_listener,
-        broker_socket.to_path_buf(),
+        broker_socket: broker_socket.to_path_buf(),
         initramfs_stamp,
-        vm_restore_snapshot,
-        config.forwards.clone(),
-        share_layout.host_home.clone(),
-        share_layout.no_host_shares,
-        config.deterministic.clone(),
-        deterministic_clock_state.clone(),
+        forwards: config.forwards.clone(),
+        host_home: share_layout.host_home.clone(),
+        no_host_shares: share_layout.no_host_shares,
+        deterministic: config.deterministic.clone(),
+        deterministic_clock_state: deterministic_clock_state.clone(),
         idle,
-        Arc::clone(&timings),
-        Arc::clone(run_log),
-        trace_log.clone(),
-        vm_error_rx,
-        owner_run_id.to_string(),
-    );
+        timings: Arc::clone(&timings),
+        run_log: Arc::clone(run_log),
+        trace_log: trace_log.clone(),
+        vm_errors: vm_error_rx,
+        owner_run_id: owner_run_id.to_string(),
+    });
     let owner = match owner {
         Ok(owner) => owner,
         Err(e) => {
@@ -1225,14 +921,13 @@ fn start_vm(
     Ok(VmHandles {
         owner,
         network,
-        timings,
         trace_log,
     })
 }
 
 fn request_checkpoint_with_timeout(
     socket: &Path,
-    checkpoint_path: &Path,
+    spec: &CheckpointSpec,
     timeout: Option<Duration>,
 ) -> Result<()> {
     let mut stream = connect_broker(socket)?;
@@ -1250,7 +945,7 @@ fn request_checkpoint_with_timeout(
         &mut stream,
         &Message::Checkpoint {
             channel_id,
-            path: checkpoint_path.to_string_lossy().into_owned(),
+            path: serde_json::to_string(spec).context("encode checkpoint request")?,
         },
     )?;
     loop {
@@ -1265,26 +960,27 @@ fn request_checkpoint_with_timeout(
     }
 }
 
-pub fn request_checkpoint_awaiting_owner(
+/// Asks the instance's running VM owner to capture it as `spec` describes.
+/// With `deterministic`, the request is refused unless the running VM uses
+/// the same deterministic configuration.
+pub(crate) fn request_live_checkpoint(
     layout: &Layout,
-    checkpoint_path: &Path,
-    deterministic: Option<&DeterministicConfig>,
+    spec: &CheckpointSpec,
+    deterministic: Option<Option<&DeterministicConfig>>,
     timeout: Duration,
 ) -> Result<()> {
-    request_checkpoint_from_current_owner(layout, checkpoint_path, deterministic, true, timeout)
-}
-
-pub(crate) fn request_coherent_checkpoint_awaiting_owner(
-    layout: &Layout,
-    checkpoint_path: &Path,
-    timeout: Duration,
-) -> Result<()> {
-    request_checkpoint_from_current_owner(layout, checkpoint_path, None, false, timeout)
+    request_checkpoint_from_current_owner(
+        layout,
+        spec,
+        deterministic.flatten(),
+        deterministic.is_some(),
+        timeout,
+    )
 }
 
 fn request_checkpoint_from_current_owner(
     layout: &Layout,
-    checkpoint_path: &Path,
+    spec: &CheckpointSpec,
     deterministic: Option<&DeterministicConfig>,
     validate_deterministic: bool,
     timeout: Duration,
@@ -1304,7 +1000,7 @@ fn request_checkpoint_from_current_owner(
                 owner.pid
             ),
             None => {
-                validate_expected_owner_shutdown(layout, expected_pid)?;
+                refuse_crashed_run(layout)?;
                 bail!(
                     "instance {} VM owner exited before its broker became ready for checkpointing",
                     layout.instance
@@ -1325,7 +1021,7 @@ fn request_checkpoint_from_current_owner(
                     layout.instance
                 );
             }
-            request_checkpoint_with_timeout(&broker_socket, checkpoint_path, Some(remaining))?;
+            request_checkpoint_with_timeout(&broker_socket, spec, Some(remaining))?;
             if let Some(owner) = current_owner()
                 && owner != expected
             {
@@ -1490,8 +1186,6 @@ fn owner_restart_args(config: &RunConfig) -> Vec<String> {
         config.layout.instance.clone(),
         "--kernel".to_string(),
         config.layout.kernel.display().to_string(),
-        "--rootfs".to_string(),
-        config.layout.rootfs.display().to_string(),
         "--cpus".to_string(),
         config.cpus.to_string(),
         "--memory-mib".to_string(),
@@ -1655,67 +1349,9 @@ fn bind_unix_listener(path: &Path) -> Result<UnixListener> {
 
 /// Either the lock a caller asked for, or the exit status of its command
 /// after it attached to a VM owner that another process started meanwhile.
-enum InstanceOutcome {
-    Lock(InstanceLock),
-    Status(i32),
-}
-
 enum OwnerStartOutcome {
     Lock(OwnerStartLock),
     Status(i32),
-}
-
-#[allow(clippy::too_many_arguments)]
-fn acquire_instance_or_run_client(
-    layout: &Layout,
-    socket: &Path,
-    command: &[String],
-    cwd: &Path,
-    run_as_root: bool,
-    no_host_shares: bool,
-    deterministic: Option<&DeterministicConfig>,
-    instance: &str,
-    no_daemon_reuse: bool,
-    run_log: &RunLog,
-) -> Result<InstanceOutcome> {
-    let lock_path = instance_lock_path(layout);
-    let start = Instant::now();
-    let mut logged_wait = false;
-    loop {
-        if let Some(lock) = try_acquire_validated_instance(layout, LeaseRole::Owner)? {
-            run_log.line(format!(
-                "instance.lock.acquired path={}",
-                lock_path.display()
-            ));
-            return Ok(InstanceOutcome::Lock(lock));
-        }
-        if !logged_wait {
-            run_log.line(format!("instance.lock.busy path={}", lock_path.display()));
-            logged_wait = true;
-        }
-        if !no_daemon_reuse {
-            if let Some(status) = run_existing_broker_client(
-                socket,
-                command,
-                cwd,
-                run_as_root,
-                no_host_shares,
-                deterministic,
-                instance,
-                Some(run_log),
-            )? {
-                return Ok(InstanceOutcome::Status(status));
-            }
-        }
-        if start.elapsed() > Duration::from_secs(120) {
-            run_log.line(format!(
-                "instance.lock.timeout path={}",
-                lock_path.display()
-            ));
-            bail!("timed out waiting for {}", lock_path.display());
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2238,63 +1874,17 @@ fn zone_from_localtime_target(target: &str) -> Option<String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_broker_client_retry(
-    socket: &Path,
-    command: &[String],
-    cwd: &Path,
-    run_as_root: bool,
-    no_host_shares: bool,
-    deterministic: Option<&DeterministicConfig>,
-    instance: &str,
-    timeout: Duration,
-) -> Result<i32> {
-    let start = Instant::now();
-    let mut last = None;
-    while start.elapsed() < timeout {
-        match connect_broker(socket) {
-            Ok(stream) => {
-                return run_broker_session(
-                    stream,
-                    command,
-                    cwd,
-                    run_as_root,
-                    no_host_shares,
-                    deterministic,
-                    instance,
-                );
-            }
-            Err(e) => {
-                if e.downcast_ref::<BrokerProtocolMismatch>().is_some() {
-                    return Err(e);
-                }
-                last = Some(e);
-                thread::sleep(Duration::from_millis(10));
-            }
-        }
-    }
-    match last {
-        Some(e) => Err(e),
-        None => bail!("timed out connecting to broker"),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_broker_owner(
-    listener: UnixListener,
+/// Everything the owner thread needs once the VM is starting.
+struct OwnerParts {
     layout: Layout,
-    console_log: PathBuf,
-    ctx: Arc<VmHandle>,
-    snapshot_path: PathBuf,
-    rootfs: PathBuf,
-    canonical_rootfs: PathBuf,
-    promote_rootfs_after_snapshot: bool,
-    clear_restore_marker_after_final_snapshot: bool,
+    vm: Arc<VmHandle>,
+    session: Arc<RunSession>,
+    agent_listener: UnixListener,
     snapshot_listener: UnixListener,
-    _control_listener: UnixListener,
+    control_listener: UnixListener,
     broker_listener: UnixListener,
     broker_socket: PathBuf,
     initramfs_stamp: PathBuf,
-    restore_snapshot: Option<PathBuf>,
     forwards: Vec<PortForward>,
     host_home: PathBuf,
     no_host_shares: bool,
@@ -2304,24 +1894,49 @@ fn run_broker_owner(
     timings: Arc<TimingLog>,
     run_log: Arc<RunLog>,
     trace_log: Option<Arc<TraceLog>>,
-    vm_error_rx: mpsc::Receiver<KrunError>,
+    vm_errors: mpsc::Receiver<KrunError>,
     owner_run_id: String,
-) -> Result<thread::JoinHandle<Result<()>>> {
+}
+
+fn run_broker_owner(parts: OwnerParts) -> Result<thread::JoinHandle<Result<()>>> {
+    let OwnerParts {
+        layout,
+        vm: ctx,
+        session,
+        agent_listener: listener,
+        snapshot_listener,
+        control_listener: _control_listener,
+        broker_listener,
+        broker_socket,
+        initramfs_stamp,
+        forwards,
+        host_home,
+        no_host_shares,
+        deterministic,
+        deterministic_clock_state,
+        idle,
+        timings,
+        run_log,
+        trace_log,
+        vm_errors: vm_error_rx,
+        owner_run_id,
+    } = parts;
+    let console_log = layout.console_log.clone();
+    let restores = session.run().restores_memory();
     listener
         .set_nonblocking(true)
         .context("set lnx-agent listener nonblocking")?;
-    let agent_timeout = agent_accept_timeout_from_env(std::env::var("LNX_AGENT_TIMEOUT_MS").ok());
+    let agent_timeout = agent_accept_timeout_from_env(
+        std::env::var("LNX_AGENT_TIMEOUT_MS").ok(),
+        restores,
+    );
     timings.event("agent.accept.begin");
     run_log.line(format!(
-        "agent.accept.begin owner_run_id={} timeout_ms={} restore={}",
+        "agent.accept.begin owner_run_id={} timeout_ms={} restore={restores}",
         owner_run_id,
         agent_timeout.as_millis(),
-        restore_snapshot
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "false".to_string())
     ));
-    let restore_snapshot_unblocker = if restore_snapshot.is_some() {
+    let restore_snapshot_unblocker = if restores {
         Some(spawn_restore_snapshot_unblocker(
             &snapshot_listener,
             agent_timeout,
@@ -2331,7 +1946,7 @@ fn run_broker_owner(
     } else {
         None
     };
-    if restore_snapshot.is_some() {
+    if restores {
         maybe_spawn_restore_proof_snapshotter(Arc::clone(&ctx), Arc::clone(&run_log));
     }
     let accept_result =
@@ -2347,7 +1962,7 @@ fn run_broker_owner(
             let e = e.context(console_hint(&console_log));
             // A restored guest that never reconnects means the devices
             // refused the memory image; tag it as a hard restore failure.
-            if restore_snapshot.is_some() {
+            if restores {
                 return Err(e.context(RestoreRefused));
             }
             return Err(e);
@@ -2360,7 +1975,7 @@ fn run_broker_owner(
         },
     )?;
 
-    if restore_snapshot.is_some() {
+    if restores {
         let channel_id = match deterministic.as_ref() {
             Some(config) => deterministic_restore_sync_request_id(&config.seed),
             None => new_request_id()?,
@@ -2370,7 +1985,7 @@ fn run_broker_owner(
             "snapshot.restore.sync.begin channel_id={channel_id:016x}"
         ));
         agent_stream
-            .set_read_timeout(Some(DEFAULT_AGENT_ACCEPT_TIMEOUT))
+            .set_read_timeout(Some(agent_timeout))
             .context("set restore-sync read timeout")?;
         let sync_result = (|| -> Result<()> {
             let entropy = restore_entropy(deterministic.as_ref())?;
@@ -2424,7 +2039,13 @@ fn run_broker_owner(
     }
 
     let (agent_tx, agent_rx) = mpsc::channel::<Message>();
-    let state = BrokerState::new(agent_tx.clone(), idle.starts_idle, Arc::clone(&run_log));
+    let dispatch_session = Arc::clone(&session);
+    let state = BrokerState::new(
+        agent_tx.clone(),
+        idle.starts_idle,
+        move || dispatch_session.mark_dirty(),
+        Arc::clone(&run_log),
+    );
     let agent_failed_before_snapshot = Arc::new(AtomicBool::new(false));
     let snapshot_started = Arc::new(AtomicBool::new(false));
 
@@ -2440,16 +2061,9 @@ fn run_broker_owner(
         }
     });
 
-    let restore_generation = restore_snapshot.as_deref().map(snapshot_generation_id);
     let capture_worker = CaptureWorker::spawn(Capturer {
         vm: Arc::clone(&ctx),
-        layout: layout.clone(),
-        rootfs: rootfs.clone(),
-        snapshot_path: snapshot_path.clone(),
-        canonical_rootfs: canonical_rootfs.clone(),
-        promote_rootfs_after_snapshot,
-        restore_snapshot: restore_snapshot.clone(),
-        restore_generation: restore_generation.clone(),
+        session: Arc::clone(&session),
         initramfs_stamp: initramfs_stamp.clone(),
         deterministic_clock_state: deterministic_clock_state.clone(),
         agent_tx: agent_tx.clone(),
@@ -2492,7 +2106,6 @@ fn run_broker_owner(
         no_host_shares,
         trace_log: trace_log.clone(),
     });
-    let force_full_snapshot = restore_snapshot.is_none();
     let broker_idle_ttl = idle.ttl;
     Ok(thread::spawn(move || {
         timings.event("broker.ready");
@@ -2568,80 +2181,41 @@ fn run_broker_owner(
             ));
         }
         snapshot_started.store(true, Ordering::SeqCst);
-        let generation_id = new_lifecycle_id("snapshot");
         timings.event("snapshot.request.guest");
         run_log.line(format!(
-            "snapshot.request.guest owner_run_id={} generation_id={} path={} full={} source_rootfs={} source_generation={}",
-            owner_run_id,
-            generation_id,
-            snapshot_path.display(),
-            force_full_snapshot,
-            rootfs.display(),
-            restore_generation.as_deref().unwrap_or("none")
+            "snapshot.request.guest owner_run_id={owner_run_id} run={}",
+            session.run().id
         ));
         if let Some(trace) = &trace_log {
-            trace.event(
-                "snapshot_request_guest",
-                vec![
-                    trace_text("path", snapshot_path.display().to_string()),
-                    trace_bool("full", force_full_snapshot),
-                ],
-            );
+            trace.event("snapshot_request_guest", Vec::new());
         }
         let _ = agent_tx.send(Message::SnapshotReady);
-        let snapshot_result = serve_snapshot(
-            snapshot_listener,
-            &ctx,
-            &snapshot_path,
-            &rootfs,
-            &initramfs_stamp,
-            &layout,
-            trace_log.as_deref(),
-            deterministic_clock_state.as_ref(),
-            restore_snapshot.as_deref(),
-            force_full_snapshot,
-            promote_rootfs_after_snapshot.then_some(canonical_rootfs.as_path()),
-            &timings,
-            &run_log,
-            &owner_run_id,
-            &generation_id,
-        );
-        match finish_restore_work_after_final_snapshot(
-            &layout,
-            clear_restore_marker_after_final_snapshot,
-            snapshot_result,
-        ) {
-            Ok(()) => {
+        let capture = CaptureContext {
+            vm: &ctx,
+            session: &session,
+            initramfs_stamp: &initramfs_stamp,
+            trace_log: trace_log.as_deref(),
+            deterministic_clock_state: deterministic_clock_state.as_ref(),
+        };
+        let result = serve_snapshot(snapshot_listener, &capture, &timings).and_then(|id| {
+            session.commit_final(&id)?;
+            Ok(id)
+        });
+        match result {
+            Ok(id) => {
                 run_log.line(format!(
-                    "snapshot.done owner_run_id={} generation_id={} path={}",
-                    owner_run_id,
-                    generation_id,
-                    snapshot_path.display()
+                    "snapshot.done owner_run_id={owner_run_id} generation={id}"
                 ));
                 if let Some(trace) = &trace_log {
-                    trace.event(
-                        "snapshot_done",
-                        vec![trace_text("path", snapshot_path.display().to_string())],
-                    );
-                }
-                log_snapshot_summary(&run_log, "snapshot.latest", &snapshot_path);
-                if clear_restore_marker_after_final_snapshot {
-                    run_log.line(format!(
-                        "snapshot.work.mark_inactive owner_run_id={owner_run_id} generation_id={generation_id} path={}",
-                        layout
-                            .snapshot_dir
-                            .join(RESTORE_WORK_ACTIVE_MARKER)
-                            .display()
-                    ));
+                    trace.event("snapshot_done", Vec::new());
                 }
                 Ok(())
             }
-            Err(e) => {
+            Err(error) => {
                 run_log.line(format!(
-                    "snapshot.error owner_run_id={} generation_id={} error={e:#}",
-                    owner_run_id, generation_id
+                    "snapshot.error owner_run_id={owner_run_id} error={error:#}"
                 ));
-                Err(e)
+                Err(error)
             }
         }
     }))
@@ -2682,17 +2256,6 @@ fn maybe_spawn_restore_proof_snapshotter(ctx: Arc<VmHandle>, run_log: Arc<RunLog
             }
         }
     });
-}
-
-fn broker_idle_ttl() -> Duration {
-    broker_idle_ttl_from_env(std::env::var("LNX_BROKER_IDLE_TTL_MS").ok().as_deref())
-}
-
-fn broker_idle_ttl_from_env(value: Option<&str>) -> Duration {
-    value
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_BROKER_IDLE_TTL)
 }
 
 fn owner_idle_ttl() -> Duration {
@@ -2744,8 +2307,6 @@ fn spawn_owner_process(config: &RunConfig, run_log: &RunLog, run_id: &str) -> Re
         .arg(&config.layout.instance)
         .arg("--kernel")
         .arg(&config.layout.kernel)
-        .arg("--rootfs")
-        .arg(&config.layout.rootfs)
         .arg("--cpus")
         .arg(config.cpus.to_string())
         .arg("--memory-mib")
@@ -2771,9 +2332,6 @@ fn spawn_owner_process(config: &RunConfig, run_log: &RunLog, run_id: &str) -> Re
     command.arg("_vm-owner").arg("--cwd").arg(&config.cwd);
     if let Some(snapshot) = &config.restore_snapshot {
         command.arg("--restore").arg(snapshot);
-    }
-    if config.restore_latest_if_available {
-        command.arg("--restore-latest-if-available");
     }
     command
         .stdin(Stdio::null())
@@ -2838,7 +2396,8 @@ fn run_broker_client_awaiting_owner(
                     "owner.exited.early status={status} restore_failed=true"
                 ));
                 bail!(
-                    "VM memory snapshot restore was refused before the broker came up{}{}",
+                    "the saved memory snapshot could not be resumed: the guest did not come back\n{}{}{}",
+                    drop_memory_guidance(&layout.instance),
                     owner_log_hint(layout),
                     console_hint(&layout.console_log)
                 );
@@ -2873,7 +2432,7 @@ fn acquire_instance_for_owner(
     let start = Instant::now();
     let mut logged_wait = false;
     loop {
-        if let Some(lock) = try_acquire_validated_instance(layout, LeaseRole::Owner)? {
+        if let Some(lock) = InstanceLock::try_acquire(layout, LeaseRole::Owner, |_| Ok(()))? {
             run_log.line(format!(
                 "owner.instance.lock.acquired path={}",
                 lock_path.display()
@@ -2937,11 +2496,18 @@ fn reset_owner_attempt_logs(layout: &Layout, run_log: &RunLog) {
     }
 }
 
-fn agent_accept_timeout_from_env(value: Option<String>) -> Duration {
+/// How long to wait for the guest agent. A booting guest may take a while;
+/// a resumed one reconnects within milliseconds, so a long wait there only
+/// delays reporting a snapshot that cannot be resumed.
+fn agent_accept_timeout_from_env(value: Option<String>, restores: bool) -> Duration {
     value
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_AGENT_ACCEPT_TIMEOUT)
+        .unwrap_or(if restores {
+            RESTORE_AGENT_ACCEPT_TIMEOUT
+        } else {
+            DEFAULT_AGENT_ACCEPT_TIMEOUT
+        })
 }
 
 fn trace_client_open(trace: &TraceLog, message: &Message) {
@@ -3481,14 +3047,6 @@ fn cwd_write_allowlist() -> Vec<String> {
     vec![".".to_string()]
 }
 
-fn host_share_unshare_dir(layout: &Layout, tag: &str) -> PathBuf {
-    host_share_state_root(layout).join(tag)
-}
-
-fn host_share_state_root(layout: &Layout) -> PathBuf {
-    layout.instance_dir.join("host-share-state")
-}
-
 fn preflight_host_share_cwd(layout: &Layout, cwd: &Path, no_host_shares: bool) -> Result<()> {
     if no_host_shares {
         return Ok(());
@@ -3546,24 +3104,12 @@ fn replace_home_write_allowlist(_ctx: &VmHandle, _cwd: &Path, _host_home: &Path)
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Waits for the guest to quiesce for its final snapshot, then captures it.
 fn serve_snapshot(
     listener: UnixListener,
-    ctx: &VmHandle,
-    snapshot_path: &Path,
-    rootfs: &Path,
-    initramfs_stamp: &Path,
-    layout: &Layout,
-    trace_log: Option<&TraceLog>,
-    deterministic_clock_state: Option<&DeterministicClockState>,
-    base_snapshot: Option<&Path>,
-    force_full: bool,
-    promote_rootfs_to: Option<&Path>,
+    capture: &CaptureContext<'_>,
     timings: &TimingLog,
-    run_log: &RunLog,
-    owner_run_id: &str,
-    generation_id: &str,
-) -> Result<()> {
+) -> Result<GenerationId> {
     listener
         .set_nonblocking(true)
         .context("set snapshot listener nonblocking")?;
@@ -3579,7 +3125,7 @@ fn serve_snapshot(
     if frame_type[0] != FRAME_SNAPSHOT || len != 0 {
         bail!("bad snapshot request");
     }
-    timings.event(&format!("snapshot.request.read full={force_full}"));
+    timings.event("snapshot.request.read");
     let mut ready_stream;
     let mut ready = [0u8; 1];
     stream
@@ -3610,107 +3156,11 @@ fn serve_snapshot(
     }
     timings.event("snapshot.ready.read");
     timings.event("snapshot.capture.begin");
-    capture_snapshot_for_publish(
-        ctx,
-        snapshot_path,
-        rootfs,
-        initramfs_stamp,
-        layout,
-        trace_log,
-        deterministic_clock_state,
-        base_snapshot,
-        force_full,
-        run_log,
-        owner_run_id,
-        generation_id,
-    )?;
-    if let Some(canonical_rootfs) = promote_rootfs_to {
-        promote_snapshot_rootfs(
-            snapshot_path,
-            canonical_rootfs,
-            timings,
-            run_log,
-            Some(generation_id),
-            Some(owner_run_id),
-        )?;
-    }
+    let id = capture.capture(Origin::Snapshot {
+        run: capture.session.run().id.clone(),
+    })?;
     timings.event("snapshot.done");
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn capture_snapshot_for_publish(
-    ctx: &VmHandle,
-    snapshot_path: &Path,
-    rootfs: &Path,
-    initramfs_stamp: &Path,
-    layout: &Layout,
-    trace_log: Option<&TraceLog>,
-    deterministic_clock_state: Option<&DeterministicClockState>,
-    base_snapshot: Option<&Path>,
-    force_full: bool,
-    run_log: &RunLog,
-    owner_run_id: &str,
-    generation_id: &str,
-) -> Result<()> {
-    cleanup_snapshot_publish_paths(snapshot_path, run_log)?;
-    let temp = snapshot_publish_temp(snapshot_path)?;
-    remove_path_if_exists(&temp)?;
-    if !force_full {
-        seed_incremental_snapshot(&temp, base_snapshot, snapshot_path, run_log)?;
-    }
-    ensure_deterministic_clock_state_file(initramfs_stamp, deterministic_clock_state)?;
-    capture_vm_state(ctx, &temp, rootfs, layout)?;
-    if let Err(e) = validate_snapshot_rootfs(&temp) {
-        let _ = remove_path_if_exists(&temp);
-        return Err(e);
-    }
-    align_snapshot_rootfs_mtime_with_memory(&temp)?;
-    copy_snapshot_stamp(&temp, initramfs_stamp, trace_log, deterministic_clock_state)?;
-    write_snapshot_lifecycle_manifest(&temp, generation_id, owner_run_id, rootfs)?;
-    publish_snapshot_dir(snapshot_path, &temp, run_log, owner_run_id, generation_id)?;
-    Ok(())
-}
-
-fn seed_incremental_snapshot(
-    snapshot_path: &Path,
-    restore_snapshot: Option<&Path>,
-    latest_snapshot: &Path,
-    run_log: &RunLog,
-) -> Result<()> {
-    if snapshot_path.join("pages.img").exists() {
-        return Ok(());
-    }
-    let base = restore_snapshot
-        .filter(|path| path.join("pages.img").exists())
-        .or_else(|| {
-            latest_snapshot
-                .join("pages.img")
-                .exists()
-                .then_some(latest_snapshot)
-        });
-    let Some(base) = base else {
-        run_log.line(format!(
-            "snapshot.seed.skip path={} reason=no_base",
-            snapshot_path.display()
-        ));
-        return Ok(());
-    };
-    remove_path_if_exists(snapshot_path)?;
-    fs::create_dir_all(snapshot_path)
-        .with_context(|| format!("create {}", snapshot_path.display()))?;
-    for name in SNAPSHOT_RESTORE_FILES {
-        let src = base.join(name);
-        if src.exists() {
-            clone_or_copy_file(&src, &snapshot_path.join(name))?;
-        }
-    }
-    run_log.line(format!(
-        "snapshot.seed.incremental path={} base={}",
-        snapshot_path.display(),
-        base.display()
-    ));
-    Ok(())
+    Ok(id)
 }
 
 #[cfg(target_os = "macos")]
@@ -3801,18 +3251,20 @@ fn copy_snapshot_metadata_file(src: &Path, dst: &Path) -> Result<()> {
         .with_context(|| format!("sync {}", dst.display()))
 }
 
-/// Captures VM memory into `dir` together with the rootfs and the host-share
-/// copy-on-write state as they were at the same paused instant. Copying either
-/// after the vCPUs resume would pair the memory image with later disk state.
-fn capture_vm_state(ctx: &VmHandle, dir: &Path, rootfs: &Path, layout: &Layout) -> Result<()> {
-    let share_state = host_share_state_root(layout);
+/// Captures VM memory into `dir` together with the run's rootfs and
+/// host-share copy-on-write state as they were at the same paused instant.
+/// Copying either after the vCPUs resume would pair the memory image with
+/// later disk state.
+fn capture_vm_state(ctx: &VmHandle, dir: &Path, run: &store::Run) -> Result<()> {
+    let rootfs = run.rootfs();
+    let share_state = run.host_share_state();
     ctx.snapshot_while_paused(dir, |stage| {
         let copy = || -> Result<()> {
-            clone_or_copy_file(rootfs, &stage.join("rootfs.ext4"))?;
+            clone_or_copy_file(&rootfs, &stage.join(store::ROOTFS))?;
             if share_state.exists() {
                 crate::sparse_copy::clone_or_copy_tree(
                     &share_state,
-                    &stage.join("host-share-state"),
+                    &stage.join(store::HOST_SHARE_STATE),
                 )?;
             }
             Ok(())
@@ -3832,14 +3284,6 @@ fn cleanup_runtime_sockets(run_log: &RunLog, paths: &[&Path]) {
                 path.display()
             )),
         }
-    }
-}
-
-fn log_snapshot_summary(run_log: &RunLog, label: &str, path: &Path) {
-    log_file_summary(run_log, label, path);
-    for name in ["vmstate.bin", "pages.img", "rootfs.ext4"] {
-        let file_label = format!("{label}.{name}");
-        log_file_summary(run_log, &file_label, &path.join(name));
     }
 }
 
@@ -3918,6 +3362,7 @@ mod launch_meta;
 mod locks;
 mod logs;
 mod protocol_io;
+mod session;
 mod snapshots;
 pub(crate) use broker::*;
 pub(crate) use capture::*;
@@ -3926,6 +3371,7 @@ pub(crate) use launch_meta::*;
 pub(crate) use locks::*;
 pub(crate) use logs::*;
 pub(crate) use protocol_io::*;
+pub(crate) use session::*;
 pub(crate) use snapshots::*;
 
 #[cfg(test)]

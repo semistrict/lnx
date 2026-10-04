@@ -1,12 +1,27 @@
-//! Captures a running VM owner takes on request: checkpoints asked for by
-//! clients and snapshot-exits asked for by the guest. They run one at a time
-//! on a dedicated worker thread, so a capture never stalls the broker's
-//! accept loop.
+//! Captures a running VM owner takes: its final snapshot, checkpoints asked
+//! for by clients, and snapshot-exits asked for by the guest. Requested
+//! captures run one at a time on a dedicated worker thread, so a capture never
+//! stalls the broker's accept loop.
+
+use serde::{Deserialize, Serialize};
 
 use super::*;
+use crate::store::CheckpointRef;
+
+/// What a client asks for in a checkpoint request. It travels JSON-encoded in
+/// the `path` field of the protocol's `Checkpoint` message.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CheckpointSpec {
+    /// Record the capture as a named checkpoint of the instance.
+    pub(crate) id: Option<String>,
+    pub(crate) name: Option<String>,
+    /// Also write a new instance at this path whose latest generation is the
+    /// capture (fork and push of a running instance).
+    pub(crate) export_to: Option<PathBuf>,
+}
 
 pub(crate) struct CheckpointRequest {
-    pub(crate) path: PathBuf,
+    pub(crate) spec: CheckpointSpec,
     pub(crate) reply: mpsc::Sender<Result<(), String>>,
 }
 
@@ -19,25 +34,48 @@ pub(crate) enum CaptureJob {
     Finish,
 }
 
+/// What capturing the running VM into a generation needs.
+pub(crate) struct CaptureContext<'a> {
+    pub(crate) vm: &'a VmHandle,
+    pub(crate) session: &'a RunSession,
+    pub(crate) initramfs_stamp: &'a Path,
+    pub(crate) trace_log: Option<&'a TraceLog>,
+    pub(crate) deterministic_clock_state: Option<&'a DeterministicClockState>,
+}
+
+impl CaptureContext<'_> {
+    /// Captures memory, disk and host-share state at one paused instant into
+    /// a new, published (not yet latest) generation.
+    pub(crate) fn capture(&self, origin: Origin) -> Result<GenerationId> {
+        let staging = self.session.stage()?;
+        ensure_deterministic_clock_state_file(
+            self.initramfs_stamp,
+            self.deterministic_clock_state,
+        )?;
+        capture_vm_state(self.vm, staging.dir(), self.session.run())?;
+        validate_snapshot_rootfs(staging.dir())?;
+        copy_snapshot_stamp(
+            staging.dir(),
+            self.initramfs_stamp,
+            self.trace_log,
+            self.deterministic_clock_state,
+        )?;
+        self.session.publish(staging, origin)
+    }
+}
+
 /// Something that can take the captures a running owner is asked for.
 pub(crate) trait Captures: Send + 'static {
-    fn checkpoint(&self, request: &CheckpointRequest) -> Result<()>;
-    /// Captures `latest` for a guest snapshot-exit and replies to the guest.
+    fn checkpoint(&self, spec: &CheckpointSpec) -> Result<()>;
+    /// Captures a new latest generation for a guest snapshot-exit and replies
+    /// to the guest.
     fn snapshot_exit(&self, channel_id: u64);
 }
 
-/// What a capture needs to know about the running VM.
+/// The running VM's side of [`Captures`].
 pub(crate) struct Capturer {
     pub(crate) vm: Arc<VmHandle>,
-    pub(crate) layout: Layout,
-    /// The rootfs the VM is running on.
-    pub(crate) rootfs: PathBuf,
-    /// Where snapshot-exits publish (usually `memory-snapshots/latest`).
-    pub(crate) snapshot_path: PathBuf,
-    pub(crate) canonical_rootfs: PathBuf,
-    pub(crate) promote_rootfs_after_snapshot: bool,
-    pub(crate) restore_snapshot: Option<PathBuf>,
-    pub(crate) restore_generation: Option<String>,
+    pub(crate) session: Arc<RunSession>,
     pub(crate) initramfs_stamp: PathBuf,
     pub(crate) deterministic_clock_state: Option<DeterministicClockState>,
     pub(crate) agent_tx: mpsc::Sender<Message>,
@@ -47,127 +85,91 @@ pub(crate) struct Capturer {
     pub(crate) owner_run_id: String,
 }
 
+impl Capturer {
+    fn context(&self) -> CaptureContext<'_> {
+        CaptureContext {
+            vm: &self.vm,
+            session: &self.session,
+            initramfs_stamp: &self.initramfs_stamp,
+            trace_log: self.trace_log.as_deref(),
+            deterministic_clock_state: self.deterministic_clock_state.as_ref(),
+        }
+    }
+
+    fn run_id(&self) -> store::RunId {
+        self.session.run().id.clone()
+    }
+}
+
 impl Captures for Capturer {
-    fn checkpoint(&self, request: &CheckpointRequest) -> Result<()> {
-        let generation_id = new_lifecycle_id("snapshot");
-        let path = &request.path;
+    fn checkpoint(&self, spec: &CheckpointSpec) -> Result<()> {
         self.timings.event("checkpoint.request.begin");
         self.run_log.line(format!(
-            "checkpoint.request owner_run_id={} generation_id={generation_id} path={}",
+            "checkpoint.request owner_run_id={} id={} export_to={}",
             self.owner_run_id,
-            path.display()
+            spec.id.as_deref().unwrap_or("none"),
+            spec.export_to
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none".to_string())
         ));
         if let Some(trace) = &self.trace_log {
-            trace.event(
-                "checkpoint_request",
-                vec![trace_text("path", path.display().to_string())],
-            );
+            trace.event("checkpoint_request", Vec::new());
         }
-        seed_incremental_snapshot(
-            path,
-            self.restore_snapshot.as_deref(),
-            &self.snapshot_path,
-            &self.run_log,
-        )?;
-        ensure_deterministic_clock_state_file(
-            &self.initramfs_stamp,
-            self.deterministic_clock_state.as_ref(),
-        )?;
+        let generation = self
+            .context()
+            .capture(Origin::Checkpoint { run: self.run_id() })?;
+        if let Some(id) = &spec.id {
+            self.session.add_checkpoint(&CheckpointRef {
+                id: id.clone(),
+                name: spec.name.clone(),
+                generation: generation.clone(),
+                created_unix: unix_seconds(),
+            })?;
+        }
+        if let Some(dest) = &spec.export_to {
+            self.session.export(&generation, dest)?;
+        }
         self.run_log.line(format!(
-            "checkpoint.capture.begin owner_run_id={} generation_id={generation_id} path={} source_rootfs={} source_generation={}",
-            self.owner_run_id,
-            path.display(),
-            self.rootfs.display(),
-            self.restore_generation.as_deref().unwrap_or("none")
-        ));
-        capture_vm_state(&self.vm, path, &self.rootfs, &self.layout)?;
-        validate_snapshot_rootfs(path)?;
-        align_snapshot_rootfs_mtime_with_memory(path)?;
-        self.run_log.line(format!(
-            "checkpoint.capture.done owner_run_id={} generation_id={generation_id} path={}",
-            self.owner_run_id,
-            path.display()
-        ));
-        copy_snapshot_stamp(
-            path,
-            &self.initramfs_stamp,
-            self.trace_log.as_deref(),
-            self.deterministic_clock_state.as_ref(),
-        )?;
-        write_snapshot_lifecycle_manifest(path, &generation_id, &self.owner_run_id, &self.rootfs)?;
-        self.run_log.line(format!(
-            "checkpoint.done owner_run_id={} generation_id={generation_id} path={}",
-            self.owner_run_id,
-            path.display()
+            "checkpoint.done owner_run_id={} generation={generation}",
+            self.owner_run_id
         ));
         if let Some(trace) = &self.trace_log {
-            trace.event(
-                "checkpoint_done",
-                vec![trace_text("path", path.display().to_string())],
-            );
+            trace.event("checkpoint_done", Vec::new());
         }
-        log_snapshot_summary(&self.run_log, "checkpoint", path);
         Ok(())
     }
 
     fn snapshot_exit(&self, channel_id: u64) {
-        let generation_id = new_lifecycle_id("snapshot");
         self.timings.event("snapshot_exit.request.begin");
         self.run_log.line(format!(
-            "snapshot_exit.request owner_run_id={} generation_id={generation_id} channel_id={channel_id} path={}",
-            self.owner_run_id,
-            self.snapshot_path.display()
+            "snapshot_exit.request owner_run_id={} channel_id={channel_id}",
+            self.owner_run_id
         ));
-        let result = capture_snapshot_for_publish(
-            &self.vm,
-            &self.snapshot_path,
-            &self.rootfs,
-            &self.initramfs_stamp,
-            &self.layout,
-            self.trace_log.as_deref(),
-            self.deterministic_clock_state.as_ref(),
-            self.restore_snapshot.as_deref(),
-            false,
-            &self.run_log,
-            &self.owner_run_id,
-            &generation_id,
-        )
-        .and_then(|()| {
-            if self.promote_rootfs_after_snapshot {
-                promote_snapshot_rootfs(
-                    &self.snapshot_path,
-                    &self.canonical_rootfs,
-                    &self.timings,
-                    &self.run_log,
-                    Some(&generation_id),
-                    Some(&self.owner_run_id),
-                )
-            } else {
-                Ok(())
-            }
-        });
+        let result = self
+            .context()
+            .capture(Origin::Snapshot { run: self.run_id() })
+            .and_then(|id| {
+                self.session.advance(&id)?;
+                Ok(id)
+            });
         let reply = match result {
-            Ok(()) => {
+            Ok(id) => {
                 self.run_log.line(format!(
-                    "snapshot_exit.done owner_run_id={} generation_id={generation_id} channel_id={channel_id} path={}",
-                    self.owner_run_id,
-                    self.snapshot_path.display()
+                    "snapshot_exit.done owner_run_id={} channel_id={channel_id} generation={id}",
+                    self.owner_run_id
                 ));
                 if let Some(trace) = &self.trace_log {
                     trace.event(
                         "snapshot_exit_done",
-                        vec![
-                            trace_text("channel_id", format!("{channel_id:016x}")),
-                            trace_text("path", self.snapshot_path.display().to_string()),
-                        ],
+                        vec![trace_text("channel_id", format!("{channel_id:016x}"))],
                     );
                 }
-                log_snapshot_summary(&self.run_log, "snapshot.latest", &self.snapshot_path);
                 Message::CheckpointCreated { channel_id }
             }
             Err(error) => {
                 self.run_log.line(format!(
-                    "snapshot_exit.error owner_run_id={} generation_id={generation_id} channel_id={channel_id} error={error:#}",
+                    "snapshot_exit.error owner_run_id={} channel_id={channel_id} error={error:#}",
                     self.owner_run_id
                 ));
                 Message::Error {
@@ -178,6 +180,13 @@ impl Captures for Capturer {
         };
         let _ = self.agent_tx.send(reply);
     }
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
 }
 
 /// Runs capture jobs one at a time in the order they were queued.
@@ -194,7 +203,7 @@ impl CaptureWorker {
                 match job {
                     CaptureJob::Checkpoint(request) => {
                         let result = capturer
-                            .checkpoint(&request)
+                            .checkpoint(&request.spec)
                             .map_err(|error| format!("{error:#}"));
                         let _ = request.reply.send(result);
                     }

@@ -37,6 +37,30 @@ pub(crate) const LOCK_FILES: [&str; 3] = [INSTANCE_LOCK, INSTANCE_LOCK_GUARD, OW
 
 const GUARD_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a busy lock whose lease names no live holder may stay busy
+/// before it counts as held. A process forked by any thread of the process
+/// that just released the lock inherits the locked descriptor until it
+/// execs, and a holder records its lease only just after taking the lock;
+/// both look like a busy lock without a live lease for a moment.
+const TRANSIENT_HOLD: Duration = Duration::from_millis(500);
+
+fn names_a_live_holder(lease: Option<&Lease>) -> bool {
+    lease.is_some_and(|lease| lease.process.is_running())
+}
+
+fn read_lease_at(path: &Path) -> Result<Option<Lease>> {
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("open lock {}", path.display())),
+    };
+    read_lease_from(&mut file, path)
+}
+
 /// A process named so that it cannot be confused with a later process that
 /// happens to reuse its pid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,6 +337,7 @@ impl InstanceLockState {
     }
 
     /// The lease of a holder that died while holding the lock.
+    #[cfg(test)]
     pub(crate) fn stale_lease(&self) -> Option<&Lease> {
         match self {
             Self::Free { stale } => stale.as_ref(),
@@ -353,14 +378,21 @@ fn probe_instance_lock(layout: &Layout) -> Result<InstanceLockState> {
         }
         Err(error) => return Err(error).with_context(|| format!("open lock {}", path.display())),
     };
-    let free = flock(&file, libc::LOCK_SH | libc::LOCK_NB)?;
-    let lease = read_lease_from(&mut file, &path)?;
-    // Dropping `file` releases the probe's shared lock.
-    Ok(if free {
-        InstanceLockState::Free { stale: lease }
-    } else {
-        InstanceLockState::Held { lease }
-    })
+    let deadline = Instant::now() + TRANSIENT_HOLD;
+    loop {
+        let free = flock(&file, libc::LOCK_SH | libc::LOCK_NB)?;
+        let lease = read_lease_from(&mut file, &path)?;
+        if free {
+            // Releasing the probe's shared lock by unlocking keeps `file`
+            // usable; dropping it would too.
+            let _ = unlock_file(&file);
+            return Ok(InstanceLockState::Free { stale: lease });
+        }
+        if names_a_live_holder(lease.as_ref()) || Instant::now() >= deadline {
+            return Ok(InstanceLockState::Held { lease });
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 pub(crate) fn instance_lock_state(layout: &Layout) -> Result<InstanceLockState> {
@@ -391,8 +423,16 @@ impl InstanceLock {
         validate: impl FnOnce(Option<&Lease>) -> Result<()>,
     ) -> Result<Option<Self>> {
         let _guard = HeldLock::acquire_with_timeout(&instance_guard_path(layout), GUARD_TIMEOUT)?;
-        let Some(mut held) = HeldLock::try_acquire(&instance_lock_path(layout))? else {
-            return Ok(None);
+        let path = instance_lock_path(layout);
+        let deadline = Instant::now() + TRANSIENT_HOLD;
+        let mut held = loop {
+            if let Some(held) = HeldLock::try_acquire(&path)? {
+                break held;
+            }
+            if names_a_live_holder(read_lease_at(&path)?.as_ref()) || Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(2));
         };
         let stale = held.read_lease()?;
         if let Err(error) = validate(stale.as_ref()) {
@@ -485,10 +525,32 @@ pub(crate) mod test_support {
 
     /// A separate process holding the instance lock, recorded as `role`.
     /// `term_handler` is the Perl body of its SIGTERM handler; the kernel
-    /// releases the lock when the process exits.
+    /// releases the lock when the process exits. Dropping it kills the
+    /// process, so a failing test cannot leak it.
     pub(crate) struct ForeignHolder {
-        pub(crate) child: Child,
+        child: Child,
         pub(crate) process: ProcessIdentity,
+    }
+
+    impl ForeignHolder {
+        pub(crate) fn wait(&mut self) -> std::process::ExitStatus {
+            self.child.wait().expect("wait for lock holder")
+        }
+
+        /// SIGKILLs the holder and reaps it.
+        pub(crate) fn kill(&mut self) {
+            self.child.kill().expect("kill lock holder");
+            self.wait();
+        }
+    }
+
+    impl Drop for ForeignHolder {
+        fn drop(&mut self) {
+            if matches!(self.child.try_wait(), Ok(None)) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
     }
 
     pub(crate) fn spawn_foreign_holder(

@@ -29,10 +29,11 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::{
-    checkpoints, descriptor,
+    checkpoints, descriptor, init,
     paths::{GVPROXY_KRUN_SOCKET_SUFFIX, Layout, RuntimeSocket},
     runner, sparse_copy,
     status::{self, InstanceState},
+    store::{self, Store},
 };
 
 #[cfg(feature = "server-ui")]
@@ -631,13 +632,10 @@ fn instance_summaries(state: &AppState) -> Result<Vec<InstanceSummary>> {
         .map(|name| {
             let layout = Layout::resolve(&name, None, None)?;
             let descriptor = descriptor::load(&layout)?;
-            let checkpoints = match fs::read_dir(&layout.checkpoint_dir) {
-                Ok(entries) => entries
-                    .filter_map(|entry| entry.ok())
-                    .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
-                    .count(),
-                Err(_) => 0,
-            };
+            let store = Store::new(&layout.instance_dir);
+            let checkpoints = store.checkpoints().map(|refs| refs.len()).unwrap_or(0);
+            let latest = store.latest().ok().flatten();
+            let rootfs = init::instance_rootfs(&layout);
             Ok(InstanceSummary {
                 name,
                 state: status::instance_state(&layout),
@@ -645,10 +643,10 @@ fn instance_summaries(state: &AppState) -> Result<Vec<InstanceSummary>> {
                 cpus: descriptor.cpus.unwrap_or(state.cpus),
                 memory_mib: descriptor.memory_mib.unwrap_or(state.memory_mib),
                 image: descriptor.image,
-                rootfs_size_bytes: file_len(&layout.rootfs),
-                rootfs_allocated_bytes: allocated_bytes(&layout.rootfs),
+                rootfs_size_bytes: rootfs.as_deref().and_then(file_len),
+                rootfs_allocated_bytes: rootfs.as_deref().and_then(allocated_bytes),
                 checkpoints,
-                has_snapshot: layout.snapshot_dir.join("latest").exists(),
+                has_snapshot: latest.is_some_and(|latest| latest.manifest.has_memory()),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -878,49 +876,44 @@ fn import_sparse_bundle_to_layout(
     options: ImportOptions,
     state: AppState,
 ) -> Result<ImportResponse> {
-    reject_running_instance(dest)?;
-    if (dest.rootfs.exists() || dest.snapshot_dir.exists()) && !options.replace {
-        bail!("target instance already exists: {target_instance} (use --replace)");
-    }
+    let source_instance = options.source_instance.clone();
+    import_to_layout(dest, target_instance, options, state, |scratch| {
+        extract_sparse_bundle(bundle, scratch, &source_instance)
+    })
+}
 
-    fs::create_dir_all(&dest.base).with_context(|| format!("create {}", dest.base.display()))?;
-    let temp = tempfile::Builder::new()
-        .prefix(".import-")
-        .tempdir_in(&dest.base)
-        .with_context(|| format!("create import tempdir in {}", dest.base.display()))?;
-    extract_sparse_bundle(bundle, temp.path(), &options.source_instance)?;
-    let imported = temp.path().join("instances").join(&options.source_instance);
-    if !imported.join("rootfs.ext4").exists() {
-        bail!(
-            "sandbox bundle is missing instances/{}/rootfs.ext4",
-            options.source_instance
-        );
-    }
-    validate_imported_snapshot(&imported, &state)?;
+fn import_archive_to_layout(
+    archive: &Path,
+    dest: &Layout,
+    target_instance: &str,
+    options: ImportOptions,
+    state: AppState,
+) -> Result<ImportResponse> {
+    import_to_layout(dest, target_instance, options, state, |scratch| {
+        extract_archive(archive, scratch)
+    })
+}
 
-    if options.replace {
-        remove_path_if_exists(&dest.instance_dir)?;
-        if dest.run_dir != dest.instance_dir {
-            remove_path_if_exists(&dest.run_dir)?;
-        }
-    }
-    fs::create_dir_all(
-        dest.instance_dir
-            .parent()
-            .context("instance dir has no parent")?,
-    )
-    .with_context(|| format!("create {}", dest.instance_dir.parent().unwrap().display()))?;
-    fs::rename(&imported, &dest.instance_dir).with_context(|| {
-        format!(
-            "move imported sandbox {} to {}",
-            imported.display(),
-            dest.instance_dir.display()
-        )
-    })?;
-    install_kernel_if_present(temp.path(), dest)?;
-    rewrite_descriptor_name(dest)?;
-    index_layout_into_cas(dest)?;
-
+/// Imports the sandbox `extract` writes into a scratch base (as
+/// `instances/<source>/`, plus an optional kernel) as `dest`, and starts it
+/// if asked.
+fn import_to_layout(
+    dest: &Layout,
+    target_instance: &str,
+    options: ImportOptions,
+    state: AppState,
+    extract: impl FnOnce(&Path) -> Result<()>,
+) -> Result<ImportResponse> {
+    ensure_import_target(dest, target_instance, options.replace)?;
+    let scratch = import_scratch(dest)?;
+    extract(scratch.path())?;
+    install_imported_sandbox(
+        scratch.path(),
+        dest,
+        &options.source_instance,
+        options.replace,
+        &state,
+    )?;
     let status = if options.start {
         Some(start_imported_instance(dest, &options, &state)?)
     } else {
@@ -935,45 +928,49 @@ fn import_sparse_bundle_to_layout(
     })
 }
 
-fn import_archive_to_layout(
-    archive: &Path,
-    dest: &Layout,
-    target_instance: &str,
-    options: ImportOptions,
-    state: AppState,
-) -> Result<ImportResponse> {
+fn ensure_import_target(dest: &Layout, target_instance: &str, replace: bool) -> Result<()> {
     reject_running_instance(dest)?;
-    if (dest.rootfs.exists() || dest.snapshot_dir.exists()) && !options.replace {
+    if init::instance_has_state(dest) && !replace {
         bail!("target instance already exists: {target_instance} (use --replace)");
     }
+    Ok(())
+}
 
+/// A scratch base on the destination's filesystem, so the imported instance
+/// moves into place with a rename.
+fn import_scratch(dest: &Layout) -> Result<tempfile::TempDir> {
     fs::create_dir_all(&dest.base).with_context(|| format!("create {}", dest.base.display()))?;
-    let temp = tempfile::Builder::new()
+    tempfile::Builder::new()
         .prefix(".import-")
         .tempdir_in(&dest.base)
-        .with_context(|| format!("create import tempdir in {}", dest.base.display()))?;
-    extract_archive(archive, temp.path())?;
-    let imported = temp.path().join("instances").join(&options.source_instance);
-    if !imported.join("rootfs.ext4").exists() {
-        bail!(
-            "sandbox bundle is missing instances/{}/rootfs.ext4",
-            options.source_instance
-        );
-    }
-    validate_imported_snapshot(&imported, &state)?;
+        .with_context(|| format!("create import tempdir in {}", dest.base.display()))
+}
 
-    if options.replace {
+/// Moves the sandbox extracted under `scratch` into place as `dest`.
+fn install_imported_sandbox(
+    scratch: &Path,
+    dest: &Layout,
+    source_instance: &str,
+    replace: bool,
+    state: &AppState,
+) -> Result<()> {
+    let imported = scratch.join("instances").join(source_instance);
+    if !init::dir_has_instance_state(&imported) {
+        bail!("sandbox bundle has no saved state for instances/{source_instance}");
+    }
+    validate_imported_snapshot(&imported, state)?;
+
+    if replace {
         remove_path_if_exists(&dest.instance_dir)?;
         if dest.run_dir != dest.instance_dir {
             remove_path_if_exists(&dest.run_dir)?;
         }
     }
-    fs::create_dir_all(
-        dest.instance_dir
-            .parent()
-            .context("instance dir has no parent")?,
-    )
-    .with_context(|| format!("create {}", dest.instance_dir.parent().unwrap().display()))?;
+    let parent = dest
+        .instance_dir
+        .parent()
+        .context("instance dir has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     fs::rename(&imported, &dest.instance_dir).with_context(|| {
         format!(
             "move imported sandbox {} to {}",
@@ -981,22 +978,9 @@ fn import_archive_to_layout(
             dest.instance_dir.display()
         )
     })?;
-    install_kernel_if_present(temp.path(), dest)?;
+    install_kernel_if_present(scratch, dest)?;
     rewrite_descriptor_name(dest)?;
-    index_layout_into_cas(dest)?;
-
-    let status = if options.start {
-        Some(start_imported_instance(dest, &options, &state)?)
-    } else {
-        None
-    };
-    Ok(ImportResponse {
-        ok: true,
-        instance: target_instance.to_string(),
-        imported: options.source_instance,
-        started: options.start,
-        status,
-    })
+    index_layout_into_cas(dest)
 }
 
 fn extract_archive(archive: &Path, dest: &Path) -> Result<()> {
@@ -1186,7 +1170,7 @@ fn start_cas_upload_blocking(
     }
     let dest = Layout::resolve(target_instance, None, None)?;
     reject_running_instance(&dest)?;
-    if (dest.rootfs.exists() || dest.snapshot_dir.exists()) && !manifest.replace {
+    if init::instance_has_state(&dest) && !manifest.replace {
         bail!("target instance already exists: {target_instance} (use --replace)");
     }
     validate_cas_manifest(&manifest)?;
@@ -1245,54 +1229,20 @@ fn commit_cas_upload_blocking(session: &str, state: AppState) -> Result<ImportRe
     let manifest = session_doc.manifest;
     let target_instance = session_doc.target_instance;
     let dest = Layout::resolve(&target_instance, None, None)?;
-    reject_running_instance(&dest)?;
-    if (dest.rootfs.exists() || dest.snapshot_dir.exists()) && !manifest.replace {
-        bail!("target instance already exists: {target_instance} (use --replace)");
-    }
+    ensure_import_target(&dest, &target_instance, manifest.replace)?;
     validate_cas_manifest(&manifest)?;
     validate_imported_snapshot_manifest(&manifest, &state)?;
     verify_cas_manifest_blocks_exist(&manifest)?;
 
-    fs::create_dir_all(&dest.base).with_context(|| format!("create {}", dest.base.display()))?;
-    let temp = tempfile::Builder::new()
-        .prefix(".import-")
-        .tempdir_in(&dest.base)
-        .with_context(|| format!("create import tempdir in {}", dest.base.display()))?;
-    reconstruct_cas_manifest(&manifest, temp.path())?;
-    let imported = temp
-        .path()
-        .join("instances")
-        .join(&manifest.source_instance);
-    if !imported.join("rootfs.ext4").exists() {
-        bail!(
-            "sandbox bundle is missing instances/{}/rootfs.ext4",
-            manifest.source_instance
-        );
-    }
-    validate_imported_snapshot(&imported, &state)?;
-
-    if manifest.replace {
-        remove_path_if_exists(&dest.instance_dir)?;
-        if dest.run_dir != dest.instance_dir {
-            remove_path_if_exists(&dest.run_dir)?;
-        }
-    }
-    fs::create_dir_all(
-        dest.instance_dir
-            .parent()
-            .context("instance dir has no parent")?,
-    )
-    .with_context(|| format!("create {}", dest.instance_dir.parent().unwrap().display()))?;
-    fs::rename(&imported, &dest.instance_dir).with_context(|| {
-        format!(
-            "move imported sandbox {} to {}",
-            imported.display(),
-            dest.instance_dir.display()
-        )
-    })?;
-    install_kernel_if_present(temp.path(), &dest)?;
-    rewrite_descriptor_name(&dest)?;
-    index_layout_into_cas(&dest)?;
+    let scratch = import_scratch(&dest)?;
+    reconstruct_cas_manifest(&manifest, scratch.path())?;
+    install_imported_sandbox(
+        scratch.path(),
+        &dest,
+        &manifest.source_instance,
+        manifest.replace,
+        &state,
+    )?;
     remove_path_if_exists(&session_dir)?;
 
     let status = if manifest.start {
@@ -1320,40 +1270,48 @@ fn validate_imported_snapshot_manifest(
     manifest: &CasUploadManifest,
     state: &AppState,
 ) -> Result<()> {
-    let has_snapshot = manifest.files.iter().any(|file| {
-        file.path
-            == format!(
-                "instances/{}/memory-snapshots/latest/vmstate.bin",
-                manifest.source_instance
-            )
+    let instance_prefix = format!("instances/{}/", manifest.source_instance);
+    let snapshots = manifest.files.iter().filter_map(|file| {
+        let snapshot = file
+            .path
+            .strip_prefix(&instance_prefix)?
+            .strip_suffix("/vmstate.bin")?;
+        is_resumable_snapshot_dir(snapshot).then(|| format!("{instance_prefix}{snapshot}"))
     });
-    if !has_snapshot {
-        return Ok(());
-    }
-    let shares_path = format!(
-        "instances/{}/memory-snapshots/latest/launch.json",
-        manifest.source_instance
-    );
-    let Some(shares_file) = manifest.files.iter().find(|file| file.path == shares_path) else {
-        bail!(
-            "snapshot cannot be restored on this server because its launch metadata is missing; push a fresh checkpoint created for this server or remove the snapshot before pushing ({shares_path})"
-        );
-    };
-    let temp = tempfile::Builder::new()
-        .prefix("lnx-cas-launch-")
-        .tempdir()
-        .context("create launch metadata tempdir")?;
-    let stamp = temp.path().join("launch.json");
-    reconstruct_cas_file(shares_file, &stamp)?;
-    let cwd = std::env::current_dir().context("current directory")?;
-    if let Some(reason) =
-        runner::snapshot_shares_incompatibility_for_import(temp.path(), &cwd, state.no_host_shares)?
-    {
-        bail!(
-            "snapshot cannot be restored on this server because its host-share/network settings differ ({reason}); push a fresh checkpoint created for this server or remove the snapshot before pushing ({shares_path})"
-        );
+    for snapshot in snapshots {
+        let shares_path = format!("{snapshot}/launch.json");
+        let Some(shares_file) = manifest.files.iter().find(|file| file.path == shares_path) else {
+            bail!(
+                "snapshot cannot be restored on this server because its launch metadata is missing; push a fresh checkpoint created for this server or remove the snapshot before pushing ({shares_path})"
+            );
+        };
+        let temp = tempfile::Builder::new()
+            .prefix("lnx-cas-launch-")
+            .tempdir()
+            .context("create launch metadata tempdir")?;
+        reconstruct_cas_file(shares_file, &temp.path().join("launch.json"))?;
+        let cwd = std::env::current_dir().context("current directory")?;
+        if let Some(reason) = runner::snapshot_shares_incompatibility_for_import(
+            temp.path(),
+            &cwd,
+            state.no_host_shares,
+        )? {
+            bail!(
+                "snapshot cannot be restored on this server because its host-share/network settings differ ({reason}); push a fresh checkpoint created for this server or remove the snapshot before pushing ({shares_path})"
+            );
+        }
     }
     Ok(())
+}
+
+/// Whether `dir`, relative to an instance, holds a memory snapshot the
+/// instance would resume: a store generation, or the latest snapshot of the
+/// layout older lnx versions push.
+fn is_resumable_snapshot_dir(dir: &str) -> bool {
+    dir == "memory-snapshots/latest"
+        || dir
+            .strip_prefix(&format!("{}/", store::GENERATIONS_DIR))
+            .is_some_and(|generation| !generation.is_empty() && !generation.contains('/'))
 }
 
 fn validate_cas_manifest(manifest: &CasUploadManifest) -> Result<()> {
@@ -1473,26 +1431,41 @@ fn index_layout_into_cas(layout: &Layout) -> Result<()> {
 }
 
 fn validate_imported_snapshot(imported: &Path, state: &AppState) -> Result<()> {
-    let latest_snapshot = imported.join("memory-snapshots/latest");
-    if !latest_snapshot.exists() {
+    let Some(snapshot) = imported_memory_snapshot(imported)? else {
         return Ok(());
-    }
+    };
     let source_instance = imported
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("unknown");
-    let logical_stamp = format!("instances/{source_instance}/memory-snapshots/latest/launch.json");
+    let relative = snapshot.strip_prefix(imported).unwrap_or(&snapshot);
+    let logical_stamp = format!(
+        "instances/{source_instance}/{}/launch.json",
+        relative.display()
+    );
     let cwd = std::env::current_dir().context("current directory")?;
-    if let Some(reason) = runner::snapshot_shares_incompatibility_for_import(
-        &latest_snapshot,
-        &cwd,
-        state.no_host_shares,
-    )? {
+    if let Some(reason) =
+        runner::snapshot_shares_incompatibility_for_import(&snapshot, &cwd, state.no_host_shares)?
+    {
         bail!(
             "snapshot cannot be restored on this server because its host-share/network settings differ ({reason}); push a fresh checkpoint created for this server or remove the snapshot before pushing ({logical_stamp})"
         );
     }
     Ok(())
+}
+
+/// The memory snapshot an imported instance would resume, in the store or in
+/// the layout older lnx versions push.
+fn imported_memory_snapshot(imported: &Path) -> Result<Option<PathBuf>> {
+    let store = Store::new(imported);
+    if store.exists() {
+        return Ok(store
+            .latest()?
+            .filter(|latest| latest.manifest.has_memory())
+            .map(|latest| latest.dir));
+    }
+    let legacy = imported.join("memory-snapshots/latest");
+    Ok(legacy.join("vmstate.bin").exists().then_some(legacy))
 }
 
 fn reject_running_instance(layout: &Layout) -> Result<()> {
@@ -1513,8 +1486,8 @@ fn start_existing_instance(layout: &Layout, state: &AppState) -> Result<()> {
         InstanceState::Partial => bail!("instance is missing rootfs: {}", layout.instance),
         InstanceState::Stopped => {}
     }
-    if !layout.rootfs.exists() {
-        bail!("instance rootfs is missing: {}", layout.rootfs.display());
+    if !init::instance_has_state(layout) {
+        bail!("instance {} has no saved state", layout.instance);
     }
     let mut command =
         build_instance_start_command(layout, state, Some(60 * 60 * 1000), &["true".to_string()])?;
@@ -1594,7 +1567,7 @@ async fn stop_existing_instance(layout: &Layout) -> Result<()> {
 }
 
 async fn stop_existing_instance_with_timeout(layout: &Layout, timeout: Duration) -> Result<()> {
-    if !layout.instance_dir.exists() && !layout.snapshot_dir.exists() && !layout.run_dir.exists() {
+    if !layout.instance_dir.exists() && !layout.run_dir.exists() {
         return Ok(());
     }
     let deadline = std::time::Instant::now() + timeout;
@@ -1699,27 +1672,8 @@ fn ensure_shutdown_state_under_guard(layout: &Layout, expected_pid: Option<i32>)
     Ok(())
 }
 
-fn ensure_no_failed_shutdown_state(layout: &Layout, expected_pid: Option<i32>) -> Result<()> {
-    if runner::restore_work_is_active(layout) {
-        bail!(
-            "instance {} stopped without publishing its final snapshot; recoverable state remains at {}\nrecovery: preserve it for inspection, or run lnx --instance {} snapshots clear to explicitly discard it",
-            layout.instance,
-            layout
-                .snapshot_dir
-                .join(runner::RESTORE_WORK_SNAPSHOT)
-                .display(),
-            layout.instance
-        );
-    }
-    let expected_pid = expected_pid
-        .map(u32::try_from)
-        .transpose()
-        .context("owner pid does not fit final snapshot outcome")?;
-    if let Some(pid) = expected_pid {
-        runner::validate_or_record_final_snapshot_failure(layout, pid)
-    } else {
-        runner::validate_final_snapshot_outcome(layout, None)
-    }
+fn ensure_no_failed_shutdown_state(layout: &Layout, _expected_pid: Option<i32>) -> Result<()> {
+    runner::refuse_crashed_run_unguarded(layout)
 }
 
 pub fn push(config: PushConfig) -> Result<()> {
@@ -2113,17 +2067,15 @@ fn bundle_runtime_path_is_excluded(layout: &Layout, path: &Path) -> bool {
         && name.ends_with(GVPROXY_KRUN_SOCKET_SUFFIX);
     let persistent_transaction_file = path.parent() == Some(layout.instance_dir.as_path())
         && (name == ".lnx-fork-lease" || name.starts_with(".lnx-descriptor-"));
-    let snapshot_runtime = path.parent() == Some(layout.snapshot_dir.as_path())
-        && (matches!(
-            name,
-            ".restore-work" | ".restore-work.active" | ".latest.next" | ".latest.previous"
-        ) || (name.starts_with('.') && name.contains(".clear-"))
-            || name.starts_with(".final-snapshot.outcome.tmp-"));
+    let store_runtime = path == layout.instance_dir.join(store::RUNS_DIR)
+        || path.parent() == Some(layout.instance_dir.join(store::GENERATIONS_DIR).as_path())
+            && name.starts_with('.')
+        || name.contains(".tmp-");
     runtime_socket_exact
         || lock_file
         || runtime_socket
         || persistent_transaction_file
-        || snapshot_runtime
+        || store_runtime
 }
 
 fn collect_sparse_bundle_file(
@@ -2335,38 +2287,24 @@ fn draw_progress(label: &str, done: u64, total: u64, started: std::time::Instant
     let _ = std::io::stderr().flush();
 }
 
+/// Materializes a coherent copy of the source instance to send: a live
+/// capture if it is running, its saved state otherwise.
 fn prepare_push_source(layout: &Layout) -> Result<PushSource> {
-    let owner_is_live = runner::validate_restore_work_for_command(layout)?;
-    if owner_is_live {
+    if runner::live_owner(layout).is_some() {
         eprintln!(
-            "source instance {} is running; checkpointing before push",
+            "source instance {} is running; capturing it before push",
             layout.instance
         );
-        let tempdir = tempfile::Builder::new()
-            .prefix("lnx-server-push-")
-            .tempdir()
-            .context("create temporary push bundle")?;
-        let bundle = checkpoint_bundle_layout(layout, tempdir.path());
-        materialize_running_source_checkpoint(layout, &bundle)?;
-        return Ok(PushSource {
-            layout: bundle,
-            _tempdir: Some(tempdir),
-        });
     }
-
     let tempdir = tempfile::Builder::new()
-        .prefix("lnx-server-push-stopped-")
+        .prefix("lnx-server-push-")
         .tempdir()
-        .context("create stable stopped-source push bundle")?;
+        .context("create temporary push bundle")?;
     let bundle = checkpoint_bundle_layout(layout, tempdir.path());
-    let copied = runner::with_validated_stopped_instance(layout, || {
-        materialize_stopped_push_copy(layout, &bundle)
-    })?;
-    if copied.is_none() {
-        bail!(
-            "source instance {} started while its push snapshot was being prepared; retry so it can be checkpointed coherently",
-            layout.instance
-        );
+    checkpoints::fork(layout, checkpoints::ForkSource::Current, &bundle)
+        .context("capture source instance for push")?;
+    if layout.kernel == layout.base.join("vmlinuz") && layout.kernel.exists() {
+        sparse_copy::clone_or_copy_file(&layout.kernel, &bundle.kernel)?;
     }
     Ok(PushSource {
         layout: bundle,
@@ -2374,79 +2312,13 @@ fn prepare_push_source(layout: &Layout) -> Result<PushSource> {
     })
 }
 
-fn materialize_stopped_push_copy(source: &Layout, bundle: &Layout) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    for file in collect_sparse_bundle_files(source)? {
-        let destination = bundle.base.join(&file.relative);
-        sparse_copy::clone_or_copy_file(&file.source, &destination).with_context(|| {
-            format!(
-                "clone stable push source {} to {}",
-                file.source.display(),
-                destination.display()
-            )
-        })?;
-        fs::set_permissions(&destination, fs::Permissions::from_mode(file.mode))
-            .with_context(|| format!("set permissions on {}", destination.display()))?;
-    }
-    Ok(())
-}
-
-fn materialize_running_source_checkpoint(source: &Layout, bundle: &Layout) -> Result<()> {
-    fs::create_dir_all(&source.checkpoint_dir)
-        .with_context(|| format!("create {}", source.checkpoint_dir.display()))?;
-    let (checkpoint, path) = checkpoints::new_checkpoint_path(source, None)?;
-    let result = (|| {
-        runner::request_coherent_checkpoint_awaiting_owner(source, &path, Duration::from_secs(120))
-            .context("checkpoint running source before push")?;
-        checkpoints::write_metadata(source, &checkpoint)?;
-        materialize_checkpoint_bundle(source, &checkpoint, bundle)
-    })();
-    let cleanup = match fs::remove_dir_all(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
-    };
-    match (result, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
-        (Err(error), Err(cleanup_error)) => Err(error.context(format!(
-            "also failed to clean temporary checkpoint: {cleanup_error:#}"
-        ))),
-    }
-}
-
-fn materialize_checkpoint_bundle(
-    source: &Layout,
-    checkpoint: &checkpoints::Checkpoint,
-    bundle: &Layout,
-) -> Result<()> {
-    checkpoints::fork(source, checkpoint, bundle)
-}
-
 fn checkpoint_bundle_layout(source: &Layout, base: &Path) -> Layout {
     Layout {
         base: base.to_path_buf(),
         instance: source.instance.clone(),
         kernel: base.join("vmlinuz"),
-        rootfs: base
-            .join("instances")
-            .join(&source.instance)
-            .join("rootfs.ext4"),
+        rootfs: None,
         instance_dir: base.join("instances").join(&source.instance),
-        snapshot_dir: base
-            .join("instances")
-            .join(&source.instance)
-            .join("memory-snapshots"),
-        checkpoint_dir: base
-            .join("instances")
-            .join(&source.instance)
-            .join("checkpoints"),
-        vm_initialized: base
-            .join("instances")
-            .join(&source.instance)
-            .join("vm-initialized"),
         run_dir: base.join("instances").join(&source.instance),
         console_log: base
             .join("instances")
@@ -2538,19 +2410,22 @@ fn store_cas_block(sha256: &str, raw: &[u8]) -> Result<()> {
     }
     let parent = path.parent().context("CAS block path has no parent")?;
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&temp, raw).with_context(|| format!("write {}", temp.display()))?;
-    match fs::hard_link(&temp, &path) {
-        Ok(()) => {
-            let _ = fs::remove_file(&temp);
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = fs::remove_file(&temp);
-            Ok(())
-        }
-        Err(_) => fs::rename(&temp, &path)
-            .with_context(|| format!("move CAS block {} to {}", temp.display(), path.display())),
+    // Concurrent uploads of the same block are common (identical images), so
+    // each writer needs its own temp file; the first link wins.
+    let mut temp = tempfile::Builder::new()
+        .prefix(&format!(".{sha256}.tmp-"))
+        .tempfile_in(parent)
+        .with_context(|| format!("create temp block in {}", parent.display()))?;
+    temp.write_all(raw)
+        .with_context(|| format!("write {}", temp.path().display()))?;
+    match fs::hard_link(temp.path(), &path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(_) => temp
+            .persist(&path)
+            .map(drop)
+            .map_err(|error| error.error)
+            .with_context(|| format!("move CAS block to {}", path.display())),
     }
 }
 

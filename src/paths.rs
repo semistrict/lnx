@@ -206,11 +206,10 @@ pub struct Layout {
     pub base: PathBuf,
     pub instance: String,
     pub kernel: PathBuf,
-    pub rootfs: PathBuf,
+    /// An image given with `--rootfs`: a new instance is created from a
+    /// clone of it. An instance's own disk lives in its store.
+    pub rootfs: Option<PathBuf>,
     pub instance_dir: PathBuf,
-    pub snapshot_dir: PathBuf,
-    pub checkpoint_dir: PathBuf,
-    pub vm_initialized: PathBuf,
     pub run_dir: PathBuf,
     pub console_log: PathBuf,
 }
@@ -347,14 +346,10 @@ impl Layout {
         kernel_base: PathBuf,
     ) -> Self {
         let instance_dir = base.join("instances").join(instance);
-        let snapshot_dir = instance_dir.join("memory-snapshots");
-        let checkpoint_dir = instance_dir.join("checkpoints");
-        let vm_initialized = instance_dir.join("vm-initialized");
         let run_dir = run_base_env
             .map(|base| base.join("instances").join(instance))
             .unwrap_or_else(|| instance_dir.clone());
         let kernel = kernel.unwrap_or_else(|| kernel_base.join("vmlinuz"));
-        let rootfs = rootfs.unwrap_or_else(|| instance_dir.join("rootfs.ext4"));
         let console_log = run_dir.join("console.log");
 
         Self {
@@ -363,9 +358,6 @@ impl Layout {
             kernel,
             rootfs,
             instance_dir,
-            snapshot_dir,
-            checkpoint_dir,
-            vm_initialized,
             run_dir,
             console_log,
         }

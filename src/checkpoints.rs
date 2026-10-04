@@ -1,7 +1,15 @@
+//! Checkpoints and forks, on top of an instance's store.
+//!
+//! A checkpoint is a named reference to a generation (rule C1 in
+//! `specs/tla/README.md`). Checkpointing a stopped instance references its
+//! latest generation, which is instant; checkpointing a running one asks the
+//! VM owner for a live capture. Forking copies a pinned generation into a new
+//! instance (C4).
+
 use std::{
     fs::{self, OpenOptions},
     os::fd::AsRawFd,
-    path::{Path, PathBuf},
+    path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -11,81 +19,98 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::{
     descriptor,
     paths::{Layout, ensure_instance_transaction_root, instance_transaction_roots},
-    runner::{self, SNAPSHOT_RESTORE_FILES},
+    runner::{self, CheckpointSpec},
+    store::{CheckpointRef, GenerationId, Store},
 };
+
+const LIVE_CAPTURE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
     pub id: String,
     pub name: Option<String>,
     pub created_unix: u64,
-    pub path: PathBuf,
+    pub generation: GenerationId,
 }
 
-pub fn new_checkpoint_path(layout: &Layout, name: Option<&str>) -> Result<(Checkpoint, PathBuf)> {
-    let created_unix = now_unix();
-    let now = OffsetDateTime::from_unix_timestamp(created_unix as i64)
-        .context("format checkpoint timestamp")?;
-    let timestamp = now
+impl From<CheckpointRef> for Checkpoint {
+    fn from(checkpoint: CheckpointRef) -> Self {
+        Self {
+            id: checkpoint.id,
+            name: checkpoint.name,
+            created_unix: checkpoint.created_unix,
+            generation: checkpoint.generation,
+        }
+    }
+}
+
+fn new_id() -> Result<String> {
+    let timestamp = OffsetDateTime::now_utc()
         .format(&time::macros::format_description!(
             "[year][month][day]T[hour][minute][second]Z"
         ))
         .context("format checkpoint id timestamp")?;
-    let id = format!("{timestamp}-{}", std::process::id());
-    let path = layout.checkpoint_dir.join(&id);
-    let checkpoint = Checkpoint {
-        id,
-        name: name.map(ToOwned::to_owned),
-        created_unix,
-        path: path.clone(),
-    };
-    Ok((checkpoint, path))
+    Ok(format!("{timestamp}-{}", std::process::id()))
 }
 
-pub fn write_metadata(layout: &Layout, checkpoint: &Checkpoint) -> Result<()> {
-    fs::create_dir_all(&checkpoint.path)
-        .with_context(|| format!("create {}", checkpoint.path.display()))?;
-    let mut metadata = String::new();
-    metadata.push_str("version=1\n");
-    metadata.push_str(&format!("id={}\n", checkpoint.id));
-    metadata.push_str(&format!("source_instance={}\n", layout.instance));
-    metadata.push_str(&format!("created_unix={}\n", checkpoint.created_unix));
-    if let Some(name) = &checkpoint.name {
-        metadata.push_str(&format!("name={}\n", sanitize_name(name)));
+fn sanitize_name(name: &str) -> String {
+    name.replace(['\r', '\n'], " ").trim().to_string()
+}
+
+/// Checkpoints the instance as it is now. A running VM is captured live; a
+/// stopped instance's latest generation is referenced as is.
+pub fn create(layout: &Layout, name: Option<&str>) -> Result<Checkpoint> {
+    runner::ensure_store(layout)?;
+    let id = new_id()?;
+    let name = name.map(sanitize_name);
+    if runner::live_owner(layout).is_some() {
+        runner::request_live_checkpoint(
+            layout,
+            &CheckpointSpec {
+                id: Some(id.clone()),
+                name: name.clone(),
+                export_to: None,
+            },
+            None,
+            LIVE_CAPTURE_TIMEOUT,
+        )
+        .context("checkpoint running VM")?;
+        return resolve(layout, &id);
     }
-    fs::write(checkpoint.path.join("checkpoint.meta"), metadata).with_context(|| {
+    let created = runner::with_exclusive_instance_state(layout, |lock, _| {
+        let store = Store::new(&layout.instance_dir);
+        let latest = store
+            .record()?
+            .and_then(|record| record.latest)
+            .with_context(|| format!("instance {} has no saved state", layout.instance))?;
+        let checkpoint = CheckpointRef {
+            id: id.clone(),
+            name: name.clone(),
+            generation: latest,
+            created_unix: now_unix(),
+        };
+        store.add_checkpoint(lock, &checkpoint)?;
+        Ok(Checkpoint::from(checkpoint))
+    })?;
+    created.with_context(|| {
         format!(
-            "write {}",
-            checkpoint.path.join("checkpoint.meta").display()
+            "instance {} started while the checkpoint was being taken; retry",
+            layout.instance
         )
     })
 }
 
 pub fn list(layout: &Layout) -> Result<Vec<Checkpoint>> {
-    let mut checkpoints = Vec::new();
-    let entries = match fs::read_dir(&layout.checkpoint_dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(checkpoints),
-        Err(e) => {
-            return Err(e).with_context(|| format!("read {}", layout.checkpoint_dir.display()));
-        }
-    };
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let id = entry.file_name().to_string_lossy().into_owned();
-        checkpoints.push(read_metadata(path, id)?);
-    }
-    checkpoints.sort_by_key(|checkpoint| checkpoint.created_unix);
-    Ok(checkpoints)
+    runner::ensure_store(layout)?;
+    Ok(Store::new(&layout.instance_dir)
+        .checkpoints()?
+        .into_iter()
+        .map(Checkpoint::from)
+        .collect())
 }
 
 pub fn resolve(layout: &Layout, identifier: &str) -> Result<Checkpoint> {
-    let checkpoints = list(layout)?;
-    let matches = checkpoints
+    let matches = list(layout)?
         .into_iter()
         .filter(|checkpoint| {
             checkpoint.id == identifier || checkpoint.name.as_deref() == Some(identifier)
@@ -98,33 +123,31 @@ pub fn resolve(layout: &Layout, identifier: &str) -> Result<Checkpoint> {
     }
 }
 
+/// Removes a checkpoint's reference; its generation is reclaimed once nothing
+/// else names it. Needs the instance lock, so not while the VM runs.
 pub fn delete(layout: &Layout, checkpoint: &Checkpoint) -> Result<()> {
-    if !checkpoint.path.starts_with(&layout.checkpoint_dir) {
+    let deleted = runner::with_exclusive_instance_state(layout, |lock, _| {
+        Store::new(&layout.instance_dir).remove_checkpoint(lock, &checkpoint.id)
+    })?;
+    if deleted.is_none() {
         bail!(
-            "refusing to delete checkpoint outside {}: {}",
-            layout.checkpoint_dir.display(),
-            checkpoint.path.display()
+            "cannot delete a checkpoint while instance {} is running or another state operation is in progress",
+            layout.instance
         );
     }
-    fs::remove_dir_all(&checkpoint.path)
-        .with_context(|| format!("remove {}", checkpoint.path.display()))
+    Ok(())
 }
 
-pub fn fork(source: &Layout, checkpoint: &Checkpoint, dest: &Layout) -> Result<()> {
-    if dest.rootfs.exists() {
-        bail!(
-            "destination rootfs already exists: {}",
-            dest.rootfs.display()
-        );
-    }
-    if dest.snapshot_dir.exists() {
-        bail!(
-            "destination snapshots already exist: {}",
-            dest.snapshot_dir.display()
-        );
-    }
-    validate_memory_checkpoint(&checkpoint.path)?;
-    let dest_descriptor = destination_descriptor(source, checkpoint, dest)?;
+/// What a fork starts from.
+pub enum ForkSource<'a> {
+    Checkpoint(&'a Checkpoint),
+    /// The source instance as it is now, captured live if it is running.
+    Current,
+}
+
+/// Creates instance `dest` from `source`.
+pub fn fork(source: &Layout, from: ForkSource<'_>, dest: &Layout) -> Result<()> {
+    runner::ensure_store(source)?;
     if dest.instance_dir.exists() {
         bail!(
             "destination instance already exists: {}",
@@ -141,62 +164,140 @@ pub fn fork(source: &Layout, checkpoint: &Checkpoint, dest: &Layout) -> Result<(
             dest.instance_dir.display()
         );
     }
-    cleanup_stale_fork_transactions(parent)?;
-    let transaction_root = ensure_instance_transaction_root(parent)?;
-    let fork_staging_root = transaction_root.join("fork");
-    fs::create_dir_all(&fork_staging_root)
-        .with_context(|| format!("create {}", fork_staging_root.display()))?;
-    let staging_creation_guard = lock_fork_transaction_root(&fork_staging_root)?;
-    let staging = tempfile::Builder::new()
-        .prefix("fork-")
-        .tempdir_in(&fork_staging_root)
-        .with_context(|| {
+    let staging = StagedInstance::create(parent)?;
+    let store = Store::new(&source.instance_dir);
+    match from {
+        ForkSource::Checkpoint(checkpoint) => {
+            let pin = store
+                .pin(&checkpoint.generation)
+                .with_context(|| format!("checkpoint {} cannot be forked", checkpoint.id))?;
+            Store::export(&pin, staging.dir())?;
+        }
+        ForkSource::Current if runner::live_owner(source).is_some() => {
+            runner::request_live_checkpoint(
+                source,
+                &CheckpointSpec {
+                    id: None,
+                    name: None,
+                    export_to: Some(staging.dir().to_path_buf()),
+                },
+                None,
+                LIVE_CAPTURE_TIMEOUT,
+            )
+            .context("capture running source instance")?;
+        }
+        ForkSource::Current => {
+            runner::refuse_crashed_run(source)?;
+            let latest = store
+                .record()?
+                .and_then(|record| record.latest)
+                .with_context(|| format!("instance {} has no saved state", source.instance))?;
+            let pin = store.pin(&latest).with_context(|| {
+                format!(
+                    "instance {} changed during the fork; retry",
+                    source.instance
+                )
+            })?;
+            Store::export(&pin, staging.dir())?;
+        }
+    }
+    let exported = Store::new(staging.dir())
+        .latest()?
+        .context("forked instance has no state")?;
+    descriptor::save_in_instance_dir(
+        staging.dir(),
+        &destination_descriptor(source, dest, &exported.dir)?,
+    )?;
+    staging.publish(&dest.instance_dir)
+}
+
+fn destination_descriptor(
+    source: &Layout,
+    dest: &Layout,
+    generation: &Path,
+) -> Result<descriptor::InstanceDescriptor> {
+    let mut config = descriptor::load(source)?;
+    config.name = Some(dest.instance.clone());
+    config.created = OffsetDateTime::now_utc().format(&Rfc3339).ok();
+    if let Some(snapshot_config) = runner::snapshot_vm_config(generation)? {
+        config.cpus = Some(
+            snapshot_config
+                .vcpu_count
+                .try_into()
+                .context("checkpoint vCPU count does not fit instance descriptor")?,
+        );
+        config.memory_mib = Some(
+            snapshot_config
+                .memory_mib()
+                .try_into()
+                .context("checkpoint memory does not fit instance descriptor")?,
+        );
+    }
+    Ok(config)
+}
+
+/// A new instance directory assembled in the instances root's transaction
+/// area and published by one rename. A crashed fork leaves only a staging
+/// directory, which a later fork removes once its lease is free.
+struct StagedInstance {
+    dir: tempfile::TempDir,
+    _lease: fs::File,
+}
+
+impl StagedInstance {
+    fn create(instances_root: &Path) -> Result<Self> {
+        cleanup_stale_fork_transactions(instances_root)?;
+        let transaction_root = ensure_instance_transaction_root(instances_root)?;
+        let fork_root = transaction_root.join("fork");
+        fs::create_dir_all(&fork_root)
+            .with_context(|| format!("create {}", fork_root.display()))?;
+        let creation_guard = lock_fork_transaction_root(&fork_root)?;
+        let dir = tempfile::Builder::new()
+            .prefix("fork-")
+            .tempdir_in(&fork_root)
+            .with_context(|| format!("create fork staging directory in {}", fork_root.display()))?;
+        let lease_path = dir.path().join(".lnx-fork-lease");
+        let lease = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lease_path)
+            .with_context(|| format!("create {}", lease_path.display()))?;
+        if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("lock {}", lease_path.display()));
+        }
+        drop(creation_guard);
+        Ok(Self { dir, _lease: lease })
+    }
+
+    fn dir(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn publish(self, dest: &Path) -> Result<()> {
+        if dest.exists() {
+            bail!(
+                "destination instance appeared while forking: {}",
+                dest.display()
+            );
+        }
+        let staged = self.dir.keep();
+        fs::rename(&staged, dest).with_context(|| {
             format!(
-                "create fork staging directory in {}",
-                fork_staging_root.display()
+                "publish staged fork {} to {}",
+                staged.display(),
+                dest.display()
             )
         })?;
-    let staging_lease_path = staging.path().join(".lnx-fork-lease");
-    let staging_lease = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&staging_lease_path)
-        .with_context(|| format!("create {}", staging_lease_path.display()))?;
-    if unsafe { libc::flock(staging_lease.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("lock {}", staging_lease_path.display()));
+        if let Err(error) = fs::remove_file(dest.join(".lnx-fork-lease")) {
+            eprintln!(
+                "warning: fork was published but its internal lease file could not be removed from {}: {error}",
+                dest.display()
+            );
+        }
+        Ok(())
     }
-    drop(staging_creation_guard);
-    let staging_layout = staging_layout(dest, staging.path())?;
-    clone_or_copy(&checkpoint.path.join("rootfs.ext4"), &staging_layout.rootfs)?;
-    clone_snapshot_dir(
-        &checkpoint.path,
-        &staging_layout.snapshot_dir.join("latest"),
-    )?;
-    clone_host_share_state(&checkpoint.path.join("host-share-state"), &staging_layout)?;
-    descriptor::save_in_instance_dir(&staging_layout.instance_dir, &dest_descriptor)?;
-    mark_vm_initialized(&staging_layout)?;
-    if dest.instance_dir.exists() {
-        bail!(
-            "destination instance appeared while forking: {}",
-            dest.instance_dir.display()
-        );
-    }
-    fs::rename(staging.path(), &dest.instance_dir).with_context(|| {
-        format!(
-            "publish staged fork {} to {}",
-            staging.path().display(),
-            dest.instance_dir.display()
-        )
-    })?;
-    if let Err(error) = fs::remove_file(dest.instance_dir.join(".lnx-fork-lease")) {
-        eprintln!(
-            "warning: fork was published but its internal lease file could not be removed from {}: {error}",
-            dest.instance_dir.display()
-        );
-    }
-    Ok(())
 }
 
 fn lock_fork_transaction_root(fork_root: &Path) -> Result<fs::File> {
@@ -218,14 +319,9 @@ fn lock_fork_transaction_root(fork_root: &Path) -> Result<fs::File> {
 fn cleanup_stale_fork_transactions(instances_root: &Path) -> Result<()> {
     for transaction_root in instance_transaction_roots(instances_root)? {
         let fork_root = transaction_root.join("fork");
-        let entries = match fs::read_dir(&fork_root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(error).with_context(|| format!("read {}", fork_root.display()));
-            }
-        };
-        drop(entries);
+        if !fork_root.exists() {
+            continue;
+        }
         let _guard = lock_fork_transaction_root(&fork_root)?;
         let entries =
             fs::read_dir(&fork_root).with_context(|| format!("read {}", fork_root.display()))?;
@@ -237,28 +333,12 @@ fn cleanup_stale_fork_transactions(instances_root: &Path) -> Result<()> {
             let path = entry.path();
             let lease_path = path.join(".lnx-fork-lease");
             let stale = match OpenOptions::new().read(true).write(true).open(&lease_path) {
-                Ok(lease) => {
-                    let locked = unsafe {
-                        libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0
-                    };
-                    if !locked {
-                        let error = std::io::Error::last_os_error();
-                        let would_block = matches!(
-                            error.raw_os_error(),
-                            Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK
-                        );
-                        if !would_block {
-                            return Err(error)
-                                .with_context(|| format!("lock {}", lease_path.display()));
-                        }
-                    }
-                    locked
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::metadata(&path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|modified| modified.elapsed().ok())
-                    .is_some_and(|age| age >= Duration::from_secs(10)),
+                Ok(lease) => unsafe {
+                    libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0
+                },
+                // Staging directories get their lease while the creation guard
+                // is held, so one without a lease belongs to a dead creator.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
                 Err(error) => {
                     return Err(error).with_context(|| format!("open {}", lease_path.display()));
                 }
@@ -272,162 +352,6 @@ fn cleanup_stale_fork_transactions(instances_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_memory_checkpoint(path: &Path) -> Result<()> {
-    for name in ["rootfs.ext4", "vmstate.bin"] {
-        let file = path.join(name);
-        let metadata = fs::symlink_metadata(&file).with_context(|| {
-            format!(
-                "checkpoint is missing required memory state: {}",
-                file.display()
-            )
-        })?;
-        if !metadata.is_file() {
-            bail!(
-                "checkpoint memory state is not a regular file: {}",
-                file.display()
-            );
-        }
-    }
-    runner::snapshot_vm_config(path)?
-        .with_context(|| format!("checkpoint has no VM state: {}", path.display()))?;
-    let pages = path.join("pages.img");
-    let metadata = fs::symlink_metadata(&pages).with_context(|| {
-        format!(
-            "checkpoint is missing required memory state: {}",
-            pages.display()
-        )
-    })?;
-    if !metadata.is_file() {
-        bail!(
-            "checkpoint memory state is not a regular file: {}",
-            pages.display()
-        );
-    }
-    let initramfs_stamp = path.join("initramfs.stamp");
-    let initramfs_metadata = fs::symlink_metadata(&initramfs_stamp).with_context(|| {
-        format!(
-            "checkpoint is missing initramfs compatibility stamp: {}",
-            initramfs_stamp.display()
-        )
-    })?;
-    if !initramfs_metadata.is_file() || runner::initramfs_stamp_key(&initramfs_stamp).is_none() {
-        bail!(
-            "checkpoint has no valid initramfs compatibility stamp: {}",
-            initramfs_stamp.display()
-        );
-    }
-    let launch = path.join("launch.json");
-    let launch_metadata = fs::symlink_metadata(&launch).with_context(|| {
-        format!(
-            "checkpoint is missing launch metadata: {}",
-            launch.display()
-        )
-    })?;
-    if !launch_metadata.is_file() {
-        bail!(
-            "checkpoint launch metadata is not a regular file: {}",
-            launch.display()
-        );
-    }
-    runner::read_launch_metadata(path)
-        .with_context(|| format!("read checkpoint launch metadata from {}", launch.display()))?;
-    if !runner::default_restore_version_matches(path)? {
-        bail!(
-            "checkpoint launch metadata version is not restorable: {}",
-            launch.display()
-        );
-    }
-    let deterministic_stamp = path.join("deterministic.stamp");
-    let deterministic_stamp = match fs::read_to_string(&deterministic_stamp) {
-        Ok(stamp) => Some(stamp),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!("read checkpoint stamp at {}", deterministic_stamp.display())
-            });
-        }
-    };
-    if deterministic_stamp
-        .as_deref()
-        .is_some_and(|stamp| stamp.lines().any(|line| line == "deterministic=true"))
-    {
-        let clock = path.join("deterministic-clock.state");
-        if !fs::symlink_metadata(&clock).is_ok_and(|metadata| metadata.is_file()) {
-            bail!(
-                "deterministic checkpoint is missing clock state: {}",
-                clock.display()
-            );
-        }
-    }
-    Ok(())
-}
-
-fn staging_layout(dest: &Layout, staging_dir: &Path) -> Result<Layout> {
-    let relocate = |path: &Path| -> Result<PathBuf> {
-        let relative = path.strip_prefix(&dest.instance_dir).with_context(|| {
-            format!(
-                "destination path {} is outside instance {}",
-                path.display(),
-                dest.instance_dir.display()
-            )
-        })?;
-        Ok(staging_dir.join(relative))
-    };
-    let staging_instance = staging_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("fork staging directory name is not UTF-8")?
-        .to_string();
-    Ok(Layout {
-        base: dest.base.clone(),
-        instance: staging_instance,
-        kernel: dest.kernel.clone(),
-        rootfs: relocate(&dest.rootfs)?,
-        instance_dir: staging_dir.to_path_buf(),
-        snapshot_dir: relocate(&dest.snapshot_dir)?,
-        checkpoint_dir: relocate(&dest.checkpoint_dir)?,
-        vm_initialized: relocate(&dest.vm_initialized)?,
-        // Fork publication only materializes persistent instance state. A
-        // split runtime directory intentionally lives outside instance_dir,
-        // so use staging-local placeholders for descriptor helpers.
-        run_dir: staging_dir.to_path_buf(),
-        console_log: staging_dir.join("console.log"),
-    })
-}
-
-fn destination_descriptor(
-    source: &Layout,
-    checkpoint: &Checkpoint,
-    dest: &Layout,
-) -> Result<descriptor::InstanceDescriptor> {
-    let mut config = descriptor::load(source)?;
-    config.name = Some(dest.instance.clone());
-    config.created = OffsetDateTime::now_utc().format(&Rfc3339).ok();
-    if let Some(snapshot_config) = runner::snapshot_vm_config(&checkpoint.path)? {
-        config.cpus = Some(
-            snapshot_config
-                .vcpu_count
-                .try_into()
-                .context("checkpoint vCPU count does not fit instance descriptor")?,
-        );
-        config.memory_mib = Some(
-            snapshot_config
-                .memory_mib()
-                .try_into()
-                .context("checkpoint memory does not fit instance descriptor")?,
-        );
-    }
-    Ok(config)
-}
-
-fn mark_vm_initialized(layout: &Layout) -> Result<()> {
-    if let Some(parent) = layout.vm_initialized.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    fs::write(&layout.vm_initialized, b"1\n")
-        .with_context(|| format!("write {}", layout.vm_initialized.display()))
-}
-
 pub fn display_time(created_unix: u64) -> String {
     OffsetDateTime::from_unix_timestamp(created_unix as i64)
         .ok()
@@ -435,93 +359,11 @@ pub fn display_time(created_unix: u64) -> String {
         .unwrap_or_else(|| created_unix.to_string())
 }
 
-fn read_metadata(path: PathBuf, fallback_id: String) -> Result<Checkpoint> {
-    let metadata = fs::read_to_string(path.join("checkpoint.meta")).unwrap_or_default();
-    let mut id = fallback_id;
-    let mut name = None;
-    let mut created_unix = metadata_created_unix(&path)?;
-    for line in metadata.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key {
-            "id" => id = value.to_string(),
-            "name" if !value.is_empty() => name = Some(value.to_string()),
-            "created_unix" => {
-                if let Ok(value) = value.parse() {
-                    created_unix = value;
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(Checkpoint {
-        id,
-        name,
-        created_unix,
-        path,
-    })
-}
-
-fn metadata_created_unix(path: &Path) -> Result<u64> {
-    let modified = fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?
-        .modified()
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    Ok(modified
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs())
-}
-
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn sanitize_name(name: &str) -> String {
-    name.replace(['\r', '\n'], " ").trim().to_string()
-}
-
-fn clone_snapshot_dir(src: &Path, dest: &Path) -> Result<()> {
-    fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
-    for name in SNAPSHOT_RESTORE_FILES
-        .iter()
-        .copied()
-        .chain(["checkpoint.meta"])
-    {
-        let src_file = src.join(name);
-        match fs::symlink_metadata(&src_file) {
-            Ok(metadata) if metadata.is_file() => {
-                clone_or_copy(&src_file, &dest.join(name))?;
-            }
-            Ok(_) => bail!(
-                "checkpoint restore state is not a regular file: {}",
-                src_file.display()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("stat {}", src_file.display()));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn clone_host_share_state(src: &Path, dest: &Layout) -> Result<()> {
-    if !src.exists() {
-        return Ok(());
-    }
-    crate::sparse_copy::clone_or_copy_tree(src, &dest.instance_dir.join("host-share-state"))
-}
-
-fn clone_or_copy(src: &Path, dest: &Path) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    crate::sparse_copy::clone_or_copy_file(src, dest)
 }
 
 #[cfg(test)]

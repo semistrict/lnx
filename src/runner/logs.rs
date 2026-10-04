@@ -72,12 +72,6 @@ pub(crate) fn log_value(value: &str) -> String {
     value.replace(['\r', '\n', '\t', ' '], "_")
 }
 
-pub(crate) fn system_time_unix_nanos(time: SystemTime) -> Option<u128> {
-    time.duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|time| time.as_nanos())
-}
-
 impl RunLog {
     pub(crate) fn open(layout: &Layout) -> Result<Self> {
         let path = layout.run_dir.join("lnx.log");

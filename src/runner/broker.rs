@@ -59,6 +59,10 @@ pub(crate) struct BrokerState {
     awake_until: Mutex<Option<Instant>>,
     auto_forward_ports: Mutex<HashSet<(String, u16)>>,
     agent_tx: mpsc::Sender<Message>,
+    /// Runs under the channel lock before any channel's opening message
+    /// reaches the guest; the owner records there that the run now holds
+    /// state a client relies on.
+    before_dispatch: Box<dyn Fn() -> Result<()> + Send + Sync>,
     run_log: Arc<RunLog>,
 }
 
@@ -66,6 +70,7 @@ impl BrokerState {
     pub(crate) fn new(
         agent_tx: mpsc::Sender<Message>,
         starts_idle: bool,
+        before_dispatch: impl Fn() -> Result<()> + Send + Sync + 'static,
         run_log: Arc<RunLog>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -77,6 +82,7 @@ impl BrokerState {
             awake_until: Mutex::new(None),
             auto_forward_ports: Mutex::new(HashSet::new()),
             agent_tx,
+            before_dispatch: Box::new(before_dispatch),
             run_log,
         })
     }
@@ -140,6 +146,7 @@ impl BrokerState {
             return Ok(ChannelAdmission::Collision);
         };
         prepare()?;
+        (self.before_dispatch)()?;
         let counts_as_active = channel.counts_as_active;
         if counts_as_active {
             self.active.fetch_add(1, Ordering::SeqCst);
@@ -355,9 +362,11 @@ pub(crate) fn handle_broker_client(
                 ],
             );
         }
+        let spec: CheckpointSpec =
+            serde_json::from_str(&path).context("parse checkpoint request")?;
         let (reply_tx, reply_rx) = mpsc::channel();
         let job = CaptureJob::Checkpoint(CheckpointRequest {
-            path: PathBuf::from(path),
+            spec,
             reply: reply_tx,
         });
         let queued = context

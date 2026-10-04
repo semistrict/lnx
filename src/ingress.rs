@@ -1704,7 +1704,7 @@ fn maybe_fork_and_redirect(
         Err(_) => return Ok(false),
     };
     let dest = Layout::resolve(&route.instance, None, None)?;
-    if !dest.rootfs.exists() {
+    if !crate::init::instance_has_state(&dest) {
         fork_instance(&source_instance, &route.instance, config)?;
     }
     write_redirect_response(response, &clean_fork_request_target(request_target))?;

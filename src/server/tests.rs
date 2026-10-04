@@ -1,33 +1,9 @@
 use super::*;
+use crate::store::{self, Store};
 use std::sync::{Mutex, MutexGuard};
 use tempfile::TempDir;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-struct ChildGuard(std::process::Child);
-
-impl ChildGuard {
-    fn new(child: std::process::Child) -> Self {
-        Self(child)
-    }
-
-    fn id(&self) -> u32 {
-        self.0.id()
-    }
-
-    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.0.wait()
-    }
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if self.0.try_wait().ok().flatten().is_none() {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-}
 
 struct LnxBaseGuard {
     _guard: MutexGuard<'static, ()>,
@@ -182,9 +158,20 @@ fn imports_bundle_into_target_layout() {
     .expect("import");
 
     assert!(response.ok);
-    assert_eq!(fs::read(&dest.rootfs).expect("read rootfs"), b"rootfs");
+    assert_eq!(
+        fs::read(dest.instance_dir.join(store::ROOTFS)).expect("read rootfs"),
+        b"rootfs"
+    );
     assert_eq!(fs::read(&dest.kernel).expect("read kernel"), b"kernel");
-    assert!(dest.snapshot_dir.join("latest/vmstate.bin").exists());
+    assert!(
+        dest.instance_dir
+            .join("memory-snapshots/latest/vmstate.bin")
+            .exists()
+    );
+    // A bundle from an older lnx lands in the old layout and moves into the
+    // store on first use; its incomplete memory snapshot is not kept.
+    runner::ensure_store(&dest).expect("migrate imported bundle");
+    assert_eq!(crate::store::test_support::latest_disk(&dest), b"rootfs");
     assert_eq!(
         descriptor::load(&dest)
             .expect("load descriptor")
@@ -195,24 +182,7 @@ fn imports_bundle_into_target_layout() {
 }
 
 #[cfg(not(target_os = "macos"))]
-#[test]
-fn rejects_sparse_bundle_with_incompatible_launch_metadata() {
-    let source_base = TempDir::new().expect("source tempdir");
-    let dest_base = TempDir::new().expect("dest tempdir");
-    let source = test_layout(source_base.path(), "source");
-    fs::create_dir_all(source.snapshot_dir.join("latest")).expect("create snapshot");
-    fs::write(&source.kernel, b"kernel").expect("write kernel");
-    fs::write(&source.rootfs, b"rootfs").expect("write rootfs");
-    fs::write(
-        source.instance_dir.join("lnx.json"),
-        br#"{"name":"source","cpus":3,"memory_mib":3072}"#,
-    )
-    .expect("write descriptor");
-    fs::write(&source.vm_initialized, b"1\n").expect("vm initialized");
-    fs::write(source.snapshot_dir.join("latest/vmstate.bin"), b"vmstate").expect("write vmstate");
-    fs::write(
-        source.snapshot_dir.join("latest/launch.json"),
-        br#"{
+const INCOMPATIBLE_LAUNCH_METADATA: &[u8] = br#"{
   "version": 2,
   "owner_args": [],
   "compatibility": {
@@ -226,9 +196,27 @@ fn rejects_sparse_bundle_with_incompatible_launch_metadata() {
     "outside_home_cwd": null
   }
 }
-"#,
+"#;
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn rejects_sparse_bundle_with_incompatible_launch_metadata() {
+    let source_base = TempDir::new().expect("source tempdir");
+    let dest_base = TempDir::new().expect("dest tempdir");
+    let source = test_layout(source_base.path(), "source");
+    stored_instance(&source, |generation| {
+        fs::write(generation.join(store::ROOTFS), b"rootfs").expect("write rootfs");
+        fs::write(generation.join(store::VMSTATE), b"vmstate").expect("write vmstate");
+        fs::write(generation.join(store::PAGES), b"pages").expect("write pages");
+        fs::write(generation.join("launch.json"), INCOMPATIBLE_LAUNCH_METADATA)
+            .expect("write launch metadata");
+    });
+    fs::write(&source.kernel, b"kernel").expect("write kernel");
+    fs::write(
+        source.instance_dir.join("lnx.json"),
+        br#"{"name":"source","cpus":3,"memory_mib":3072}"#,
     )
-    .expect("write launch metadata");
+    .expect("write descriptor");
 
     let bundle = SparseBundle::open(&source).expect("open sparse bundle");
     let bundle_file = tempfile::NamedTempFile::new().expect("bundle file");
@@ -267,113 +255,89 @@ fn rejects_sparse_bundle_with_incompatible_launch_metadata() {
 }
 
 #[test]
-fn materializes_checkpoint_bundle_for_running_push() {
+fn a_push_bundle_from_a_checkpoint_carries_its_memory_and_vm_shape() {
     let source_base = TempDir::new().expect("source tempdir");
     let bundle_base = TempDir::new().expect("bundle tempdir");
     let source = test_layout(source_base.path(), "source");
     fs::create_dir_all(&source.instance_dir).expect("create source instance");
-    fs::write(&source.rootfs, b"stale-rootfs").expect("write source rootfs");
     fs::write(
         source.instance_dir.join("lnx.json"),
-        br#"{"name":"source","cpus":1,"memory_mib":512}"#,
+        br#"{"name":"source","cpus":2,"memory_mib":1024}"#,
     )
     .expect("write descriptor");
-    fs::write(
-        source.instance_dir.join(".lnx-descriptor-partial"),
-        b"partial descriptor",
-    )
-    .expect("write stale descriptor staging file");
-    fs::write(source.instance_dir.join(".lnx-fork-lease"), b"").expect("write stale fork lease");
-    let checkpoint = checkpoints::Checkpoint {
-        id: "checkpoint-for-push".to_string(),
-        name: None,
-        created_unix: 123,
-        path: source.checkpoint_dir.join("checkpoint-for-push"),
-    };
-    fs::create_dir_all(&checkpoint.path).expect("create checkpoint");
-    fs::write(checkpoint.path.join("rootfs.ext4"), b"checkpoint-rootfs")
-        .expect("write checkpoint rootfs");
+    let lock = runner::test_support::hold_as_owner(&source);
+    let store = Store::new(&source.instance_dir);
+    let staging = store.stage(&lock).expect("stage checkpoint");
+    fs::write(staging.dir().join(store::ROOTFS), b"checkpoint-rootfs").expect("write rootfs");
     let mut vmstate = [0u8; 40];
     vmstate[0..8].copy_from_slice(b"LKRNSS01");
     vmstate[8..12].copy_from_slice(&runner::SNAPSHOT_VMSTATE_VERSION.to_le_bytes());
     vmstate[16..24].copy_from_slice(&(512u64 * 1024 * 1024).to_le_bytes());
     vmstate[32..36].copy_from_slice(&1u32.to_le_bytes());
-    fs::write(checkpoint.path.join("vmstate.bin"), vmstate).expect("write checkpoint vmstate");
-    fs::write(checkpoint.path.join("pages.img"), b"pages").expect("write checkpoint pages");
-    fs::write(
-        checkpoint.path.join("initramfs.stamp"),
-        b"source=test-agent\n",
-    )
-    .expect("write checkpoint initramfs stamp");
-    fs::write(
-        checkpoint.path.join("launch.json"),
-        br#"{
-  "version": 2,
-  "owner_args": [],
-  "compatibility": { "host_share_cache": { "dax": false } },
-  "shares": {
-    "no_host_shares": true,
-    "host_home": null,
-    "outside_home_cwd": null
-  }
-}"#,
-    )
-    .expect("write checkpoint launch metadata");
-    checkpoints::write_metadata(&source, &checkpoint).expect("write checkpoint metadata");
+    fs::write(staging.dir().join(store::VMSTATE), vmstate).expect("write vmstate");
+    fs::write(staging.dir().join(store::PAGES), b"pages").expect("write pages");
+    let generation = store.initialize(&lock, staging).expect("initialize source");
+    store
+        .add_checkpoint(
+            &lock,
+            &crate::store::CheckpointRef {
+                id: "checkpoint-for-push".to_string(),
+                name: None,
+                generation,
+                created_unix: 123,
+            },
+        )
+        .expect("add checkpoint");
+    drop(lock);
+    let checkpoint = checkpoints::resolve(&source, "checkpoint-for-push").expect("resolve");
 
     let bundle = checkpoint_bundle_layout(&source, bundle_base.path());
-    materialize_checkpoint_bundle(&source, &checkpoint, &bundle).expect("materialize bundle");
+    checkpoints::fork(
+        &source,
+        checkpoints::ForkSource::Checkpoint(&checkpoint),
+        &bundle,
+    )
+    .expect("materialize bundle");
 
-    assert_eq!(
-        fs::read(&bundle.rootfs).expect("read bundle rootfs"),
-        b"checkpoint-rootfs"
-    );
-    assert_eq!(
-        fs::read(bundle.snapshot_dir.join("latest/vmstate.bin")).expect("read bundle vmstate"),
-        vmstate
-    );
+    let latest = Store::new(&bundle.instance_dir)
+        .latest()
+        .expect("read bundle")
+        .expect("bundle latest");
+    assert_eq!(fs::read(latest.rootfs()).unwrap(), b"checkpoint-rootfs");
+    assert_eq!(fs::read(latest.dir.join(store::VMSTATE)).unwrap(), vmstate);
     assert!(!bundle.kernel.exists());
-    assert!(bundle.vm_initialized.exists());
-    assert_eq!(
-        descriptor::load(&bundle)
-            .expect("load bundle descriptor")
-            .name
-            .as_deref(),
-        Some("source")
-    );
     let bundle_descriptor = descriptor::load(&bundle).expect("load bundle descriptor");
+    assert_eq!(bundle_descriptor.name.as_deref(), Some("source"));
     assert_eq!(bundle_descriptor.cpus, Some(1));
     assert_eq!(bundle_descriptor.memory_mib, Some(512));
 }
 
 #[test]
-fn stopped_push_refuses_failed_final_snapshot_outcome() {
+fn pushing_an_instance_with_a_crashed_vm_asks_for_recovery_first() {
     let source_base = TempDir::new().expect("source tempdir");
     let source = test_layout(source_base.path(), "source");
-    fs::create_dir_all(&source.instance_dir).expect("create source instance");
-    fs::write(&source.rootfs, b"newer-canonical-rootfs").expect("write source rootfs");
-    runner::write_final_snapshot_outcome(&source, &Err(anyhow::anyhow!("snapshot failed")))
-        .expect("write failed outcome");
+    crate::store::test_support::initialized(&source, b"saved disk", true);
+    crate::store::test_support::crash_after_serving(&source, b"acknowledged writes");
 
     let error = prepare_push_source(&source)
         .err()
-        .expect("failed snapshot blocks stopped push");
+        .expect("crashed run blocks push");
 
-    assert!(error.to_string().contains("final snapshot failed"));
-    assert!(error.to_string().contains("snapshots clear"));
+    let message = format!("{error:#}");
+    assert!(message.contains("recover --keep"), "{message}");
 }
 
 #[test]
 fn push_refuses_live_owner_without_broker() {
     let source_base = TempDir::new().expect("source tempdir");
     let source = test_layout(source_base.path(), "source");
-    fs::create_dir_all(&source.instance_dir).expect("create source instance");
-    fs::write(&source.rootfs, b"live-rootfs").expect("write source rootfs");
+    crate::store::test_support::initialized(&source, b"live-rootfs", false);
     let owner = runner::test_support::hold_as_owner(&source);
 
-    let error = runner::request_coherent_checkpoint_awaiting_owner(
+    let error = runner::request_live_checkpoint(
         &source,
-        &source.checkpoint_dir.join("test"),
+        &runner::CheckpointSpec::default(),
+        None,
         Duration::from_millis(25),
     )
     .expect_err("unavailable live broker blocks push");
@@ -383,82 +347,61 @@ fn push_refuses_live_owner_without_broker() {
 }
 
 #[test]
-fn stopped_push_uses_stable_copy_without_runtime_leases() {
+fn stopped_push_copies_only_the_saved_state() {
     let source_base = TempDir::new().expect("source tempdir");
     let source = test_layout(source_base.path(), "source");
     fs::create_dir_all(&source.instance_dir).expect("create source instance");
-    fs::write(&source.rootfs, b"stable-rootfs").expect("write source rootfs");
     fs::write(
         source.instance_dir.join("lnx.json"),
         br#"{"name":"source","cpus":1,"memory_mib":512}"#,
     )
     .expect("write descriptor");
-    let deferred_clear = source.snapshot_dir.join(".latest.clear-123-0");
-    fs::create_dir_all(&deferred_clear).expect("create deferred clear trash");
-    fs::write(deferred_clear.join("discarded-secret"), b"discarded")
-        .expect("write deferred clear trash");
-    let nested_reserved_name = source
-        .instance_dir
-        .join("host-share-state/home/upper/project/lnx-agent.sock");
-    fs::create_dir_all(nested_reserved_name.parent().unwrap())
-        .expect("create nested state directory");
-    fs::write(&nested_reserved_name, b"guest-visible-state")
-        .expect("write nested reserved-name file");
+    {
+        let lock = runner::test_support::hold_as_owner(&source);
+        let store = Store::new(&source.instance_dir);
+        let staging = store.stage(&lock).expect("stage");
+        fs::write(staging.dir().join(store::ROOTFS), b"stable-rootfs").expect("write rootfs");
+        let nested = staging
+            .dir()
+            .join("host-share-state/home/upper/project/lnx-agent.sock");
+        fs::create_dir_all(nested.parent().unwrap()).expect("create nested state directory");
+        fs::write(&nested, b"guest-visible-state").expect("write nested reserved-name file");
+        store.initialize(&lock, staging).expect("initialize source");
+    }
+    fs::write(
+        source.instance_dir.join(".lnx-descriptor-partial"),
+        b"partial descriptor",
+    )
+    .expect("write stale descriptor staging file");
     let stale_agent_socket = source.run_dir.join("lnx-agent.sock");
     let _listener = std::os::unix::net::UnixListener::bind(&stale_agent_socket)
         .expect("create stale runtime socket");
-    let stale_checkpoint_broker = source.run_dir.join("checkpoint-broker.sock");
-    let _checkpoint_listener = std::os::unix::net::UnixListener::bind(&stale_checkpoint_broker)
-        .expect("create stale checkpoint broker socket");
 
     let prepared = prepare_push_source(&source).expect("prepare stopped push");
 
-    assert_eq!(
-        fs::read(&prepared.layout.rootfs).expect("read stable rootfs copy"),
-        b"stable-rootfs"
-    );
-    for lock in runner::LOCK_FILES {
-        assert!(!prepared.layout.instance_dir.join(lock).exists());
-    }
-    assert!(!prepared.layout.run_dir.join("lnx-agent.sock").exists());
-    assert!(
-        !prepared
-            .layout
-            .instance_dir
-            .join(".lnx-descriptor-partial")
-            .exists()
-    );
-    assert!(
-        !prepared
-            .layout
-            .instance_dir
-            .join(".lnx-fork-lease")
-            .exists()
-    );
-    assert!(
-        !prepared
-            .layout
-            .run_dir
-            .join("checkpoint-broker.sock")
-            .exists()
-    );
-    assert!(
-        !prepared
-            .layout
-            .snapshot_dir
-            .join(".latest.clear-123-0")
-            .exists()
-    );
+    let latest = Store::new(&prepared.layout.instance_dir)
+        .latest()
+        .expect("read bundle")
+        .expect("bundle latest");
+    assert_eq!(fs::read(latest.rootfs()).unwrap(), b"stable-rootfs");
     assert_eq!(
         fs::read(
-            prepared
-                .layout
-                .instance_dir
+            latest
+                .dir
                 .join("host-share-state/home/upper/project/lnx-agent.sock")
         )
         .expect("nested reserved-name file is preserved"),
         b"guest-visible-state"
     );
+    for leftover in [".lnx-descriptor-partial", "lnx-agent.sock", "runs"] {
+        assert!(
+            !prepared.layout.instance_dir.join(leftover).exists(),
+            "{leftover}"
+        );
+    }
+    for lock in runner::LOCK_FILES {
+        assert!(!prepared.layout.instance_dir.join(lock).exists(), "{lock}");
+    }
 }
 
 #[test]
@@ -466,27 +409,20 @@ fn sparse_bundle_round_trips_sparse_rootfs() {
     let source_base = TempDir::new().expect("source tempdir");
     let dest_base = TempDir::new().expect("dest tempdir");
     let source = test_layout(source_base.path(), "source");
-    fs::create_dir_all(&source.instance_dir).expect("create source instance");
+    stored_instance(&source, |generation| {
+        let mut rootfs = fs::File::create(generation.join(store::ROOTFS)).expect("create rootfs");
+        rootfs.set_len(64 * 1024 * 1024).expect("sparse rootfs");
+        rootfs
+            .seek(SeekFrom::Start(48 * 1024 * 1024))
+            .expect("seek rootfs");
+        rootfs.write_all(b"SPARSE_DATA").expect("write sparse data");
+    });
     fs::write(&source.kernel, b"kernel").expect("write kernel");
     fs::write(
         source.instance_dir.join("lnx.json"),
         br#"{"name":"source","cpus":1,"memory_mib":512}"#,
     )
     .expect("write descriptor");
-    fs::write(&source.vm_initialized, b"1\n").expect("vm initialized");
-
-    let mut rootfs = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&source.rootfs)
-        .expect("create rootfs");
-    rootfs.set_len(64 * 1024 * 1024).expect("sparse rootfs");
-    rootfs
-        .seek(SeekFrom::Start(48 * 1024 * 1024))
-        .expect("seek rootfs");
-    rootfs.write_all(b"SPARSE_DATA").expect("write sparse data");
-    drop(rootfs);
 
     let bundle = SparseBundle::open(&source).expect("open sparse bundle");
     assert!(
@@ -523,12 +459,12 @@ fn sparse_bundle_round_trips_sparse_rootfs() {
 
     assert!(response.ok);
     assert_eq!(
-        fs::metadata(&dest.rootfs)
+        fs::metadata(latest_rootfs(&dest))
             .expect("stat imported rootfs")
             .len(),
         64 * 1024 * 1024
     );
-    let mut imported = fs::File::open(&dest.rootfs).expect("open imported rootfs");
+    let mut imported = fs::File::open(latest_rootfs(&dest)).expect("open imported rootfs");
     imported
         .seek(SeekFrom::Start(48 * 1024 * 1024))
         .expect("seek imported rootfs");
@@ -558,20 +494,26 @@ fn formats_upload_progress_bytes() {
 fn cas_manifest_splits_and_deduplicates_blocks() {
     let source_base = TempDir::new().expect("source tempdir");
     let source = test_layout(source_base.path(), "source");
-    fs::create_dir_all(&source.instance_dir).expect("create source instance");
+    stored_instance(&source, |generation| {
+        let mut rootfs = fs::File::create(generation.join(store::ROOTFS)).expect("create rootfs");
+        let block = vec![0x42; CAS_BLOCK_SIZE as usize];
+        rootfs.write_all(&block).expect("write block 1");
+        rootfs.write_all(&block).expect("write block 2");
+        rootfs.write_all(b"tail").expect("write tail");
+    });
     fs::write(&source.kernel, b"kernel").expect("write kernel");
     fs::write(
         source.instance_dir.join("lnx.json"),
         br#"{"name":"source","cpus":1,"memory_mib":512}"#,
     )
     .expect("write descriptor");
-    fs::write(&source.vm_initialized, b"1\n").expect("vm initialized");
-    let mut rootfs = fs::File::create(&source.rootfs).expect("create rootfs");
-    let block = vec![0x42; CAS_BLOCK_SIZE as usize];
-    rootfs.write_all(&block).expect("write block 1");
-    rootfs.write_all(&block).expect("write block 2");
-    rootfs.write_all(b"tail").expect("write tail");
-    drop(rootfs);
+    let rootfs_path = format!(
+        "instances/source/{}",
+        latest_rootfs(&source)
+            .strip_prefix(&source.instance_dir)
+            .expect("rootfs under instance")
+            .display()
+    );
 
     let bundle = CasPushBundle::open(
         &source,
@@ -590,7 +532,7 @@ fn cas_manifest_splits_and_deduplicates_blocks() {
         .manifest
         .files
         .iter()
-        .find(|file| file.path == "instances/source/rootfs.ext4")
+        .find(|file| file.path == rootfs_path)
         .expect("rootfs file");
     assert_eq!(rootfs_file.blocks.len(), 3);
     assert_eq!(rootfs_file.blocks[0].sha256, rootfs_file.blocks[1].sha256);
@@ -682,15 +624,15 @@ fn cas_commit_reconstructs_imported_instance() {
     let server_base = TempDir::new().expect("server tempdir");
     let _env = LnxBaseGuard::set(server_base.path());
     let source = test_layout(source_base.path(), "source");
-    fs::create_dir_all(&source.instance_dir).expect("create source instance");
+    stored_instance(&source, |generation| {
+        fs::write(generation.join(store::ROOTFS), b"rootfs-data").expect("write rootfs");
+    });
     fs::write(&source.kernel, b"kernel").expect("write kernel");
-    fs::write(&source.rootfs, b"rootfs-data").expect("write rootfs");
     fs::write(
         source.instance_dir.join("lnx.json"),
         br#"{"name":"source","cpus":1,"memory_mib":512}"#,
     )
     .expect("write descriptor");
-    fs::write(&source.vm_initialized, b"1\n").expect("vm initialized");
     let config = PushConfig {
         source: source.clone(),
         url: "http://127.0.0.1:7777".to_string(),
@@ -730,7 +672,7 @@ fn cas_commit_reconstructs_imported_instance() {
 
     let dest = test_layout(server_base.path(), "target");
     assert!(response.ok);
-    assert_eq!(fs::read(&dest.rootfs).expect("read rootfs"), b"rootfs-data");
+    assert_eq!(fs::read(latest_rootfs(&dest)).expect("read rootfs"), b"rootfs-data");
     assert_eq!(
         descriptor::load(&dest)
             .expect("load descriptor")
@@ -745,85 +687,80 @@ fn cas_commit_reconstructs_imported_instance() {
     );
 }
 
+/// Creates `layout` as a stopped instance whose first generation holds the
+/// files `write` puts in the directory it is given.
+fn stored_instance(layout: &Layout, write: impl FnOnce(&Path)) {
+    fs::create_dir_all(&layout.instance_dir).expect("create instance");
+    let lock = runner::test_support::hold_as_owner(layout);
+    let store = Store::new(&layout.instance_dir);
+    let staging = store.stage(&lock).expect("stage generation");
+    write(staging.dir());
+    store.initialize(&lock, staging).expect("initialize instance");
+}
+
+fn latest_rootfs(layout: &Layout) -> PathBuf {
+    Store::new(&layout.instance_dir)
+        .latest()
+        .expect("read store")
+        .expect("latest generation")
+        .rootfs()
+}
+
 fn test_layout(base: &Path, instance: &str) -> Layout {
     Layout {
         base: base.to_path_buf(),
         instance: instance.to_string(),
         kernel: base.join("vmlinuz"),
-        rootfs: base.join("instances").join(instance).join("rootfs.ext4"),
+        rootfs: None,
         instance_dir: base.join("instances").join(instance),
-        snapshot_dir: base
-            .join("instances")
-            .join(instance)
-            .join("memory-snapshots"),
-        checkpoint_dir: base.join("instances").join(instance).join("checkpoints"),
-        vm_initialized: base.join("instances").join(instance).join("vm-initialized"),
         run_dir: base.join("instances").join(instance),
         console_log: base.join("instances").join(instance).join("console.log"),
     }
 }
 
 #[tokio::test]
-async fn stop_reports_final_snapshot_failure_from_recovery_marker() {
+async fn stop_reports_a_vm_that_died_after_serving_commands() {
     let temp = TempDir::new().expect("tempdir");
-    let layout = test_layout(temp.path(), "stop-failed-snapshot");
-    fs::create_dir_all(layout.snapshot_dir.join(runner::RESTORE_WORK_SNAPSHOT))
-        .expect("create restore work");
-    fs::write(
-        layout.snapshot_dir.join(runner::RESTORE_WORK_ACTIVE_MARKER),
-        b"generation_id=recovery\n",
-    )
-    .expect("write recovery marker");
-    let mut owner = ChildGuard::new(
-        runner::test_support::spawn_foreign_holder(&layout, runner::LeaseRole::Owner, "exit 1")
-            .child,
-    );
+    let layout = test_layout(temp.path(), "stop-crashed-run");
+    crate::store::test_support::initialized(&layout, b"saved disk", true);
+    crate::store::test_support::crash_after_serving(&layout, b"acknowledged writes");
+    let mut owner =
+        runner::test_support::spawn_foreign_holder(&layout, runner::LeaseRole::Owner, "exit 1");
 
     let error = stop_existing_instance_with_timeout(&layout, Duration::from_secs(2))
         .await
-        .expect_err("recovery marker reports failed shutdown snapshot");
+        .expect_err("a crashed run is reported");
 
-    assert!(
-        error
-            .to_string()
-            .contains("without publishing its final snapshot")
-    );
-    assert!(error.to_string().contains("snapshots clear"));
-    assert!(runner::restore_work_is_active(&layout));
+    let message = format!("{error:#}");
+    assert!(message.contains("stopped unexpectedly"), "{message}");
+    assert!(message.contains("recover --keep"), "{message}");
     let _ = owner.wait();
 }
 
 #[tokio::test]
-async fn stop_reports_missing_fresh_owner_snapshot_outcome() {
+async fn stopping_an_owner_that_never_served_a_command_leaves_a_usable_instance() {
     let temp = TempDir::new().expect("tempdir");
-    let layout = test_layout(temp.path(), "stop-missing-outcome");
-    let mut owner = ChildGuard::new(
-        runner::test_support::spawn_foreign_holder(&layout, runner::LeaseRole::Owner, "exit 1")
-            .child,
-    );
+    let layout = test_layout(temp.path(), "stop-idle-run");
+    crate::store::test_support::initialized(&layout, b"saved disk", true);
+    crate::store::test_support::crash_before_serving(&layout);
+    let mut owner =
+        runner::test_support::spawn_foreign_holder(&layout, runner::LeaseRole::Owner, "exit 1");
 
-    let error = stop_existing_instance_with_timeout(&layout, Duration::from_secs(2))
+    stop_existing_instance_with_timeout(&layout, Duration::from_secs(2))
         .await
-        .expect_err("missing fresh-owner outcome is a stop failure");
+        .expect("an idle run needs no recovery");
 
-    assert!(error.to_string().contains("without reporting whether"));
     let _ = owner.wait();
-    let persisted = runner::read_final_snapshot_outcome(&layout)
-        .expect("read persisted failure")
-        .expect("missing outcome is replaced by a failure tombstone");
-    assert_eq!(persisted.pid, owner.id());
-    assert!(!persisted.succeeded);
-    let retry = runner::validate_restore_work_for_command(&layout)
-        .expect_err("the next start remains blocked");
-    assert!(retry.to_string().contains("final snapshot failed"));
+    runner::refuse_crashed_run(&layout).expect("the next start is not blocked");
 }
 
 #[tokio::test]
-async fn stop_reports_missing_snapshot_outcome_after_owner_crash() {
+async fn stop_reports_an_owner_that_already_crashed_after_serving() {
     let temp = TempDir::new().expect("tempdir");
     let layout = test_layout(temp.path(), "stop-crashed-owner");
+    crate::store::test_support::initialized(&layout, b"saved disk", true);
+    crate::store::test_support::crash_after_serving(&layout, b"acknowledged writes");
     let crashed = runner::test_support::exited_process();
-    let stale_pid = crashed.pid as u32;
     runner::test_support::write_instance_lease(
         &layout,
         &runner::test_support::lease_for(runner::LeaseRole::Owner, crashed),
@@ -831,35 +768,26 @@ async fn stop_reports_missing_snapshot_outcome_after_owner_crash() {
 
     let error = stop_existing_instance_with_timeout(&layout, Duration::from_millis(50))
         .await
-        .expect_err("a crashed owner without an outcome is a stop failure");
+        .expect_err("a crashed run is reported");
 
-    assert!(error.to_string().contains("without reporting whether"));
-    assert!(error.to_string().contains(&stale_pid.to_string()));
+    assert!(format!("{error:#}").contains("recover --keep"));
     assert_eq!(
         runner::instance_lock_state(&layout)
             .expect("inspect lock")
             .stale_lease()
             .map(|lease| lease.process),
         Some(crashed),
-        "failed verification must retain PID evidence"
+        "the crashed owner's lease is kept as evidence"
     );
-    let retry = runner::validate_restore_work_for_command(&layout)
-        .expect_err("a later start must remain blocked");
-    assert!(retry.to_string().contains("final snapshot failed"));
-    let persisted = runner::read_final_snapshot_outcome(&layout)
-        .expect("read persisted crash outcome")
-        .expect("crash outcome is persisted");
-    assert_eq!(persisted.pid, stale_pid);
-    assert!(!persisted.succeeded);
 }
 
 #[tokio::test]
 async fn stop_timeout_leaves_unresponsive_owner_running() {
     let temp = TempDir::new().expect("tempdir");
     let layout = test_layout(temp.path(), "stop-timeout");
-    let holder = runner::test_support::spawn_foreign_holder(&layout, runner::LeaseRole::Owner, "1");
-    let owner_process = holder.process;
-    let mut owner = ChildGuard::new(holder.child);
+    let mut owner =
+        runner::test_support::spawn_foreign_holder(&layout, runner::LeaseRole::Owner, "1");
+    let owner_process = owner.process;
 
     let error = stop_existing_instance_with_timeout(&layout, Duration::from_millis(50))
         .await
@@ -867,6 +795,5 @@ async fn stop_timeout_leaves_unresponsive_owner_running() {
 
     assert!(error.to_string().contains("left running"));
     assert!(owner_process.is_running());
-    unsafe { libc::kill(owner.id() as i32, libc::SIGKILL) };
-    let _ = owner.wait();
+    owner.kill();
 }

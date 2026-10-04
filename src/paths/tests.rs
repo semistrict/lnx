@@ -28,34 +28,7 @@ fn resolve_builds_per_instance_paths() {
     assert_eq!(layout.base, home.join(".lnx"));
     assert_eq!(layout.instance, "dev");
     assert_eq!(layout.kernel, home.join(".lnx").join("vmlinuz"));
-    assert_eq!(
-        layout.rootfs,
-        home.join(".lnx")
-            .join("instances")
-            .join("dev")
-            .join("rootfs.ext4")
-    );
-    assert_eq!(
-        layout.snapshot_dir,
-        home.join(".lnx")
-            .join("instances")
-            .join("dev")
-            .join("memory-snapshots")
-    );
-    assert_eq!(
-        layout.checkpoint_dir,
-        home.join(".lnx")
-            .join("instances")
-            .join("dev")
-            .join("checkpoints")
-    );
-    assert_eq!(
-        layout.vm_initialized,
-        home.join(".lnx")
-            .join("instances")
-            .join("dev")
-            .join("vm-initialized")
-    );
+    assert_eq!(layout.rootfs, None);
     assert_eq!(
         layout.run_dir,
         home.join(".lnx").join("instances").join("dev")
@@ -78,7 +51,7 @@ fn resolve_honors_explicit_kernel_and_rootfs() {
     );
 
     assert_eq!(layout.kernel, kernel);
-    assert_eq!(layout.rootfs, rootfs);
+    assert_eq!(layout.rootfs, Some(rootfs));
     assert_eq!(layout.instance, "custom");
 }
 
@@ -96,14 +69,7 @@ fn resolve_honors_lnx_base_env() {
 
     assert_eq!(layout.base, base);
     assert_eq!(layout.kernel, layout.base.join("vmlinuz"));
-    assert_eq!(
-        layout.rootfs,
-        layout
-            .base
-            .join("instances")
-            .join("envbase")
-            .join("rootfs.ext4")
-    );
+    assert_eq!(layout.rootfs, None);
 }
 
 #[test]
@@ -120,10 +86,6 @@ fn resolve_honors_lnx_run_base_env() {
     );
 
     assert_eq!(layout.instance_dir, base.join("instances/dev"));
-    assert_eq!(
-        layout.snapshot_dir,
-        base.join("instances/dev/memory-snapshots")
-    );
     assert_eq!(layout.run_dir, run_base.join("instances/dev"));
     assert_eq!(layout.console_log, layout.run_dir.join("console.log"));
 }
@@ -143,10 +105,7 @@ fn resolve_prefers_nearest_ancestor_with_requested_instance() {
 
     assert_eq!(layout.base, project.join(".lnx"));
     assert_eq!(layout.kernel, home.join(".lnx/vmlinuz"));
-    assert_eq!(
-        layout.rootfs,
-        project.join(".lnx/instances/dev/rootfs.ext4")
-    );
+    assert_eq!(layout.rootfs, None);
 }
 
 #[test]
@@ -188,10 +147,7 @@ fn resolve_in_base_places_new_instances_in_selected_store() {
     let layout = Layout::resolve_in_base("new", base.clone(), None, None);
 
     assert_eq!(layout.base, base);
-    assert_eq!(
-        layout.rootfs,
-        PathBuf::from("/tmp/lnx-selected-base/instances/new/rootfs.ext4")
-    );
+    assert_eq!(layout.rootfs, None);
 }
 
 #[test]

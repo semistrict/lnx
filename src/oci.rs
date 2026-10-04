@@ -16,12 +16,8 @@ use crate::{descriptor, init, paths::Layout};
 /// 16 KiB pages match the 16 KiB-block ext4 the managed rootfs layout
 /// requires. The built image lands back on the host through the cwd share.
 pub fn import_image(layout: &Layout, reference: &str, kernel: Option<&Path>) -> Result<()> {
-    if layout.rootfs.exists() {
-        bail!(
-            "instance {} already has a rootfs: {}",
-            layout.instance,
-            layout.rootfs.display()
-        );
+    if init::instance_has_state(layout) {
+        bail!("instance {} already exists", layout.instance);
     }
     match kernel {
         Some(kernel) => init::install_kernel(layout, kernel)?,
@@ -359,13 +355,11 @@ fn cleanup_builder_instance(layout: &Layout) {
 fn publish_rootfs(layout: &Layout, staging: &Path, reference: &str) -> Result<()> {
     let built = staging.join("rootfs.ext4");
     init::validate_managed_rootfs_at(&built)?;
-    if let Some(parent) = layout.rootfs.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    fs::rename(&built, &layout.rootfs)
-        .with_context(|| format!("move {} to {}", built.display(), layout.rootfs.display()))?;
+    fs::create_dir_all(&layout.instance_dir)
+        .with_context(|| format!("create {}", layout.instance_dir.display()))?;
     descriptor::ensure_identity(layout, &format!("oci:{reference}"))?;
-    eprintln!("oci: imported {reference} as {}", layout.rootfs.display());
+    init::ensure_instance_from(layout, &built)?;
+    eprintln!("oci: imported {reference} as instance {}", layout.instance);
     Ok(())
 }
 

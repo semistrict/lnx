@@ -118,14 +118,6 @@ fn host_share_cache_metadata() -> LaunchHostShareCache {
 /// Whether the default restore snapshot was written by the current launch
 /// metadata version. Missing launch metadata is treated as matching; deciding
 /// on it is the general snapshot compatibility check's job.
-pub fn default_restore_version_matches(snapshot: &Path) -> Result<bool> {
-    match read_launch_metadata(snapshot) {
-        Ok(metadata) => Ok(metadata.version == LAUNCH_METADATA_VERSION),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(_) => Ok(false),
-    }
-}
-
 pub fn snapshot_shares_incompatibility_for_import(
     snapshot_path: &Path,
     cwd: &Path,

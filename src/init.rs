@@ -22,6 +22,8 @@ const EXT4_VALID_FS: u16 = 0x0001;
 const EXT4_ERROR_FS: u16 = 0x0002;
 const ZERO_SCAN_BLOCK: usize = 16 * 1024 * 1024;
 
+/// Installs the kernel and base image and creates the instance from the
+/// image (a clone of `rootfs` when given) unless it already exists.
 pub fn run(layout: &Layout, kernel: Option<&Path>, rootfs: Option<&Path>) -> Result<()> {
     eprintln!("init: base {}", layout.base.display());
     create_dir(&layout.base)?;
@@ -39,59 +41,83 @@ pub fn run(layout: &Layout, kernel: Option<&Path>, rootfs: Option<&Path>) -> Res
         download_kernel(&layout.kernel)?;
     }
 
-    let initialized_rootfs = if let Some(rootfs) = rootfs {
-        copy_if_needed(rootfs, &layout.rootfs, "rootfs")?;
-        &layout.rootfs
-    } else {
-        ensure_release_asset(
-            &default_rootfs,
-            "rootfs.ext4.zst",
-            DEFAULT_IMAGE_VERSION,
-            CachePolicy::MatchRelease,
-        )?;
-        &default_rootfs
+    let (source, image) = match rootfs {
+        Some(rootfs) => (rootfs, format!("file:{}", rootfs.display())),
+        None => {
+            ensure_release_asset(
+                &default_rootfs,
+                "rootfs.ext4.zst",
+                DEFAULT_IMAGE_VERSION,
+                CachePolicy::MatchRelease,
+            )?;
+            ensure_rootfs_min_size(&default_rootfs, DEFAULT_ROOTFS_SIZE)?;
+            validate_managed_rootfs(&default_rootfs, DEFAULT_ROOTFS_SIZE)?;
+            (
+                default_rootfs.as_path(),
+                format!("release:{DEFAULT_IMAGE_VERSION}"),
+            )
+        }
     };
-
-    if rootfs.is_none() {
-        ensure_rootfs_min_size(&default_rootfs, DEFAULT_ROOTFS_SIZE)?;
-        validate_managed_rootfs(&default_rootfs, DEFAULT_ROOTFS_SIZE)?;
-    }
-
-    let image = match rootfs {
-        Some(rootfs) => format!("file:{}", rootfs.display()),
-        None => format!("release:{DEFAULT_IMAGE_VERSION}"),
-    };
+    create_dir(&layout.instance_dir)?;
     crate::descriptor::ensure_identity(layout, &image)?;
+    ensure_instance_from(layout, source)?;
 
     eprintln!("init: kernel {}", layout.kernel.display());
-    eprintln!("init: rootfs {}", initialized_rootfs.display());
+    eprintln!("init: rootfs {}", source.display());
     eprintln!("init: complete");
     Ok(())
 }
 
-pub fn ensure_instance(layout: &Layout) -> Result<()> {
+/// Whether the instance has saved state, in the store or in the layout lnx
+/// used before it (which the next owner migrates).
+pub fn instance_has_state(layout: &Layout) -> bool {
+    dir_has_instance_state(&layout.instance_dir)
+}
+
+/// Whether `instance_dir` holds saved instance state in either layout.
+pub fn dir_has_instance_state(instance_dir: &Path) -> bool {
+    crate::store::Store::new(instance_dir).exists() || instance_dir.join(crate::store::ROOTFS).exists()
+}
+
+/// The rootfs of the instance's saved state, for status reporting.
+pub fn instance_rootfs(layout: &Layout) -> Option<PathBuf> {
+    let store = crate::store::Store::new(&layout.instance_dir);
+    if store.exists() {
+        return store.latest().ok().flatten().map(|latest| latest.rootfs());
+    }
+    let legacy = layout.instance_dir.join(crate::store::ROOTFS);
+    legacy.exists().then_some(legacy)
+}
+
+/// Creates the instance with a clone of `rootfs` as its first generation,
+/// unless it already has state.
+pub fn ensure_instance_from(layout: &Layout, rootfs: &Path) -> Result<()> {
     ensure_base_ignored(&layout.base)?;
     create_dir(&layout.instance_dir)?;
-    create_dir(
-        layout
-            .rootfs
-            .parent()
-            .context("rootfs path has no parent directory")?,
-    )?;
-    if layout.rootfs.exists() {
+    if instance_has_state(layout) {
         return Ok(());
     }
-    let default_rootfs = default_rootfs(layout);
-    if !default_rootfs.exists() {
-        bail!("missing default rootfs: {}", default_rootfs.display());
-    }
-    crate::descriptor::ensure_identity(layout, &format!("clone:{}", default_rootfs.display()))?;
+    crate::descriptor::ensure_identity(layout, &format!("clone:{}", rootfs.display()))?;
     eprintln!(
-        "init: clone rootfs {} -> {}",
-        default_rootfs.display(),
-        layout.rootfs.display()
+        "init: create instance {} from {}",
+        layout.instance,
+        rootfs.display()
     );
-    clone_or_copy(&default_rootfs, &layout.rootfs)
+    let created = crate::runner::with_exclusive_instance_state(layout, |lock, _| {
+        let store = crate::store::Store::new(&layout.instance_dir);
+        if store.exists() {
+            return Ok(());
+        }
+        let staging = store.stage(lock)?;
+        crate::sparse_copy::clone_or_copy_file(rootfs, &staging.dir().join(crate::store::ROOTFS))?;
+        store.initialize(lock, staging).map(drop)
+    })?;
+    created.with_context(|| {
+        format!(
+            "instance {} is being created by another command",
+            layout.instance
+        )
+    })
 }
 
 pub fn ensure_base_ignored(base: &Path) -> Result<()> {
@@ -146,13 +172,6 @@ fn copy_if_needed(src: &Path, dest: &Path, label: &str) -> Result<()> {
 
 fn default_rootfs(layout: &Layout) -> PathBuf {
     layout.base.join("cache").join("rootfs.ext4")
-}
-
-fn clone_or_copy(src: &Path, dest: &Path) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    crate::sparse_copy::clone_or_copy_file(src, dest)
 }
 
 fn download_kernel(dest: &Path) -> Result<()> {

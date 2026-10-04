@@ -322,245 +322,165 @@ fn deterministic_implies_one_cpu() {
     assert_eq!(effective_cpus(8, None), 8);
 }
 
-#[test]
-fn restore_snapshot_uses_latest_by_default() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let layout = test_layout(temp.path());
-    let latest = layout.snapshot_dir.join("latest");
-    std::fs::create_dir_all(&latest).expect("create latest snapshot");
+use crate::store::test_support::{crash_after_serving, latest_disk};
 
-    assert_eq!(
-        restore_snapshot_for_run(&layout, None, false, false),
-        Some(latest)
-    );
+fn store_instance(layout: &Layout, disk: &[u8], memory: bool) -> store::GenerationId {
+    crate::store::test_support::initialized(layout, disk, memory)
+}
+
+fn latest_has_memory(layout: &Layout) -> bool {
+    store::Store::new(&layout.instance_dir)
+        .latest()
+        .expect("read latest")
+        .expect("latest")
+        .manifest
+        .has_memory()
 }
 
 #[test]
-fn restore_snapshot_skips_latest_for_explicit_image_inputs() {
+fn dropping_saved_memory_keeps_the_disk() {
     let temp = tempfile::tempdir().expect("tempdir");
     let layout = test_layout(temp.path());
-    std::fs::create_dir_all(layout.snapshot_dir.join("latest")).expect("create latest snapshot");
+    store_instance(&layout, b"saved disk", true);
 
-    assert_eq!(restore_snapshot_for_run(&layout, None, true, false), None);
-    assert_eq!(restore_snapshot_for_run(&layout, None, false, true), None);
+    drop_saved_memory(&layout).expect("drop memory");
+
+    assert!(!latest_has_memory(&layout));
+    assert_eq!(latest_disk(&layout), b"saved disk");
 }
 
 #[test]
-fn restore_snapshot_preserves_explicit_snapshot() {
+fn dropping_saved_memory_refuses_while_the_vm_runs() {
     let temp = tempfile::tempdir().expect("tempdir");
     let layout = test_layout(temp.path());
-    let snapshot = temp.path().join("requested-snapshot");
-
-    assert_eq!(
-        restore_snapshot_for_run(&layout, Some(snapshot.clone()), true, true),
-        Some(snapshot)
-    );
-}
-
-#[test]
-fn default_restore_version_mismatch_is_a_hard_actionable_error() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let layout = test_layout(temp.path());
-    let snapshot = layout.snapshot_dir.join("latest");
-    fs::create_dir_all(&snapshot).expect("create snapshot");
-    fs::write(
-        snapshot.join("launch.json"),
-        r#"{
-            "version": 1,
-            "owner_args": [],
-            "compatibility": {"host_share_cache": {"dax": true}},
-            "shares": {
-                "no_host_shares": true,
-                "host_home": null,
-                "outside_home_cwd": null
-            }
-        }"#,
-    )
-    .expect("write legacy launch metadata");
-
-    let error =
-        require_default_restore_version_compatibility(Some(snapshot.clone()), false, &layout)
-            .expect_err("reject incompatible default snapshot");
-    let message = error.to_string();
-    assert!(message.contains("incompatible with this lnx version"));
-    assert!(message.contains("lnx --instance dev snapshots clear"));
-    assert!(snapshot.exists(), "rejected snapshot must remain intact");
-}
-
-#[test]
-fn running_owner_skips_unused_default_snapshot_version_check() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let layout = test_layout(temp.path());
-    let snapshot = layout.snapshot_dir.join("latest");
-    fs::create_dir_all(&snapshot).expect("create snapshot");
-    fs::write(snapshot.join("launch.json"), r#"{"version":1}"#)
-        .expect("write legacy launch metadata");
+    store_instance(&layout, b"saved disk", true);
     let owner = runner::test_support::hold_as_owner(&layout);
 
-    let selected =
-        require_default_restore_version_compatibility(Some(snapshot.clone()), false, &layout)
-            .expect("running owner does not use on-disk snapshot");
+    let error = drop_saved_memory(&layout).expect_err("a live owner blocks dropping memory");
 
-    assert_eq!(selected, Some(snapshot));
+    assert!(error.to_string().contains("is running"));
+    assert!(latest_has_memory(&layout));
     drop(owner);
 }
 
 #[test]
-fn orphaned_restore_work_is_reported_before_snapshot_clear_advice() {
+fn dropping_memory_of_an_instance_without_any_is_a_no_op() {
     let temp = tempfile::tempdir().expect("tempdir");
     let layout = test_layout(temp.path());
-    let snapshot = layout.snapshot_dir.join("latest");
-    fs::create_dir_all(&snapshot).expect("create snapshot");
-    fs::write(snapshot.join("launch.json"), r#"{"version":1}"#)
-        .expect("write legacy launch metadata");
-    fs::create_dir_all(layout.snapshot_dir.join(runner::RESTORE_WORK_SNAPSHOT))
-        .expect("create restore work");
-    fs::write(
-        layout.snapshot_dir.join(runner::RESTORE_WORK_ACTIVE_MARKER),
-        b"generation_id=recovery\n",
-    )
-    .expect("write active marker");
+    let image = store_instance(&layout, b"cold disk", false);
 
-    let error = require_default_restore_version_compatibility(Some(snapshot), false, &layout)
-        .expect_err("orphaned work takes precedence");
+    drop_saved_memory(&layout).expect("nothing to drop");
 
-    assert!(error.to_string().contains("recoverable state"));
-    assert!(
-        !error
-            .to_string()
-            .contains("incompatible with this lnx version")
-    );
-}
-
-#[test]
-fn clear_latest_snapshot_removes_snapshot_runtime_state() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let layout = test_layout(temp.path());
-    let paths = [
-        layout.snapshot_dir.join("latest"),
-        layout.snapshot_dir.join(".latest.next"),
-        layout.snapshot_dir.join(".latest.previous"),
-        layout.snapshot_dir.join(".restore-work"),
-        layout.snapshot_dir.join(".restore-work.active"),
-    ];
-    for path in &paths {
-        fs::create_dir_all(path).expect("create snapshot path");
-        fs::write(path.join("marker"), b"x").expect("write marker");
-    }
-    let stale_clear_trash = layout.snapshot_dir.join(".latest.clear-999999-0");
-    fs::create_dir_all(&stale_clear_trash).expect("create stale clear trash");
-    fs::write(stale_clear_trash.join("large-snapshot-page"), b"x")
-        .expect("write stale clear trash");
-    runner::write_final_snapshot_outcome(&layout, &Err(anyhow::anyhow!("snapshot failed")))
-        .expect("write failed snapshot outcome");
-
-    clear_latest_snapshot(&layout).expect("clear latest snapshot");
-
-    for path in &paths {
-        assert!(!path.exists(), "{} should be removed", path.display());
-    }
-    assert!(
-        !stale_clear_trash.exists(),
-        "a retry should clean trash left by an interrupted clear"
-    );
-    let acknowledged = runner::read_final_snapshot_outcome(&layout)
-        .expect("read acknowledged outcome")
-        .expect("acknowledgement remains for concurrent stop verification");
-    assert!(acknowledged.succeeded);
-    assert!(!acknowledged.pending);
-}
-
-#[test]
-fn clear_latest_snapshot_refuses_while_owner_is_live() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let layout = test_layout(temp.path());
-    fs::create_dir_all(&layout.run_dir).expect("create run dir");
-    let latest = layout.snapshot_dir.join("latest");
-    let work = layout.snapshot_dir.join(runner::RESTORE_WORK_SNAPSHOT);
-    fs::create_dir_all(&latest).expect("create latest");
-    fs::create_dir_all(&work).expect("create restore work");
-    fs::write(
-        layout.snapshot_dir.join(runner::RESTORE_WORK_ACTIVE_MARKER),
-        b"generation_id=active\n",
-    )
-    .expect("write restore marker");
-    runner::write_final_snapshot_outcome(&layout, &Err(anyhow::anyhow!("snapshot failed")))
-        .expect("write failed snapshot outcome");
-    let outcome_before = fs::read(layout.snapshot_dir.join(runner::FINAL_SNAPSHOT_OUTCOME))
-        .expect("read outcome before clear");
-    let owner = runner::test_support::hold_as_owner(&layout);
-
-    let error = clear_latest_snapshot(&layout).expect_err("running owner blocks snapshot clear");
-
-    assert!(error.to_string().contains("running VM owner"));
-    assert!(latest.exists());
-    assert!(work.exists());
-    assert!(
-        layout
-            .snapshot_dir
-            .join(runner::RESTORE_WORK_ACTIVE_MARKER)
-            .exists()
-    );
     assert_eq!(
-        fs::read(layout.snapshot_dir.join(runner::FINAL_SNAPSHOT_OUTCOME))
-            .expect("live-owner outcome remains"),
-        outcome_before
+        store::Store::new(&layout.instance_dir)
+            .latest()
+            .unwrap()
+            .map(|latest| latest.id().clone()),
+        Some(image)
     );
-    drop(owner);
 }
 
 #[test]
-fn clear_snapshot_recovery_works_after_split_run_directory_loss() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let mut layout = test_layout(temp.path());
-    layout.run_dir = temp.path().join("ephemeral-run/default");
-    fs::create_dir_all(layout.snapshot_dir.join("latest")).expect("create latest snapshot");
-    runner::write_final_snapshot_outcome(
-        &layout,
-        &Err(anyhow::anyhow!("failed before run dir loss")),
-    )
-    .expect("write persistent failed outcome");
-    assert!(!layout.run_dir.exists());
-
-    clear_latest_snapshot(&layout).expect("clear with missing split run dir");
-
-    assert!(!layout.snapshot_dir.join("latest").exists());
-    assert!(
-        layout.instance_dir.join(runner::INSTANCE_LOCK).exists(),
-        "coordination lives with the persistent instance state"
-    );
-    let outcome = runner::read_final_snapshot_outcome(&layout)
-        .expect("read clear acknowledgement")
-        .expect("clear acknowledgement");
-    assert!(outcome.succeeded);
-}
-
-#[test]
-fn clear_nonexistent_instance_does_not_create_phantom_state() {
+fn dropping_memory_of_a_missing_instance_creates_nothing() {
     let temp = tempfile::tempdir().expect("tempdir");
     let layout = test_layout(temp.path());
 
-    let error = clear_latest_snapshot(&layout).expect_err("missing instance is rejected");
+    let error = drop_saved_memory(&layout).expect_err("missing instance is rejected");
 
     assert!(error.to_string().contains("instance does not exist"));
     assert!(!layout.instance_dir.exists());
-    assert!(!layout.instance_dir.join(runner::INSTANCE_LOCK).exists());
 }
 
 #[test]
-fn clear_never_snapshotted_instance_is_idempotent() {
+fn a_crashed_run_must_be_recovered_before_memory_can_be_dropped() {
     let temp = tempfile::tempdir().expect("tempdir");
     let layout = test_layout(temp.path());
-    fs::create_dir_all(&layout.instance_dir).expect("create cold instance");
-    fs::write(&layout.rootfs, b"cold-rootfs").expect("write cold rootfs");
+    store_instance(&layout, b"saved disk", true);
+    crash_after_serving(&layout, b"acknowledged writes");
 
-    clear_latest_snapshot(&layout).expect("clear cold instance");
+    let error = drop_saved_memory(&layout).expect_err("crashed run needs a decision");
 
-    assert_eq!(
-        fs::read(&layout.rootfs).expect("rootfs remains"),
-        b"cold-rootfs"
-    );
-    assert!(layout.snapshot_dir.exists());
+    let message = format!("{error:#}");
+    assert!(message.contains("recover --keep"), "{message}");
+    assert!(message.contains("recover --discard"), "{message}");
+    assert!(latest_has_memory(&layout));
+}
+
+#[test]
+fn recover_keep_saves_the_crashed_vms_disk() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+    store_instance(&layout, b"saved disk", true);
+    crash_after_serving(&layout, b"acknowledged writes");
+
+    recover_instance(
+        &layout,
+        &RecoverArgs {
+            keep: true,
+            discard: false,
+        },
+    )
+    .expect("keep crashed disk");
+
+    assert_eq!(latest_disk(&layout), b"acknowledged writes");
+    assert!(!latest_has_memory(&layout));
+    runner::refuse_crashed_run(&layout).expect("instance is usable again");
+}
+
+#[test]
+fn recover_discard_returns_to_the_last_saved_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+    store_instance(&layout, b"saved disk", true);
+    crash_after_serving(&layout, b"acknowledged writes");
+
+    recover_instance(
+        &layout,
+        &RecoverArgs {
+            keep: false,
+            discard: true,
+        },
+    )
+    .expect("discard crashed run");
+
+    assert_eq!(latest_disk(&layout), b"saved disk");
+    assert!(latest_has_memory(&layout));
+    runner::refuse_crashed_run(&layout).expect("instance is usable again");
+}
+
+#[test]
+fn recover_without_a_choice_explains_both() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+    store_instance(&layout, b"saved disk", true);
+    crash_after_serving(&layout, b"acknowledged writes");
+
+    let error = recover_instance(
+        &layout,
+        &RecoverArgs {
+            keep: false,
+            discard: false,
+        },
+    )
+    .expect_err("a choice is required");
+
+    let message = format!("{error:#}");
+    assert!(message.contains("recover --keep"), "{message}");
+    assert!(message.contains("recover --discard"), "{message}");
+}
+
+#[test]
+fn starting_after_a_crash_reports_how_to_recover() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let layout = test_layout(temp.path());
+    store_instance(&layout, b"saved disk", true);
+    crash_after_serving(&layout, b"acknowledged writes");
+
+    let error = runner::refuse_crashed_run(&layout).expect_err("crashed run blocks starts");
+
+    let message = format!("{error:#}");
+    assert!(message.contains("stopped unexpectedly"), "{message}");
+    assert!(message.contains("recover --keep"), "{message}");
 }
 
 #[test]
@@ -577,12 +497,12 @@ fn delete_instance_refuses_a_concurrent_state_copy() {
     let temp = tempfile::tempdir().expect("tempdir");
     let layout = test_layout(temp.path());
     fs::create_dir_all(&layout.instance_dir).expect("create instance");
-    fs::write(&layout.rootfs, b"rootfs").expect("write rootfs");
+    store_instance(&layout, b"rootfs", false);
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let holder_layout = layout.clone();
     let holder = std::thread::spawn(move || {
-        runner::with_exclusive_instance_state(&holder_layout, |_| {
+        runner::with_exclusive_instance_state(&holder_layout, |_, _| {
             held_tx.send(()).expect("signal held lease");
             release_rx.recv().expect("wait for release");
             Ok(())
@@ -595,7 +515,7 @@ fn delete_instance_refuses_a_concurrent_state_copy() {
     let error = delete_instance(temp.path(), "dev").expect_err("state copy blocks deletion");
 
     assert!(error.to_string().contains("became busy"));
-    assert!(layout.rootfs.exists());
+    assert_eq!(latest_disk(&layout), b"rootfs");
     release_tx.send(()).expect("release state lease");
     holder.join().expect("join state holder");
 }
@@ -618,7 +538,7 @@ fn set_settings_refuses_a_concurrent_state_operation() {
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let holder_layout = layout.clone();
     let holder = std::thread::spawn(move || {
-        runner::with_exclusive_instance_state(&holder_layout, |_| {
+        runner::with_exclusive_instance_state(&holder_layout, |_, _| {
             held_tx.send(()).expect("signal held lease");
             release_rx.recv().expect("wait for release");
             Ok(())
@@ -642,7 +562,7 @@ fn delete_instance_atomically_detaches_and_removes_state() {
     let temp = tempfile::tempdir().expect("tempdir");
     let layout = test_layout(temp.path());
     fs::create_dir_all(layout.instance_dir.join("nested")).expect("create instance");
-    fs::write(&layout.rootfs, b"rootfs").expect("write rootfs");
+    store_instance(&layout, b"rootfs", false);
     fs::write(layout.instance_dir.join("nested/state"), b"state").expect("write state");
 
     delete_instance(temp.path(), "dev").expect("delete instance");
@@ -821,11 +741,8 @@ fn nested_deterministic_inner_args_preserve_requested_run() {
         base: PathBuf::from("/Users/test/.lnx"),
         instance: "dev".to_string(),
         kernel: PathBuf::from("/Users/test/.lnx/vmlinuz"),
-        rootfs: PathBuf::from("/Users/test/.lnx/instances/dev/rootfs.ext4"),
+        rootfs: None,
         instance_dir: PathBuf::from("/Users/test/.lnx/instances/dev"),
-        snapshot_dir: PathBuf::from("/Users/test/.lnx/instances/dev/memory-snapshots"),
-        checkpoint_dir: PathBuf::from("/Users/test/.lnx/instances/dev/checkpoints"),
-        vm_initialized: PathBuf::from("/Users/test/.lnx/instances/dev/vm-initialized"),
         run_dir: PathBuf::from("/Users/test/.lnx/instances/dev"),
         console_log: PathBuf::from("/Users/test/.lnx/instances/dev/console.log"),
     };
@@ -852,8 +769,6 @@ fn nested_deterministic_inner_args_preserve_requested_run() {
             "dev",
             "--kernel",
             "/Users/test/.lnx/vmlinuz",
-            "--rootfs",
-            "/Users/test/.lnx/instances/dev/rootfs.ext4",
             "--cpus",
             "1",
             "--memory-mib",
@@ -878,11 +793,8 @@ fn nested_deterministic_inner_args_preserve_checkpoint_subcommand() {
         base: PathBuf::from("/Users/test/.lnx"),
         instance: "dev".to_string(),
         kernel: PathBuf::from("/Users/test/.lnx/vmlinuz"),
-        rootfs: PathBuf::from("/Users/test/.lnx/instances/dev/rootfs.ext4"),
+        rootfs: None,
         instance_dir: PathBuf::from("/Users/test/.lnx/instances/dev"),
-        snapshot_dir: PathBuf::from("/Users/test/.lnx/instances/dev/memory-snapshots"),
-        checkpoint_dir: PathBuf::from("/Users/test/.lnx/instances/dev/checkpoints"),
-        vm_initialized: PathBuf::from("/Users/test/.lnx/instances/dev/vm-initialized"),
         run_dir: PathBuf::from("/Users/test/.lnx/instances/dev"),
         console_log: PathBuf::from("/Users/test/.lnx/instances/dev/console.log"),
     };
@@ -916,11 +828,8 @@ fn test_layout(base: &Path) -> Layout {
         base: base.to_path_buf(),
         instance: "dev".to_string(),
         kernel: base.join("vmlinuz"),
-        rootfs: base.join("instances/dev/rootfs.ext4"),
+        rootfs: None,
         instance_dir: base.join("instances/dev"),
-        snapshot_dir: base.join("instances/dev/memory-snapshots"),
-        checkpoint_dir: base.join("instances/dev/checkpoints"),
-        vm_initialized: base.join("instances/dev/vm-initialized"),
         run_dir: base.join("instances/dev"),
         console_log: base.join("instances/dev/console.log"),
     }
@@ -974,12 +883,25 @@ fn write_snapshot_shape(snapshot: &Path, cpus: u32, memory_mib: u64, owner_args:
 fn latest_snapshot_shape_reads_the_booted_vm_shape() {
     let temp = tempfile::tempdir().expect("tempdir");
     let layout = test_layout(temp.path());
+    let lock = runner::test_support::hold_as_owner(&layout);
+    let store = store::Store::new(&layout.instance_dir);
+    let staging = store.stage(&lock).expect("stage snapshot");
+    fs::write(staging.dir().join(store::ROOTFS), b"disk").expect("write disk");
+    fs::write(staging.dir().join(store::PAGES), b"pages").expect("write pages");
     write_snapshot_shape(
-        &layout.snapshot_dir.join("latest"),
+        staging.dir(),
         8,
         16384,
-        &["--cpus", "8", "--memory-mib", "16384", "--nested-kvm", "_vm-owner"],
+        &[
+            "--cpus",
+            "8",
+            "--memory-mib",
+            "16384",
+            "--nested-kvm",
+            "_vm-owner",
+        ],
     );
+    store.initialize(&lock, staging).expect("initialize store");
 
     assert_eq!(
         latest_snapshot_shape(&layout),

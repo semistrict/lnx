@@ -6,11 +6,8 @@ fn layout(base: &Path) -> Layout {
         base: base.to_path_buf(),
         instance: "test".to_string(),
         kernel: base.join("vmlinuz"),
-        rootfs: base.join("instances/test/rootfs.ext4"),
+        rootfs: None,
         instance_dir: base.join("instances/test"),
-        snapshot_dir: base.join("instances/test/memory-snapshots"),
-        checkpoint_dir: base.join("instances/test/checkpoints"),
-        vm_initialized: base.join("instances/test/vm-initialized"),
         run_dir: base.join("instances/test"),
         console_log: base.join("instances/test/console.log"),
     }

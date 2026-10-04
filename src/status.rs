@@ -48,7 +48,7 @@ pub(crate) fn instance_state(layout: &Layout) -> InstanceState {
         InstanceState::Running
     } else if runner::live_owner(layout).is_some() {
         InstanceState::Starting
-    } else if layout.rootfs.exists() {
+    } else if crate::init::instance_has_state(layout) {
         InstanceState::Stopped
     } else {
         InstanceState::Partial
