@@ -20,6 +20,22 @@ fn parses_explicit_forward_spec() {
 }
 
 #[test]
+fn version_flag_prints_version_instead_of_running_a_guest_command() {
+    let error = Cli::try_parse_from(["lnx", "--version"]).expect_err("version exits early");
+    assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+    assert_eq!(
+        error.to_string(),
+        format!("lnx {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn version_flag_after_guest_command_is_forwarded_to_the_guest() {
+    let cli = Cli::try_parse_from(["lnx", "node", "--version"]).expect("parse");
+    assert_eq!(cli.guest_command, ["node", "--version"]);
+}
+
+#[test]
 fn parses_directory_before_guest_command() {
     let cli = Cli::try_parse_from(["lnx", "-C", "/tmp", "echo", "hi"]).expect("parse");
 

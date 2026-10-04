@@ -24,7 +24,7 @@ const DEFAULT_CPUS: u8 = 2;
 const DEFAULT_MEMORY_MIB: u32 = 4096;
 
 #[derive(Debug, Parser)]
-#[command(name = "lnx", about = "Linux VM runner using Rust and libkrun")]
+#[command(name = "lnx", version, about = "Linux VM runner using Rust and libkrun")]
 pub struct Cli {
     #[arg(short = 'C', value_name = "DIR", help = "Run as if started in DIR")]
     directory: Option<PathBuf>,
