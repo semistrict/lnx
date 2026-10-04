@@ -102,7 +102,7 @@ while IFS= read -r -u 3 cfg; do
         echo "ok   ${rel} (expected pass; ${states}; ${elapsed}s)"
       else
         echo "FAIL ${rel}: expected pass, TLC exit ${status}"
-        sed -n '/Error:/,$p' "${log}" </dev/null | sed -n '1,80p'
+        tail -n 60 "${log}"
         failures=$((failures + 1))
       fi
       ;;
@@ -113,7 +113,7 @@ while IFS= read -r -u 3 cfg; do
         echo "ok   ${rel} (expected violation of ${inv} reproduced; trace ${trace_len} states; ${elapsed}s)"
       else
         echo "FAIL ${rel}: expected violation of ${inv}, TLC exit ${status}"
-        sed -n '/Error:/,$p;/No error has been found/p' "${log}" </dev/null | sed -n '1,40p'
+        tail -n 40 "${log}"
         failures=$((failures + 1))
       fi
       ;;
