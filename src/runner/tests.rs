@@ -229,6 +229,18 @@ fn broker_shutdown_closes_registration_gate_before_draining_clients() {
 }
 
 #[test]
+fn a_new_owner_waits_for_its_first_client_before_it_may_stop() {
+    let (state, _agent_rx, _temp) = test_broker();
+
+    let status = state.idle_status();
+    assert!(!status.busy, "waiting does not restart the idle timer");
+    assert!(status.pending, "the starting client is still on its way");
+
+    drop(state.pending_connection());
+    assert!(!state.idle_status().pending, "the first client has arrived");
+}
+
+#[test]
 fn pending_connections_delay_stopping_without_restarting_the_idle_timer() {
     let (state, _agent_rx, _temp) = test_broker();
 
@@ -1167,6 +1179,63 @@ fn initramfs_stamp_key_prefers_source_but_keeps_sha256_compatibility() {
 
     fs::write(&stamp, "unrelated=true\n").expect("write unrelated stamp");
     assert_eq!(initramfs_stamp_key(&stamp), None);
+}
+
+/// A snapshot dir and a current stamp file holding the given stamps.
+fn agent_stamps(temp: &TempDir, snapshot: &str, current: &str) -> (PathBuf, PathBuf) {
+    let snapshot_dir = temp.path().join("snapshot");
+    fs::create_dir_all(&snapshot_dir).expect("create snapshot");
+    fs::write(snapshot_dir.join("initramfs.stamp"), snapshot).expect("write snapshot stamp");
+    let current_stamp = temp.path().join("current.stamp");
+    fs::write(&current_stamp, current).expect("write current stamp");
+    (snapshot_dir, current_stamp)
+}
+
+#[test]
+fn a_changed_agent_speaking_the_same_protocol_can_be_resumed() {
+    let temp = TempDir::new("agent-same-protocol");
+    let (snapshot, current) = agent_stamps(
+        &temp,
+        "source=old\nprotocol=11\n",
+        "source=new\nprotocol=11\n",
+    );
+
+    assert_eq!(snapshot_agent_incompatibility(&snapshot, &current, false), None);
+}
+
+#[test]
+fn an_agent_speaking_another_protocol_cannot_be_resumed() {
+    let temp = TempDir::new("agent-other-protocol");
+    let (snapshot, current) = agent_stamps(
+        &temp,
+        "source=old\nprotocol=10\n",
+        "source=new\nprotocol=11\n",
+    );
+
+    assert_eq!(
+        snapshot_agent_incompatibility(&snapshot, &current, false).as_deref(),
+        Some("its guest agent speaks lnx protocol 10, this lnx speaks 11")
+    );
+}
+
+#[test]
+fn deterministic_runs_and_old_stamps_need_the_same_agent() {
+    let temp = TempDir::new("agent-exact");
+    let (snapshot, current) = agent_stamps(
+        &temp,
+        "source=old\nprotocol=11\n",
+        "source=new\nprotocol=11\n",
+    );
+    assert_eq!(
+        snapshot_agent_incompatibility(&snapshot, &current, true).as_deref(),
+        Some("it was taken by a different version of the lnx guest agent")
+    );
+
+    let temp = TempDir::new("agent-legacy-stamp");
+    let (snapshot, current) = agent_stamps(&temp, "source=old\n", "source=new\nprotocol=11\n");
+    assert!(snapshot_agent_incompatibility(&snapshot, &current, false).is_some());
+    let (snapshot, current) = agent_stamps(&temp, "source=same\n", "source=same\nprotocol=11\n");
+    assert_eq!(snapshot_agent_incompatibility(&snapshot, &current, false), None);
 }
 
 fn test_run_config(layout: &Layout, cwd: &Path) -> RunConfig {

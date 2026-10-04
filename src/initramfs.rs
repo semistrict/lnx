@@ -41,8 +41,13 @@ fn write_agent(agent: &[u8], path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Identifies the agent: its exact source, and the host protocol it speaks,
+/// which decides whether lnx can serve a VM still running it.
 fn stamp(agent_source_stamp: &str) -> String {
-    format!("source={agent_source_stamp}\n")
+    format!(
+        "source={agent_source_stamp}\nprotocol={}\n",
+        lnx_protocol::PROTOCOL_VERSION
+    )
 }
 
 fn entry(buf: &mut Vec<u8>, name: &str, data: &[u8], mode: u32) -> Result<()> {

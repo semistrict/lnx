@@ -69,6 +69,10 @@ const DETERMINISTIC_TIMER_JUMPS: &str = "deterministic-timer-jumps.log";
 const DETERMINISTIC_TIMER_JUMPS_CURSOR: &str = "deterministic-timer-jumps.cursor";
 const RUN_ID_ENV: &str = "LNX_RUN_ID";
 const LAUNCH_METADATA: &str = "launch.json";
+/// The stamp of the agent the running VM is executing, which a capture
+/// records: the snapshot's agent when the VM was resumed, the current one
+/// when it booted.
+const RUNNING_AGENT_STAMP: &str = "running-agent.stamp";
 static SIGNAL_INIT: Once = Once::new();
 static OWNER_SIGNAL_INIT: Once = Once::new();
 /// The signal (SIGINT, SIGTERM or SIGHUP) that asked the client to stop, or 0.
@@ -708,6 +712,18 @@ fn start_vm(
             run_log,
         )?;
     }
+    let running_agent = restore_dir
+        .as_ref()
+        .map(|snapshot| snapshot.join("initramfs.stamp"))
+        .unwrap_or_else(|| initramfs_stamp.clone());
+    let running_agent_stamp = initramfs_stamp.with_file_name(RUNNING_AGENT_STAMP);
+    fs::copy(&running_agent, &running_agent_stamp).with_context(|| {
+        format!(
+            "record the running agent from {} in {}",
+            running_agent.display(),
+            running_agent_stamp.display()
+        )
+    })?;
     let vm_restore_snapshot = restore_dir.clone();
     configure_snapshot_restore_compat(vm_restore_snapshot.as_deref(), run_log);
 
@@ -3177,16 +3193,19 @@ fn copy_snapshot_stamp(
     import_deterministic_timer_jumps(initramfs_stamp, trace_log)?;
     sync_deterministic_clock_event_sequence(initramfs_stamp, trace_log)?;
     ensure_deterministic_clock_state_file(initramfs_stamp, deterministic_clock_state)?;
+    let running_agent_stamp = initramfs_stamp.with_file_name(RUNNING_AGENT_STAMP);
     let shares_stamp = initramfs_stamp.with_file_name(LAUNCH_METADATA);
     let deterministic_stamp = initramfs_stamp.with_file_name("deterministic.stamp");
     let deterministic_clock_state_path = initramfs_stamp.with_file_name(DETERMINISTIC_CLOCK_STATE);
-    for stamp in [
-        initramfs_stamp,
-        shares_stamp.as_path(),
-        deterministic_stamp.as_path(),
-        deterministic_clock_state_path.as_path(),
+    for (stamp, name) in [
+        (running_agent_stamp.as_path(), "initramfs.stamp"),
+        (shares_stamp.as_path(), LAUNCH_METADATA),
+        (deterministic_stamp.as_path(), "deterministic.stamp"),
+        (
+            deterministic_clock_state_path.as_path(),
+            DETERMINISTIC_CLOCK_STATE,
+        ),
     ] {
-        let name = stamp.file_name().context("stamp file name")?;
         let target = snapshot_path.join(name);
         if name == DETERMINISTIC_CLOCK_STATE {
             if let Some(state) = deterministic_clock_state {

@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 10;
+/// The host/agent protocol. Bump it whenever the host and the guest agent
+/// would disagree about anything: messages, their meaning, or what the agent
+/// does with them. A VM resumed from a memory snapshot keeps running the agent
+/// it was booted with, and lnx resumes it only if their versions match.
+/// (11: the agent applies every environment variable the host sends, runs
+/// each command in its own session, and hangs it up on Close.)
+pub const PROTOCOL_VERSION: u16 = 11;
 pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

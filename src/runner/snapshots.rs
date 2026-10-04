@@ -70,14 +70,49 @@ pub(crate) fn drop_memory_guidance(instance: &str) -> String {
     )
 }
 
-pub(crate) fn snapshot_initramfs_is_compatible(snapshot_path: &Path, current_stamp: &Path) -> bool {
-    let Some(snapshot_key) = initramfs_stamp_key(&snapshot_path.join("initramfs.stamp")) else {
-        return false;
-    };
-    let Some(current_key) = initramfs_stamp_key(current_stamp) else {
-        return false;
-    };
-    snapshot_key == current_key
+/// Why the guest agent a snapshot's VM is running cannot be served by this
+/// lnx, if it cannot. Guest memory, the running agent included, comes from
+/// the snapshot, so what matters is that the agent speaks this lnx's
+/// protocol. A deterministic run also needs the very same agent, since its
+/// behaviour is part of what is replayed. Stamps without a protocol (from
+/// older lnx versions) need the same agent too.
+pub(crate) fn snapshot_agent_incompatibility(
+    snapshot_path: &Path,
+    current_stamp: &Path,
+    deterministic: bool,
+) -> Option<String> {
+    let snapshot = AgentStamp::read(&snapshot_path.join("initramfs.stamp"));
+    let current = AgentStamp::read(current_stamp);
+    if !deterministic
+        && let (Some(snapshot), Some(current)) = (snapshot.protocol, current.protocol)
+    {
+        return (snapshot != current).then(|| {
+            format!("its guest agent speaks lnx protocol {snapshot}, this lnx speaks {current}")
+        });
+    }
+    (snapshot.source.is_none() || snapshot.source != current.source)
+        .then(|| "it was taken by a different version of the lnx guest agent".to_string())
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AgentStamp {
+    source: Option<String>,
+    protocol: Option<u16>,
+}
+
+impl AgentStamp {
+    fn read(path: &Path) -> Self {
+        let protocol = fs::read_to_string(path).ok().and_then(|stamp| {
+            stamp
+                .lines()
+                .find_map(|line| line.strip_prefix("protocol="))
+                .and_then(|value| value.parse().ok())
+        });
+        Self {
+            source: initramfs_stamp_key(path),
+            protocol,
+        }
+    }
 }
 
 pub(crate) fn initramfs_stamp_key(path: &Path) -> Option<String> {
@@ -96,7 +131,7 @@ pub(crate) fn initramfs_stamp_key(path: &Path) -> Option<String> {
 }
 
 /// Refuses to resume a memory snapshot that this VM configuration cannot
-/// run: a different guest agent, share layout, deterministic mode or VM
+/// run: an incompatible guest agent, share layout, deterministic mode or VM
 /// shape. The run never falls back to booting on its own (AGENTS.md); the
 /// user chooses that with `snapshots clear`.
 pub(crate) fn validate_restore_compatibility(
@@ -107,8 +142,10 @@ pub(crate) fn validate_restore_compatibility(
     config: &RunConfig,
     run_log: &RunLog,
 ) -> Result<()> {
-    let reason = if !snapshot_initramfs_is_compatible(snapshot, initramfs_stamp) {
-        Some("it was taken by a different version of the lnx guest agent".to_string())
+    let reason = if let Some(reason) =
+        snapshot_agent_incompatibility(snapshot, initramfs_stamp, config.deterministic.is_some())
+    {
+        Some(reason)
     } else if let Some(reason) = snapshot_launch_incompatibility(snapshot, launch_metadata) {
         Some(format!("its host shares differ ({reason})"))
     } else if let Some(reason) =

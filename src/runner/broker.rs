@@ -14,6 +14,9 @@ const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// so a client reconnecting to a forwarded port (a browser reloading a page)
 /// still finds the VM running.
 const FORWARD_LINGER: Duration = Duration::from_secs(60);
+/// How long a new owner waits for the client that started it to connect
+/// before it may idle out.
+const FIRST_CLIENT_GRACE: Duration = Duration::from_secs(10);
 
 /// An open channel between a client and the guest agent.
 #[derive(Clone)]
@@ -57,6 +60,9 @@ pub(crate) struct BrokerState {
     pending: AtomicUsize,
     seen_active: AtomicBool,
     awake_until: Mutex<Option<Instant>>,
+    /// Until the first client connects (or this passes), the owner may not
+    /// stop: the client that started it is still on its way.
+    first_client_deadline: Mutex<Option<Instant>>,
     auto_forward_ports: Mutex<HashSet<(String, u16)>>,
     agent_tx: mpsc::Sender<Message>,
     /// Runs under the channel lock before any channel's opening message
@@ -80,6 +86,7 @@ impl BrokerState {
             pending: AtomicUsize::new(0),
             seen_active: AtomicBool::new(starts_idle),
             awake_until: Mutex::new(None),
+            first_client_deadline: Mutex::new(Some(Instant::now() + FIRST_CLIENT_GRACE)),
             auto_forward_ports: Mutex::new(HashSet::new()),
             agent_tx,
             before_dispatch: Box::new(before_dispatch),
@@ -250,6 +257,9 @@ impl BrokerState {
     /// as long as the guard lives.
     pub(crate) fn pending_connection(self: &Arc<Self>) -> PendingConnection {
         self.pending.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut deadline) = self.first_client_deadline.lock() {
+            *deadline = None;
+        }
         PendingConnection {
             state: Arc::clone(self),
         }
@@ -269,9 +279,15 @@ impl BrokerState {
             .ok()
             .and_then(|awake_until| *awake_until)
             .is_some_and(|until| Instant::now() < until);
+        let awaiting_first_client = self
+            .first_client_deadline
+            .lock()
+            .ok()
+            .and_then(|deadline| *deadline)
+            .is_some_and(|deadline| Instant::now() < deadline);
         IdleStatus {
             busy: self.active.load(Ordering::SeqCst) > 0 || lingering,
-            pending: self.pending.load(Ordering::SeqCst) > 0,
+            pending: self.pending.load(Ordering::SeqCst) > 0 || awaiting_first_client,
             seen_active: self.seen_active.load(Ordering::SeqCst),
         }
     }
