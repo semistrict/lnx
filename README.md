@@ -79,6 +79,8 @@ lnx --instance dev bash           # named instances are isolated machines
 lnx --forward 8080:80 nginx       # forward Mac localhost:8080 to guest :80
 lnx checkpoint -m "deps installed"
 lnx fork dev2                     # clone the instance, memory and disk
+lnx restore "deps installed"      # roll back in place (undo with: lnx restore before-restore)
+lnx stop                          # save and stop the VM now instead of on idle
 lnx instances list
 lnx set cpus=4 memory-mib=8192    # applies at the instance's next cold boot
 lnx snapshots clear               # drop saved memory; the next run boots from disk

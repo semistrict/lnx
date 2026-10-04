@@ -3357,6 +3357,7 @@ mod logs;
 mod protocol_io;
 mod session;
 mod snapshots;
+mod stop;
 pub(crate) use broker::*;
 pub(crate) use capture::*;
 pub(crate) use deterministic::*;
@@ -3366,6 +3367,7 @@ pub(crate) use logs::*;
 pub(crate) use protocol_io::*;
 pub(crate) use session::*;
 pub(crate) use snapshots::*;
+pub(crate) use stop::*;
 
 #[cfg(test)]
 mod tests;

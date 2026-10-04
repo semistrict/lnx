@@ -162,6 +162,12 @@ enum Command {
     Snapshots(SnapshotsArgs),
     #[command(about = "Recover an instance whose VM stopped unexpectedly after running commands")]
     Recover(RecoverArgs),
+    #[command(about = "Stop the instance's VM, saving its memory and disk")]
+    Stop,
+    #[command(
+        about = "Roll the instance back to a checkpoint; the replaced state is kept as checkpoint before-restore"
+    )]
+    Restore(RestoreArgs),
     #[command(about = "Fork a checkpoint into a new instance")]
     Fork(ForkArgs),
     #[command(about = "Filesystem state commands")]
@@ -245,6 +251,12 @@ struct CheckpointArgs {
 }
 
 #[derive(Debug, Args)]
+struct RestoreArgs {
+    #[arg(help = "Checkpoint id or name")]
+    checkpoint: String,
+}
+
+#[derive(Debug, Args)]
 struct CheckpointsArgs {
     #[command(subcommand)]
     command: Option<CheckpointsCommand>,
@@ -293,7 +305,8 @@ struct ForkArgs {
     #[arg(long)]
     checkpoint: Option<String>,
 
-    instance: String,
+    #[arg(value_name = "NEW_INSTANCE")]
+    destination: String,
 }
 
 #[derive(Debug, Args)]
@@ -641,6 +654,8 @@ impl Cli {
             },
             Some(Command::Snapshots(args)) => run_snapshots_command(&layout, args),
             Some(Command::Recover(args)) => recover_instance(&layout, &args),
+            Some(Command::Stop) => stop_instance(&layout),
+            Some(Command::Restore(args)) => restore_checkpoint(&layout, &args.checkpoint),
             Some(Command::Fork(args)) => {
                 let macos_deterministic =
                     deterministic.as_ref().filter(|_| cfg!(target_os = "macos"));
@@ -650,7 +665,7 @@ impl Cli {
                         subcommand.push("--checkpoint".to_string());
                         subcommand.push(checkpoint);
                     }
-                    subcommand.push(args.instance);
+                    subcommand.push(args.destination);
                     run_nested_deterministic_on_macos(
                         &layout,
                         cpus,
@@ -665,7 +680,7 @@ impl Cli {
                         explicit_kernel,
                     )
                 } else {
-                    fork_checkpoint(layout, args.checkpoint.as_deref(), &args.instance)
+                    fork_checkpoint(layout, args.checkpoint.as_deref(), &args.destination)
                 }
             }
             Some(Command::Fs(args)) => match args.command {
@@ -2367,6 +2382,37 @@ fn drop_saved_memory(layout: &Layout) -> Result<()> {
             layout.instance
         ),
         Some(None) => println!("{} has no saved memory", layout.instance),
+    }
+    Ok(())
+}
+
+/// How long `stop` and `restore` wait for a running VM to save its state.
+const STOP_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn stop_instance(layout: &Layout) -> Result<()> {
+    require_instance(layout)?;
+    let was_running = runner::live_owner(layout).is_some();
+    runner::stop_owner(layout, STOP_TIMEOUT)?;
+    if was_running {
+        println!("stopped {}", layout.instance);
+    } else {
+        println!("{} is not running", layout.instance);
+    }
+    Ok(())
+}
+
+fn restore_checkpoint(layout: &Layout, identifier: &str) -> Result<()> {
+    require_instance(layout)?;
+    let checkpoint = checkpoints::resolve(layout, identifier)?;
+    runner::stop_owner(layout, STOP_TIMEOUT)?;
+    let label = checkpoint.name.as_deref().unwrap_or(&checkpoint.id);
+    match checkpoints::restore(layout, &checkpoint)? {
+        Some(_) => println!(
+            "restored {} to {label}; its previous state is checkpoint {}",
+            layout.instance,
+            checkpoints::BEFORE_RESTORE
+        ),
+        None => println!("{} is already at {label}", layout.instance),
     }
     Ok(())
 }

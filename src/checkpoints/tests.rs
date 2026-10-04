@@ -64,6 +64,59 @@ fn a_stopped_instance_is_checkpointed_by_reference() {
 }
 
 #[test]
+fn checkpoints_taken_back_to_back_keep_distinct_ids() {
+    let fixture = Fixture::new();
+    initialized(&fixture.source, b"disk", true);
+
+    let first = create(&fixture.source, Some("one")).expect("first");
+    let second = create(&fixture.source, Some("two")).expect("second");
+
+    assert_ne!(first.id, second.id);
+    assert_eq!(list(&fixture.source).expect("list").len(), 2);
+}
+
+#[test]
+fn restoring_a_checkpoint_rolls_back_and_keeps_the_replaced_state() {
+    let fixture = Fixture::new();
+    initialized(&fixture.source, b"v1", true);
+    let v1 = create(&fixture.source, Some("v1")).expect("checkpoint v1");
+    advance_source(&fixture.source, b"v2");
+
+    let before = restore(&fixture.source, &v1)
+        .expect("restore")
+        .expect("state changed");
+
+    assert_eq!(latest_disk(&fixture.source), b"v1");
+    assert_eq!(before.name.as_deref(), Some(BEFORE_RESTORE));
+    assert_eq!(
+        resolve(&fixture.source, BEFORE_RESTORE).expect("kept").generation,
+        before.generation
+    );
+
+    // Undo the restore; the newer replaced state takes the name over.
+    let undo = resolve(&fixture.source, BEFORE_RESTORE).expect("before-restore");
+    restore(&fixture.source, &undo).expect("undo");
+    assert_eq!(latest_disk(&fixture.source), b"v2");
+    let names: Vec<_> = list(&fixture.source)
+        .expect("list")
+        .into_iter()
+        .filter_map(|checkpoint| checkpoint.name)
+        .collect();
+    assert_eq!(names.iter().filter(|name| *name == BEFORE_RESTORE).count(), 1);
+    assert!(names.contains(&"v1".to_string()));
+}
+
+#[test]
+fn restoring_the_current_state_changes_nothing() {
+    let fixture = Fixture::new();
+    initialized(&fixture.source, b"v1", true);
+    let v1 = create(&fixture.source, Some("v1")).expect("checkpoint v1");
+
+    assert_eq!(restore(&fixture.source, &v1).expect("restore"), None);
+    assert_eq!(list(&fixture.source).expect("list").len(), 1);
+}
+
+#[test]
 fn resolve_rejects_ambiguous_checkpoint_names() {
     let fixture = Fixture::new();
     initialized(&fixture.source, b"disk", true);

@@ -32,6 +32,16 @@ function lnxCommand(instance: string, args: string[], options: Parameters<typeof
   return run([ctx.lnxBin, "--instance", instance, ...vmArgs, ...args], options);
 }
 
+async function readSourceState(): Promise<string> {
+  return (
+    await lnxVm([
+      "bash",
+      "-lc",
+      'printf "%s/%s" "$(sudo cat /root/lnx-checkpoint-disk)" "$(sudo cat /run/lnx-checkpoint-memory)"',
+    ])
+  ).stdout;
+}
+
 async function cleanupForks() {
   await run(["rm", "-rf", forkAImage, forkARun, forkBImage, forkBRun], { check: false });
 }
@@ -96,6 +106,21 @@ try {
       'printf "%s/%s" "$(sudo cat /root/lnx-checkpoint-disk)" "$(sudo cat /run/lnx-checkpoint-memory)"',
     ]);
     assertEq(forkRead.stdout, "current-disk/current-memory", "implicit fork restored current state");
+  });
+
+  await testStep("restore rolls the instance back in place and can be undone", async () => {
+    const restored = await lnxCommand(ctx.instance, ["restore", "named-before"]);
+    assertContains(restored.stdout, "its previous state is checkpoint before-restore", "restore message");
+    assertEq(await readSourceState(), "disk-before/memory-before", "restored checkpoint state");
+    await lnxCommand(ctx.instance, ["restore", "before-restore"]);
+    assertEq(await readSourceState(), "current-disk/current-memory", "restore undone");
+  });
+
+  await testStep("stop saves and stops a running VM", async () => {
+    await readSourceState();
+    assertEq((await lnxCommand(ctx.instance, ["stop"])).stdout, `stopped ${ctx.instance}`, "stop a running VM");
+    assertEq((await lnxCommand(ctx.instance, ["stop"])).stdout, `${ctx.instance} is not running`, "stop a stopped VM");
+    assertEq(await readSourceState(), "current-disk/current-memory", "state survives stop");
   });
 
   await testStep("duplicate fork destination fails without overwriting", async () => {

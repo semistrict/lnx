@@ -65,6 +65,16 @@ fn lnx_options_work_after_run() {
 }
 
 #[test]
+fn fork_destination_is_not_the_source_instance() {
+    let cli = Cli::try_parse_from(["lnx", "--instance", "src", "fork", "dst"]).expect("parse");
+    assert_eq!(cli.instance, "src");
+    let Some(Command::Fork(args)) = cli.command else {
+        panic!("expected fork");
+    };
+    assert_eq!(args.destination, "dst");
+}
+
+#[test]
 fn parses_exec_options() {
     let cli = Cli::try_parse_from([
         "lnx", "-e", "A=1", "--env", "B=x=y", "-w", "src", "--timeout", "90s", "-d", "make",

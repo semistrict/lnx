@@ -10,6 +10,7 @@ use std::{
     fs::{self, OpenOptions},
     os::fd::AsRawFd,
     path::Path,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -44,13 +45,17 @@ impl From<CheckpointRef> for Checkpoint {
     }
 }
 
+/// A new checkpoint id: when, which process, and how many this process has
+/// made before, so ids never repeat.
 fn new_id() -> Result<String> {
+    static MADE: AtomicU64 = AtomicU64::new(0);
     let timestamp = OffsetDateTime::now_utc()
         .format(&time::macros::format_description!(
             "[year][month][day]T[hour][minute][second]Z"
         ))
         .context("format checkpoint id timestamp")?;
-    Ok(format!("{timestamp}-{}", std::process::id()))
+    let sequence = MADE.fetch_add(1, Ordering::Relaxed);
+    Ok(format!("{timestamp}-{}-{sequence}", std::process::id()))
 }
 
 fn sanitize_name(name: &str) -> String {
@@ -136,6 +141,46 @@ pub fn delete(layout: &Layout, checkpoint: &Checkpoint) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The name of the checkpoint `restore` keeps the replaced state under.
+pub const BEFORE_RESTORE: &str = "before-restore";
+
+/// Rolls the instance back to `checkpoint`. The state it replaces is kept as
+/// the checkpoint named [`BEFORE_RESTORE`] (replacing an older one), so a
+/// restore can itself be undone. The instance must be stopped.
+pub fn restore(layout: &Layout, checkpoint: &Checkpoint) -> Result<Option<Checkpoint>> {
+    let restored = runner::with_exclusive_instance_state(layout, |lock, _| {
+        let store = Store::new(&layout.instance_dir);
+        store.recover(lock)?;
+        let previous = store
+            .record()?
+            .and_then(|record| record.latest)
+            .with_context(|| format!("instance {} has no saved state", layout.instance))?;
+        if previous == checkpoint.generation {
+            return Ok(None);
+        }
+        let before = CheckpointRef {
+            id: new_id()?,
+            name: Some(BEFORE_RESTORE.to_string()),
+            generation: previous,
+            created_unix: now_unix(),
+        };
+        store.add_checkpoint(lock, &before)?;
+        store.commit_latest(lock, &checkpoint.generation)?;
+        for older in store.checkpoints()? {
+            if older.name.as_deref() == Some(BEFORE_RESTORE) && older.id != before.id {
+                store.remove_checkpoint(lock, &older.id)?;
+            }
+        }
+        Ok(Some(Checkpoint::from(before)))
+    })?;
+    restored.with_context(|| {
+        format!(
+            "instance {} started while it was being restored; retry",
+            layout.instance
+        )
+    })
 }
 
 /// What a fork starts from.
