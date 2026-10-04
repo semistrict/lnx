@@ -307,6 +307,27 @@ fn a_command_stopped_while_running_is_not_retried() {
 }
 
 #[test]
+fn an_owner_whose_guest_panicked_at_boot_is_reported_as_such() {
+    use std::os::unix::process::ExitStatusExt;
+    let temp = TempDir::new("early-exit-summary");
+    let console = temp.path().join("console.log");
+    let status = std::process::ExitStatus::from_raw(0);
+
+    fs::write(&console, "[    0.11] Kernel panic - not syncing: Attempted to kill init!\n")
+        .expect("write console");
+    assert_eq!(
+        early_exit_summary(&console, status),
+        "the guest kernel panicked while booting"
+    );
+
+    fs::write(&console, "[    0.11] booting\n").expect("write console");
+    assert_eq!(
+        early_exit_summary(&console, status),
+        "lnx VM owner exited with exit status: 0 before the broker came up"
+    );
+}
+
+#[test]
 fn a_new_owner_waits_for_its_first_client_before_it_may_stop() {
     let (state, _agent_rx, _temp) = test_broker();
 

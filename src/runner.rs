@@ -2449,7 +2449,8 @@ fn run_broker_client_awaiting_owner(
             } else {
                 run_log.line(format!("owner.exited.early status={status}"));
                 bail!(
-                    "lnx VM owner exited with {status} before the broker came up{}{}",
+                    "{}{}{}",
+                    early_exit_summary(&layout.console_log, status),
                     owner_log_hint(layout),
                     console_hint(&layout.console_log)
                 );
@@ -3418,6 +3419,20 @@ fn log_console_tail(run_log: &RunLog, path: &Path) {
             "console.tail path={} read_error={e}",
             path.display()
         )),
+    }
+}
+
+/// What to call an owner that exited before its broker came up: a guest
+/// that panicked while booting says so on the console.
+fn early_exit_summary(console_log: &Path, status: std::process::ExitStatus) -> String {
+    let panicked = fs::read(console_log).is_ok_and(|bytes| {
+        let start = bytes.len().saturating_sub(4096);
+        String::from_utf8_lossy(&bytes[start..]).contains("Kernel panic")
+    });
+    if panicked {
+        "the guest kernel panicked while booting".to_string()
+    } else {
+        format!("lnx VM owner exited with {status} before the broker came up")
     }
 }
 
