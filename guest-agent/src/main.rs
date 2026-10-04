@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
 use lnx_protocol::{MAX_MESSAGE_SIZE, Message, PROTOCOL_VERSION};
@@ -46,7 +46,10 @@ const STDIN_FILENO: c_int = 0;
 const STDOUT_FILENO: c_int = 1;
 const STDERR_FILENO: c_int = 2;
 const SIGHUP: c_int = 1;
+const SIGKILL: c_int = 9;
 const SIGTERM: c_int = 15;
+/// How long a hung-up command gets to exit before it is killed.
+const HANGUP_GRACE: Duration = Duration::from_secs(5);
 const WNOHANG: c_int = 1;
 const POLLIN: i16 = 0x0001;
 const POLLERR: i16 = 0x0008;
@@ -2136,12 +2139,25 @@ fn log_child_probe(channel_id: u64, pid: c_int) {
 
 /// Ends an exec whose client went away: hangs up its session (the command
 /// is a session leader, so its pid is also its process group) the way
-/// closing a terminal does.
+/// closing a terminal does, and kills whatever is left after a grace period,
+/// so a command that ignores the hangup cannot keep running unattended.
 fn hang_up_session(pid: c_int) {
     unsafe {
         kill(-pid, SIGHUP);
         kill(-pid, SIGTERM);
     }
+    thread::spawn(move || {
+        let deadline = Instant::now() + HANGUP_GRACE;
+        while Instant::now() < deadline {
+            if unsafe { kill(-pid, 0) } != 0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        unsafe {
+            kill(-pid, SIGKILL);
+        }
+    });
 }
 
 fn send_status(agent_fd: &Arc<Mutex<c_int>>, channel_id: u64, status: c_int) {

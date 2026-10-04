@@ -103,6 +103,17 @@ try {
     });
   }
 
+  await testStep("a command that ignores the hangup is killed after a grace period", async () => {
+    const proc = ctx.vm.spawnCli(["bash", "-c", "trap '' HUP TERM; echo started; sleep 7775"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    await waitForOutput(proc.stdout, "started");
+    proc.kill("SIGKILL");
+    await proc.exited;
+    assertEq(await guestSleepGone(7775), "gone", "stubborn guest command");
+  });
+
   await testStep("an instance whose client was killed goes idle", async () => {
     const proc = ctx.vm.spawnCli(["bash", "-c", "echo started; sleep 7774"], {
       stdout: "pipe",
