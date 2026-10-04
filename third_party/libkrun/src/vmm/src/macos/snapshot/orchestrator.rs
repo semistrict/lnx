@@ -12,14 +12,8 @@
 //   7. Atomic publish: write into a staging directory, rename to <path>.
 //   8. Resume devices, then vCPUs.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc, LazyLock, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 
 use log::info;
 
@@ -40,24 +34,10 @@ use crate::snapshot_metadata::{
 use crate::vstate::KvmGicVcpuState;
 
 use super::container::{SectionId, SnapshotWriter};
-use super::ram::{
-    clone_and_patch_dirty_pages_img, clone_pages_image, patch_dirty_pages_img, write_full_pages_img,
-};
+use super::ram::{clone_and_patch_dirty_pages_img, write_full_pages_img};
 use super::{Result, SnapshotError};
 
 const VCPU_PAUSE_TIMEOUT_MS: u64 = 2000;
-const PREPATCH_ENV: &str = "KRUN_SNAPSHOT_PREPATCH";
-const PREPATCH_POLL_MS: u64 = 25;
-const PREPATCH_COLD_DELAY_MS: u64 = 25;
-const PREPATCH_MAX_BACKOFF_MS: u64 = 250;
-
-static PREPATCH_WORKERS: LazyLock<Mutex<HashMap<PathBuf, PrepatchWorker>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-struct PrepatchWorker {
-    stop: Arc<AtomicBool>,
-    handle: JoinHandle<()>,
-}
 
 /// Snapshot of a single virtio-mmio device: transport-side state + the
 /// per-device payload returned by `VirtioDevice::serialize_state`.
@@ -379,19 +359,9 @@ where
     crate::timing_event("snapshot.capture.vcpus.paused");
     let capture_mach_time = cntvct_el0();
 
-    let prepatch_dir =
-        match stop_prepatch_workers_for_capture(dir, inputs.guest_memory, inputs.ram_ranges) {
-            Ok(prepatch_dir) => prepatch_dir,
-            Err(e) => {
-                let _ = resume_vcpus(inputs.vcpu_handles);
-                return Err(e);
-            }
-        };
-
     let result = capture_paused(
         &inputs,
         dir,
-        prepatch_dir.as_deref(),
         &vcpu_states,
         capture_mach_time,
         paused_hook,
@@ -432,7 +402,6 @@ pub fn arm_dirty_tracking(inputs: &CaptureInputs<'_>) -> Result<()> {
 fn capture_paused<F>(
     inputs: &CaptureInputs<'_>,
     dir: &Path,
-    prepatch_dir: Option<&Path>,
     vcpu_states: &[Vec<u8>],
     capture_mach_time: u64,
     paused_hook: F,
@@ -538,16 +507,7 @@ where
             dirty_blocks.len()
         ));
         crate::timing_event("snapshot.capture_paused.ram.begin");
-        let ram = if let Some(prepatch_dir) = prepatch_dir {
-            crate::timing_event("snapshot.capture_paused.ram.prepatch_base");
-            clone_and_patch_dirty_pages_img(
-                inputs.guest_memory,
-                inputs.ram_ranges,
-                prepatch_dir,
-                &stage_dir,
-                &dirty_blocks,
-            )?
-        } else if dir.join(super::PAGES_IMG).exists() {
+        let ram = if dir.join(super::PAGES_IMG).exists() {
             clone_and_patch_dirty_pages_img(
                 inputs.guest_memory,
                 inputs.ram_ranges,
@@ -651,184 +611,6 @@ fn resume_devices(inputs: &CaptureInputs<'_>) -> Result<()> {
 fn enable_dirty_tracking(inputs: &CaptureInputs<'_>) -> Result<()> {
     hvf::enable_dirty_tracking(inputs.ram_ranges)
         .map_err(|e| SnapshotError::Io(std::io::Error::other(format!("enable dirty RAM: {e}"))))
-}
-
-fn prepatch_enabled() -> bool {
-    std::env::var(PREPATCH_ENV)
-        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
-}
-
-fn prepatch_dir(dir: &Path) -> PathBuf {
-    let name = dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("snapshot");
-    match dir.parent() {
-        Some(parent) => parent.join(format!(".{name}.prepatch")),
-        None => PathBuf::from(format!(".{name}.prepatch")),
-    }
-}
-
-#[allow(dead_code)]
-fn start_prepatch_worker(dir: &Path, mem: &GuestMemoryMmap, ram_ranges: &[(u64, u64)]) {
-    if !prepatch_enabled() || !dir.join(super::PAGES_IMG).exists() {
-        return;
-    }
-    let dir = dir.to_path_buf();
-    let stage_dir = prepatch_dir(&dir);
-    let mem = mem.clone();
-    let ram_ranges = ram_ranges.to_vec();
-    let stop = Arc::new(AtomicBool::new(false));
-    let thread_stop = Arc::clone(&stop);
-    let worker_key = dir.clone();
-
-    if let Ok(mut workers) = PREPATCH_WORKERS.lock() {
-        if let Some(worker) = workers.remove(&dir) {
-            worker.stop.store(true, Ordering::SeqCst);
-            let _ = worker.handle.join();
-        }
-        let handle = thread::spawn(move || {
-            if let Err(e) = run_prepatch_worker(&dir, &stage_dir, &mem, &ram_ranges, thread_stop) {
-                crate::timing_event(&format!("snapshot.prepatch.error {e}"));
-            }
-        });
-        workers.insert(worker_key, PrepatchWorker { stop, handle });
-    }
-}
-
-fn stop_prepatch_workers_for_capture(
-    dir: &Path,
-    mem: &GuestMemoryMmap,
-    ram_ranges: &[(u64, u64)],
-) -> Result<Option<PathBuf>> {
-    let workers = {
-        let mut workers = PREPATCH_WORKERS.lock().unwrap();
-        if let Some(worker) = workers.remove(dir) {
-            vec![(dir.to_path_buf(), worker)]
-        } else {
-            workers.drain().collect::<Vec<_>>()
-        }
-    };
-    if workers.is_empty() {
-        return Ok(None);
-    }
-
-    let mut stage_dirs = Vec::with_capacity(workers.len());
-    for (worker_dir, worker) in workers {
-        worker.stop.store(true, Ordering::SeqCst);
-        let _ = worker.handle.join();
-        let stage_dir = prepatch_dir(&worker_dir);
-        if stage_dir.join(super::PAGES_IMG).exists() {
-            stage_dirs.push(stage_dir);
-        }
-    }
-    if stage_dirs.is_empty() {
-        return Ok(None);
-    }
-
-    let dirty = hvf::take_dirty_blocks_and_reprotect().map_err(|e| {
-        SnapshotError::Io(std::io::Error::other(format!(
-            "prepatch final dirty RAM: {e}"
-        )))
-    })?;
-    if !dirty.is_empty() {
-        crate::timing_event(&format!(
-            "snapshot.prepatch.final_flush.begin count={}",
-            dirty.len()
-        ));
-        for stage_dir in &stage_dirs {
-            patch_dirty_pages_img(mem, ram_ranges, stage_dir, &dirty)?;
-        }
-        crate::timing_event("snapshot.prepatch.final_flush.done");
-    }
-    crate::timing_event(&format!(
-        "snapshot.prepatch.capture_base count={}",
-        stage_dirs.len()
-    ));
-    Ok(stage_dirs.into_iter().next())
-}
-
-fn run_prepatch_worker(
-    dir: &Path,
-    stage_dir: &Path,
-    mem: &GuestMemoryMmap,
-    ram_ranges: &[(u64, u64)],
-    stop: Arc<AtomicBool>,
-) -> Result<()> {
-    let _ = std::fs::remove_dir_all(stage_dir);
-    clone_pages_image(dir, stage_dir)?;
-    crate::timing_event("snapshot.prepatch.started");
-
-    let mut pending: HashMap<u64, PendingBlock> = HashMap::new();
-    let mut copied = 0usize;
-    let mut delayed = 0usize;
-    while !stop.load(Ordering::SeqCst) {
-        let now = Instant::now();
-        let dirty = hvf::take_dirty_blocks_and_reprotect().map_err(|e| {
-            SnapshotError::Io(std::io::Error::other(format!("prepatch dirty RAM: {e}")))
-        })?;
-        for block in dirty {
-            let entry = pending
-                .entry(block.guest_addr)
-                .or_insert_with(|| PendingBlock::new(block));
-            entry.block = block;
-            entry.redirties = entry.redirties.saturating_add(1);
-            entry.due = now + entry.backoff();
-        }
-
-        let mut ready = Vec::new();
-        pending.retain(|_, entry| {
-            if entry.due <= now {
-                ready.push(entry.block);
-                false
-            } else {
-                true
-            }
-        });
-        if !ready.is_empty() {
-            copied += ready.len();
-            patch_dirty_pages_img(mem, ram_ranges, stage_dir, &ready)?;
-        } else if !pending.is_empty() {
-            delayed += pending.len();
-        }
-        thread::sleep(Duration::from_millis(PREPATCH_POLL_MS));
-    }
-
-    if !pending.is_empty() {
-        let ready = pending
-            .values()
-            .map(|entry| entry.block)
-            .collect::<Vec<_>>();
-        patch_dirty_pages_img(mem, ram_ranges, stage_dir, &ready)?;
-        copied += ready.len();
-    }
-    crate::timing_event(&format!(
-        "snapshot.prepatch.stopped copied_blocks={copied} delayed_samples={delayed}"
-    ));
-    Ok(())
-}
-
-struct PendingBlock {
-    block: hvf::DirtyBlock,
-    redirties: u32,
-    due: Instant,
-}
-
-impl PendingBlock {
-    fn new(block: hvf::DirtyBlock) -> Self {
-        Self {
-            block,
-            redirties: 0,
-            due: Instant::now() + Duration::from_millis(PREPATCH_COLD_DELAY_MS),
-        }
-    }
-
-    fn backoff(&self) -> Duration {
-        let shift = self.redirties.min(4);
-        let ms = (PREPATCH_COLD_DELAY_MS << shift).min(PREPATCH_MAX_BACKOFF_MS);
-        Duration::from_millis(ms)
-    }
 }
 
 fn add_virtio_dma_dirty_blocks(

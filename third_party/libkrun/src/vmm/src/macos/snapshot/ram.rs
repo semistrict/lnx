@@ -131,13 +131,7 @@ pub fn clone_and_patch_dirty_pages_img(
     patch_dirty_pages_img(mem, ram_ranges, stage_dir, dirty_blocks)
 }
 
-pub fn clone_pages_image(src_dir: &Path, dst_dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst_dir)?;
-    clone_pages_img(&pages_img_path(src_dir), &pages_img_path(dst_dir))?;
-    Ok(())
-}
-
-pub fn patch_dirty_pages_img(
+fn patch_dirty_pages_img(
     mem: &GuestMemoryMmap,
     ram_ranges: &[(u64, u64)],
     dir: &Path,
