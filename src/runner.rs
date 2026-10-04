@@ -20,6 +20,7 @@ use std::{
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 
+use crate::fsutil::remove_path_if_exists;
 use anyhow::{Context, Result, anyhow, bail};
 use libkrun::{Error as KrunError, Kernel, Network, VmBuilder, VmHandle};
 use lnx_protocol::{Message, PROTOCOL_VERSION};
@@ -4709,43 +4710,7 @@ fn copy_host_share_state_to_snapshot(layout: &Layout, snapshot_path: &Path) -> R
     }
     let target = snapshot_path.join("host-share-state");
     remove_path_if_exists(&target)?;
-    clone_or_copy_tree(&source, &target)
-}
-
-fn clone_or_copy_tree(source: &Path, target: &Path) -> Result<()> {
-    let metadata =
-        fs::symlink_metadata(source).with_context(|| format!("stat {}", source.display()))?;
-    if metadata.is_dir() {
-        fs::create_dir_all(target).with_context(|| format!("create {}", target.display()))?;
-        for entry in fs::read_dir(source).with_context(|| format!("read {}", source.display()))? {
-            let entry = entry.with_context(|| format!("read {}", source.display()))?;
-            clone_or_copy_tree(&entry.path(), &target.join(entry.file_name()))?;
-        }
-        return Ok(());
-    }
-    if metadata.file_type().is_symlink() {
-        let link =
-            fs::read_link(source).with_context(|| format!("readlink {}", source.display()))?;
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-        }
-        std::os::unix::fs::symlink(&link, target)
-            .with_context(|| format!("symlink {} to {}", link.display(), target.display()))?;
-        return Ok(());
-    }
-    clone_or_copy_file(source, target)
-}
-
-fn remove_path_if_exists(path: &Path) -> Result<()> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(dir_err) => match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(file_err) if file_err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(_) => Err(dir_err).with_context(|| format!("remove {}", path.display())),
-        },
-    }
+    crate::sparse_copy::clone_or_copy_tree(&source, &target)
 }
 
 fn cleanup_runtime_sockets(run_log: &RunLog, paths: &[&Path]) {

@@ -9,6 +9,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::fsutil::remove_path_if_exists;
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
@@ -1718,14 +1719,6 @@ fn ensure_no_failed_shutdown_state(layout: &Layout, expected_pid: Option<i32>) -
         runner::validate_or_record_final_snapshot_failure(layout, pid)
     } else {
         runner::validate_final_snapshot_outcome(layout, None)
-    }
-}
-
-fn remove_path_if_exists(path: &Path) -> Result<()> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
     }
 }
 

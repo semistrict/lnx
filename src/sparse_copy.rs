@@ -15,6 +15,31 @@ use std::{
 
 const LARGE_SPARSE_IMAGE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+/// Recursively clones a directory tree (or a single file or symlink) from
+/// `src` to `dst`, cloning files with [`clone_or_copy_file`] and recreating
+/// symlinks rather than following them.
+pub fn clone_or_copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(src).with_context(|| format!("stat {}", src.display()))?;
+    if metadata.is_dir() {
+        fs::create_dir_all(dst).with_context(|| format!("create {}", dst.display()))?;
+        for entry in fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
+            let entry = entry.with_context(|| format!("read {}", src.display()))?;
+            clone_or_copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    if metadata.file_type().is_symlink() {
+        let link = fs::read_link(src).with_context(|| format!("readlink {}", src.display()))?;
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::os::unix::fs::symlink(&link, dst)
+            .with_context(|| format!("symlink {} to {}", link.display(), dst.display()))?;
+        return Ok(());
+    }
+    clone_or_copy_file(src, dst)
+}
+
 /// Clone or sparsely copy `src` to `dst`, preserving VM-image sparseness.
 ///
 /// Large VM images must not silently degrade to dense copies. When Linux cannot

@@ -514,29 +514,7 @@ fn clone_host_share_state(src: &Path, dest: &Layout) -> Result<()> {
     if !src.exists() {
         return Ok(());
     }
-    clone_tree(src, &dest.instance_dir.join("host-share-state"))
-}
-
-fn clone_tree(src: &Path, dest: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(src).with_context(|| format!("stat {}", src.display()))?;
-    if metadata.is_dir() {
-        fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
-        for entry in fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
-            let entry = entry.with_context(|| format!("read {}", src.display()))?;
-            clone_tree(&entry.path(), &dest.join(entry.file_name()))?;
-        }
-        return Ok(());
-    }
-    if metadata.file_type().is_symlink() {
-        let link = fs::read_link(src).with_context(|| format!("readlink {}", src.display()))?;
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-        }
-        std::os::unix::fs::symlink(&link, dest)
-            .with_context(|| format!("symlink {} to {}", link.display(), dest.display()))?;
-        return Ok(());
-    }
-    clone_or_copy(src, dest)
+    crate::sparse_copy::clone_or_copy_tree(src, &dest.instance_dir.join("host-share-state"))
 }
 
 fn clone_or_copy(src: &Path, dest: &Path) -> Result<()> {

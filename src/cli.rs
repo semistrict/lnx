@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::fsutil::remove_path_if_exists;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
@@ -1759,17 +1760,6 @@ fn git_ignore_reason(path: &Path) -> Option<String> {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     stdout.lines().next().map(str::to_string)
-}
-
-fn remove_path_if_exists(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => {
-            fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))
-        }
-        Ok(_) => fs::remove_file(path).with_context(|| format!("remove {}", path.display())),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| format!("stat {}", path.display())),
-    }
 }
 
 fn ensure_image_and_instance(

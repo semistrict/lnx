@@ -1,6 +1,7 @@
 mod checkpoints;
 mod cli;
 mod descriptor;
+mod fsutil;
 mod gvproxy_embedded;
 mod host_share;
 mod ingress;
