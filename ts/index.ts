@@ -222,6 +222,10 @@ export type LnxInstance = {
   checkpoint(options?: CheckpointCreateOptions): Promise<Checkpoint>;
   checkpoints(options?: CommandOptions): Promise<Checkpoint[]>;
   fork(targetName: string, options?: ForkOptions): Promise<LnxInstance>;
+  /** Rolls back to a checkpoint; the replaced state becomes checkpoint "before-restore". */
+  restore(checkpoint: string, options?: CommandOptions): Promise<void>;
+  /** Saves and stops the VM now instead of when it idles. */
+  stop(options?: CommandOptions): Promise<void>;
   snapshots: {
     clear(options?: CommandOptions): Promise<void>;
   };
@@ -398,6 +402,14 @@ class BinaryLnxInstance implements LnxInstance {
     args.push(targetName);
     await this.cli(args, options);
     return this.client.instance(targetName, this.defaults);
+  }
+
+  async restore(checkpoint: string, options: CommandOptions = {}): Promise<void> {
+    await this.cli(["restore", checkpoint], options);
+  }
+
+  async stop(options: CommandOptions = {}): Promise<void> {
+    await this.cli(["stop"], options);
   }
 }
 

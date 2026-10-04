@@ -112,7 +112,7 @@ try {
     const restored = await lnxCommand(ctx.instance, ["restore", "named-before"]);
     assertContains(restored.stdout, "its previous state is checkpoint before-restore", "restore message");
     assertEq(await readSourceState(), "disk-before/memory-before", "restored checkpoint state");
-    await lnxCommand(ctx.instance, ["restore", "before-restore"]);
+    await ctx.vm.restore("before-restore");
     assertEq(await readSourceState(), "current-disk/current-memory", "restore undone");
   });
 
