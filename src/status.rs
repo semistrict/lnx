@@ -17,7 +17,7 @@ pub(crate) enum InstanceState {
     /// A VM owner holds the instance but is not accepting commands yet.
     Starting,
     Stopped,
-    /// The instance directory exists but has no rootfs.
+    /// The instance directory exists but holds no saved state.
     Partial,
 }
 

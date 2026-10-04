@@ -252,8 +252,8 @@ class BinaryLnxClient implements LnxClient {
   get instances() {
     return {
       list: async (options: CommandOptions = {}) => {
-        const result = await this.cli(["instances", "list"], options);
-        return parseInstances(result.stdout);
+        const result = await this.cli(["instances", "list", "--json"], options);
+        return JSON.parse(result.stdout) as InstanceSummary[];
       },
       delete: async (name: string, options: CommandOptions = {}) => {
         await this.cli(["instances", "delete", name], options);
@@ -383,7 +383,7 @@ class BinaryLnxInstance implements LnxInstance {
   }
 
   async checkpoints(options: CommandOptions = {}): Promise<Checkpoint[]> {
-    return parseCheckpoints((await this.cli(["checkpoints"], options)).stdout);
+    return parseCheckpoints((await this.cli(["checkpoints", "--json"], options)).stdout);
   }
 
   async fork(targetName: string, options: ForkOptions = {}): Promise<LnxInstance> {
@@ -570,36 +570,14 @@ function parseKeyValueOutput(stdout: string): Record<string, string> {
   return result;
 }
 
-function parseInstances(stdout: string): InstanceSummary[] {
-  return stdout
-    .split("\n")
-    .slice(1)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const [name = "", state = "", pids = ""] = line.split(/\s+/, 3);
-      return {
-        name,
-        state,
-        pids: pids
-          .split(",")
-          .filter(Boolean)
-          .map((pid) => Number(pid))
-          .filter(Number.isFinite),
-      };
-    });
-}
-
 function parseCheckpoints(stdout: string): Checkpoint[] {
-  return stdout
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const [id, maybeName, maybeCreated] = line.split("\t");
-      if (maybeCreated) return { id, name: maybeName, created: maybeCreated, label: maybeName };
-      return { id, created: maybeName, label: id ?? "" };
-    });
+  const rows = JSON.parse(stdout) as { id: string; name: string | null; created: string }[];
+  return rows.map(({ id, name, created }) => ({
+    id,
+    ...(name === null ? {} : { name }),
+    created,
+    label: name ?? id,
+  }));
 }
 
 function parseHostShareEntries(stdout: string): HostShareEntry[] {

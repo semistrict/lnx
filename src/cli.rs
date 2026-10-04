@@ -209,6 +209,8 @@ struct CheckpointArgs {
 struct CheckpointsArgs {
     #[command(subcommand)]
     command: Option<CheckpointsCommand>,
+    #[arg(long, help = "Print the list as JSON")]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -348,7 +350,10 @@ struct InstancesArgs {
 
 #[derive(Debug, Subcommand)]
 enum InstancesCommand {
-    List,
+    List {
+        #[arg(long, help = "Print the list as JSON")]
+        json: bool,
+    },
     #[command(about = "Delete an instance and all its state")]
     Delete {
         name: String,
@@ -609,7 +614,7 @@ impl Cli {
                 }
             }
             Some(Command::Checkpoints(args)) => match args.command {
-                None => list_checkpoints(&layout),
+                None => list_checkpoints(&layout, args.json),
                 Some(CheckpointsCommand::Delete { identifier }) => {
                     delete_checkpoint(&layout, &identifier)
                 }
@@ -674,7 +679,7 @@ impl Cli {
                 }
             }
             Some(Command::Instances(args)) => match args.command {
-                InstancesCommand::List => list_instances(&layout.base),
+                InstancesCommand::List { json } => list_instances(&layout.base, json),
                 InstancesCommand::Delete { name } => delete_instance(&layout.base, &name),
             },
             Some(Command::Set(args)) => set_instance_settings(&layout, &args.settings),
@@ -1172,7 +1177,7 @@ fn print_instance_logs(layout: &Layout, console: bool, owner: bool) -> Result<()
     Ok(())
 }
 
-fn list_instances(base: &Path) -> Result<()> {
+fn list_instances(base: &Path, json: bool) -> Result<()> {
     let mut names = BTreeSet::new();
     collect_child_dir_names(&base.join("instances"), &mut names)?;
 
@@ -1181,19 +1186,25 @@ fn list_instances(base: &Path) -> Result<()> {
         .map(|name| {
             let layout = Layout::resolve_in_base(&name, base.to_path_buf(), None, None);
             let state = status::instance_state(&layout);
-            let pids = status::instance_pids(&layout)
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",");
+            let pids = status::instance_pids(&layout);
             Ok(InstanceRow { name, state, pids })
         })
         .collect::<Result<Vec<_>>>()?;
     instances.sort_by_key(|row| (row.state, row.name.clone()));
 
+    if json {
+        println!("{}", serde_json::to_string_pretty(&instances)?);
+        return Ok(());
+    }
     println!("{:<36} {:<12} PIDS", "NAME", "STATE");
     for row in instances {
-        println!("{:<36} {:<12} {}", row.name, row.state, row.pids);
+        let pids = row
+            .pids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("{:<36} {:<12} {pids}", row.name, row.state);
     }
     Ok(())
 }
@@ -1405,10 +1416,11 @@ fn remove_contained_instance_dir(dir: &Path, instances_root: &Path, name: &str) 
     }
 }
 
+#[derive(serde::Serialize)]
 struct InstanceRow {
     name: String,
     state: status::InstanceState,
-    pids: String,
+    pids: Vec<i32>,
 }
 
 fn collect_child_dir_names(parent: &Path, names: &mut BTreeSet<String>) -> Result<()> {
@@ -2167,8 +2179,24 @@ fn create_checkpoint(layout: &Layout, name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn list_checkpoints(layout: &Layout) -> Result<()> {
-    for checkpoint in checkpoints::list(layout)? {
+fn list_checkpoints(layout: &Layout, json: bool) -> Result<()> {
+    let checkpoints = checkpoints::list(layout)?;
+    if json {
+        let rows: Vec<_> = checkpoints
+            .iter()
+            .map(|checkpoint| {
+                serde_json::json!({
+                    "id": checkpoint.id,
+                    "name": checkpoint.name,
+                    "created": checkpoints::display_time(checkpoint.created_unix),
+                    "generation": checkpoint.generation.to_string(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    for checkpoint in checkpoints {
         match checkpoint.name.as_deref() {
             Some(name) => println!(
                 "{}\t{}\t{}",

@@ -146,7 +146,22 @@ fn instances_list_parses() {
         panic!("expected instances command");
     };
 
-    assert!(matches!(args.command, InstancesCommand::List));
+    assert!(matches!(args.command, InstancesCommand::List { json: false }));
+}
+
+#[test]
+fn listings_take_json() {
+    let cli = Cli::try_parse_from(["lnx", "instances", "list", "--json"]).expect("parse");
+    let Some(Command::Instances(args)) = cli.command else {
+        panic!("expected instances command");
+    };
+    assert!(matches!(args.command, InstancesCommand::List { json: true }));
+
+    let cli = Cli::try_parse_from(["lnx", "checkpoints", "--json"]).expect("parse");
+    let Some(Command::Checkpoints(args)) = cli.command else {
+        panic!("expected checkpoints command");
+    };
+    assert!(args.json);
 }
 
 #[test]

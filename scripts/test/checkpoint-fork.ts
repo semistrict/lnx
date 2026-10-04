@@ -52,6 +52,10 @@ try {
     assertFile(join(ctx.imageDir, "checkpoints"), "checkpoint directory");
     const list = await run([ctx.lnxBin, "--instance", ctx.instance, "checkpoints"]);
     assertContains(list.stdout, "named-before", "checkpoint listed");
+    const listed = await ctx.vm.checkpoints();
+    assertEq(listed.length, 1, "SDK lists one checkpoint");
+    assertEq(listed[0]?.name, "named-before", "SDK checkpoint name");
+    assertEq(listed[0]?.label, "named-before", "SDK checkpoint label");
   });
 
   await testStep("fork from named checkpoint is isolated from later source writes", async () => {
