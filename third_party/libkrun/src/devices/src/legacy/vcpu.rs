@@ -1,4 +1,4 @@
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender, bounded};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{
@@ -31,7 +31,7 @@ struct PerCPUInterruptControllerState {
     vcpuid: u64,
     status: VcpuStatus,
     pending_irqs: VecDeque<u32>,
-    wfe_sender: Option<Sender<u32>>,
+    wfe_sender: Option<Sender<()>>,
 }
 
 impl PerCPUInterruptControllerState {
@@ -48,11 +48,19 @@ impl PerCPUInterruptControllerState {
     }
 
     fn wake(&mut self) {
-        if let Some(sender) = self.wfe_sender.as_mut() {
-            let _ = sender.send(self.vcpuid as u32);
+        if let Some(sender) = &self.wfe_sender {
+            // A full channel already holds a wakeup the vCPU has yet to
+            // consume, and a closed one means its thread is gone; neither
+            // needs another token.
+            let _ = sender.try_send(());
         }
         self.status = VcpuStatus::Running;
-        vcpu_request_exit(self.vcpuid).unwrap();
+        if let Err(e) = vcpu_request_exit(self.vcpuid) {
+            warn!(
+                "vCPU {}: requesting exit for IRQ delivery failed: {e}",
+                self.vcpuid
+            );
+        }
     }
 
     fn should_wait(&mut self) -> bool {
@@ -129,9 +137,15 @@ impl VcpuList {
         }
     }
 
-    pub fn register(&self, vcpuid: u64, wfe_sender: Sender<u32>) {
+    /// Registers the thread running `vcpuid` and returns the channel it waits
+    /// on for interrupts. Wakeups coalesce into a single pending token: the
+    /// vCPU re-checks its pending IRQs after every wakeup, so more tokens
+    /// would only pile up while it runs and cause spurious wakeups later.
+    pub fn register(&self, vcpuid: u64) -> Receiver<()> {
         assert!(vcpuid < self.cpu_count);
+        let (wfe_sender, wfe_receiver) = bounded(1);
         self.vcpus[vcpuid as usize].lock().unwrap().wfe_sender = Some(wfe_sender);
+        wfe_receiver
     }
 
     /// Snapshot per-vCPU pending IRQ queues. Status/wfe_sender are runtime-only.

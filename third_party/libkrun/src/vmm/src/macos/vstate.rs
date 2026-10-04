@@ -517,8 +517,7 @@ impl Vcpu {
         };
         let hvf_vcpuid = hvf_vcpu.id();
 
-        let (wfe_sender, wfe_receiver) = unbounded();
-        self.vcpu_list.register(hvf_vcpuid, wfe_sender);
+        let wfe_receiver = self.vcpu_list.register(hvf_vcpuid);
 
         let entry_addr = if self.initial_pause {
             self.boot_entry_addr
@@ -675,7 +674,7 @@ impl Vcpu {
     fn wait_for_event(
         &mut self,
         hvf_vcpuid: u64,
-        receiver: &Receiver<u32>,
+        receiver: &Receiver<()>,
         timeout: Option<Duration>,
     ) {
         if !self.vcpu_list.should_wait(hvf_vcpuid) {
@@ -1699,7 +1698,7 @@ mod tests {
     /// woken, so a missed wakeup fails the test instead of hanging it.
     fn spawn_wait_for_event(
         mut vcpu: Vcpu,
-        wfe: Receiver<u32>,
+        wfe: Receiver<()>,
         timeout: Option<Duration>,
     ) -> Receiver<Vcpu> {
         let (woken_sender, woken) = unbounded();
@@ -1747,7 +1746,7 @@ mod tests {
         let wfe_after_wake = wfe.clone();
 
         let woken = spawn_wait_for_event(vcpu, wfe, None);
-        wfe_sender.send(0).unwrap();
+        wfe_sender.send(()).unwrap();
         let vcpu = expect_woken(&woken);
 
         assert!(matches!(
@@ -1758,6 +1757,19 @@ mod tests {
             vcpu.event_receiver.try_recv(),
             Err(TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn device_irq_wakeups_coalesce_while_vcpu_runs() {
+        // VcpuList lives in krun-devices, whose tests cannot link HVF.
+        let vcpu_list = VcpuList::new(1);
+        let wfe = vcpu_list.register(0);
+
+        vcpu_list.wake_vcpu(0);
+        vcpu_list.set_irq_common(0, 40);
+        vcpu_list.set_irq_common(0, 41);
+
+        assert_eq!(wfe.len(), 1);
     }
 
     #[test]
