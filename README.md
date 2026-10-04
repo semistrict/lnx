@@ -32,7 +32,7 @@ Here an agent drives Chromium inside a VM with
 in 0.6 s, and the agent keeps working in both copies: same browser, same page,
 same driver session ([scripts/demo/cua-fork](scripts/demo/cua-fork)).
 
-DEMO_VIDEO_URL
+https://github.com/user-attachments/assets/f2f82cac-2871-429f-9222-e3521eea9ca9
 
 ## What you get
 
