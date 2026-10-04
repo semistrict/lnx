@@ -32,27 +32,52 @@ systemd root:
    mapping, sends one argv vector, streams stdout/stderr frames, and exits with
    the guest command status.
 
-## Snapshot lifecycle
+## Instance state
 
-Memory snapshot restore defaults to
-`~/.lnx/instances/<instance>/memory-snapshots/latest` and can be overridden
-with `--snapshot <dir>`. The VM runs in a detached `_vm-owner` process, so
-`lnx` exits as soon as the guest command's status arrives. The owner keeps the
-VM alive for an idle grace period (5s by default, `LNX_BROKER_IDLE_TTL_MS` to
-override) so rapid-fire commands reuse the live VM without a restore; once
-idle it asks the guest to quiesce, snapshots, and exits, so the next exec
-restores systemd, the agent, and the rootfs from that point. A fresh boot
-writes a full memory snapshot; restored runs use libkrun dirty tracking and
-APFS clones to patch only changed RAM and disk blocks.
+Each instance keeps its state under `~/.lnx/instances/<instance>/` as
+immutable *generations* plus one record naming the latest one:
+
+```text
+state.json                 {latest generation, phase: stopped | running | dirty}
+generations/<gen>/         rootfs.ext4, [vmstate.bin pages.img stamps], host-share-state/, manifest.json
+runs/<run>/                private clones the running VM works on
+checkpoints/<id>.ref       a named reference to a generation
+instance.lock              flock held by the VM owner or a maintenance command
+```
+
+A run starts by cloning the latest generation into `runs/<run>/` (APFS
+clones, so this is instant) and recording `phase: running`. Before the first
+command reaches the guest the record becomes `dirty`. The VM runs in a
+detached `_vm-owner` process, so `lnx` exits as soon as the guest command's
+status arrives; the owner keeps the VM alive for an idle grace period (5s by
+default) so rapid-fire commands reuse it. Once idle, it asks the guest to
+quiesce, captures memory, disk and host-share state at one paused instant
+into a new generation, syncs it, and commits `{latest: new, phase: stopped}`
+as the single commit point. The next command resumes from there. Restored
+runs use libkrun dirty tracking to write only changed RAM.
+
+If an owner dies, the next command recovers before starting a VM: a run that
+had published its final snapshot is rolled forward, and a run that never
+served a command is dropped. A run that crashed after serving commands may
+hold writes a client was told about, so lnx stops and asks:
+`lnx recover --keep` keeps its disk (dropping only its memory), and
+`lnx recover --discard` returns to the last saved state. Nothing deletes the
+latest generation.
+
+`lnx snapshots clear` drops the saved memory, never the disk: the next run
+boots from the saved disk. Checkpoints of a stopped instance are references
+to its latest generation; checkpoints of a running one are live captures.
+Forks copy a generation into a new instance. Instances created by older lnx
+versions are migrated into this layout on first use.
+
+The protocol is modeled in TLA+ under `specs/tla/` (`bun run tla:check`).
 
 Per-run timings are appended to `~/.lnx/instances/<instance>/timings.log`.
-Incremental snapshots skip `fsync` by default for speed; set
-`KRUN_SNAPSHOT_SYNC=1` to make snapshot files crash-durable before returning.
 
-Host shares always mount with virtio-fs DAX. The cache mode is recorded in
-the snapshot compatibility stamp, so snapshots created under the removed
-non-DAX mode refuse to memory-restore; clear them with
-`lnx --instance <instance> snapshots clear`.
+Host shares always mount with virtio-fs DAX. A memory snapshot records the
+share layout, guest agent and VM shape it needs; a run that cannot resume it
+fails with an explanation and the `snapshots clear` remedy instead of silently
+booting.
 
 ## Filesystem
 
@@ -69,8 +94,8 @@ Host directories (the home directory and the working directory the command
 started in) are exported over virtio-fs with DAX and mounted at their host
 paths inside the guest, so absolute paths work unchanged on both sides. Guest
 writes to shared trees pass through only for allowlisted paths; everything
-else is diverted into per-instance copy-on-write state
-(`instances/<instance>/host-share-state` with upper files and whiteouts), so
+else is diverted into per-instance copy-on-write state (upper files and
+whiteouts, saved with each generation), so
 a guest can never mutate the host tree outside the allowlist. `lnx fs
 unshare` lists and clears that state. Additional read-only virtio-fs mounts
 from external vhost-user backends attach with `--vhost-user-fs`.
