@@ -86,7 +86,10 @@ pub(crate) fn snapshot_agent_incompatibility(
     if !deterministic
         && let (Some(snapshot), Some(current)) = (snapshot.protocol, current.protocol)
     {
-        return (snapshot != current).then(|| {
+        // This host speaks its own protocol and every older one it still
+        // supports; the current agent's stamp says which one is its own.
+        let supported = snapshot <= current && lnx_protocol::agent_protocol_supported(snapshot);
+        return (!supported).then(|| {
             format!("its guest agent speaks lnx protocol {snapshot}, this lnx speaks {current}")
         });
     }

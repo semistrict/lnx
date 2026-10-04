@@ -115,6 +115,7 @@ fn exec_options_round_trip_through_flags() {
         workdir: Some("/srv".to_string()),
         timeout: Some(Duration::from_millis(1500)),
         detach: false,
+        keep_running: false,
     };
     let mut argv = vec!["lnx".to_string()];
     argv.extend(exec_option_args(&exec));

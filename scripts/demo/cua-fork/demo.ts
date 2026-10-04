@@ -130,21 +130,17 @@ async function ensureBase(): Promise<void> {
   await lnx(["--instance", BASE, "checkpoint", "-m", PROVISIONED]);
 }
 
-// A restored guest's wall clock resumes at snapshot time. The page and the
-// recordings show wall-clock times, so set it from the host.
+// lnx sets a restored guest's clock, but only for guest agents that speak
+// protocol 12 or later; a base provisioned before that still runs an older
+// agent. The page and the recordings show wall-clock times, so set it here.
 async function syncClock(vm: Vm): Promise<void> {
   await exec(vm, ["date", "-s", `@${(Date.now() / 1000).toFixed(3)}`]);
 }
 
-// Keeps a VM running for the whole demo; without a client the owner would
-// suspend it between commands.
-function hold(vm: Vm) {
-  return Bun.spawn([lnxBin, "--no-host-shares", "--instance", vm, "--", "sleep", "infinity"], {
-    env: { ...Bun.env, LNX_BASE: lnxBase },
-    stdout: "ignore",
-    stderr: "inherit",
-  });
-}
+// The VMs stay running for the whole demo, instead of suspending between
+// commands, so the recordings and the agent never pause.
+const startVm = (vm: Vm) => lnx(["--no-host-shares", "--instance", vm, "start"]);
+const stopVm = (vm: Vm) => lnx(["--instance", vm, "stop"]);
 
 async function startDesktop(vm: Vm): Promise<void> {
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -253,7 +249,8 @@ async function record(): Promise<void> {
   await rm(partsDir, { recursive: true, force: true });
   await mkdir(partsDir, { recursive: true });
 
-  const holders = [hold(SOURCE)];
+  const started: Vm[] = [SOURCE];
+  await startVm(SOURCE);
   try {
     await syncClock(SOURCE);
     await startDesktop(SOURCE);
@@ -282,7 +279,8 @@ async function record(): Promise<void> {
     await lnx(["--instance", SOURCE, "fork", FORK]);
     const forkSeconds = (performance.now() - forkStarted) / 1000;
     const forked = Date.now() / 1000;
-    holders.push(hold(FORK));
+    started.push(FORK);
+    await startVm(FORK);
     await Promise.all([syncClock(SOURCE), syncClock(FORK)]);
 
     const [original, after] = await Promise.all([inspect(SOURCE, tab), inspect(FORK, tab)]);
@@ -315,8 +313,7 @@ async function record(): Promise<void> {
     const marks: Marks = { forkCommand, forked, end, forkSeconds };
     await writeFile(join(partsDir, "timeline.json"), JSON.stringify({ captions, marks }, null, 2));
   } finally {
-    for (const holder of holders) holder.kill();
-    await Promise.all(holders.map((holder) => holder.exited));
+    await Promise.all(started.map(stopVm));
   }
 }
 

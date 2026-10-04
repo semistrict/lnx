@@ -1175,6 +1175,41 @@ fn deterministic_restore_requires_clock_state() {
 }
 
 #[test]
+fn root_commands_get_root_identity_before_user_env() {
+    let config = DeterministicConfig {
+        seed: "seed42".to_string(),
+    };
+    let tail = |exec: &ExecOptions| {
+        command_env(exec, Some(&config), "box", "lnx".to_string())
+            .into_iter()
+            .skip(exec_env(Some(&config)).len())
+            .collect::<Vec<_>>()
+    };
+    let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
+
+    assert_eq!(
+        tail(&ExecOptions::default()),
+        vec![pair("LNX_INSTANCE", "box"), pair("LNX_INGRESS_DOMAIN", "lnx")]
+    );
+    assert_eq!(
+        tail(&ExecOptions {
+            run_as_root: true,
+            env: vec![pair("HOME", "/srv")],
+            ..ExecOptions::default()
+        }),
+        vec![
+            pair("LNX_INSTANCE", "box"),
+            pair("LNX_INGRESS_DOMAIN", "lnx"),
+            pair("HOME", "/root"),
+            pair("USER", "root"),
+            pair("LOGNAME", "root"),
+            // --env comes last, so it still wins.
+            pair("HOME", "/srv"),
+        ]
+    );
+}
+
+#[test]
 fn deterministic_exec_identity_and_env_are_host_independent() {
     let config = DeterministicConfig {
         seed: "seed42".to_string(),
@@ -1404,6 +1439,33 @@ fn an_agent_speaking_another_protocol_cannot_be_resumed() {
         snapshot_agent_incompatibility(&snapshot, &current, false).as_deref(),
         Some("its guest agent speaks lnx protocol 10, this lnx speaks 11")
     );
+}
+
+#[test]
+fn an_agent_speaking_an_older_supported_protocol_can_be_resumed() {
+    let temp = TempDir::new("agent-older-protocol");
+    let (snapshot, current) = agent_stamps(
+        &temp,
+        &format!("source=old\nprotocol={}\n", lnx_protocol::OLDEST_AGENT_PROTOCOL),
+        &format!("source=new\nprotocol={PROTOCOL_VERSION}\n"),
+    );
+    assert_eq!(snapshot_agent_incompatibility(&snapshot, &current, false), None);
+
+    // An agent newer than this host is not one it can talk to.
+    let (snapshot, current) = agent_stamps(
+        &temp,
+        &format!("source=newer\nprotocol={}\n", PROTOCOL_VERSION + 1),
+        &format!("source=new\nprotocol={PROTOCOL_VERSION}\n"),
+    );
+    assert!(snapshot_agent_incompatibility(&snapshot, &current, false).is_some());
+}
+
+#[test]
+fn agents_get_only_messages_their_protocol_knows() {
+    let set_clock = Message::SetClock { unix_nanos: 1 };
+    assert!(!agent_understands(&set_clock, lnx_protocol::OLDEST_AGENT_PROTOCOL));
+    assert!(agent_understands(&set_clock, PROTOCOL_VERSION));
+    assert!(agent_understands(&Message::SnapshotReady, lnx_protocol::OLDEST_AGENT_PROTOCOL));
 }
 
 #[test]

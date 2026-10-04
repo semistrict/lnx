@@ -517,11 +517,23 @@ fn sync_clock_from_host() {
     let Ok(raw) = env::var("LNX_HOST_UNIX_SECS") else {
         return;
     };
-    let Ok(tv_sec) = raw.parse::<i64>() else {
+    let Ok(secs) = raw.parse::<u64>() else {
         return;
     };
-    let ts = Timespec { tv_sec, tv_nsec: 0 };
-    let _ = unsafe { clock_settime(CLOCK_REALTIME, &ts) };
+    set_wall_clock(secs.saturating_mul(1_000_000_000));
+}
+
+/// Sets CLOCK_REALTIME; the host sends its time at boot and whenever the VM
+/// resumes after a pause, since the guest's clock does not advance while
+/// paused.
+fn set_wall_clock(unix_nanos: u64) {
+    let ts = Timespec {
+        tv_sec: (unix_nanos / 1_000_000_000) as i64,
+        tv_nsec: (unix_nanos % 1_000_000_000) as i64,
+    };
+    if unsafe { clock_settime(CLOCK_REALTIME, &ts) } != 0 {
+        log!("clock.set.error {}", std::io::Error::last_os_error());
+    }
 }
 
 /// The host can pass an explicit address override; without one the VM is
@@ -2945,6 +2957,7 @@ fn agent_loop() {
             Message::ExitStatus { channel_id, .. } => {
                 channels.retain(|(id, _)| *id != channel_id);
             }
+            Message::SetClock { unix_nanos } => set_wall_clock(unix_nanos),
             Message::SnapshotReady => {
                 unsafe {
                     sync();

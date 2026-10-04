@@ -16,7 +16,9 @@ import {
   latestSnapshotDir,
   latestGenerationDir,
   instanceLeasePid,
+  sleep,
   spawn,
+  waitForOwnerExit,
 } from "./lib";
 
 // Shorten the detached owner's idle grace period so suspend-dependent
@@ -79,6 +81,36 @@ try {
     assertEq((await ctx.vm.cli(["--snapshot", latestSnapshotDir(ctx), "echo", "explicit-snapshot"])).stdout, "explicit-snapshot", "explicit snapshot restore");
   });
 
+  await testStep("a restored guest's clock is the host's", async () => {
+    await waitForVmSuspend(ctx);
+    // The guest's clock stands still while the VM is suspended; this gap is
+    // what a restore has to make up.
+    await sleep(3000);
+    const before = Date.now() / 1000;
+    const guest = Number((await ctx.vm.cli(["date", "+%s.%N"])).stdout);
+    const after = Date.now() / 1000;
+    assertEq(
+      guest >= before - 0.5 && guest <= after + 0.5,
+      true,
+      `guest clock ${guest} within the host's ${before}..${after}`,
+    );
+  });
+
+  await testStep("start keeps the VM running until stop", async () => {
+    const start = await run([ctx.lnxBin, "--instance", ctx.instance, "start"]);
+    assertEq(start.stdout, `${ctx.instance} is running until \`lnx --instance ${ctx.instance} stop\``, "start message");
+    const owner = instanceLeasePid(ctx.imageDir);
+    assertEq(owner !== null, true, "start leaves a VM owner running");
+    // Many idle periods (500 ms here) pass without the VM suspending.
+    await sleep(3000);
+    assertEq(instanceLeasePid(ctx.imageDir), owner, "the started VM is still running");
+    assertEq((await ctx.vm.cli(["echo", "live"])).stdout, "live", "commands use the started VM");
+    await sleep(1500);
+    assertEq(instanceLeasePid(ctx.imageDir), owner, "a command does not end keep-running");
+    assertEq((await run([ctx.lnxBin, "--instance", ctx.instance, "stop"])).stdout, `stopped ${ctx.instance}`, "stop message");
+    await waitForOwnerExit(ctx);
+  });
+
   await testStep("stdio and status", async () => {
     assertEq((await ctx.vm.cli(["cat"], { stdin: "stdin-ok" })).stdout, "stdin-ok", "non-pty stdin");
     assertEq((await ctx.vm.cli([], { stdin: "echo noargs-shell; exit\n" })).stdout, "noargs-shell", "default shell over stdin");
@@ -107,6 +139,8 @@ try {
   await testStep("exec options", async () => {
     const env = await ctx.vm.cli(["-e", "LNX_TEST_A=one", "--env", "LNX_TEST_B=two=2", "sh", "-c", "echo $LNX_TEST_A/$LNX_TEST_B"]);
     assertEq(env.stdout, "one/two=2", "--env reaches the guest command");
+    assertEq((await ctx.vm.cli(["--root", "sh", "-c", "echo $HOME $USER $LOGNAME"])).stdout, "/root root root", "--root gets root's identity");
+    assertEq((await ctx.vm.cli(["--root", "-e", "HOME=/srv", "sh", "-c", "echo $HOME"])).stdout, "/srv", "--env overrides root's HOME");
     assertEq((await ctx.vm.cli(["-w", "/etc", "pwd"])).stdout, "/etc", "--workdir sets the guest directory");
     assertEq((await ctx.vm.cli(["run", "--workdir", "/usr", "pwd"])).stdout, "/usr", "options work after run");
 

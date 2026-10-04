@@ -78,6 +78,8 @@ pub(crate) struct Capturer {
     pub(crate) session: Arc<RunSession>,
     pub(crate) initramfs_stamp: PathBuf,
     pub(crate) deterministic_clock_state: Option<DeterministicClockState>,
+    /// Reset the guest's wall clock after each capture, which pauses the VM.
+    pub(crate) sets_wall_clock: bool,
     pub(crate) agent_tx: mpsc::Sender<Message>,
     pub(crate) timings: Arc<TimingLog>,
     pub(crate) run_log: Arc<RunLog>,
@@ -99,6 +101,17 @@ impl Capturer {
     fn run_id(&self) -> store::RunId {
         self.session.run().id.clone()
     }
+
+    /// Captures a generation. The guest's clock stands still while the VM is
+    /// paused for it, so it is set again afterwards, whether or not the
+    /// capture succeeded.
+    fn capture(&self, origin: Origin) -> Result<GenerationId> {
+        let result = self.context().capture(origin);
+        if self.sets_wall_clock {
+            let _ = self.agent_tx.send(Message::set_clock_now());
+        }
+        result
+    }
 }
 
 impl Captures for Capturer {
@@ -116,9 +129,7 @@ impl Captures for Capturer {
         if let Some(trace) = &self.trace_log {
             trace.event("checkpoint_request", Vec::new());
         }
-        let generation = self
-            .context()
-            .capture(Origin::Checkpoint { run: self.run_id() })?;
+        let generation = self.capture(Origin::Checkpoint { run: self.run_id() })?;
         if let Some(id) = &spec.id {
             self.session.add_checkpoint(&CheckpointRef {
                 id: id.clone(),
@@ -147,7 +158,6 @@ impl Captures for Capturer {
             self.owner_run_id
         ));
         let result = self
-            .context()
             .capture(Origin::SnapshotExit { run: self.run_id() })
             .and_then(|id| {
                 self.session.advance(&id)?;

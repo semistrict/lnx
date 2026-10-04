@@ -93,3 +93,53 @@ fn port_listeners_round_trip() {
 
     assert_eq!(decoded, message);
 }
+
+/// Agents restored from snapshots still speak protocol 11, so every message
+/// they know must keep its postcard variant index. A new message that lands
+/// anywhere but the end of `Message` fails here.
+#[test]
+fn protocol_11_messages_keep_their_wire_positions() {
+    let protocol_11 = [
+        (Message::Hello { version: 11 }, 0),
+        (Message::Close { channel_id: 1 }, 11),
+        (
+            Message::Error {
+                channel_id: 1,
+                message: String::new(),
+            },
+            12,
+        ),
+        (
+            Message::RestoreSync {
+                channel_id: 1,
+                entropy: Vec::new(),
+            },
+            13,
+        ),
+        (Message::RestoreSynced { channel_id: 1 }, 14),
+        (Message::SnapshotReady, 19),
+        (Message::ForwardAdded { channel_id: 1 }, 21),
+    ];
+    for (message, index) in protocol_11 {
+        let encoded = postcard::to_allocvec(&message).expect("encode");
+        assert_eq!(encoded[0], index, "{message:?}");
+    }
+    assert_eq!(
+        postcard::to_allocvec(&Message::Hello { version: 11 }).expect("encode"),
+        vec![0, 11]
+    );
+    assert_eq!(
+        postcard::to_allocvec(&Message::SetClock { unix_nanos: 1 }).expect("encode")[0],
+        22
+    );
+}
+
+#[test]
+fn host_speaks_every_agent_protocol_from_the_oldest_supported() {
+    assert!(!agent_protocol_supported(OLDEST_AGENT_PROTOCOL - 1));
+    assert!(agent_protocol_supported(OLDEST_AGENT_PROTOCOL));
+    assert!(agent_protocol_supported(PROTOCOL_VERSION));
+    assert!(!agent_protocol_supported(PROTOCOL_VERSION + 1));
+    assert_eq!(Message::SnapshotReady.min_protocol(), OLDEST_AGENT_PROTOCOL);
+    assert_eq!(Message::SetClock { unix_nanos: 0 }.min_protocol(), 12);
+}

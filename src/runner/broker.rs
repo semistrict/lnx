@@ -63,6 +63,8 @@ pub(crate) struct BrokerState {
     active: AtomicUsize,
     pending: AtomicUsize,
     seen_active: AtomicBool,
+    /// Set by `lnx start`: the VM counts as busy until it is stopped.
+    kept_running: AtomicBool,
     awake_until: Mutex<Option<Instant>>,
     /// Until the first channel opens (or this passes), the owner may not
     /// stop: the client that started it is still on its way. Status probes
@@ -93,6 +95,7 @@ impl BrokerState {
             active: AtomicUsize::new(0),
             pending: AtomicUsize::new(0),
             seen_active: AtomicBool::new(starts_idle),
+            kept_running: AtomicBool::new(false),
             awake_until: Mutex::new(None),
             first_client_deadline: Mutex::new(Some(Instant::now() + FIRST_CLIENT_GRACE)),
             auto_forward_ports: Mutex::new(HashSet::new()),
@@ -281,6 +284,12 @@ impl BrokerState {
         }
     }
 
+    /// Keeps the VM running until the owner is stopped.
+    pub(crate) fn keep_running(&self) {
+        self.seen_active.store(true, Ordering::SeqCst);
+        self.kept_running.store(true, Ordering::SeqCst);
+    }
+
     pub(crate) fn keep_awake_for(&self, duration: Duration) {
         if let Ok(mut awake_until) = self.awake_until.lock() {
             let until = Instant::now() + duration;
@@ -302,7 +311,9 @@ impl BrokerState {
             .and_then(|deadline| *deadline)
             .is_some_and(|deadline| Instant::now() < deadline);
         IdleStatus {
-            busy: self.active.load(Ordering::SeqCst) > 0 || lingering,
+            busy: self.active.load(Ordering::SeqCst) > 0
+                || lingering
+                || self.kept_running.load(Ordering::SeqCst),
             pending: self.pending.load(Ordering::SeqCst) > 0 || awaiting_first_client,
             seen_active: self.seen_active.load(Ordering::SeqCst),
         }
@@ -409,6 +420,21 @@ pub(crate) fn handle_broker_client(
             Err(error) => Message::Error {
                 channel_id,
                 message: format!("{error:#}"),
+            },
+        };
+        write_message(&mut client, &reply)?;
+        drop(pending);
+        return Ok(());
+    }
+    if let Message::KeepRunning { channel_id } = first {
+        let reply = match context.state.unless_stopping(|| context.state.keep_running())? {
+            Some(()) => {
+                run_log.line("broker.keep_running");
+                Message::KeepingRunning { channel_id }
+            }
+            None => Message::Error {
+                channel_id,
+                message: OWNER_STOPPING_NOT_STARTED.to_string(),
             },
         };
         write_message(&mut client, &reply)?;

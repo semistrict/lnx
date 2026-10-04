@@ -21,7 +21,8 @@ codesign --entitlements entitlements.plist --force -s - target/debug/lnx
 
 An instance resumes its saved memory only in the shape it was taken with
 (CPUs, memory, host shares, nested virtualization) and with a guest agent
-that speaks this lnx's protocol. The error says which of those differs.
+whose protocol this lnx still speaks (its own, or an older one it keeps
+supporting). The error says which of those differs.
 Dropping the saved memory keeps the disk; the next run boots from it:
 
 ```sh

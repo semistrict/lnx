@@ -162,6 +162,8 @@ enum Command {
     Snapshots(SnapshotsArgs),
     #[command(about = "Recover an instance whose VM stopped unexpectedly after running commands")]
     Recover(RecoverArgs),
+    #[command(about = "Start the instance's VM and keep it running until `lnx stop`")]
+    Start,
     #[command(about = "Stop the instance's VM, saving its memory and disk")]
     Stop,
     #[command(
@@ -542,6 +544,7 @@ impl Cli {
             workdir,
             timeout,
             detach,
+            keep_running: matches!(command, Some(Command::Start)),
         };
 
         if let Some(directory) = directory {
@@ -674,6 +677,28 @@ impl Cli {
             },
             Some(Command::Snapshots(args)) => run_snapshots_command(&layout, args),
             Some(Command::Recover(args)) => recover_instance(&layout, &args),
+            Some(Command::Start) => {
+                let instance = layout.instance.clone();
+                let status = run_guest(
+                    layout,
+                    vec!["true".to_string()],
+                    cpus,
+                    memory_mib,
+                    snapshot_path,
+                    nested_kvm,
+                    effective_no_host_shares,
+                    deterministic,
+                    trace_events,
+                    exec,
+                    forwards,
+                    vhost_user_fs,
+                    explicit_kernel,
+                )?;
+                if status == 0 {
+                    println!("{instance} is running until `lnx --instance {instance} stop`");
+                }
+                std::process::exit(status);
+            }
             Some(Command::Stop) => stop_instance(&layout),
             Some(Command::Restore(args)) => restore_checkpoint(&layout, &args.checkpoint),
             Some(Command::Fork(args)) => {
@@ -787,7 +812,7 @@ impl Cli {
                         explicit_kernel,
                     )
                 } else {
-                    run_guest(
+                    let status = run_guest(
                         layout,
                         guest_command,
                         cpus,
@@ -801,7 +826,8 @@ impl Cli {
                         forwards,
                         vhost_user_fs,
                         explicit_kernel,
-                    )
+                    )?;
+                    std::process::exit(status);
                 }
             }
         }
@@ -1550,7 +1576,7 @@ fn run_guest(
     forwards: Vec<runner::PortForward>,
     vhost_user_fs: Vec<runner::VhostUserFsMount>,
     explicit_kernel: bool,
-) -> Result<()> {
+) -> Result<i32> {
     if exec.detach && deterministic.is_some() {
         bail!("--detach cannot be combined with --deterministic");
     }
@@ -1575,7 +1601,7 @@ fn run_guest(
             explicit_kernel.then_some(layout.kernel.as_path()),
             layout.rootfs.as_deref(),
         )?;
-        return Ok(());
+        return Ok(0);
     }
     let cwd = std::env::current_dir().context("current directory")?;
 
@@ -1596,8 +1622,7 @@ fn run_guest(
         trace_events,
     };
 
-    let status = runner::run(config)?;
-    std::process::exit(status);
+    runner::run(config)
 }
 
 fn run_fs_unshare(layout: &Layout, args: FsUnshareArgs) -> Result<()> {

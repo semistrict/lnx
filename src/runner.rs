@@ -23,7 +23,7 @@ use std::os::unix::process::CommandExt;
 use crate::fsutil::remove_path_if_exists;
 use anyhow::{Context, Result, anyhow, bail};
 use libkrun::{Error as KrunError, Kernel, Network, VmBuilder, VmHandle};
-use lnx_protocol::{Message, PROTOCOL_VERSION};
+use lnx_protocol::{Message, PROTOCOL_VERSION, agent_protocol_supported};
 
 use crate::store::{self, GenerationId, Origin, Store};
 use crate::{
@@ -129,6 +129,9 @@ pub struct ExecOptions {
     /// Starts the command in its own session in the background, prints its
     /// pid and returns; its output goes to /tmp/lnx-detached-PID.log.
     pub detach: bool,
+    /// Asks the owner to keep the VM running until `lnx stop`, instead of
+    /// suspending it once nothing is using it.
+    pub keep_running: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1501,33 +1504,49 @@ fn run_existing_broker_client(
 /// they work without restarting the VM.
 fn add_forwards(socket: &Path, forwards: &[PortForward]) -> Result<()> {
     for forward in forwards {
-        let mut stream = connect_broker(socket)?;
-        let channel_id = new_request_id()?;
-        write_message(
-            &mut stream,
-            &Message::AddForward {
-                channel_id,
-                listen_host: forward.listen_host.clone(),
-                listen_port: forward.listen_port,
-                guest_host: forward.guest_host.clone(),
-                guest_port: forward.guest_port,
-            },
-        )?;
-        match read_message(&mut stream)? {
-            Message::ForwardAdded { channel_id: id } if id == channel_id => {}
-            Message::Error {
-                channel_id: id,
-                message,
-            } if id == channel_id => {
-                if message == OWNER_STOPPING_NOT_STARTED {
-                    return Err(CommandNotStarted.into());
-                }
-                bail!("forward {}: {message}", forward_spec(forward));
-            }
+        owner_request(socket, |channel_id| Message::AddForward {
+            channel_id,
+            listen_host: forward.listen_host.clone(),
+            listen_port: forward.listen_port,
+            guest_host: forward.guest_host.clone(),
+            guest_port: forward.guest_port,
+        })
+        .and_then(|reply| match reply {
+            Message::ForwardAdded { .. } => Ok(()),
             other => bail!("unexpected reply to a forward request: {other:?}"),
-        }
+        })
+        .with_context(|| format!("forward {}", forward_spec(forward)))?;
     }
     Ok(())
+}
+
+/// Asks the running owner to keep the VM running until `lnx stop`.
+fn request_keep_running(socket: &Path) -> Result<()> {
+    match owner_request(socket, |channel_id| Message::KeepRunning { channel_id })? {
+        Message::KeepingRunning { .. } => Ok(()),
+        other => bail!("unexpected reply to a keep-running request: {other:?}"),
+    }
+}
+
+/// Sends one request to the running owner on its own connection and returns
+/// the owner's reply to it. An owner that is already stopping did not act on
+/// it, which the caller may retry as a command that never started.
+fn owner_request(socket: &Path, request: impl FnOnce(u64) -> Message) -> Result<Message> {
+    let mut stream = connect_broker(socket)?;
+    let channel_id = new_request_id()?;
+    write_message(&mut stream, &request(channel_id))?;
+    match read_message(&mut stream)? {
+        Message::Error {
+            channel_id: id,
+            message,
+        } if id == channel_id => {
+            if message == OWNER_STOPPING_NOT_STARTED {
+                return Err(CommandNotStarted.into());
+            }
+            bail!("{message}");
+        }
+        reply => Ok(reply),
+    }
 }
 
 pub(crate) fn connect_broker(socket: &Path) -> Result<UnixStream> {
@@ -1582,6 +1601,9 @@ fn run_broker_session(mut stream: UnixStream, config: &RunConfig) -> Result<i32>
     } = config;
     let deterministic = config.deterministic.as_ref();
     INTERRUPT_SIGNAL.store(0, Ordering::SeqCst);
+    if exec.keep_running {
+        request_keep_running(&config.layout.socket(RuntimeSocket::Broker))?;
+    }
     // Validate the cwd resolves to a host home directory even when
     // no_host_shares is set, matching the eager-validation pattern used
     // elsewhere (e.g. snapshot_shares_incompatibility_for_import).
@@ -1626,10 +1648,7 @@ fn run_broker_session(mut stream: UnixStream, config: &RunConfig) -> Result<i32>
         (String::new(), String::new(), 1, 1)
     };
     let (uid, gid, group) = exec_identity(exec.run_as_root, deterministic);
-    let mut env = exec_env(deterministic);
-    env.push(("LNX_INSTANCE".to_string(), config.layout.instance.clone()));
-    env.push(("LNX_INGRESS_DOMAIN".to_string(), ingress_domain()));
-    env.extend(exec.env.iter().cloned());
+    let env = command_env(exec, deterministic, &config.layout.instance, ingress_domain());
     let channel_id = match deterministic {
         Some(config) => deterministic_exec_request_id(
             &config.seed,
@@ -1839,6 +1858,32 @@ fn exec_identity(
     )
 }
 
+/// The environment a guest command gets on top of the agent's defaults.
+/// The agent applies it in order, so later entries win: what lnx forwards,
+/// then root's identity for a root command, then the user's `--env`.
+fn command_env(
+    exec: &ExecOptions,
+    deterministic: Option<&DeterministicConfig>,
+    instance: &str,
+    ingress_domain: String,
+) -> Vec<(String, String)> {
+    let mut env = exec_env(deterministic);
+    env.push(("LNX_INSTANCE".to_string(), instance.to_string()));
+    env.push(("LNX_INGRESS_DOMAIN".to_string(), ingress_domain));
+    if exec.run_as_root {
+        // The agent gives every command the exec user's HOME, USER and
+        // LOGNAME. Setting root's here, rather than in the agent, also fixes
+        // agents already running in restored snapshots.
+        env.extend([
+            ("HOME".to_string(), "/root".to_string()),
+            ("USER".to_string(), "root".to_string()),
+            ("LOGNAME".to_string(), "root".to_string()),
+        ]);
+    }
+    env.extend(exec.env.iter().cloned());
+    env
+}
+
 fn exec_env(deterministic: Option<&DeterministicConfig>) -> Vec<(String, String)> {
     if deterministic.is_some() {
         return vec![
@@ -2045,8 +2090,8 @@ fn run_broker_owner(parts: OwnerParts) -> Result<thread::JoinHandle<Result<()>>>
     if let Some(unblocker) = restore_snapshot_unblocker {
         unblocker.stop(&run_log);
     }
-    let mut agent_stream = match accept_result {
-        Ok(stream) => stream,
+    let (mut agent_stream, agent_protocol) = match accept_result {
+        Ok(accepted) => accepted,
         Err(e) => {
             run_log.line(format!("agent.accept.error {e:#}"));
             log_console_tail(&run_log, &console_log);
@@ -2088,6 +2133,14 @@ fn run_broker_owner(parts: OwnerParts) -> Result<thread::JoinHandle<Result<()>>>
                         trace_blob("entropy", &entropy),
                     ],
                 );
+            }
+            // The guest's clock stopped when the snapshot was taken. The
+            // agent handles messages in order, so the clock is right by the
+            // time it acknowledges the restore. Deterministic runs keep
+            // their own virtual time.
+            let set_clock = Message::set_clock_now();
+            if deterministic.is_none() && agent_understands(&set_clock, agent_protocol) {
+                write_message(&mut agent_stream, &set_clock)?;
             }
             write_message(
                 &mut agent_stream,
@@ -2145,6 +2198,9 @@ fn run_broker_owner(parts: OwnerParts) -> Result<thread::JoinHandle<Result<()>>>
         .context("clone lnx-agent stream for writer")?;
     thread::spawn(move || {
         while let Ok(message) = agent_rx.recv() {
+            if !agent_understands(&message, agent_protocol) {
+                continue;
+            }
             let _activity = krun::deterministic_host_activity();
             if write_message(&mut agent_writer, &message).is_err() {
                 break;
@@ -2157,6 +2213,7 @@ fn run_broker_owner(parts: OwnerParts) -> Result<thread::JoinHandle<Result<()>>>
         session: Arc::clone(&session),
         initramfs_stamp: initramfs_stamp.clone(),
         deterministic_clock_state: deterministic_clock_state.clone(),
+        sets_wall_clock: deterministic.is_none(),
         agent_tx: agent_tx.clone(),
         timings: Arc::clone(&timings),
         run_log: Arc::clone(&run_log),
@@ -2901,13 +2958,22 @@ fn accept_unix(listener: &UnixListener, timeout: Duration) -> Result<UnixStream>
     accept_unix_with_progress(listener, timeout, None, None)
 }
 
+/// Whether the connected agent, which speaks `agent_protocol`, understands
+/// `message`. An agent restored from an older snapshot never gets messages
+/// added after its protocol.
+fn agent_understands(message: &Message, agent_protocol: u16) -> bool {
+    message.min_protocol() <= agent_protocol
+}
+
+/// Accepts the guest agent's connection and returns it with the protocol the
+/// agent speaks: this host's, or an older one a restored agent still runs.
 fn accept_agent_hello(
     listener: &UnixListener,
     timeout: Duration,
     timings: &TimingLog,
     run_log: &RunLog,
     vm_error_rx: &mpsc::Receiver<KrunError>,
-) -> Result<UnixStream> {
+) -> Result<(UnixStream, u16)> {
     let start = Instant::now();
     while start.elapsed() < timeout {
         let remaining = timeout.saturating_sub(start.elapsed());
@@ -2924,11 +2990,11 @@ fn accept_agent_hello(
             .set_read_timeout(Some(remaining.min(Duration::from_secs(2))))
             .context("set lnx-agent hello read timeout")?;
         match read_message(&mut stream) {
-            Ok(Message::Hello { version }) if version == PROTOCOL_VERSION => {
+            Ok(Message::Hello { version }) if agent_protocol_supported(version) => {
                 let _ = stream.set_read_timeout(None);
                 timings.event("agent.accepted");
-                run_log.line("agent.accepted");
-                return Ok(stream);
+                run_log.line(format!("agent.accepted protocol={version}"));
+                return Ok((stream, version));
             }
             Ok(other) => {
                 run_log.line(format!("agent.accept.bad_hello {other:?}"));
