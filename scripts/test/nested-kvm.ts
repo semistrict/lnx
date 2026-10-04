@@ -58,7 +58,9 @@ const rootfs =
 const outerRootfs = join(cwd, "outer-rootfs.ext4");
 const snapshotInnerRootfs = join(cwd, "snapshot-inner-rootfs.ext4");
 const outerRootfsBytes = Number(
-  Bun.env.LNX_NESTED_OUTER_ROOTFS_BYTES ?? 16 * 1024 * 1024 * 1024,
+  // Sparse on the host, so size is free; inside the outer guest clones are
+  // full copies, so the suite's instances need the room.
+  Bun.env.LNX_NESTED_OUTER_ROOTFS_BYTES ?? 64 * 1024 * 1024 * 1024,
 );
 const nestedCheckpointInstance = "lnx-checkpoint-nested";
 const nestedSnapshotInstance = "lnx-nested-snapshot";
@@ -966,7 +968,11 @@ try {
     }
   });
 
-  await testStep(
+  if (Bun.env.LNX_NESTED_SKIP_MACOS_LINUX === "1") {
+    process.stderr.write(
+      "test restore macOS snapshot inside nested Linux host ... SKIP (LNX_NESTED_SKIP_MACOS_LINUX=1)\n",
+    );
+  } else await testStep(
     "restore macOS snapshot inside nested Linux host",
     async () => {
       const fixtureSnapshot = Bun.env.LNX_MACOS_SNAPSHOT_FIXTURE;
@@ -1437,9 +1443,10 @@ print("mac-source-after", flush=True)
           const suiteDefaultImage = join(suiteBase, "instances", "default");
           const suiteKernel = join(suiteBase, "vmlinuz");
           const suiteRootfs = join(suiteDefaultImage, "rootfs.ext4");
-          const suiteLog = join(cwd, "nested-suite.log");
+          // On the outer's own disk: the guest may not write host paths
+          // outside its working directory.
+          const suiteLog = "/var/tmp/lnx-nested-suite.log";
           await rm(suiteBase, { recursive: true, force: true });
-          await rm(suiteLog, { force: true });
           await mkdir(suiteDefaultImage, { recursive: true });
           await run(["cp", kernel, suiteKernel], { timeoutMs: 180_000 });
           await cloneShrunkRootfs(rootfs, suiteRootfs);
@@ -1468,11 +1475,15 @@ print("mac-source-after", flush=True)
             "export CARGO_TARGET_DIR=/tmp/lnx-nested-kvm-cargo-target",
             // Inner VMs cannot map rootfs files shared over virtio-fs, so
             // the suite runs on a copy of its base on the outer's own disk.
-            "suite_base=/root/lnx-nested-suite-base",
+            "suite_base=/var/tmp/lnx-nested-suite-base",
             'rm -rf "$suite_base"',
             'mkdir -p "$suite_base"',
             `cp -a --sparse=always ${quoteShell(suiteBase)}/. "$suite_base"/`,
             'export LNX_BASE="$suite_base"',
+            // The outer's /tmp is a small tmpfs; tests copy whole snapshots.
+            'export TMPDIR=/var/tmp/lnx-nested-suite-tmp',
+            'rm -rf "$TMPDIR"',
+            'mkdir -p "$TMPDIR"',
             "export LNX_BROKER_IDLE_TTL_MS=250",
             "export LNX_SKIP_TEST_CLEANUP=1",
             `suite_log=${quoteShell(suiteLog)}`,

@@ -2448,6 +2448,11 @@ fn run_broker_client_awaiting_owner(
                 );
             } else {
                 run_log.line(format!("owner.exited.early status={status}"));
+                // An owner that refused to start (a snapshot it cannot
+                // resume, a crashed run) said why; that is the whole story.
+                if let Some(error) = owner_error(&layout.run_dir.join("owner.log")) {
+                    bail!("{error}");
+                }
                 bail!(
                     "{}{}{}",
                     early_exit_summary(&layout.console_log, status),
@@ -3420,6 +3425,18 @@ fn log_console_tail(run_log: &RunLog, path: &Path) {
             path.display()
         )),
     }
+}
+
+/// The error an owner process reported before exiting, from its log (which
+/// holds only the current attempt).
+fn owner_error(owner_log: &Path) -> Option<String> {
+    let log = fs::read_to_string(owner_log).ok()?;
+    let start = if log.starts_with("Error: ") {
+        0
+    } else {
+        log.rfind("\nError: ")? + 1
+    };
+    Some(log[start + "Error: ".len()..].trim_end().to_string())
 }
 
 /// What to call an owner that exited before its broker came up: a guest

@@ -68,7 +68,7 @@ pub(crate) fn migrate_legacy_layout(layout: &Layout, lock: &InstanceLock) -> Res
         Some(dir) => store.import_dir(lock, dir, None, Origin::Migrated)?,
         None => {
             let staging = store.stage(lock)?;
-            clone_or_copy_file(&canonical, &staging.dir.join(ROOTFS))?;
+            adopt_file(&canonical, &staging.dir.join(ROOTFS))?;
             let shares = layout.instance_dir.join(HOST_SHARE_STATE);
             if shares.exists() {
                 clone_or_copy_tree(&shares, &staging.dir.join(HOST_SHARE_STATE))?;
@@ -118,6 +118,18 @@ pub(crate) fn migrate_legacy_layout(layout: &Layout, lock: &InstanceLock) -> Res
     })
 }
 
+/// Gives the store a legacy file without copying it: a hard link when the
+/// filesystem allows (instant, and no extra space where clones are full
+/// copies), else a clone. The legacy name is removed once the migration
+/// commits, and nothing writes through it before, so the store's copy is
+/// never changed behind its back.
+fn adopt_file(legacy: &Path, dest: &Path) -> Result<()> {
+    match fs::hard_link(legacy, dest) {
+        Ok(()) => Ok(()),
+        Err(_) => clone_or_copy_file(legacy, dest),
+    }
+}
+
 /// The old `latest` snapshot, if complete. A crash between the two renames
 /// of the old publish protocol left only `.latest.previous`.
 fn legacy_latest(snapshots: &Path) -> Option<PathBuf> {
@@ -144,7 +156,7 @@ fn migrate_crashed_run(layout: &Layout, store: &Store, snapshots: &Path) -> Resu
     for entry in fs::read_dir(&work).with_context(|| format!("read {}", work.display()))? {
         let entry = entry?;
         if entry.file_type()?.is_file() {
-            clone_or_copy_file(&entry.path(), &dir.join(entry.file_name()))?;
+            adopt_file(&entry.path(), &dir.join(entry.file_name()))?;
         }
     }
     // The crashed VM wrote its share state in place, not into the work dir.

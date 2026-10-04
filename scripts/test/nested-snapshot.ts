@@ -87,7 +87,7 @@ try {
     }
     assertContains(
       failure.stderr,
-      "lnx VM owner exited with exit status: 86 before the broker came up",
+      "the saved memory snapshot could not be resumed",
       "restore refusal fails hard",
     );
     const log = await Bun.file(`${ctx.runDir}/lnx.log`).text();
@@ -118,7 +118,7 @@ try {
     }
     assertContains(
       drifted.stderr,
-      "snapshot launch metadata is incompatible (share_mismatch)",
+      "the saved memory snapshot cannot be resumed: its host shares differ (share_mismatch",
       "share root drift rejects the restore",
     );
   });

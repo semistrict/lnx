@@ -307,6 +307,25 @@ fn a_command_stopped_while_running_is_not_retried() {
 }
 
 #[test]
+fn an_owner_that_refused_to_start_is_reported_by_its_own_error() {
+    let temp = TempDir::new("owner-error");
+    let log = temp.path().join("owner.log");
+
+    fs::write(
+        &log,
+        "[krun] starting\nError: the saved memory snapshot cannot be resumed: its host shares differ\nrecovery: drop it\n",
+    )
+    .expect("write owner log");
+    assert_eq!(
+        owner_error(&log).as_deref(),
+        Some("the saved memory snapshot cannot be resumed: its host shares differ\nrecovery: drop it")
+    );
+
+    fs::write(&log, "[krun] vcpu exited\n").expect("write owner log");
+    assert_eq!(owner_error(&log), None);
+}
+
+#[test]
 fn an_owner_whose_guest_panicked_at_boot_is_reported_as_such() {
     use std::os::unix::process::ExitStatusExt;
     let temp = TempDir::new("early-exit-summary");
