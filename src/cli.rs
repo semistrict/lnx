@@ -471,7 +471,6 @@ impl Cli {
             trace_events,
         )?;
         validate_vhost_user_fs_mounts(&vhost_user_fs)?;
-        let effective_no_host_shares = no_host_shares || deterministic.is_some();
         maybe_auto_init_git_worktree(
             &instance,
             command.as_ref(),
@@ -503,16 +502,23 @@ impl Cli {
         if matches!(command, None | Some(Command::Run(_)) | Some(Command::Checkpoint(_))) {
             runner::ensure_store(&layout)?;
         }
+        // Saved memory can only resume in the shape it was taken with, so
+        // that shape wins over saved settings, which apply at cold boot. Only
+        // an explicit flag can ask for something else (and then fails with
+        // the remedy rather than silently dropping memory).
         let snapshot_shape = latest_snapshot_shape(&layout);
         let cpus = cpus
-            .or(persisted.cpus)
             .or(snapshot_shape.map(|shape| shape.cpus))
+            .or(persisted.cpus)
             .unwrap_or(DEFAULT_CPUS);
         let memory_mib = memory_mib
-            .or(persisted.memory_mib)
             .or(snapshot_shape.map(|shape| shape.memory_mib))
+            .or(persisted.memory_mib)
             .unwrap_or(DEFAULT_MEMORY_MIB);
         let nested_kvm = nested_kvm || snapshot_shape.is_some_and(|shape| shape.nested_kvm);
+        let effective_no_host_shares = no_host_shares
+            || deterministic.is_some()
+            || snapshot_shape.is_some_and(|shape| shape.no_host_shares);
         let cpus = effective_cpus(cpus, deterministic.as_ref());
         match command {
             Some(Command::Init(args)) => run_init_command(
@@ -882,7 +888,33 @@ fn set_instance_settings(layout: &Layout, settings: &[String]) -> Result<()> {
         Ok(config)
     })?;
     println!("{}", serde_json::to_string_pretty(&config)?);
+    if let Some(notice) =
+        settings_pending_notice(&layout.instance, &config, latest_snapshot_shape(layout))
+    {
+        eprintln!("{notice}");
+    }
     Ok(())
+}
+
+/// Saved settings take effect at an instance's next cold boot; while it has
+/// saved memory in another shape, it keeps resuming in that shape. Says so
+/// when that is the case.
+fn settings_pending_notice(
+    instance: &str,
+    config: &descriptor::InstanceDescriptor,
+    snapshot: Option<SnapshotShape>,
+) -> Option<String> {
+    let shape = snapshot?;
+    let differs = config.cpus.is_some_and(|cpus| cpus != shape.cpus)
+        || config
+            .memory_mib
+            .is_some_and(|memory_mib| memory_mib != shape.memory_mib);
+    differs.then(|| {
+        format!(
+            "lnx: {instance} resumes its saved memory with {} CPUs and {} MiB; the new settings apply at its next cold boot. `lnx --instance {instance} snapshots clear` drops the saved memory so the next run boots with them.",
+            shape.cpus, shape.memory_mib
+        )
+    })
 }
 
 fn should_init_local_fork(
@@ -1626,21 +1658,24 @@ struct SnapshotShape {
     cpus: u8,
     memory_mib: u32,
     nested_kvm: bool,
+    no_host_shares: bool,
 }
 
 /// Restoring a snapshot needs the shape it was taken with, so a command that
-/// asks for no particular CPUs, memory or nested virtualization (by flag or
-/// saved setting) resumes the instance however it was booted, instead of
-/// failing with a mismatch against the defaults.
+/// asks for no particular CPUs, memory, nested virtualization or host shares
+/// resumes the instance however it was booted, instead of failing with a
+/// mismatch against defaults or saved settings.
 fn latest_snapshot_shape(layout: &Layout) -> Option<SnapshotShape> {
     let latest = store::Store::new(&layout.instance_dir).latest().ok()??.dir;
     let config = runner::snapshot_vm_config(&latest).ok()??;
-    let nested_kvm = runner::read_launch_metadata(&latest)
-        .is_ok_and(|metadata| metadata.owner_args.iter().any(|arg| arg == "--nested-kvm"));
+    let metadata = runner::read_launch_metadata(&latest).ok();
     Some(SnapshotShape {
         cpus: u8::try_from(config.vcpu_count).ok()?,
         memory_mib: u32::try_from(config.memory_mib()).ok()?,
-        nested_kvm,
+        nested_kvm: metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.owner_args.iter().any(|arg| arg == "--nested-kvm")),
+        no_host_shares: metadata.is_some_and(|metadata| metadata.shares.no_host_shares),
     })
 }
 

@@ -56,6 +56,14 @@ try {
     assertEq(view.getUint32(32, true), 1, "snapshot header vcpus match persisted setting");
   });
 
+  await testStep("changed settings apply at the next cold boot instead of wedging", async () => {
+    const set = await lnxCommand(["set", "cpus=2"]);
+    assertContains(set.stderr, "resumes its saved memory with 1 CPUs and 2048 MiB", "set explains when settings apply");
+    assertEq((await ctx.vm.cli(["nproc"])).stdout, "1", "the instance resumes in its saved shape");
+    await waitForVmSuspend(ctx);
+    await lnxCommand(["set", "cpus=1"]);
+  });
+
   await testStep("explicit flags override persisted settings", async () => {
     const mismatch = await ctx.vm.cli(["--cpus", "2", "nproc"], { check: false });
     assertEq(mismatch.status === 0, false, "incompatible snapshot rejects restore");
@@ -89,7 +97,7 @@ try {
     const inspect = JSON.parse((await lnxCommand(["inspect"])).stdout);
     assertEq(inspect.name, ctx.instance, "inspect name");
     assertEq(inspect.state, "stopped", "inspect state");
-    assertEq(inspect.cpus, 1, "inspect effective cpus");
+    assertEq(inspect.cpus, 2, "inspect effective cpus come from the saved memory");
     assertEq(inspect.memory_mib, 2048, "inspect effective memory");
     assertEq(inspect.settings.cpus, 1, "inspect persisted cpus");
     assertEq(inspect.settings.memory_mib, 2048, "inspect persisted memory");

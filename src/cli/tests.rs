@@ -909,8 +909,47 @@ fn latest_snapshot_shape_reads_the_booted_vm_shape() {
             cpus: 8,
             memory_mib: 16384,
             nested_kvm: true,
+            no_host_shares: false,
         })
     );
+}
+
+const SAVED_SHAPE: SnapshotShape = SnapshotShape {
+    cpus: 2,
+    memory_mib: 4096,
+    nested_kvm: false,
+    no_host_shares: false,
+};
+
+#[test]
+fn changed_settings_on_an_instance_with_saved_memory_say_when_they_apply() {
+    let config = descriptor::InstanceDescriptor {
+        cpus: Some(4),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        settings_pending_notice("dev", &config, Some(SAVED_SHAPE)).as_deref(),
+        Some(
+            "lnx: dev resumes its saved memory with 2 CPUs and 4096 MiB; the new settings apply at its next cold boot. `lnx --instance dev snapshots clear` drops the saved memory so the next run boots with them."
+        )
+    );
+}
+
+#[test]
+fn settings_matching_the_saved_memory_or_without_it_need_no_notice() {
+    let matching = descriptor::InstanceDescriptor {
+        cpus: Some(2),
+        memory_mib: Some(4096),
+        ..Default::default()
+    };
+    let changed = descriptor::InstanceDescriptor {
+        memory_mib: Some(8192),
+        ..Default::default()
+    };
+
+    assert_eq!(settings_pending_notice("dev", &matching, Some(SAVED_SHAPE)), None);
+    assert_eq!(settings_pending_notice("dev", &changed, None), None);
 }
 
 #[test]

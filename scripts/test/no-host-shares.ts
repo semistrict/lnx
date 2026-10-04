@@ -7,6 +7,7 @@ import {
   defaultContext,
   prepareContext,
   testStep,
+  waitForVmSuspend,
 } from "./lib";
 
 const ctx = defaultContext("no-host-shares");
@@ -41,6 +42,11 @@ try {
     const launch = JSON.parse(await Bun.file(join(ctx.runDir, "launch.json")).text());
     assertEq(launch.shares.no_host_shares, true, "host shares disabled in launch metadata");
     assertEq("net" in launch.compatibility, false, "network is not a launch option");
+  });
+
+  await testStep("a plain run resumes it without host shares", async () => {
+    await waitForVmSuspend(ctx);
+    assertEq((await ctx.vm.cli(["pwd"])).stdout, "/", "resumed without host shares");
   });
 } finally {
   await cleanupContext(ctx);
