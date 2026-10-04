@@ -1179,7 +1179,7 @@ fn test_run_config(layout: &Layout, cwd: &Path) -> RunConfig {
         nested_kvm: false,
         restore_snapshot: None,
         forwards: Vec::new(),
-        run_as_root: false,
+        exec: ExecOptions::default(),
         no_host_shares: true,
         vhost_user_fs: Vec::new(),
         reuse_owner: true,
@@ -1391,17 +1391,10 @@ fn existing_broker_client_propagates_protocol_mismatch() {
         .expect("write stale hello");
     });
 
-    let err = run_existing_broker_client(
-        &socket,
-        &["true".to_string()],
-        Path::new("/"),
-        true,
-        true,
-        None,
-        "default",
-        None,
-    )
-    .expect_err("protocol mismatch should fail fast");
+    let temp = TempDir::new("broker-stale-hello");
+    let config = test_run_config(&temp_layout(&temp, "default"), Path::new("/"));
+    let err = run_existing_broker_client(&socket, &config, None)
+        .expect_err("protocol mismatch should fail fast");
     server.join().expect("broker thread");
     let _ = fs::remove_file(&socket);
 
@@ -1421,17 +1414,10 @@ fn existing_broker_client_treats_missing_hello_as_not_ready() {
         let (_stream, _) = listener.accept().expect("accept broker");
     });
 
-    let status = run_existing_broker_client(
-        &socket,
-        &["true".to_string()],
-        Path::new("/"),
-        true,
-        true,
-        None,
-        "default",
-        None,
-    )
-    .expect("missing hello is transient");
+    let temp = TempDir::new("broker-missing-hello");
+    let config = test_run_config(&temp_layout(&temp, "default"), Path::new("/"));
+    let status = run_existing_broker_client(&socket, &config, None)
+        .expect("missing hello is transient");
     server.join().expect("broker thread");
     let _ = fs::remove_file(&socket);
 

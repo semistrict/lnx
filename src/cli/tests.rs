@@ -36,6 +36,88 @@ fn version_flag_after_guest_command_is_forwarded_to_the_guest() {
 }
 
 #[test]
+fn a_misspelled_lnx_flag_is_an_error_not_a_guest_command() {
+    let error = Cli::try_parse_from(["lnx", "--memroy-mib", "8192", "true"])
+        .expect_err("unknown flag");
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+
+    let cli = Cli::try_parse_from(["lnx", "--", "--weird-binary"]).expect("parse");
+    assert_eq!(cli.guest_command, ["--weird-binary"]);
+}
+
+#[test]
+fn guest_command_flags_belong_to_the_guest() {
+    let cli = Cli::try_parse_from(["lnx", "ls", "-la", "--instance", "x"]).expect("parse");
+    assert_eq!(cli.guest_command, ["ls", "-la", "--instance", "x"]);
+    assert_eq!(cli.instance, "default");
+}
+
+#[test]
+fn lnx_options_work_after_run() {
+    let cli = Cli::try_parse_from(["lnx", "run", "--instance", "t1", "--root", "pwd"])
+        .expect("parse");
+    assert_eq!(cli.instance, "t1");
+    assert!(cli.root);
+    let Some(Command::Run(args)) = cli.command else {
+        panic!("expected run");
+    };
+    assert_eq!(args.command, ["pwd"]);
+}
+
+#[test]
+fn parses_exec_options() {
+    let cli = Cli::try_parse_from([
+        "lnx", "-e", "A=1", "--env", "B=x=y", "-w", "src", "--timeout", "90s", "-d", "make",
+    ])
+    .expect("parse");
+    assert_eq!(
+        cli.env,
+        [
+            ("A".to_string(), "1".to_string()),
+            ("B".to_string(), "x=y".to_string())
+        ]
+    );
+    assert_eq!(cli.workdir.as_deref(), Some("src"));
+    assert_eq!(cli.timeout, Some(Duration::from_secs(90)));
+    assert!(cli.detach);
+    assert_eq!(cli.guest_command, ["make"]);
+
+    assert!(Cli::try_parse_from(["lnx", "-e", "NOEQUALS", "true"]).is_err());
+}
+
+#[test]
+fn parses_durations() {
+    assert_eq!(parse_duration("30"), Ok(Duration::from_secs(30)));
+    assert_eq!(parse_duration("500ms"), Ok(Duration::from_millis(500)));
+    assert_eq!(parse_duration("1.5s"), Ok(Duration::from_millis(1500)));
+    assert_eq!(parse_duration("5m"), Ok(Duration::from_secs(300)));
+    assert_eq!(parse_duration("2h"), Ok(Duration::from_secs(7200)));
+    assert!(parse_duration("0").is_err());
+    assert!(parse_duration("5d").is_err());
+    assert!(parse_duration("soon").is_err());
+}
+
+#[test]
+fn exec_options_round_trip_through_flags() {
+    let exec = runner::ExecOptions {
+        run_as_root: true,
+        env: vec![("A".to_string(), "1".to_string())],
+        workdir: Some("/srv".to_string()),
+        timeout: Some(Duration::from_millis(1500)),
+        detach: false,
+    };
+    let mut argv = vec!["lnx".to_string()];
+    argv.extend(exec_option_args(&exec));
+    argv.push("true".to_string());
+
+    let cli = Cli::try_parse_from(argv).expect("parse");
+    assert!(cli.root);
+    assert_eq!(cli.env, exec.env);
+    assert_eq!(cli.workdir, exec.workdir);
+    assert_eq!(cli.timeout, exec.timeout);
+}
+
+#[test]
 fn parses_directory_before_guest_command() {
     let cli = Cli::try_parse_from(["lnx", "-C", "/tmp", "echo", "hi"]).expect("parse");
 
@@ -79,14 +161,11 @@ fn init_path_accepts_default_instance_seed() {
 
 #[test]
 fn package_store_flag_and_packages_subcommand_are_gone() {
-    // With the nix package store removed, both parse as plain guest commands.
-    let cli = Cli::try_parse_from(["lnx", "--package-store", "disabled", "run", "true"])
-        .expect("unknown flags fall through to the guest command");
-    assert!(cli.command.is_none());
-    assert_eq!(
-        cli.guest_command,
-        vec!["--package-store", "disabled", "run", "true"]
-    );
+    // With the nix package store removed, the flag is unknown and
+    // `packages` is a plain guest command.
+    let error = Cli::try_parse_from(["lnx", "--package-store", "disabled", "run", "true"])
+        .expect_err("unknown lnx flags are errors");
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
 
     let cli = Cli::try_parse_from(["lnx", "packages", "list"])
         .expect("`packages` is no longer a subcommand");
@@ -802,7 +881,10 @@ fn nested_deterministic_inner_args_preserve_requested_run() {
             seed: "seed42".to_string(),
         },
         true,
-        true,
+        &runner::ExecOptions {
+            run_as_root: true,
+            ..Default::default()
+        },
         &["bash".to_string(), "-lc".to_string(), "date".to_string()],
         Vec::new(),
     );
@@ -825,6 +907,7 @@ fn nested_deterministic_inner_args_preserve_requested_run() {
             "/Users/test/.lnx/instances/dev/memory-snapshots/latest",
             "--trace-events",
             "--root",
+            "--",
             "bash",
             "-lc",
             "date",
@@ -852,7 +935,7 @@ fn nested_deterministic_inner_args_preserve_checkpoint_subcommand() {
             seed: "default".to_string(),
         },
         false,
-        false,
+        &runner::ExecOptions::default(),
         &[],
         vec![
             "checkpoint".to_string(),

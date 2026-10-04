@@ -34,7 +34,7 @@ pub struct Cli {
     #[arg(short = 'C', value_name = "DIR", help = "Run as if started in DIR")]
     directory: Option<PathBuf>,
 
-    #[arg(long, env = "LNX_INSTANCE", default_value = "default")]
+    #[arg(long, env = "LNX_INSTANCE", default_value = "default", global = true)]
     instance: String,
 
     #[arg(long)]
@@ -81,9 +81,46 @@ pub struct Cli {
 
     #[arg(
         long,
+        global = true,
         help = "Run the guest command as root instead of the host-matching user"
     )]
     root: bool,
+
+    #[arg(
+        short = 'e',
+        long = "env",
+        value_name = "KEY=VALUE",
+        value_parser = parse_env_var,
+        global = true,
+        help = "Set an environment variable for the guest command"
+    )]
+    env: Vec<(String, String)>,
+
+    #[arg(
+        short = 'w',
+        long,
+        value_name = "DIR",
+        global = true,
+        help = "Guest working directory (default: the current directory)"
+    )]
+    workdir: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "DURATION",
+        value_parser = parse_duration,
+        global = true,
+        help = "Stop the guest command after DURATION (e.g. 30s, 5m); exits 124"
+    )]
+    timeout: Option<Duration>,
+
+    #[arg(
+        short = 'd',
+        long,
+        global = true,
+        help = "Start the guest command in the background and print its pid"
+    )]
+    detach: bool,
 
     #[arg(
         long = "forward",
@@ -103,7 +140,9 @@ pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    /// A first word starting with `-` is taken for a misspelled lnx option;
+    /// put `--` before a guest command that starts with one.
+    #[arg(trailing_var_arg = true)]
     guest_command: Vec<String>,
 }
 
@@ -195,7 +234,7 @@ struct InitArgs {
 
 #[derive(Debug, Args)]
 struct RunArgs {
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(trailing_var_arg = true)]
     command: Vec<String>,
 }
 
@@ -454,11 +493,27 @@ impl Cli {
             trace_events,
             no_host_shares,
             root,
+            env,
+            workdir,
+            timeout,
+            detach,
             forwards,
             vhost_user_fs,
             command,
             guest_command,
         } = self;
+        // `lnx run CMD` and `lnx CMD` are the same command.
+        let (command, guest_command) = match command {
+            Some(Command::Run(args)) => (None, args.command),
+            command => (command, guest_command),
+        };
+        let exec = runner::ExecOptions {
+            run_as_root: root,
+            env,
+            workdir,
+            timeout,
+            detach,
+        };
 
         if let Some(directory) = directory {
             std::env::set_current_dir(&directory)
@@ -535,41 +590,6 @@ impl Cli {
                 explicit_kernel,
                 explicit_rootfs,
             ),
-            Some(Command::Run(args)) => {
-                let macos_deterministic =
-                    deterministic.as_ref().filter(|_| cfg!(target_os = "macos"));
-                if let Some(det) = macos_deterministic {
-                    run_nested_deterministic_on_macos(
-                        &layout,
-                        cpus,
-                        memory_mib,
-                        snapshot_path.as_deref(),
-                        det,
-                        trace_events,
-                        root,
-                        &args.command,
-                        "run",
-                        Vec::new(),
-                        explicit_kernel,
-                    )
-                } else {
-                    run_guest(
-                        layout,
-                        args.command,
-                        cpus,
-                        memory_mib,
-                        snapshot_path,
-                        nested_kvm,
-                        effective_no_host_shares,
-                        deterministic.clone(),
-                        trace_events,
-                        root,
-                        forwards,
-                        vhost_user_fs.clone(),
-                        explicit_kernel,
-                    )
-                }
-            }
             Some(Command::Paths) => {
                 println!("kernel: {}", layout.kernel.display());
                 match init::instance_rootfs(&layout) {
@@ -603,7 +623,7 @@ impl Cli {
                         snapshot_path.as_deref(),
                         det,
                         trace_events,
-                        root,
+                        &exec,
                         &[],
                         "checkpoint",
                         subcommand,
@@ -638,7 +658,7 @@ impl Cli {
                         snapshot_path.as_deref(),
                         det,
                         trace_events,
-                        root,
+                        &exec,
                         &[],
                         "fork",
                         subcommand,
@@ -693,6 +713,7 @@ impl Cli {
             Some(Command::HiddenSparseCopy(args)) => {
                 crate::sparse_copy::clone_or_copy_file(&args.source, &args.dest)
             }
+            Some(Command::Run(_)) => unreachable!("run is handled as a guest command"),
             Some(Command::HiddenVmOwner(args)) => runner::run_owner(runner::RunConfig {
                 layout,
                 command: Vec::new(),
@@ -702,7 +723,7 @@ impl Cli {
                 nested_kvm,
                 restore_snapshot: args.restore,
                 forwards,
-                run_as_root: false,
+                exec: runner::ExecOptions::default(),
                 no_host_shares: effective_no_host_shares || args.no_host_shares,
                 vhost_user_fs: vhost_user_fs.clone(),
                 reuse_owner: true,
@@ -723,7 +744,7 @@ impl Cli {
                         snapshot_path.as_deref(),
                         det,
                         trace_events,
-                        root,
+                        &exec,
                         &guest_command,
                         "run",
                         Vec::new(),
@@ -740,7 +761,7 @@ impl Cli {
                         effective_no_host_shares,
                         deterministic,
                         trace_events,
-                        root,
+                        exec,
                         forwards,
                         vhost_user_fs,
                         explicit_kernel,
@@ -1449,11 +1470,14 @@ fn run_guest(
     no_host_shares: bool,
     deterministic: Option<runner::DeterministicConfig>,
     trace_events: bool,
-    run_as_root: bool,
+    exec: runner::ExecOptions,
     forwards: Vec<runner::PortForward>,
     vhost_user_fs: Vec<runner::VhostUserFsMount>,
     explicit_kernel: bool,
 ) -> Result<()> {
+    if exec.detach && deterministic.is_some() {
+        bail!("--detach cannot be combined with --deterministic");
+    }
     ensure_image_and_instance(&layout, explicit_kernel)?;
 
     // An empty command means "login shell"; the agent resolves which shell
@@ -1488,7 +1512,7 @@ fn run_guest(
         nested_kvm,
         restore_snapshot: snapshot_path,
         forwards,
-        run_as_root,
+        exec,
         no_host_shares,
         vhost_user_fs,
         reuse_owner: true,
@@ -1709,7 +1733,7 @@ fn run_nested_deterministic_on_macos(
     snapshot_path: Option<&Path>,
     deterministic: &runner::DeterministicConfig,
     trace_events: bool,
-    run_as_root: bool,
+    exec: &runner::ExecOptions,
     guest_command: &[String],
     command_label: &str,
     subcommand: Vec<String>,
@@ -1731,7 +1755,7 @@ fn run_nested_deterministic_on_macos(
         snapshot_path,
         deterministic,
         trace_events,
-        run_as_root,
+        exec,
         guest_command,
         subcommand,
     );
@@ -1753,7 +1777,7 @@ fn run_nested_deterministic_on_macos(
         nested_kvm: true,
         restore_snapshot: None,
         forwards: Vec::new(),
-        run_as_root: false,
+        exec: runner::ExecOptions::default(),
         no_host_shares: false,
         vhost_user_fs: Vec::new(),
         reuse_owner: true,
@@ -1776,7 +1800,7 @@ fn nested_deterministic_inner_args(
     snapshot_path: Option<&Path>,
     deterministic: &runner::DeterministicConfig,
     trace_events: bool,
-    run_as_root: bool,
+    exec: &runner::ExecOptions,
     guest_command: &[String],
     subcommand: Vec<String>,
 ) -> Vec<String> {
@@ -1800,12 +1824,70 @@ fn nested_deterministic_inner_args(
     if trace_events {
         args.push("--trace-events".to_string());
     }
-    if run_as_root {
+    args.extend(exec_option_args(exec));
+    args.extend(subcommand);
+    if !guest_command.is_empty() {
+        args.push("--".to_string());
+        args.extend(guest_command.iter().cloned());
+    }
+    args
+}
+
+/// The command-line flags that reproduce `exec` for another lnx process.
+fn exec_option_args(exec: &runner::ExecOptions) -> Vec<String> {
+    let mut args = Vec::new();
+    if exec.run_as_root {
         args.push("--root".to_string());
     }
-    args.extend(subcommand);
-    args.extend(guest_command.iter().cloned());
+    for (key, value) in &exec.env {
+        args.push("--env".to_string());
+        args.push(format!("{key}={value}"));
+    }
+    if let Some(workdir) = &exec.workdir {
+        args.push("--workdir".to_string());
+        args.push(workdir.clone());
+    }
+    if let Some(timeout) = exec.timeout {
+        args.push("--timeout".to_string());
+        args.push(format!("{}ms", timeout.as_millis()));
+    }
+    if exec.detach {
+        args.push("--detach".to_string());
+    }
     args
+}
+
+/// Parses `KEY=VALUE` for `--env`.
+fn parse_env_var(value: &str) -> Result<(String, String), String> {
+    match value.split_once('=') {
+        Some((key, value)) if !key.is_empty() && !key.contains('\0') && !value.contains('\0') => {
+            Ok((key.to_string(), value.to_string()))
+        }
+        _ => Err(format!("expected KEY=VALUE, got {value:?}")),
+    }
+}
+
+/// Parses a duration like `30`, `30s`, `500ms`, `5m` or `1h` (bare numbers
+/// are seconds).
+fn parse_duration(value: &str) -> Result<Duration, String> {
+    let split = value
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    let number: f64 = number
+        .parse()
+        .map_err(|_| format!("expected a duration like 30s or 5m, got {value:?}"))?;
+    let seconds = match unit {
+        "" | "s" => number,
+        "ms" => number / 1000.0,
+        "m" => number * 60.0,
+        "h" => number * 3600.0,
+        _ => return Err(format!("unknown duration unit {unit:?} in {value:?} (use ms, s, m or h)")),
+    };
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(format!("duration must be positive, got {value:?}"));
+    }
+    Ok(Duration::from_secs_f64(seconds))
 }
 
 fn nested_deterministic_script(

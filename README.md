@@ -82,6 +82,9 @@ lnx fork dev2                     # clone the instance, memory and disk
 lnx instances list
 lnx set cpus=4 memory-mib=8192    # applies at the instance's next cold boot
 lnx snapshots clear               # drop saved memory; the next run boots from disk
+lnx -e KEY=VALUE -w /srv make     # guest environment and working directory
+lnx --timeout 5m npm test         # stop the command (and its children) after 5m
+lnx -d python3 -m http.server     # run in the background; prints the guest pid
 ```
 
 `lnx` exits with the guest command's status; failures in `lnx` itself exit

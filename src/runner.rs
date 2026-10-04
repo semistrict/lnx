@@ -42,6 +42,8 @@ const FRAME_SNAPSHOT: u8 = b'K';
 // Owner exit status meaning "the VM failed to start with a restore
 // configured"; the client reports a hard restore failure.
 const EXIT_RESTORE_FAILED: i32 = 86;
+/// What `--timeout` exits with, as timeout(1) does.
+const EXIT_TIMED_OUT: i32 = 124;
 
 const DEFAULT_OWNER_IDLE_TTL: Duration = Duration::from_secs(5);
 // The detached owner counts idle time from broker start, so a TTL shorter than
@@ -101,12 +103,28 @@ pub struct RunConfig {
     pub nested_kvm: bool,
     pub restore_snapshot: Option<PathBuf>,
     pub forwards: Vec<PortForward>,
-    pub run_as_root: bool,
+    pub exec: ExecOptions,
     pub no_host_shares: bool,
     pub vhost_user_fs: Vec<VhostUserFsMount>,
     pub reuse_owner: bool,
     pub deterministic: Option<DeterministicConfig>,
     pub trace_events: bool,
+}
+
+/// Options for one guest command, as opposed to the VM's shape.
+#[derive(Debug, Clone, Default)]
+pub struct ExecOptions {
+    pub run_as_root: bool,
+    /// Environment set after what lnx forwards, so it wins.
+    pub env: Vec<(String, String)>,
+    /// The guest working directory, instead of the host's; a relative path
+    /// is relative to the host's.
+    pub workdir: Option<String>,
+    /// Ends the command, and everything it started, after this long.
+    pub timeout: Option<Duration>,
+    /// Starts the command in its own session in the background, prints its
+    /// pid and returns; its output goes to /tmp/lnx-detached-PID.log.
+    pub detach: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,16 +243,7 @@ pub fn run(config: RunConfig) -> Result<i32> {
             )?;
             validate_runtime_share_compatibility(&config)?;
         }
-        if let Some(status) = run_existing_broker_client(
-            &broker_socket,
-            &config.command,
-            &config.cwd,
-            config.run_as_root,
-            config.no_host_shares,
-            config.deterministic.as_ref(),
-            &config.layout.instance,
-            Some(&run_log),
-        )? {
+        if let Some(status) = run_existing_broker_client(&broker_socket, &config, Some(&run_log))? {
             run_log.line(format!("run.done run_id={run_id} status={status}"));
             return Ok(status);
         }
@@ -244,14 +253,8 @@ pub fn run(config: RunConfig) -> Result<i32> {
     }
     preflight_fresh_owner_network(&config, &run_log)?;
     let start_lock = match acquire_owner_start_or_run_client(
-        &config.layout,
         &broker_socket,
-        &config.command,
-        &config.cwd,
-        config.run_as_root,
-        config.no_host_shares,
-        config.deterministic.as_ref(),
-        &config.layout.instance,
+        &config,
         config.forwards.is_empty() && !no_daemon_reuse,
         &run_log,
     )? {
@@ -262,16 +265,8 @@ pub fn run(config: RunConfig) -> Result<i32> {
         }
     };
     let mut owner = spawn_owner_process(&config, &run_log, &run_id)?;
-    let status = match run_broker_client_awaiting_owner(
-        &broker_socket,
-        &config.command,
-        &config.cwd,
-        &mut owner,
-        &config,
-        &config.layout,
-        &run_log,
-        &run_id,
-    ) {
+    let status = match run_broker_client_awaiting_owner(&broker_socket, &mut owner, &config, &run_log)
+    {
         Ok(status) => status,
         Err(e) => {
             run_log.line(format!("client.error {e:#}"));
@@ -1371,19 +1366,13 @@ enum OwnerStartOutcome {
     Status(i32),
 }
 
-#[allow(clippy::too_many_arguments)]
 fn acquire_owner_start_or_run_client(
-    layout: &Layout,
     socket: &Path,
-    command: &[String],
-    cwd: &Path,
-    run_as_root: bool,
-    no_host_shares: bool,
-    deterministic: Option<&DeterministicConfig>,
-    instance: &str,
+    config: &RunConfig,
     allow_existing_broker: bool,
     run_log: &RunLog,
 ) -> Result<OwnerStartOutcome> {
+    let layout = &config.layout;
     let lock_path = owner_start_lock_path(layout);
     let start = Instant::now();
     let mut logged_wait = false;
@@ -1403,16 +1392,7 @@ fn acquire_owner_start_or_run_client(
             logged_wait = true;
         }
         if allow_existing_broker {
-            if let Some(status) = run_existing_broker_client(
-                socket,
-                command,
-                cwd,
-                run_as_root,
-                no_host_shares,
-                deterministic,
-                instance,
-                Some(run_log),
-            )? {
+            if let Some(status) = run_existing_broker_client(socket, config, Some(run_log))? {
                 return Ok(OwnerStartOutcome::Status(status));
             }
         }
@@ -1427,15 +1407,9 @@ fn acquire_owner_start_or_run_client(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_existing_broker_client(
     socket: &Path,
-    command: &[String],
-    cwd: &Path,
-    run_as_root: bool,
-    no_host_shares: bool,
-    deterministic: Option<&DeterministicConfig>,
-    instance: &str,
+    config: &RunConfig,
     run_log: Option<&RunLog>,
 ) -> Result<Option<i32>> {
     match connect_broker(socket) {
@@ -1446,16 +1420,7 @@ fn run_existing_broker_client(
                     socket.display()
                 ));
             }
-            run_broker_session(
-                stream,
-                command,
-                cwd,
-                run_as_root,
-                no_host_shares,
-                deterministic,
-                instance,
-            )
-            .map(Some)
+            run_broker_session(stream, config).map(Some)
         }
         Err(e) => {
             if e.downcast_ref::<BrokerProtocolMismatch>().is_some() {
@@ -1516,26 +1481,34 @@ pub(crate) fn connect_broker(socket: &Path) -> Result<UnixStream> {
     Ok(stream)
 }
 
-fn run_broker_session(
-    mut stream: UnixStream,
-    command: &[String],
-    cwd: &Path,
-    run_as_root: bool,
-    no_host_shares: bool,
-    deterministic: Option<&DeterministicConfig>,
-    instance: &str,
-) -> Result<i32> {
+fn run_broker_session(mut stream: UnixStream, config: &RunConfig) -> Result<i32> {
+    let RunConfig {
+        command,
+        cwd,
+        exec,
+        no_host_shares,
+        ..
+    } = config;
+    let deterministic = config.deterministic.as_ref();
     INTERRUPT_SIGNAL.store(0, Ordering::SeqCst);
     // Validate the cwd resolves to a host home directory even when
     // no_host_shares is set, matching the eager-validation pattern used
     // elsewhere (e.g. snapshot_shares_incompatibility_for_import).
     host_home_for_cwd(cwd)?;
-    let guest_cwd = if no_host_shares {
+    let default_cwd = if *no_host_shares {
         "/".to_string()
     } else {
         guest_cwd(cwd)
     };
-    let use_pty = if deterministic.is_some() {
+    let guest_cwd = exec_workdir(&default_cwd, exec.workdir.as_deref());
+    let detached;
+    let command = if exec.detach {
+        detached = detached_argv(command);
+        &detached
+    } else {
+        command
+    };
+    let use_pty = if deterministic.is_some() || exec.detach {
         false
     } else {
         should_request_pty()
@@ -1561,16 +1534,17 @@ fn run_broker_session(
     } else {
         (String::new(), String::new(), 1, 1)
     };
-    let (uid, gid, group) = exec_identity(run_as_root, deterministic);
+    let (uid, gid, group) = exec_identity(exec.run_as_root, deterministic);
     let mut env = exec_env(deterministic);
-    env.push(("LNX_INSTANCE".to_string(), instance.to_string()));
+    env.push(("LNX_INSTANCE".to_string(), config.layout.instance.clone()));
     env.push(("LNX_INGRESS_DOMAIN".to_string(), ingress_domain()));
+    env.extend(exec.env.iter().cloned());
     let channel_id = match deterministic {
         Some(config) => deterministic_exec_request_id(
             &config.seed,
             command,
             &guest_cwd,
-            run_as_root,
+            exec.run_as_root,
             use_pty,
             rows,
             cols,
@@ -1601,7 +1575,7 @@ fn run_broker_session(
     } else {
         spawn_stdin_pump(&stream, channel_id)?;
     }
-    let status = relay_channel_output(&mut stream, channel_id);
+    let status = relay_channel_output(&mut stream, channel_id, exec.timeout);
     drop(raw_mode);
     status
 }
@@ -1650,13 +1624,29 @@ fn spawn_stdin_pump(stream: &UnixStream, channel_id: u64) -> Result<()> {
 }
 
 /// Copies the guest command's output to stdout and stderr until it exits.
-/// A client stopped by a signal closes the channel, which ends the command.
-fn relay_channel_output(stream: &mut UnixStream, channel_id: u64) -> Result<i32> {
+/// A client stopped by a signal, or a command that runs past `timeout`,
+/// closes the channel, which ends the command.
+fn relay_channel_output(
+    stream: &mut UnixStream,
+    channel_id: u64,
+    timeout: Option<Duration>,
+) -> Result<i32> {
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
     loop {
-        let Some(message) = read_message_interruptible(stream)? else {
-            let _ = write_message(stream, &Message::Eof { channel_id });
-            let _ = write_message(stream, &Message::Close { channel_id });
-            return Ok(interrupted_status());
+        let message = match read_message_interruptible(stream, deadline)? {
+            Interruptible::Message(message) => message,
+            stopped => {
+                let _ = write_message(stream, &Message::Eof { channel_id });
+                let _ = write_message(stream, &Message::Close { channel_id });
+                if matches!(stopped, Interruptible::DeadlinePassed) {
+                    eprintln!(
+                        "lnx: the command ran longer than {} and was stopped",
+                        humantime_seconds(timeout.unwrap_or_default())
+                    );
+                    return Ok(EXIT_TIMED_OUT);
+                }
+                return Ok(interrupted_status());
+            }
         };
         match message {
             Message::Data {
@@ -2338,17 +2328,13 @@ pub(crate) fn vhost_user_fs_arg(mount: &VhostUserFsMount) -> String {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_broker_client_awaiting_owner(
     socket: &Path,
-    command: &[String],
-    cwd: &Path,
     owner: &mut Child,
     config: &RunConfig,
-    layout: &Layout,
     run_log: &RunLog,
-    _run_id: &str,
 ) -> Result<i32> {
+    let layout = &config.layout;
     let deadline = Instant::now() + OWNER_BOOT_TIMEOUT;
     let mut last = None;
     while Instant::now() < deadline {
@@ -2357,15 +2343,7 @@ fn run_broker_client_awaiting_owner(
         }
         match connect_broker(socket) {
             Ok(stream) => {
-                return run_broker_session(
-                    stream,
-                    command,
-                    cwd,
-                    config.run_as_root,
-                    config.no_host_shares,
-                    config.deterministic.as_ref(),
-                    &layout.instance,
-                );
+                return run_broker_session(stream, config);
             }
             Err(e) => {
                 if e.downcast_ref::<BrokerProtocolMismatch>().is_some() {
@@ -3008,6 +2986,37 @@ fn host_home_for_cwd(cwd: &Path) -> Result<PathBuf> {
         }
     }
     dirs::home_dir().context("host home directory")
+}
+
+/// Runs `command` detached: in its own session, with no input, writing its
+/// output to /tmp/lnx-detached-PID.log, and prints its pid. (`setsid` runs
+/// in place here, since a background job of a non-interactive shell is not a
+/// process group leader, so `$!` is the command's own pid.)
+fn detached_argv(command: &[String]) -> Vec<String> {
+    let mut argv = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        r#"setsid /bin/sh -c 'exec "$@" >"/tmp/lnx-detached-$$.log" 2>&1' lnx-detached "$@" </dev/null & echo $!"#
+            .to_string(),
+        "lnx-detach".to_string(),
+    ];
+    argv.extend(command.iter().cloned());
+    argv
+}
+
+/// The guest working directory for `--workdir`, relative to `default_cwd`.
+fn exec_workdir(default_cwd: &str, workdir: Option<&str>) -> String {
+    match workdir {
+        Some(workdir) => Path::new(default_cwd)
+            .join(workdir)
+            .to_string_lossy()
+            .into_owned(),
+        None => default_cwd.to_string(),
+    }
+}
+
+fn humantime_seconds(duration: Duration) -> String {
+    format!("{}s", duration.as_secs_f64())
 }
 
 fn guest_cwd(cwd: &Path) -> String {

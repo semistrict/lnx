@@ -1900,28 +1900,19 @@ fn set_default_exec_environment() {
     set_env("BROWSER", DEFAULT_BROWSER);
 }
 
+/// Applies the environment the host sent for this command. The host chooses
+/// what to forward (its own allowlist, plus what the user set with
+/// `lnx --env`); later entries win.
 fn set_forwarded_environment(env: &[(String, String)]) {
     for (name, value) in env {
-        if allowed_forwarded_env(name) {
+        if is_env_name(name) {
             set_env(name, value);
         }
     }
 }
 
-fn allowed_forwarded_env(name: &str) -> bool {
-    matches!(
-        name,
-        "TERM"
-            | "COLORTERM"
-            | "LANG"
-            | "LANGUAGE"
-            | "TZ"
-            | "NO_COLOR"
-            | "CLICOLOR"
-            | "CLICOLOR_FORCE"
-            | "LNX_INSTANCE"
-            | "LNX_INGRESS_DOMAIN"
-    ) || name.starts_with("LC_")
+fn is_env_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('=') && !name.contains('\0')
 }
 
 fn set_env(name: &str, value: &str) {
@@ -2034,9 +2025,18 @@ struct ChildExec {
     exec_paths: Vec<CString>,
 }
 
+/// Sets `name` in an execve environment, replacing an earlier value.
 fn push_env(storage: &mut Vec<CString>, name: &str, value: &str) {
-    if let Ok(entry) = CString::new(format!("{name}={value}")) {
-        storage.push(entry);
+    let Ok(entry) = CString::new(format!("{name}={value}")) else {
+        return;
+    };
+    let prefix = format!("{name}=");
+    match storage
+        .iter_mut()
+        .find(|existing| existing.as_bytes().starts_with(prefix.as_bytes()))
+    {
+        Some(existing) => *existing = entry,
+        None => storage.push(entry),
     }
 }
 
@@ -2083,7 +2083,7 @@ fn make_child_exec(
     );
     push_env(&mut env_storage, CONTROL_SOCKET_ENV, control_socket);
     for (name, value) in env {
-        if allowed_forwarded_env(name) {
+        if is_env_name(name) {
             push_env(&mut env_storage, name, value);
         }
     }
@@ -3037,6 +3037,33 @@ mod tests {
             .expect("BROWSER is set");
 
         assert_eq!(browser, DEFAULT_BROWSER);
+    }
+
+    #[test]
+    fn child_exec_environment_takes_what_the_host_sent_and_lets_it_win() {
+        let child = make_child_exec(
+            &["env".to_string()],
+            "/tmp",
+            &[
+                ("PATH".to_string(), "/custom/bin".to_string()),
+                ("MY_SETTING".to_string(), "on".to_string()),
+                ("BAD=NAME".to_string(), "ignored".to_string()),
+            ],
+            0x1234,
+            "/run/lnx-agent.sock",
+        );
+        let env: Vec<_> = child
+            .env_storage
+            .iter()
+            .map(|entry| entry.to_str().expect("env entry is utf-8"))
+            .collect();
+
+        assert_eq!(
+            env.iter().filter(|entry| entry.starts_with("PATH=")).collect::<Vec<_>>(),
+            [&"PATH=/custom/bin"]
+        );
+        assert!(env.contains(&"MY_SETTING=on"));
+        assert!(!env.iter().any(|entry| entry.starts_with("BAD")));
     }
 
     #[test]

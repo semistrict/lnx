@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 pub(crate) use lnx_protocol::MAX_MESSAGE_SIZE;
@@ -32,43 +33,64 @@ pub(crate) fn read_message(stream: &mut UnixStream) -> Result<Message> {
     postcard::from_bytes(&bytes).context("decode protocol message")
 }
 
-pub(crate) fn read_message_interruptible(stream: &mut UnixStream) -> Result<Option<Message>> {
-    stream
-        .set_read_timeout(Some(INTERRUPT_POLL_TIMEOUT))
-        .context("set interruptible read timeout")?;
+/// What waiting for a message ended with.
+pub(crate) enum Interruptible {
+    Message(Message),
+    /// The client was asked to stop by a signal.
+    Interrupted,
+    DeadlinePassed,
+}
+
+/// Reads a message, giving up when the client is interrupted or `deadline`
+/// passes. It waits for the stream to become readable and then reads a
+/// whole frame, so giving up can never split a frame.
+pub(crate) fn read_message_interruptible(
+    stream: &mut UnixStream,
+    deadline: Option<Instant>,
+) -> Result<Interruptible> {
     loop {
         if client_interrupted() {
-            let _ = stream.set_read_timeout(None);
-            return Ok(None);
+            return Ok(Interruptible::Interrupted);
         }
-        match read_message(stream) {
-            Ok(message) => {
-                let _ = stream.set_read_timeout(None);
-                return Ok(Some(message));
-            }
-            Err(e) if is_timeout_error(&e) => {}
-            Err(e) => {
-                let _ = stream.set_read_timeout(None);
-                return Err(e);
-            }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(Interruptible::DeadlinePassed);
+        }
+        if wait_readable(stream, INTERRUPT_POLL_TIMEOUT)? {
+            return read_message(stream).map(Interruptible::Message);
         }
     }
 }
 
-pub(crate) fn is_timeout_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .map(|io| {
-                matches!(
-                    io.kind(),
-                    std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::Interrupted
-                )
-            })
-            .unwrap_or(false)
-    })
+/// Reads a message if one starts arriving within `timeout`. Like
+/// [`read_message_interruptible`], it never gives up partway through a frame.
+pub(crate) fn read_message_within(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<Option<Message>> {
+    if !wait_readable(stream, timeout)? {
+        return Ok(None);
+    }
+    read_message(stream).map(Some)
+}
+
+/// Whether `stream` has data (or its end, or an error) to read within
+/// `timeout`. A signal cuts the wait short.
+fn wait_readable(stream: &UnixStream, timeout: Duration) -> Result<bool> {
+    let mut poll = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+    let ready = unsafe { libc::poll(&mut poll, 1, timeout_ms) };
+    if ready < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(error).context("wait for the broker stream");
+    }
+    Ok(ready > 0)
 }
 
 pub(crate) fn read_u32(stream: &mut UnixStream) -> Result<u32> {

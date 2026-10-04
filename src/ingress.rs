@@ -1496,9 +1496,6 @@ fn proxy_tls_to_guest(
     stream
         .set_nonblocking(true)
         .context("set tls stream nonblocking")?;
-    broker
-        .set_read_timeout(Some(Duration::from_millis(10)))
-        .context("set ingress broker timeout")?;
 
     let mut sent_client_eof = false;
     let mut buf = [0u8; 8192];
@@ -1530,24 +1527,22 @@ fn proxy_tls_to_guest(
             Err(e) => return Err(e).context("read tls"),
         }
 
-        match runner::read_message(&mut broker) {
-            Ok(Message::Data {
+        match runner::read_message_within(&mut broker, Duration::from_millis(10))? {
+            Some(Message::Data {
                 channel_id: id,
                 bytes,
             }) if id == channel_id => {
                 conn.writer().write_all(&bytes)?;
             }
-            Ok(Message::Eof { channel_id: id }) if id == channel_id => {
+            Some(Message::Eof { channel_id: id }) if id == channel_id => {
                 conn.send_close_notify();
             }
-            Ok(Message::Close { channel_id: id }) if id == channel_id => return Ok(()),
-            Ok(Message::Error {
+            Some(Message::Close { channel_id: id }) if id == channel_id => return Ok(()),
+            Some(Message::Error {
                 channel_id: id,
                 message,
             }) if id == channel_id => bail!("{message}"),
-            Ok(_) => {}
-            Err(e) if runner::is_timeout_error(&e) => {}
-            Err(e) => return Err(e),
+            Some(_) | None => {}
         }
 
         flush_tls_nonblocking(&mut conn, &mut stream)?;

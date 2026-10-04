@@ -24,6 +24,11 @@ export interface LnxProviderConfig {
   timeout?: number;
   /** Prefix used for auto-generated sandbox names. Default: "csdk-". */
   namePrefix?: string;
+  /**
+   * Mount the host home and working directories into sandboxes. Default:
+   * false, so a sandbox cannot read host files such as ~/.ssh.
+   */
+  hostShares?: boolean;
 }
 
 export interface LnxSandboxHandle {
@@ -58,19 +63,23 @@ function clientFor(config: LnxProviderConfig): LnxClient {
   return createLnxClient({ binary: resolveBinary(config) });
 }
 
+function instanceFor(client: LnxClient, config: LnxProviderConfig, name: string): LnxInstance {
+  return client.instance(name, { noHostShares: !config.hostShares });
+}
+
 function toHandle(
   client: LnxClient,
+  config: LnxProviderConfig,
   name: string,
-  timeout: number,
   envs: Record<string, string> = {},
   createdAt?: Date,
 ): LnxSandboxHandle {
   return {
     name,
-    instance: client.instance(name),
+    instance: instanceFor(client, config, name),
     envs,
     createdAt,
-    timeout,
+    timeout: resolveTimeout(config),
     client,
   };
 }
@@ -202,7 +211,7 @@ export const lnx = defineProvider<LnxSandboxHandle, LnxProviderConfig>({
           throw new Error(`invalid lnx sandbox name: ${name}`);
         }
         const timeout = options?.timeout ?? resolveTimeout(config);
-        const instance = client.instance(name);
+        const instance = instanceFor(client, config, name);
         // Boots the VM; the first-ever run may download the kernel/rootfs images.
         await instance.run(["/bin/true"]);
         const sandbox: LnxSandboxHandle = {
@@ -221,7 +230,7 @@ export const lnx = defineProvider<LnxSandboxHandle, LnxProviderConfig>({
         if (!rows.some((row) => row.name === sandboxId)) {
           return null;
         }
-        const instance = client.instance(sandboxId);
+        const instance = instanceFor(client, config, sandboxId);
         const inspect = await instance.inspect();
         const sandbox: LnxSandboxHandle = {
           name: sandboxId,
@@ -242,7 +251,7 @@ export const lnx = defineProvider<LnxSandboxHandle, LnxProviderConfig>({
         return rows
           .filter((row) => row.state !== "partial")
           .map((row) => ({
-            sandbox: toHandle(client, row.name, resolveTimeout(config)),
+            sandbox: toHandle(client, config, row.name),
             sandboxId: row.name,
           }));
       },
@@ -260,25 +269,12 @@ export const lnx = defineProvider<LnxSandboxHandle, LnxProviderConfig>({
       },
 
       async runCommand(sandbox, command, options) {
-        const merged = { ...sandbox.envs, ...options?.env };
-        const effectiveCommand = options?.background
-          ? `nohup ${command} >/dev/null 2>&1 &`
-          : command;
-        const argv =
-          Object.keys(merged).length > 0
-            ? [
-                "/usr/bin/env",
-                ...Object.entries(merged).map(([key, value]) => `${key}=${value}`),
-                "/bin/sh",
-                "-c",
-                effectiveCommand,
-              ]
-            : ["/bin/sh", "-c", effectiveCommand];
-
         const start = Date.now();
-        const result = await sandbox.instance.run(argv, {
+        const result = await sandbox.instance.run(["/bin/sh", "-c", command], {
           check: false,
-          cwd: options?.cwd,
+          guestEnv: { ...sandbox.envs, ...options?.env },
+          workdir: options?.cwd,
+          detach: options?.background,
           timeoutMs: options?.timeout,
         });
         const durationMs = Date.now() - start;

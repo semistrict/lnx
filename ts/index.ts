@@ -44,6 +44,12 @@ export type RunOptions = Omit<CommandOptions, "cwd"> & {
   traceEvents?: boolean;
   noHostShares?: boolean;
   root?: boolean;
+  /** Environment for the guest command (`env` is the lnx process's own). */
+  guestEnv?: Record<string, string>;
+  /** Guest working directory, relative to the current one. */
+  workdir?: string;
+  /** Start the command in the background; stdout is its guest pid. */
+  detach?: boolean;
   forwards?: Array<PortForward | string>;
   vhostUserFs?: Array<ReadonlyVhostUserFsMount | string>;
 };
@@ -310,7 +316,7 @@ class BinaryLnxInstance implements LnxInstance {
 
   run(argv: string[], options: RunOptions = {}): Promise<CommandResult> {
     const merged = { ...this.defaults, ...options };
-    return this.cli([...runOptionArgs(merged), ...argv], {
+    return this.cli([...runOptionArgs(merged), "--", ...argv], {
       ...merged,
       cwd: merged.processCwd ?? merged.cwd,
     });
@@ -318,7 +324,7 @@ class BinaryLnxInstance implements LnxInstance {
 
   spawn(argv: string[], options: SpawnOptions = {}): LnxProcess {
     const merged = { ...this.defaults, ...options };
-    return this.spawnCli([...runOptionArgs(merged), ...argv], {
+    return this.spawnCli([...runOptionArgs(merged), "--", ...argv], {
       cwd: merged.processCwd ?? merged.cwd,
       env: merged.env,
       timeoutMs: merged.timeoutMs,
@@ -466,6 +472,9 @@ function runOptionArgs(options: RunOptions): string[] {
   if (options.traceEvents) args.push("--trace-events");
   if (options.noHostShares) args.push("--no-host-shares");
   if (options.root) args.push("--root");
+  for (const [key, value] of Object.entries(options.guestEnv ?? {})) args.push("--env", `${key}=${value}`);
+  if (options.workdir) args.push("--workdir", options.workdir);
+  if (options.detach) args.push("--detach");
   for (const forward of options.forwards ?? []) args.push("--forward", formatForward(forward));
   for (const mount of options.vhostUserFs ?? []) args.push("--vhost-user-fs", formatVhostUserFs(mount));
   return args;

@@ -102,6 +102,27 @@ try {
     assertEq(existsSync(join(ctx.base, "instances", `${ghost}-copy`)), false, "fork created no copy");
   });
 
+  await testStep("exec options", async () => {
+    const env = await ctx.vm.cli(["-e", "LNX_TEST_A=one", "--env", "LNX_TEST_B=two=2", "sh", "-c", "echo $LNX_TEST_A/$LNX_TEST_B"]);
+    assertEq(env.stdout, "one/two=2", "--env reaches the guest command");
+    assertEq((await ctx.vm.cli(["-w", "/etc", "pwd"])).stdout, "/etc", "--workdir sets the guest directory");
+    assertEq((await ctx.vm.cli(["run", "--workdir", "/usr", "pwd"])).stdout, "/usr", "options work after run");
+
+    const timedOut = await ctx.vm.cli(["--timeout", "1s", "sh", "-c", "echo started; sleep 7781"], { check: false });
+    assertEq(timedOut.status, 124, "--timeout exit status");
+    assertEq(timedOut.stdout, "started", "--timeout keeps earlier output");
+    assertContains(timedOut.stderr, "ran longer than 1s", "--timeout message");
+    const probe = "for i in $(seq 100); do pgrep -f '[s]leep 7781' >/dev/null || { echo gone; exit 0; }; sleep 0.1; done; echo alive";
+    assertEq((await ctx.vm.cli(["bash", "-c", probe])).stdout, "gone", "--timeout ends the command");
+
+    const detached = await ctx.vm.cli(["-d", "sh", "-c", "echo detached-output; sleep 7782"]);
+    const pid = Number(detached.stdout);
+    assertEq(Number.isInteger(pid) && pid > 1, true, `--detach prints a pid, got <${detached.stdout}>`);
+    assertEq((await ctx.vm.cli(["sh", "-c", `kill -0 ${pid} && echo running`])).stdout, "running", "detached command keeps running");
+    assertEq((await ctx.vm.cli(["cat", `/tmp/lnx-detached-${pid}.log`])).stdout, "detached-output", "detached output is logged");
+    await ctx.vm.cli(["kill", String(pid)]);
+  });
+
   await testStep("guest shape", async () => {
     assertEq((await ctx.vm.cli(["id", "-un"])).stdout, "lnxuser", "exec runs as lnxuser");
     assertEq((await ctx.vm.cli(["bash", "-lc", 'printf "%s:%s:%s" "$USER" "$LOGNAME" "$HOME"'])).stdout, "lnxuser:lnxuser:/home/lnxuser", "exec user environment");
