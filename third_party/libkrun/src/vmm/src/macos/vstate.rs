@@ -53,6 +53,8 @@ pub enum Error {
     VcpuRun,
     /// Cannot spawn a new vCPU thread.
     VcpuSpawn(io::Error),
+    /// The vCPU thread has exited and no longer accepts events.
+    VcpuThreadGone,
     /// Cannot cleanly initialize vcpu TLS.
     VcpuTlsInit,
     /// Vcpu not present in TLS.
@@ -83,6 +85,7 @@ impl Display for Error {
                 "Error configuring the general purpose aarch64 registers: {e:?}"
             ),
             VcpuSpawn(e) => write!(f, "Cannot spawn a new vCPU thread: {e}"),
+            VcpuThreadGone => write!(f, "vCPU thread has exited"),
             VcpuTlsInit => write!(f, "Cannot clean init vcpu TLS"),
             VcpuTlsNotPresent => write!(f, "Vcpu not present in TLS"),
             VcpuUnhandledKvmExit => write!(f, "Unexpected KVM_RUN exit reason"),
@@ -837,10 +840,11 @@ impl VcpuHandle {
     /// guest runs or while idle; callers kick a running vCPU out of the guest.
     pub fn send_event(&self, event: VcpuEvent) -> Result<VcpuTicket> {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        // Use expect() to crash if the other thread closed this channel.
+        // The guest can shut down at any time, e.g. while a snapshot is
+        // pausing or resuming it, so a gone vCPU is an error, not a bug.
         self.event_sender
             .send(VcpuRequest { seq, event })
-            .expect("event sender channel closed on vcpu end.");
+            .map_err(|_| Error::VcpuThreadGone)?;
         Ok(VcpuTicket(seq))
     }
 
@@ -1825,6 +1829,17 @@ mod tests {
         vcpu.reports.send(VcpuReport::Exited(4)).unwrap();
 
         assert_eq!(vcpu.handle.exit_code(), Some(4));
+    }
+
+    #[test]
+    fn send_event_to_exited_vcpu_is_an_error() {
+        let vcpu = FakeVcpu::new();
+        drop(vcpu.requests);
+
+        assert!(matches!(
+            vcpu.handle.send_event(VcpuEvent::Resume),
+            Err(Error::VcpuThreadGone)
+        ));
     }
 
     #[test]

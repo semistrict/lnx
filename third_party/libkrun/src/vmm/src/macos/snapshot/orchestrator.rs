@@ -807,10 +807,7 @@ fn send_to_all_vcpus(
     handles
         .iter()
         .enumerate()
-        .map(|(i, h)| {
-            h.send_event(event())
-                .map_err(|e| vcpu_error(i, "send", format!("{e:?}")))
-        })
+        .map(|(i, h)| h.send_event(event()).map_err(|e| vcpu_error(i, "send", e)))
         .collect()
 }
 
@@ -823,7 +820,7 @@ fn vcpu_call(
 ) -> Result<VcpuResponse> {
     let ticket = handle
         .send_event(event)
-        .map_err(|e| vcpu_error(index, what, format!("send: {e:?}")))?;
+        .map_err(|e| vcpu_error(index, what, format!("send: {e}")))?;
     vcpu_reply(handle, index, ticket, what)
 }
 
