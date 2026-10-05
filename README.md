@@ -27,6 +27,13 @@ every copy wakes up with the original's processes still running. Prepare one
 instance — repo checked out, dependencies installed, server running — then
 stamp out copies of it, one per experiment, test shard, or coding agent.
 
+Here an agent drives Chromium inside a VM with
+[cua-driver](https://github.com/trycua/cua). `lnx fork` copies the running VM
+in 0.6 s, and the agent keeps working in both copies: same browser, same page,
+same driver session ([scripts/demo/cua-fork](scripts/demo/cua-fork)).
+
+https://github.com/user-attachments/assets/f2f82cac-2871-429f-9222-e3521eea9ca9
+
 ## What you get
 
 - **A real Linux machine, not a container.** Ubuntu userland with systemd,
