@@ -32,3 +32,6 @@
 # Server web UI
 /server-ui/dist/
 /server-ui/node_modules/
+
+# Release builds (scripts/build-distribution.sh)
+/dist/
