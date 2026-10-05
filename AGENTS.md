@@ -22,9 +22,9 @@ code paths. If a direct Cargo command is unavoidable for a narrow check, do not
 treat its output as an installable or runnable VM binary until it has gone
 through the repo signing step.
 
-Releases are Developer ID signed and notarized by `scripts/build-distribution.sh`
-(`bun run dist`), which the tag workflow runs; see
-`docs/release-automation.md`. The image assets lnx downloads are pinned by
+Releases are made locally: `scripts/release.sh X.Y.Z` builds a Developer ID
+signed, notarized binary with `scripts/build-distribution.sh`, then tags and
+publishes it; see `docs/release-automation.md`. The image assets lnx downloads are pinned by
 SHA-256 in `src/release_assets.json`; regenerate it with
 `bun run images:pin <images-vX.Y.Z>` instead of editing it.
 

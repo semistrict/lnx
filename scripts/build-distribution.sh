@@ -8,8 +8,9 @@
 # Environment:
 #   LNX_SIGNING_IDENTITY  Signing identity; defaults to the first
 #                         "Developer ID Application" identity in the keychain.
-#   LNX_NOTARY_PROFILE    notarytool keychain profile (default lnx-notary),
-#                         made with `xcrun notarytool store-credentials`.
+#   LNX_NOTARY_PROFILE    notarytool keychain profile, made with
+#                         `xcrun notarytool store-credentials`; defaults to
+#                         pablo-notary, the same team's profile Pablo uses.
 #   LNX_NOTARY_KEYCHAIN   Keychain holding that profile, when not the default.
 #
 # A bare executable cannot be stapled; Gatekeeper fetches its notarization
@@ -52,7 +53,7 @@ codesign --verify --strict --verbose=2 "$binary"
 codesign --display --entitlements - "$binary" 2>/dev/null | grep -q com.apple.security.hypervisor
 
 ditto -c -k --keepParent "$binary" "$submission_zip"
-notary_arguments=(--keychain-profile "${LNX_NOTARY_PROFILE:-lnx-notary}")
+notary_arguments=(--keychain-profile "${LNX_NOTARY_PROFILE:-pablo-notary}")
 if [[ -n ${LNX_NOTARY_KEYCHAIN:-} ]]; then
     notary_arguments+=(--keychain "$LNX_NOTARY_KEYCHAIN")
 fi

@@ -17,6 +17,7 @@
     "release:server-ui": "CC_LINUX=${CC_LINUX:-/opt/homebrew/bin/aarch64-linux-musl-gcc} cargo build --release --features server-ui && scripts/prepare-nested-helpers.sh release && codesign --entitlements entitlements.plist --force -s - target/release/lnx",
     "install": "bun run release && mkdir -p ${INSTALL_BIN:-$HOME/.cargo/bin} && install -m 755 target/release/lnx ${INSTALL_BIN:-$HOME/.cargo/bin}/lnx && ${INSTALL_BIN:-$HOME/.cargo/bin}/lnx _ingress --refresh-if-running",
     "dist": "scripts/build-distribution.sh",
+    "publish-release": "scripts/release.sh",
     "run": "bun run build && target/debug/lnx /bin/echo hello",
     "apt-update": "bun run build && target/debug/lnx /usr/bin/apt-get update",
     "deps": "brew install FiloSottile/musl-cross/musl-cross llvm",

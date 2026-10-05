@@ -146,8 +146,8 @@ More in [docs/architecture.md](docs/architecture.md).
   platform support
 - [Troubleshooting](docs/troubleshooting.md)
 - [Testing](docs/testing.md)
-- [Release automation](docs/release-automation.md) — Developer ID signing,
-  notarization, pinned image digests
+- [Releases](docs/release-automation.md) — local notarized releases, pinned
+  image digests
 
 ## Building and developing
 
