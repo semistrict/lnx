@@ -11,7 +11,7 @@ class Lnx < Formula
   homepage "https://github.com/semistrict/lnx"
   version "0.3.0"
   url "https://github.com/semistrict/lnx/releases/download/v#{version}/lnx-macos-arm64.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "7d08e0be0f53b960f502cd32eda9b931b24c9b8acfd4b61b6b3aedb9624a1c13"
   license "Apache-2.0"
 
   depends_on :macos
