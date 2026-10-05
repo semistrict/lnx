@@ -9,9 +9,9 @@
 class Lnx < Formula
   desc "Linux VMs on macOS that resume with memory and disk state intact"
   homepage "https://github.com/semistrict/lnx"
-  version "0.3.0"
+  version "0.3.1"
   url "https://github.com/semistrict/lnx/releases/download/v#{version}/lnx-macos-arm64.tar.gz"
-  sha256 "7d08e0be0f53b960f502cd32eda9b931b24c9b8acfd4b61b6b3aedb9624a1c13"
+  sha256 "77ae19d86a44e94c9cec29c1aea58347f52261416739f48cb8513e2fa2c1def7"
   license "Apache-2.0"
 
   depends_on :macos
