@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/mdlayher/vsock"
 	"github.com/semistrict/lnx/internal/protocol"
@@ -25,40 +26,57 @@ const guestControlSock = "/var/run/lnx/control.sock"
 // startGuestControlServer dials the host on the guest control vsock port
 // and starts an HTTP server on a unix socket inside the guest.
 func startGuestControlServer() {
-	hostConn, err := vsock.Dial(vsockHostCID, protocol.GuestControlPort, nil)
-	if err != nil {
-		slog.Warn("guest control vsock dial failed", "error", err)
-		return
-	}
+	consolef("guest-control: dialing host port %d", protocol.GuestControlPort)
 
-	os.MkdirAll("/var/run/lnx", 0755)
-	os.Remove(guestControlSock)
+	// Use a goroutine with retry so we don't block the init flow.
+	// On the HV backend, the vsock driver's RX interrupt delivery may
+	// be delayed; a retry with timeout ensures we eventually connect
+	// without blocking other services from starting.
+	go func() {
+		var hostConn *vsock.Conn
+		for i := 0; i < 50; i++ {
+			conn, err := vsock.Dial(vsockHostCID, protocol.GuestControlPort, nil)
+			if err == nil {
+				hostConn = conn
+				break
+			}
+			consolef("guest-control: dial attempt %d failed: %v", i+1, err)
+			time.Sleep(200 * time.Millisecond)
+		}
+		if hostConn == nil {
+			consolef("guest-control: dial failed after retries")
+			slog.Warn("guest control vsock dial failed after retries")
+			return
+		}
+		consolef("guest-control: connected")
 
-	ln, err := net.Listen("unix", guestControlSock)
-	if err != nil {
-		slog.Warn("guest control socket listen failed", "error", err)
-		hostConn.Close()
-		return
-	}
-	// Make it world-accessible so non-root users can curl it.
-	os.Chmod(guestControlSock, 0666)
+		os.MkdirAll("/var/run/lnx", 0755)
+		os.Remove(guestControlSock)
 
-	gc := &guestControl{
-		enc: gob.NewEncoder(hostConn),
-		dec: gob.NewDecoder(hostConn),
-	}
-	setGuestControl(gc)
+		ln, err := net.Listen("unix", guestControlSock)
+		if err != nil {
+			slog.Warn("guest control socket listen failed", "error", err)
+			hostConn.Close()
+			return
+		}
+		os.Chmod(guestControlSock, 0666)
 
-	mux := newGuestControlMux(gc)
+		gc := &guestControl{
+			enc: gob.NewEncoder(hostConn),
+			dec: gob.NewDecoder(hostConn),
+		}
+		setGuestControl(gc)
 
-	go http.Serve(ln, mux)
+		mux := newGuestControlMux(gc)
+		go http.Serve(ln, mux)
 
-	vsockLn, err := vsock.Listen(protocol.GuestHTTPPort, nil)
-	if err != nil {
-		slog.Warn("guest control vsock listen failed", "error", err, "port", protocol.GuestHTTPPort)
-		return
-	}
-	go http.Serve(vsockLn, mux)
+		vsockLn, err := vsock.Listen(protocol.GuestHTTPPort, nil)
+		if err != nil {
+			slog.Warn("guest control vsock listen failed", "error", err, "port", protocol.GuestHTTPPort)
+			return
+		}
+		http.Serve(vsockLn, mux)
+	}()
 }
 
 func newGuestControlMux(gc *guestControl) *http.ServeMux {

@@ -1,4 +1,4 @@
-.PHONY: all cmd/lnx/init lnx lnx-linux kernel rootfs test test-integration install deps-macos clean help
+.PHONY: all cmd/lnx/init lnx lnx-linux kernel rootfs test test-integration test-integration-hv install deps-macos clean help
 
 all: lnx
 
@@ -15,7 +15,8 @@ help:
 	@echo ""
 	@echo "Test:"
 	@echo "  test             Run unit tests (any platform)"
-	@echo "  test-integration Run integration tests (macOS, optional TEST=regex filter)"
+	@echo "  test-integration    Run integration tests with VF backend (optional TEST=regex filter)"
+	@echo "  test-integration-hv Run integration tests with HV backend (optional TEST=regex filter)"
 	@echo ""
 	@echo "Other:"
 	@echo "  deps-macos       Install local macOS dependencies (currently zstd)"
@@ -62,6 +63,14 @@ test:
 test-integration: lnx
 	go build -o /tmp/lnx-codesign ./cmd/codesign
 	PATH="$(PWD):$$PATH" go test -v -timeout 180s -tags integration -exec /tmp/lnx-codesign $(if $(TEST),-run '$(TEST)') ./...
+
+# Integration tests with HV (Hypervisor.framework) backend.
+# Runs tests that respect LNX_BACKEND (testConfig-based + HV boot tests).
+# Usage: make test-integration-hv [TEST=Regex]
+HV_TESTS := TestRun_|TestHV_
+test-integration-hv: lnx
+	go build -o /tmp/lnx-codesign ./cmd/codesign
+	LNX_BACKEND=hv PATH="$(PWD):$$PATH" go test -v -timeout 600s -tags integration -exec /tmp/lnx-codesign -run '$(if $(TEST),$(TEST),$(HV_TESTS))' ./...
 
 # Install to $GOPATH/bin
 install: cmd/lnx/init

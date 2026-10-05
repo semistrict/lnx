@@ -62,7 +62,8 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 
 	var ephCleanup func()
 	if cfg.Ephemeral {
-		tmpDir, err := os.MkdirTemp("", "lnx-ephemeral-*")
+		// Create temp dir alongside rootfs so APFS clonefile works (same volume).
+		tmpDir, err := os.MkdirTemp(filepath.Dir(cfg.RootfsPath), "lnx-ephemeral-*")
 		if err != nil {
 			return nil, fmt.Errorf("create ephemeral dir: %w", err)
 		}
@@ -88,6 +89,10 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 			SSHAgent:      cfg.SSHAgent,
 			SocketDir:     cfg.SocketDir,
 			NestedRootfs:  cfg.NestedRootfs,
+			Backend:       cfg.Backend,
+			SyncShares:    cfg.SyncShares,
+			UARTWriter:    cfg.UARTWriter,
+			KernelArgs:    cfg.KernelArgs,
 		}
 	}
 
@@ -210,6 +215,10 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		})
 	}
 
+	sm := shareMethod()
+	if cfg.Backend == "hv" {
+		sm = "9p" // HV backend has no virtiofs; use 9P over vsock
+	}
 	setupMsg := &protocol.Setup{
 		CWD:          cwd,
 		Env:          append([]string(nil), cfg.Env...),
@@ -219,7 +228,7 @@ func bootVM(cfg *Config) (*bootedVM, error) {
 		Hostname:     hostname,
 		SSHAgent:     sshAgent,
 		Shares:       cfg.Shares,
-		ShareMethod:  shareMethod(),
+		ShareMethod:  sm,
 		NestedDrives: nestedDrives,
 	}
 	setupMsg.Env = append(setupMsg.Env, "LNX_PARENT="+parentInstance)
@@ -302,6 +311,7 @@ waitBoot:
 		}
 		return nil, fmt.Errorf("control connection failed\n%s", serialLogTail(sockDir))
 	}
+	slog.Info("bootVM: got control connection, sending Setup")
 	enc := gob.NewEncoder(ctrlConn)
 	if err := enc.Encode(protocol.Msg{Setup: setupMsg}); err != nil {
 		ctrlConn.Close()
@@ -313,6 +323,7 @@ waitBoot:
 		return nil, fmt.Errorf("send setup: %w", err)
 	}
 
+	slog.Info("bootVM: Setup sent, returning")
 	return &bootedVM{
 		vm:         vm,
 		vs:         vs,

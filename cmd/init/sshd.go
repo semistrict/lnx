@@ -29,49 +29,51 @@ func startSSHServer() {
 		return
 	}
 
-	_, privKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		slog.Warn("ssh host key generation failed", "error", err)
-		ln.Close()
-		return
-	}
-	signer, err := gossh.NewSignerFromKey(privKey)
-	if err != nil {
-		slog.Warn("ssh signer creation failed", "error", err)
-		ln.Close()
-		return
-	}
-
-	forwardHandler := &ssh.ForwardedTCPHandler{}
-	server := &ssh.Server{
-		Handler: handleSSHSession,
-		PublicKeyHandler: func(ctx ssh.Context, key ssh.PublicKey) bool {
-			return true // vsock is host-only, no network exposure
-		},
-		LocalPortForwardingCallback: func(ctx ssh.Context, dhost string, dport uint32) bool {
-			return true // allow all port forwarding (needed for VS Code Remote)
-		},
-		ReversePortForwardingCallback: func(ctx ssh.Context, bhost string, bport uint32) bool {
-			return true
-		},
-		ChannelHandlers: map[string]ssh.ChannelHandler{
-			"session":      ssh.DefaultSessionHandler,
-			"direct-tcpip": ssh.DirectTCPIPHandler,
-		},
-		RequestHandlers: map[string]ssh.RequestHandler{
-			"tcpip-forward":        forwardHandler.HandleSSHRequest,
-			"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
-		},
-	}
-	server.AddHostKey(signer)
-
+	// Key generation uses crypto/rand which blocks until the guest CRNG
+	// is seeded. On HV backend VMs without virtio-rng this can take seconds.
+	// Run the entire setup in a goroutine so it doesn't block init.
 	go func() {
+		_, privKey, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			slog.Warn("ssh host key generation failed", "error", err)
+			ln.Close()
+			return
+		}
+		signer, err := gossh.NewSignerFromKey(privKey)
+		if err != nil {
+			slog.Warn("ssh signer creation failed", "error", err)
+			ln.Close()
+			return
+		}
+
+		forwardHandler := &ssh.ForwardedTCPHandler{}
+		server := &ssh.Server{
+			Handler: handleSSHSession,
+			PublicKeyHandler: func(ctx ssh.Context, key ssh.PublicKey) bool {
+				return true // vsock is host-only, no network exposure
+			},
+			LocalPortForwardingCallback: func(ctx ssh.Context, dhost string, dport uint32) bool {
+				return true // allow all port forwarding (needed for VS Code Remote)
+			},
+			ReversePortForwardingCallback: func(ctx ssh.Context, bhost string, bport uint32) bool {
+				return true
+			},
+			ChannelHandlers: map[string]ssh.ChannelHandler{
+				"session":      ssh.DefaultSessionHandler,
+				"direct-tcpip": ssh.DirectTCPIPHandler,
+			},
+			RequestHandlers: map[string]ssh.RequestHandler{
+				"tcpip-forward":        forwardHandler.HandleSSHRequest,
+				"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
+			},
+		}
+		server.AddHostKey(signer)
+
+		slog.Info("ssh server started", "port", protocol.SSHPort)
 		if err := server.Serve(ln); err != nil {
 			slog.Debug("ssh server stopped", "error", err)
 		}
 	}()
-
-	slog.Info("ssh server started", "port", protocol.SSHPort)
 }
 
 func handleSSHSession(s ssh.Session) {

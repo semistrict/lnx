@@ -18,27 +18,40 @@ import (
 
 // startPortForwarder scans for listening TCP ports and notifies the host.
 // It also listens on a vsock port for incoming forwarded connections from the host.
+// Runs in a goroutine with retry to avoid blocking the init flow — on the HV
+// backend, vsock interrupt delivery may be delayed.
 func startPortForwarder() {
-	// Control connection: notify host of port changes.
-	ctrlConn, err := vsock.Dial(vsockHostCID, protocol.PortForwardPort, nil)
-	if err != nil {
-		slog.Warn("port forward vsock dial failed", "error", err)
-		return
-	}
+	go func() {
+		var ctrlConn *vsock.Conn
+		for i := 0; i < 50; i++ {
+			conn, err := vsock.Dial(vsockHostCID, protocol.PortForwardPort, nil)
+			if err == nil {
+				ctrlConn = conn
+				break
+			}
+			consolef("port-forward: dial attempt %d failed: %v", i+1, err)
+			time.Sleep(200 * time.Millisecond)
+		}
+		if ctrlConn == nil {
+			consolef("port-forward: dial failed after retries")
+			slog.Warn("port forward vsock dial failed after retries")
+			return
+		}
 
-	// Data listener: host connects here to forward TCP connections.
-	dataLn, err := vsock.Listen(protocol.PortForwardDataPort, nil)
-	if err != nil {
-		slog.Warn("port forward data listen failed", "error", err)
-		ctrlConn.Close()
-		return
-	}
+		// Data listener: host connects here to forward TCP connections.
+		dataLn, err := vsock.Listen(protocol.PortForwardDataPort, nil)
+		if err != nil {
+			slog.Warn("port forward data listen failed", "error", err)
+			ctrlConn.Close()
+			return
+		}
 
-	// Accept forwarded connections from host.
-	go acceptForwardedConns(dataLn)
+		// Accept forwarded connections from host.
+		go acceptForwardedConns(dataLn)
 
-	// Scan for listening ports and notify host.
-	go scanPorts(ctrlConn)
+		// Scan for listening ports and notify host.
+		scanPorts(ctrlConn)
+	}()
 }
 
 func scanPorts(conn net.Conn) {

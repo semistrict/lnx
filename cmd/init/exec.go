@@ -209,26 +209,58 @@ func doGuestFork() string {
 // exec request per connection. Multiple connections are accepted
 // concurrently so `lnx exec` works while the main command runs.
 func startExecServer() {
-	execLn, err := vsock.Listen(protocol.ExecPort, nil)
-	if err != nil {
-		slog.Warn("exec listen failed", "error", err)
-		return
-	}
+	consolef("exec: listening on port %d", protocol.ExecPort)
 
 	interactiveLn, err := vsock.Listen(protocol.ExecInteractivePort, nil)
 	if err != nil {
+		consolef("exec: interactive listen failed: %v", err)
 		slog.Warn("exec interactive listen failed", "error", err)
-		execLn.Close()
-		return
 	}
 
+	// Use raw blocking accept to avoid Go netpoller (epoll) issues on
+	// single-CPU HV VMs where timer interrupts may not fire frequently
+	// enough to schedule epoll-blocked goroutines.
+	rawFd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
+	if err != nil {
+		consolef("exec: socket failed: %v", err)
+		return
+	}
+	if err := unix.Bind(rawFd, &unix.SockaddrVM{CID: unix.VMADDR_CID_ANY, Port: protocol.ExecPort}); err != nil {
+		consolef("exec: bind failed: %v", err)
+		unix.Close(rawFd)
+		return
+	}
+	if err := unix.Listen(rawFd, 5); err != nil {
+		consolef("exec: listen failed: %v", err)
+		unix.Close(rawFd)
+		return
+	}
+	consolef("exec: server ready (raw accept)")
+
+	// Monitor /proc/net/vsock in background for diagnostics.
 	go func() {
-		for {
-			conn, err := execLn.Accept()
+		for i := 0; i < 30; i++ {
+			time.Sleep(1 * time.Second)
+			data, err := os.ReadFile("/proc/net/vsock")
 			if err != nil {
+				consolef("exec: /proc/net/vsock: %v", err)
+				continue
+			}
+			consolef("exec: /proc/net/vsock:\n%s", string(data))
+		}
+	}()
+
+	go func() {
+		consolef("exec: goroutine started, entering accept loop fd=%d", rawFd)
+		for {
+			nfd, _, err := unix.Accept(rawFd)
+			if err != nil {
+				consolef("exec: accept error: %v", err)
+				slog.Debug("exec accept error", "error", err)
 				return
 			}
-			go handleExecConn(conn.(*vsock.Conn), interactiveLn)
+			consolef("exec: accepted connection fd=%d", nfd)
+			go handleExecRawFd(nfd, interactiveLn)
 		}
 	}()
 }
@@ -312,18 +344,23 @@ func (s *execSession) readControlMessages(dec *gob.Decoder) {
 	}
 }
 
-func handleExecConn(conn *vsock.Conn, interactiveLn *vsock.Listener) {
-	defer conn.Close()
-	enc := gob.NewEncoder(conn)
-	dec := gob.NewDecoder(conn)
+func handleExecRawFd(fd int, interactiveLn *vsock.Listener) {
+	f := os.NewFile(uintptr(fd), "vsock-exec")
+	defer f.Close()
+	enc := gob.NewEncoder(f)
+	dec := gob.NewDecoder(f)
 
+	consolef("exec: reading ExecReq from raw fd %d", fd)
 	var msg protocol.Msg
 	if err := dec.Decode(&msg); err != nil {
+		consolef("exec: decode ExecReq failed: %v", err)
 		return
 	}
 	if msg.ExecReq == nil {
+		consolef("exec: expected ExecReq, got nil")
 		return
 	}
+	consolef("exec: raw exec request args=%v", msg.ExecReq.Args)
 
 	sess := &execSession{enc: enc}
 	go sess.readControlMessages(dec)
@@ -333,6 +370,34 @@ func handleExecConn(conn *vsock.Conn, interactiveLn *vsock.Listener) {
 	} else {
 		runExecPipe(msg.ExecReq, sess)
 	}
+}
+
+func handleExecConn(conn *vsock.Conn, interactiveLn *vsock.Listener) {
+	defer conn.Close()
+	enc := gob.NewEncoder(conn)
+	dec := gob.NewDecoder(conn)
+
+	consolef("exec: reading ExecReq from connection")
+	var msg protocol.Msg
+	if err := dec.Decode(&msg); err != nil {
+		consolef("exec: decode ExecReq failed: %v", err)
+		return
+	}
+	if msg.ExecReq == nil {
+		consolef("exec: expected ExecReq, got nil")
+		return
+	}
+	consolef("exec: request args=%v pty=%v cwd=%s", msg.ExecReq.Args, msg.ExecReq.PTY, msg.ExecReq.CWD)
+
+	sess := &execSession{enc: enc}
+	go sess.readControlMessages(dec)
+
+	if msg.ExecReq.PTY {
+		runExecPTY(msg.ExecReq, interactiveLn, sess)
+	} else {
+		runExecPipe(msg.ExecReq, sess)
+	}
+	consolef("exec: handler done for args=%v", msg.ExecReq.Args)
 }
 
 // runExecPTY handles an interactive exec request with a PTY.

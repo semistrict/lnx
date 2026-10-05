@@ -43,9 +43,8 @@ func setupTestDir(t *testing.T) string {
 	require.NoError(t, err)
 	lnx.InitBinary = initBin
 
-	testDirOnce.Do(func() { os.MkdirAll("tmp", 0755) })
-
-	dir, err := os.MkdirTemp("tmp", "test-*")
+	// Create temp dir alongside rootfs so clonefile works (same APFS volume).
+	dir, err := os.MkdirTemp(filepath.Dir(rootfsPath), "test-*")
 	require.NoError(t, err)
 	t.Cleanup(func() { os.RemoveAll(dir) })
 
@@ -70,8 +69,14 @@ func findDefaultRootfs(base string) string {
 }
 
 func testConfig(dir string) *lnx.Config {
-	return &lnx.Config{
+	cfg := &lnx.Config{
 		KernelPath: filepath.Join(dir, "vmlinuz"),
 		RootfsPath: filepath.Join(dir, "rootfs.ext4"),
 	}
+	if os.Getenv("LNX_BACKEND") == "hv" {
+		cfg.Backend = "hv"
+		cfg.CPUs = 1
+		cfg.MemoryBytes = 512 << 20 // 512MB — keep it small for HV testing
+	}
+	return cfg
 }

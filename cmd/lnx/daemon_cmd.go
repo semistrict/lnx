@@ -24,7 +24,12 @@ var daemonCmd = &cobra.Command{
 		// Scan for nested instances to attach as block devices.
 		nested := scanNestedInstances()
 
-		err := lnx.RunDaemon(&lnx.Config{
+		backend := daemonBackend
+		if backend == "" {
+			backend = os.Getenv("LNX_BACKEND")
+		}
+
+		cfg := &lnx.Config{
 			KernelPath:   resolveKernel(),
 			RootfsPath:   rootfsPath,
 			Hostname:     qualifiedInstanceName() + ".lnx",
@@ -34,7 +39,24 @@ var daemonCmd = &cobra.Command{
 			Shares:       loadShares(dir),
 			SocketDir:    socketDir,
 			NestedRootfs: nested,
-		})
+			Backend:      backend,
+		}
+
+		// HV backend: force single CPU (multi-CPU not yet supported)
+		// and cap memory to avoid wasting address space.
+		if backend == "hv" {
+			cfg.CPUs = 1
+			if cfg.MemoryBytes == 0 {
+				cfg.MemoryBytes = 512 << 20
+			}
+			// Write UART output to a log file for debugging.
+			uartPath := filepath.Join(os.Getenv("HOME"), ".lnx", "hv-uart.log")
+			if f, err := os.Create(uartPath); err == nil {
+				cfg.UARTWriter = f
+			}
+		}
+
+		err := lnx.RunDaemon(cfg)
 		if err != nil {
 			errPath := filepath.Join(socketDir, "error.log")
 			os.WriteFile(errPath, []byte(err.Error()+"\n"), 0644)
@@ -45,10 +67,13 @@ var daemonCmd = &cobra.Command{
 	},
 }
 
+var daemonBackend string
+
 func init() {
 	daemonCmd.Flags().BoolVarP(&doCheckpoint, "checkpoint", "c", false, "snapshot rootfs before starting")
 	daemonCmd.Flags().BoolVar(&doEphemeral, "ephemeral", false, "clone rootfs to a temp file; discard on exit")
 	daemonCmd.Flags().BoolVar(&doSSHAgent, "ssh-agent", false, "forward host SSH agent into the guest")
+	daemonCmd.Flags().StringVar(&daemonBackend, "backend", "", "VM backend (vf or hv)")
 	rootCmd.AddCommand(daemonCmd)
 }
 

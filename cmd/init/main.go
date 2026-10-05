@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +28,11 @@ const (
 )
 
 func main() {
+	// Ensure the Go runtime has enough threads for sysmon + blocked
+	// goroutines on single-CPU VMs. Without this, sysmon may never
+	// run and timers/preemption break.
+	runtime.GOMAXPROCS(2)
+
 	// Busybox-style dispatch: if invoked as "systemctl", run that instead.
 	base := filepath.Base(os.Args[0])
 	if base == "systemctl" {
@@ -67,23 +73,29 @@ func run() error {
 	parseEpoch()
 
 	// Connect to the host control channel.
+	consolef("dialing host control port %d", protocol.Port)
 	conn, err := vsock.Dial(vsockHostCID, protocol.Port, nil)
 	if err != nil {
+		consolef("vsock dial control failed: %v", err)
 		return fmt.Errorf("vsock dial control: %w", err)
 	}
+	consolef("control connection established")
 	ctrlConn = conn
 	ctrlDec = gob.NewDecoder(conn)
 	ctrlDone = make(chan struct{})
 
 	// Read the Setup message from the host.
+	consolef("waiting for Setup message")
 	var msg protocol.Msg
 	if err := ctrlDec.Decode(&msg); err != nil {
+		consolef("decode setup msg failed: %v", err)
 		return fmt.Errorf("decode setup msg: %w", err)
 	}
 	if msg.Setup == nil {
 		return fmt.Errorf("expected Setup message, got %+v", msg)
 	}
 	setup := msg.Setup
+	consolef("setup received: user=%s cwd=%s shareMethod=%s", setup.User, setup.CWD, setup.ShareMethod)
 
 	// Start reading signals/resize from control connection.
 	go controlReader()
@@ -179,18 +191,28 @@ func run() error {
 
 	installSystemctlShim()
 	installSystemdCatShim()
-	configureNetwork()
-
 	installBashDefaults()
 	installXdgOpen()
 	installForkRoleHelper()
-	startEnabledServices()
-	startStatusServer()
-	startExecServer()
-	startSSHServer()
-	startGuestControlServer()
-	startPortForwarder()
 
+	// Start critical vsock services early so the host can connect
+	// while slower operations (network, enabled services) finish.
+	consolef("starting vsock services")
+	startStatusServer()
+	consolef("status server started")
+	startExecServer()
+	consolef("exec server started")
+	startSSHServer()
+	consolef("ssh server started")
+	startGuestControlServer()
+	consolef("guest control started")
+	startPortForwarder()
+	consolef("vsock services started, configuring network")
+
+	go configureNetwork()
+	go startEnabledServices()
+
+	consolef("guest ready")
 	slog.Info("guest ready", "user", setup.User, "uid", setup.UID)
 
 	// Block until the host closes the control connection.
@@ -473,6 +495,18 @@ curl -sf --unix-socket /var/run/lnx/control.sock \
 	if err := os.WriteFile("/usr/local/bin/xdg-open", []byte(script), 0755); err != nil {
 		slog.Warn("failed to install xdg-open shim", "error", err)
 	}
+}
+
+// consolef writes a formatted message to /dev/console (UART).
+// This bypasses the vsock-based slog and is visible in UARTWriter output,
+// making it invaluable for debugging when vsock itself is under test.
+func consolef(format string, args ...any) {
+	f, err := os.OpenFile("/dev/console", os.O_WRONLY, 0)
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(f, "[lnx-init] "+format+"\n", args...)
+	f.Close()
 }
 
 func poweroff() {

@@ -1,6 +1,10 @@
 package lnx
 
-import "path/filepath"
+import (
+	"io"
+	"os"
+	"path/filepath"
+)
 
 // Config holds the configuration for a VM instance.
 type Config struct {
@@ -63,6 +67,22 @@ type Config struct {
 	// NestedRootfs is a list of rootfs file paths for nested VM instances.
 	// Each is attached as an additional virtio-blk device (vdc, vdd, ...).
 	NestedRootfs []NestedRootfs
+
+	// Backend selects the VM backend: "vf" (Virtualization.framework, default)
+	// or "hv" (Hypervisor.framework — supports snapshots, cloning, fake time).
+	Backend string
+
+	// SyncShares is a list of host directories to share with lazy caching.
+	// Each is mounted read-only via virtiofs and lazily copied into the
+	// guest's ext4 rootfs for native-speed access after first read.
+	SyncShares []string
+
+	// UARTWriter is the writer for HV backend UART output. Defaults to os.Stdout.
+	UARTWriter io.Writer
+
+	// KernelArgs contains extra kernel command-line arguments appended by the
+	// HV backend (e.g. "init=/bin/sh" for UART-only testing).
+	KernelArgs string
 }
 
 // NestedRootfs pairs a nested instance name with its rootfs file path.
@@ -90,4 +110,11 @@ func (c *Config) memoryBytes() uint64 {
 		return hostMemoryBytes() / 2
 	}
 	return c.MemoryBytes
+}
+
+func (c *Config) uartWriter() io.Writer {
+	if c.UARTWriter != nil {
+		return c.UARTWriter
+	}
+	return os.Stdout
 }

@@ -57,10 +57,16 @@ func vzStateToVMState(s vz.VirtualMachineState) VMState {
 	}
 }
 
-// buildVM creates a Darwin VM configured and ready to start.
-// macAddr is a stable MAC address string; if empty, one is generated.
-// epoch overrides lnx.epoch in the kernel cmdline (0 = use current time).
+// buildVM dispatches VM creation to the configured backend.
 func buildVM(cfg *Config, initrdPath, cwd, swapPath, criuPath, homeDir, macAddr string, epoch int64) (VirtualMachine, error) {
+	if cfg.Backend == "hv" {
+		return buildHVVM(cfg)
+	}
+	return buildVFVM(cfg, initrdPath, cwd, swapPath, criuPath, homeDir, macAddr, epoch)
+}
+
+// buildVFVM creates a Virtualization.framework VM configured and ready to start.
+func buildVFVM(cfg *Config, initrdPath, cwd, swapPath, criuPath, homeDir, macAddr string, epoch int64) (VirtualMachine, error) {
 	vmConfig, err := buildVMConfig(cfg, initrdPath, cwd, swapPath, criuPath, homeDir, macAddr, epoch)
 	if err != nil {
 		return nil, err

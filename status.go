@@ -297,8 +297,10 @@ func (s *apiServer) connectExec() (*gob.Encoder, *gob.Decoder, net.Conn, error) 
 	for i := 0; i < 300; i++ {
 		conn, err = s.sock.Connect(protocol.ExecPort)
 		if err == nil {
+			slog.Info("connectExec succeeded", "attempt", i+1)
 			return gob.NewEncoder(conn), gob.NewDecoder(conn), conn, nil
 		}
+		slog.Info("connectExec failed", "attempt", i+1, "error", err)
 		if errSuggestsDeadVM(err) {
 			s.requestStop("vm no longer live during exec connect", "error", err)
 			return nil, nil, nil, err
