@@ -98,7 +98,7 @@ jobs:
         run: |
           tag="${GITHUB_REF#refs/tags/}"
           gh release view "$tag" >/dev/null 2>&1 || \
-            gh release create "$tag" --title "lnx $tag" --generate-notes
+            gh release create "$tag" --title "lnx $tag" --generate-notes --latest
           gh release upload "$tag" --clobber \
             lnx-macos-arm64.tar.gz lnx-macos-arm64.tar.gz.sha256
 

@@ -55,7 +55,15 @@ Requirements: Apple Silicon Mac. The guest is arm64 Linux.
 
 ## Install
 
-Download the latest release from
+With Homebrew (the repository is also a tap):
+
+```sh
+brew tap semistrict/lnx https://github.com/semistrict/lnx
+brew install semistrict/lnx/lnx
+lnx echo hello         # downloads the kernel + rootfs image on first run
+```
+
+Or download the latest release from
 [GitHub Releases](https://github.com/semistrict/lnx/releases):
 
 ```sh

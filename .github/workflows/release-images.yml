@@ -130,6 +130,9 @@ jobs:
         with:
           tag_name: images-${{ inputs.version }}
           name: "VM images ${{ inputs.version }}"
+          # Keep "Latest" on the lnx binary release: the README installs from
+          # releases/latest, which has no binary on an image release.
+          make_latest: false
           body: |
             Pre-built kernel and rootfs images for lnx.
 
@@ -137,8 +140,7 @@ jobs:
             - `rootfs.ext4.zst` — Ubuntu rootfs with node/npm/pnpm baked in (64G sparse ext4, 16K block size, zstd compressed)
             - `lnx-linux-aarch64` — Linux helper used by nested deterministic runs on macOS
 
-            Place the decompressed images at `~/.lnx/vmlinuz` and
-            `~/.lnx/images/default/rootfs.ext4`.
+            lnx downloads these itself on first use.
           files: |
             vmlinuz.gz
             rootfs.ext4.zst
