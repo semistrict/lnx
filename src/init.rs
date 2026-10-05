@@ -7,10 +7,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::paths::Layout;
+use crate::{paths::Layout, release_assets::image_release};
 
-const DEFAULT_IMAGE_VERSION: &str = "images-v0.6.0";
-const NESTED_HELPER_IMAGE_VERSION: &str = "images-v0.6.0";
 const RELEASE_BASE: &str = "https://github.com/semistrict/lnx/releases/download";
 const DEFAULT_ROOTFS_SIZE: u64 = 64 * 1024 * 1024 * 1024;
 const REQUIRED_EXT4_BLOCK_SIZE: u64 = 16 * 1024;
@@ -47,14 +45,14 @@ pub fn run(layout: &Layout, kernel: Option<&Path>, rootfs: Option<&Path>) -> Res
             ensure_release_asset(
                 &default_rootfs,
                 "rootfs.ext4.zst",
-                DEFAULT_IMAGE_VERSION,
+                image_release(),
                 CachePolicy::MatchRelease,
             )?;
             ensure_rootfs_min_size(&default_rootfs, DEFAULT_ROOTFS_SIZE)?;
             validate_managed_rootfs(&default_rootfs, DEFAULT_ROOTFS_SIZE)?;
             (
                 default_rootfs.as_path(),
-                format!("release:{DEFAULT_IMAGE_VERSION}"),
+                format!("release:{}", image_release()),
             )
         }
     };
@@ -153,7 +151,7 @@ pub fn ensure_nested_linux_lnx(dest: &Path) -> Result<()> {
     ensure_release_asset(
         dest,
         "lnx-linux-aarch64",
-        NESTED_HELPER_IMAGE_VERSION,
+        image_release(),
         CachePolicy::MatchRelease,
     )?;
     make_executable(dest)
@@ -194,7 +192,7 @@ fn download_kernel(dest: &Path) -> Result<()> {
     ensure_release_asset(
         dest,
         "vmlinuz.gz",
-        DEFAULT_IMAGE_VERSION,
+        image_release(),
         CachePolicy::KeepExisting,
     )
 }
@@ -301,6 +299,7 @@ fn fetch_release_asset(dest: &Path, asset: &str, version: &str) -> Result<()> {
                 .arg(&url),
             "curl",
         )?;
+        crate::release_assets::verify_download(&download_tmp, version, asset)?;
         match Path::new(asset).extension().and_then(|ext| ext.to_str()) {
             Some("zst") => {
                 eprintln!("init: decompress {asset}");

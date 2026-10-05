@@ -1,0 +1,8 @@
+{
+  "release": "images-v0.6.0",
+  "sha256": {
+    "lnx-linux-aarch64": "71d355db72664fca0f88200e3b3d9253188a11e64b6607a6f063d827ff95baf9",
+    "rootfs.ext4.zst": "98d4219a331d84d0a233290b628651a2d8d0dbe655dc33cc266efd61f8ec0718",
+    "vmlinuz.gz": "3260b0949a002f240008e13c5ce6bcd6640bc0abba2c1e9232d39d6efe34d357"
+  }
+}

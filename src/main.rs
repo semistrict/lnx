@@ -10,6 +10,7 @@ mod initramfs;
 mod krun;
 mod oci;
 mod paths;
+mod release_assets;
 mod runner;
 mod server;
 mod sparse_copy;
