@@ -36,12 +36,13 @@ const EINVAL: c_int = 22;
 const ENOENT: c_int = 2;
 const ENOTTY: c_int = 25;
 const EEXIST: c_int = 17;
-const F_GETFD: c_int = 1;
-const F_SETFD: c_int = 2;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
-const FD_CLOEXEC: c_int = 1;
 const O_NONBLOCK: c_int = 0o4000;
+const O_RDWR: c_int = 2;
+const O_NOCTTY: c_int = 0o400;
+const O_CLOEXEC: c_int = 0o2000000;
+const SOCK_CLOEXEC: c_int = O_CLOEXEC;
 const STDIN_FILENO: c_int = 0;
 const STDOUT_FILENO: c_int = 1;
 const STDERR_FILENO: c_int = 2;
@@ -57,6 +58,8 @@ const POLLHUP: i16 = 0x0010;
 const POLLNVAL: i16 = 0x0020;
 const TIOCSCTTY: c_ulong = 0x540e;
 const TIOCSWINSZ: c_ulong = 0x5414;
+const TIOCGPTN: c_ulong = 0x8004_5430;
+const TIOCSPTLCK: c_ulong = 0x4004_5431;
 const IFF_UP: c_uint = 0x1;
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
@@ -249,7 +252,7 @@ struct RandPoolInfo {
 }
 
 unsafe extern "C" {
-    fn accept(fd: c_int, addr: *mut Sockaddr, len: *mut c_uint) -> c_int;
+    fn accept4(fd: c_int, addr: *mut Sockaddr, len: *mut c_uint, flags: c_int) -> c_int;
     fn bind(fd: c_int, addr: *const Sockaddr, len: c_uint) -> c_int;
     fn chdir(path: *const c_char) -> c_int;
     fn clock_settime(clockid: c_int, tp: *const Timespec) -> c_int;
@@ -265,13 +268,7 @@ unsafe extern "C" {
     fn listen(fd: c_int, backlog: c_int) -> c_int;
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     fn kill(pid: c_int, sig: c_int) -> c_int;
-    fn openpty(
-        amaster: *mut c_int,
-        aslave: *mut c_int,
-        name: *mut c_char,
-        termp: *const c_void,
-        winp: *const c_void,
-    ) -> c_int;
+    fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn poll(fds: *mut PollFd, nfds: usize, timeout: c_int) -> c_int;
     fn mount(
         source: *const c_char,
@@ -280,7 +277,7 @@ unsafe extern "C" {
         mountflags: c_ulong,
         data: *const c_void,
     ) -> c_int;
-    fn pipe(fds: *mut c_int) -> c_int;
+    fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn socket(domain: c_int, typ: c_int, protocol: c_int) -> c_int;
     fn setsockopt(
@@ -619,7 +616,7 @@ fn parse_ipv4_cidr(value: &str) -> Result<(Ipv4Addr, u8), String> {
 }
 
 fn open_route_netlink() -> Result<OwnedFd, String> {
-    let fd = unsafe { socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) };
+    let fd = unsafe { socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE) };
     if fd < 0 {
         return Err(format!("socket(AF_NETLINK): {}", Error::last_os_error()));
     }
@@ -1325,11 +1322,10 @@ fn try_connect_vsock(port: u32, attempts: usize) -> c_int {
     log!("vsock.connect.begin port={port}");
     for attempt in 0..attempts {
         let addr = vsock_addr(port);
-        let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
+        let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0) };
         if fd < 0 {
             die("socket(AF_VSOCK)");
         }
-        set_cloexec(fd);
         let ret = unsafe {
             connect(
                 fd,
@@ -1443,11 +1439,10 @@ fn sockaddr_un(path: &str) -> SockaddrUn {
 }
 
 fn connect_unix(path: &str) -> c_int {
-    let fd = unsafe { socket(AF_UNIX, SOCK_STREAM, 0) };
+    let fd = unsafe { socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0) };
     if fd < 0 {
         die("socket(AF_UNIX)");
     }
-    set_cloexec(fd);
     let addr = sockaddr_un(path);
     for _ in 0..100 {
         let ret = unsafe {
@@ -1469,11 +1464,10 @@ fn connect_unix(path: &str) -> c_int {
 
 fn listen_unix(path: &str) -> c_int {
     let _ = fs::remove_file(path);
-    let fd = unsafe { socket(AF_UNIX, SOCK_STREAM, 0) };
+    let fd = unsafe { socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0) };
     if fd < 0 {
         die("socket(AF_UNIX)");
     }
-    set_cloexec(fd);
     let addr = sockaddr_un(path);
     if unsafe {
         bind(
@@ -1774,22 +1768,39 @@ fn set_nonblocking(fd: c_int) -> bool {
     false
 }
 
-fn set_cloexec(fd: c_int) {
-    let flags = unsafe { fcntl(fd, F_GETFD) };
-    if flags >= 0 {
-        unsafe {
-            fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
-        }
-    }
+// Every descriptor the agent creates is close-on-exec from the moment it
+// exists: commands start on several threads at once, and a descriptor
+// marked only after creation can leak into a command forked in between,
+// which then holds another command's pipe open forever.
+fn make_pipe(fds: &mut [c_int; 2]) -> bool {
+    unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC) == 0 }
 }
 
-fn make_pipe(fds: &mut [c_int; 2]) -> bool {
-    if unsafe { pipe(fds.as_mut_ptr()) } < 0 {
-        return false;
+/// Opens a pseudo-terminal pair, both ends close-on-exec from creation (see
+/// [`make_pipe`]); openpty(3) cannot do that.
+fn open_pty() -> Option<(c_int, c_int)> {
+    let master = unsafe { open(c"/dev/ptmx".as_ptr(), O_RDWR | O_NOCTTY | O_CLOEXEC) };
+    if master < 0 {
+        return None;
     }
-    set_cloexec(fds[0]);
-    set_cloexec(fds[1]);
-    true
+    let unlock: c_int = 0;
+    let mut number: c_uint = 0;
+    let slave = if unsafe { ioctl(master, TIOCSPTLCK, &unlock as *const c_int) } == 0
+        && unsafe { ioctl(master, TIOCGPTN, &mut number as *mut c_uint) } == 0
+    {
+        CString::new(format!("/dev/pts/{number}"))
+            .map(|path| unsafe { open(path.as_ptr(), O_RDWR | O_NOCTTY | O_CLOEXEC) })
+            .unwrap_or(-1)
+    } else {
+        -1
+    };
+    if slave < 0 {
+        unsafe {
+            close(master);
+        }
+        return None;
+    }
+    Some((master, slave))
 }
 
 fn close_if_open(fd: &mut c_int) {
@@ -1818,11 +1829,11 @@ fn vsock_addr(port: u32) -> SockaddrVm {
 }
 
 fn accept_channel_control(listener_fd: c_int) -> Option<ChannelControlRequest> {
-    let client_fd = unsafe { accept(listener_fd, ptr::null_mut(), ptr::null_mut()) };
+    let client_fd =
+        unsafe { accept4(listener_fd, ptr::null_mut(), ptr::null_mut(), SOCK_CLOEXEC) };
     if client_fd < 0 {
         return None;
     }
-    set_cloexec(client_fd);
     let mut frame_type = [0u8; 1];
     let mut len = [0u8; 4];
     if !try_read_exact(client_fd, &mut frame_type) || !try_read_exact(client_fd, &mut len) {
@@ -2291,19 +2302,8 @@ fn run_channel_pty(
     ensure_exec_user(uid, gid, &group);
     relax_nested_kvm();
     let argv = resolve_login_shell(argv, uid);
-    let mut pty_master = -1;
-    let mut pty_slave = -1;
     let control_socket = channel_control_socket(channel_id);
-    if unsafe {
-        openpty(
-            &mut pty_master,
-            &mut pty_slave,
-            ptr::null_mut(),
-            ptr::null(),
-            ptr::null(),
-        )
-    } < 0
-    {
+    let Some((pty_master, pty_slave)) = open_pty() else {
         let _ = write_message_locked(
             &agent_fd,
             &Message::Error {
@@ -2313,9 +2313,7 @@ fn run_channel_pty(
         );
         send_status(&agent_fd, channel_id, 127 << 8);
         return;
-    }
-    set_cloexec(pty_master);
-    set_cloexec(pty_slave);
+    };
     let winsize = Winsize {
         ws_row: rows,
         ws_col: cols,
@@ -2389,9 +2387,11 @@ fn run_channel_pty(
     let mut child_exited = false;
     let mut pty_eof = false;
     loop {
+        // poll() skips negative descriptors: a stream at EOF reports a
+        // hangup at once, every time, and would turn this into a busy loop.
         let mut pollfds = [
             PollFd {
-                fd: pty_master,
+                fd: if pty_eof { -1 } else { pty_master },
                 events: POLLIN | POLLHUP | POLLERR | POLLNVAL,
                 revents: 0,
             },
@@ -2586,14 +2586,17 @@ fn run_channel_pipe(
     let mut stderr_eof = false;
     loop {
         loop_count = loop_count.saturating_add(1);
+        // poll() skips negative descriptors: a stream at EOF reports a
+        // hangup at once, every time, and would turn this into a busy loop
+        // while the command keeps running.
         let mut pollfds = [
             PollFd {
-                fd: stdout_read,
+                fd: if stdout_eof { -1 } else { stdout_read },
                 events: POLLIN | POLLHUP | POLLERR | POLLNVAL,
                 revents: 0,
             },
             PollFd {
-                fd: stderr_read,
+                fd: if stderr_eof { -1 } else { stderr_read },
                 events: POLLIN | POLLHUP | POLLERR | POLLNVAL,
                 revents: 0,
             },

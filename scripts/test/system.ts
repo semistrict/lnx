@@ -159,6 +159,38 @@ try {
     await ctx.vm.cli(["kill", String(pid)]);
   });
 
+  await testStep("a command with a closed output stream does not busy-loop the agent", async () => {
+    // Closing stderr while running used to make the agent poll the dead
+    // pipe in a tight loop, burning a core for as long as the command ran.
+    const command = spawn([ctx.lnxBin, "--instance", ctx.instance, "sh", "-c", "exec 2>&-; echo started; sleep 7784"]);
+    try {
+      const reader = command.stdout!.getReader();
+      assertEq(new TextDecoder().decode((await reader.read()).value).trim(), "started", "command started");
+      reader.releaseLock();
+      const ticks = await ctx.vm.cli(["--root", "sh", "-c",
+        "pid=$(pgrep -o -f 'lnx-agent --agent'); t() { awk '{print $14+$15}' /proc/$pid/stat; }; a=$(t); sleep 2; echo $(( $(t) - a ))"]);
+      // 2 s is 200 ticks of one core; an idle agent uses a handful.
+      assertEq(Number(ticks.stdout) < 20, true, `agent CPU ticks over 2 s: ${ticks.stdout}`);
+    } finally {
+      command.kill("SIGTERM");
+      await command.exited;
+    }
+  });
+
+  await testStep("commands started together do not inherit each other's pipes", async () => {
+    const commands = Array.from({ length: 8 }, () => spawn([ctx.lnxBin, "--instance", ctx.instance, "sleep", "7785"]));
+    try {
+      const fds = await ctx.vm.cli(["--root", "sh", "-c",
+        "for i in $(seq 100); do [ $(pgrep -x -f 'sleep 7785' | wc -l) -eq 8 ] && break; sleep 0.1; done; " +
+        "for p in $(pgrep -x -f 'sleep 7785'); do ls /proc/$p/fd | wc -l; done | sort | uniq -c | tr -s ' '"]);
+      // Each command has its own stdin, stdout and stderr, and nothing else.
+      assertEq(fds.stdout.trim(), "8 3", "open descriptors per command");
+    } finally {
+      for (const command of commands) command.kill("SIGTERM");
+      await Promise.all(commands.map((command) => command.exited));
+    }
+  });
+
   await testStep("create makes an instance with saved settings", async () => {
     const created = `${ctx.instance}-created`;
     try {
